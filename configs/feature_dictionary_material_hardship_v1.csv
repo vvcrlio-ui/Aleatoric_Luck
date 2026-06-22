@@ -1,0 +1,189 @@
+domain,concept,wave,respondent,exact_column_name,source_label,include
+family_economics,household income,baseline,mother,cm1hhinc,Constructed - Household income (with imputed values),true
+family_economics,household income imputation flag,baseline,mother,cm1hhimp,Constructed - Flag variable for household income imputation,true
+family_economics,poverty category,baseline,mother,cm1povca,Constructed - Poverty categories,true
+family_economics,mother earnings indicator,baseline,mother,m1j1a,In last yr did you have income from earnings?,true
+family_economics,mother earnings amount,baseline,mother,m1j2a,"In last 12 mo, about how much money did you receive from earnings?",true
+family_economics,family or friend income support,baseline,mother,m1j1d,In last yr did you have income from from family/friends?,true
+family_economics,father child support paid,year1,mother,m2c21,Has father paid anything toward child support since child was born?,true
+family_economics,household income,year1,mother,cm2hhinc,Constructed - Household income (with imputed values),true
+family_economics,poverty category,year1,mother,cm2povca,Constructed - Poverty categories,true
+family_economics,child support received,year3,mother,m3c26,About how much in child support have you received since agreement?,true
+family_economics,household income,year3,mother,cm3hhinc,Constructed - Household income (with imputed values),true
+family_economics,poverty category,year3,mother,cm3povca,Constructed - Poverty categories,true
+family_economics,household income,year5,mother,cm4hhinc,Constructed - Household income (with imputed values),true
+family_economics,poverty category,year5,mother,cm4povca,Constructed - Poverty categories,true
+family_economics,household income,year9,mother,cm5hhinc,Constructed - Mother's Household income (with imputed values),true
+family_economics,income-to-poverty ratio,year9,mother,cm5povco,Constructed - Mother's household income/poverty threshold at 9-year,true
+family_economics,poverty category,year9,mother,cm5povca,Constructed - Mother's poverty category at 9-year,true
+family_economics,prior food hardship,year9,primary caregiver,n5g1b,G1B. Was hungry but did not eat because not enough money,true
+family_economics,prior utility hardship,year9,primary caregiver,n5g1f,G1F. Gas or electric service ever turned off or oil not delivered,true
+family_economics,prior bill-payment borrowing,year9,primary caregiver,n5g1g,G1G. Borrowed money from friends or family to help pay bills,true
+employment,mother prior work hours,baseline,mother,m1i2a,"When you last worked, how many hours per week did you work?",true
+employment,mother expects to work,baseline,mother,m1i2d,Do you expect to work during next year?,true
+employment,father activity last week,baseline,mother,m1i6,"What was BF doing most of last week (working, going to school,else)?",true
+employment,father looking for regular job,baseline,father,f1j2,Are you currently looking for a regular job?,true
+employment,father weekly work hours,baseline,father,f1j6,How many hrs/wk do/did you work at your current/most recent job?,true
+employment,mother worked for pay last week,year1,mother,m2k5,Did you do any regular work for pay last week?,true
+employment,mother looking for regular job,year1,mother,m2k6,Are you currently looking for a regular job?,true
+employment,mother current weekly hours,year1,mother,m2k9,How many hours per week do you usually work at current job?,true
+employment,mother worked for pay last week,year3,mother,m3k4,"Last week, did you do any regular work for pay?",true
+employment,mother looking for regular job,year3,mother,m3k5,Are you currently looking for a regular job?,true
+employment,mother multiple jobs,year3,mother,m3k17,"In past year, did you work more than one job at a time?",true
+employment,mother annual regular-job earnings,year3,mother,m3k19,How much did you earn from all regular jobs in past year? ($),true
+employment,mother worked for pay last week,year5,mother,m4k4,"Last week, did you do any regular work for pay?",true
+employment,mother looking for regular job,year5,mother,m4k5,Are you currently looking for a regular job?,true
+employment,mother usual weekly hours,year5,mother,m4k10,How many hours do you usually work per week at that job?,true
+employment,mother annual regular-job earnings,year5,mother,m4k19,How much did you earn from all reg jobs in past 12 months (amount)?,true
+employment,employment-office help,year9,mother,m5f7a,F7A. Received help from an employment office in past 12 months,true
+housing,rent or own status,baseline,mother,m1f2,Is the home/apartment were you currently reside owned/rented?,true
+housing,public housing,baseline,mother,m1f3,Do you live in a public housing project?,true
+housing,government rent help,baseline,mother,m1f4,Is the fed/state/local government helping to pay for your rent?,true
+housing,moved since birth,year1,mother,m2h1,Have you moved since child was born?,true
+housing,number of moves since birth,year1,mother,m2h1a,How many times have you moved since child's birth?,true
+housing,current living situation,year1,mother,m2h2,What is current living situation?,true
+housing,government rent help,year1,mother,m2h7,"Is fed, state, or local gov helping to pay your rent?",true
+housing,rent or mortgage not fully paid,year1,mother,m2h19d,"In past 12 months, did you-Not pay full amount of rent/mortgage?",true
+housing,evicted for nonpayment,year1,mother,m2h19e,"In past 12 months, did you-Get evicted for not paying rent/mortgage?",true
+housing,moved since prior wave,year3,mother,m3i1,Have you moved since your child's first birthday?,true
+housing,government rent help,year3,mother,m3i6,Is the federal/state/local government helping you pay your rent?,true
+housing,rent or mortgage not fully paid,year3,mother,m3i23b,"In past year, did you not pay full rent or mortgage?",true
+housing,evicted from home,year3,mother,m3i23c,"In past year, were you evicted from home?",true
+housing,moved in last two years,year5,mother,m4i1,Have you moved in the last two years?,true
+housing,government rent help,year5,mother,m4i6,"Is the federal, state, or local government helping to pay for your rent?",true
+housing,moved in last four years,year9,mother,m5f1,F1. Mother has moved in the last four years,true
+housing,number of moves in last four years,year9,mother,m5f1a,F1A. Number of times have you have moved in the last four years,true
+housing,current housing situation,year9,mother,m5f2,F2. Your current housing situation,true
+housing,public housing,year9,mother,m5f5,F5. Home is in a public housing project,true
+housing,government rent help,year9,mother,m5f6,"F6. The federal, state, or local government helps to pay for your rent",true
+housing,prior rent hardship,year9,primary caregiver,n5g1c,G1C. Rent or mortgage was not paid because not enough money,true
+housing,prior eviction hardship,year9,primary caregiver,n5g1d,G1D. Evicted from home or apartment for not paying rent or mortgage,true
+housing,prior doubled-up hardship,year9,primary caregiver,n5g1h,G1H. Moved in with other people because of financial problems,true
+housing,prior shelter homelessness hardship,year9,primary caregiver,n5g1i,"G1I. Stayed at shelter, abandoned building, or in automobile",true
+program_participation,welfare amount,baseline,mother,m1j2b,"In 12 mo, about how much money did you receive from pub. assis/welfare?",true
+program_participation,WIC help,year1,mother,m2h8e,"Since child's birth,have you received help from-WIC Program?",true
+program_participation,TANF receipt,year1,mother,m2h9a1,In past 12 months have you received help from Welfare or TANF?,true
+program_participation,food stamp receipt,year1,mother,m2h9a2,"In past 12 months, have you received help from food stamps?",true
+program_participation,Medicaid coverage,year1,mother,m2j3,Are you/children covered by Medicaid or other assistance pgms or HMO?,true
+program_participation,child care subsidy eligibility,year1,mother,m2b34a,Are you eligible for subsidies/vouchers for child care?,true
+program_participation,WIC help,year3,mother,m3i7e,Since child's first birthday: helped by WIC?,true
+program_participation,TANF receipt,year3,mother,m3i8a1,"In past year, received help from welfare or TANF?",true
+program_participation,food stamp receipt,year3,mother,m3i8a2,"In the past year, received help from Food Stamps?",true
+program_participation,Medicaid coverage,year3,mother,m3j3,Are you/your child(ren) covered by Medicaid/any government program?,true
+program_participation,child care subsidy eligibility,year3,mother,m3b21,Are you eligible for any subsidies or vouchers for child care?,true
+program_participation,WIC help,year5,mother,m4i7d,"In the past 12 months, have you received help from W.I.C.?",true
+program_participation,TANF receipt,year5,mother,m4i8a1,"In the past 12 months, have you received income from welfare or TANF?",true
+program_participation,food stamp receipt,year5,mother,m4i8a2,"In the past 12 months, have you received income from food stamps?",true
+program_participation,food stamp receipt,year5,mother,m4i19,Did mother receive food stamps in the past 12 months?,true
+program_participation,welfare or TANF receipt,year9,mother,m5f8a1,F8A1. Received income from welfare/TANF in last 12 months,true
+program_participation,food stamps or EBT receipt,year9,mother,m5f8a2,F8A2. Received income from food stamps/EBT in last 12 months,true
+program_participation,SSI receipt,year9,mother,m5f18e,F18E. Who has received SSI in past 12 months,true
+program_participation,child care assistance,year9,mother,m5f7_104,F7_104. Received child care assistance in past 12 months,true
+program_participation,health insurance assistance,year9,mother,m5f7_105,F7_105. Received health insurance assistance in past 12 months,true
+program_participation,housing assistance,year9,mother,m5f7_107,F7_107. Received housing assistance in past 12 months,true
+family_structure,mother-father relationship,baseline,mother,cm1relf,Constructed-Household Relationship-mother,true
+family_structure,mother married,baseline,mother,cm1marf,Constructed - Is respondent married?,true
+family_structure,number of adults in household,baseline,mother,cm1adult,Constructed - # of adults 18 or older in the HH,true
+family_structure,number of children in household,baseline,mother,cm1kids,Constructed - # of children under 18 in HH,true
+family_structure,mother-father relationship,year1,mother,cm2relf,Constructed - Mother's romantic relationship w/BF at one-year,true
+family_structure,mother married to father,year1,mother,cm2marf,Constructed - Mother married to BF at one-year,true
+family_structure,mother married new partner,year1,mother,cm2marp,Constructed - Is mother married to a new partner?,true
+family_structure,mother cohabiting new partner,year1,mother,cm2cohp,Constructed - Is mother cohabiting with a new partner?,true
+family_structure,number of adults in household,year1,mother,cm2adult,Constructed - # of adults in HH,true
+family_structure,number of children in household,year1,mother,cm2kids,Constructed - # of children in HH,true
+family_structure,mother-father relationship,year3,mother,cm3relf,Constructed - Mother relationship with father at year three,true
+family_structure,mother married to father,year3,mother,cm3marf,Constructed - Mother married to baby's father at year three,true
+family_structure,mother married new partner,year3,mother,cm3marp,Constructed - Mother married to new partner at year three,true
+family_structure,number of adults in household,year3,mother,cm3adult,Constructed - Number of adults 18 or over in household,true
+family_structure,number of children in household,year3,mother,cm3kids,Constructed - Number of children under 18 in household,true
+family_structure,mother-father relationship,year5,mother,cm4relf,Constructed - Mother relationship with father at year five,true
+family_structure,mother married to father,year5,mother,cm4marf,Constructed - Mother married to baby's father at year five,true
+family_structure,mother married new partner,year5,mother,cm4marp,Constructed - Mother married to new partner at year five,true
+family_structure,number of adults in household,year5,mother,cm4adult,Constructed - Number of adults 18 or over in household,true
+family_structure,number of children in household,year5,mother,cm4kids,Constructed - Number of children under 18 in household,true
+family_structure,mother-father relationship,year9,mother,cm5relf,Constructed - Mother relationship with father at nine-year follow-up,true
+family_structure,mother married to father,year9,mother,cm5marf,Constructed - Mother married to child's father at nine-year,true
+family_structure,mother cohabiting father,year9,mother,cm5cohf,Constructed - Mother living with child's father at nine-year,true
+family_structure,mother married new partner,year9,mother,cm5marp,Constructed - Mother married to new partner at nine-year,true
+family_structure,mother cohabiting new partner,year9,mother,cm5cohp,Constructed - Mother living with new partner at nine-year,true
+family_structure,number of adults in household,year9,mother,cm5adult,Number of adults (18+) in mother's hh -Includes mother,true
+family_structure,current romantic relationship,year9,mother,m5d2,D2. Mother currently involved in a romantic relationship with someone,true
+family_structure,married current partner,year9,mother,m5d2b,D2B. Married to current partner,true
+family_structure,living with current partner,year9,mother,m5d2d,D2D. Mother and current partner live together most of the time,true
+parent_health,mother self-rated health,baseline,mother,m1g1,How is your health?,true
+parent_health,mother alcohol or drug interference,baseline,mother,m1g5,In past yr has alc/drugs interfered with your work/relationships?,true
+parent_health,father self-rated health,baseline,father,f1g1,How is your health?,true
+parent_health,father alcohol or drug interference,baseline,father,f1g5,"In the past year, has drinking/drugs interfered with work/relationships?",true
+parent_health,father depressed frequency,baseline,father,f1g9e,"In the past week, how often did you feel depressed?",true
+parent_health,mother self-rated health,year1,mother,m2j1,"In general, how is your health?",true
+parent_health,mother work-limiting health problem,year1,mother,m2j2,Do you have a serious health problem that limits the work you can do?,true
+parent_health,mother depression screen,year1,mother,m2j13c1,Int Chk: Was respondent sad/blue/depressed for 2 weeks?,true
+parent_health,mother excess worry,year1,mother,m2j16a,"During past 12 mons, did you worry a lot more than most people would?",true
+parent_health,mother self-rated health,year3,mother,m3j1,"In general, how is your health?",true
+parent_health,mother work-limiting health problem,year3,mother,m3j2,Do you have any serious health problem that limits the work you can do?,true
+parent_health,mother depression medication,year3,mother,m3j2b_4,Take medication for: depression?,true
+parent_health,mother anxiety medication,year3,mother,m3j2b_5,Take medication for: anxiety?,true
+parent_health,mother anxious month,year3,mother,m3j18,"In past year, did you feel worried/tense/anxious for a month or more?",true
+parent_health,mother heavy drinking,year3,mother,m3j28,What is the largest number of drinks consumed in a day in past year?,true
+parent_health,mother drug use,year3,mother,m3j36j,Did respondent use one/more drugs?,true
+parent_health,mother self-rated health,year5,mother,m4j1,"In general, how is your health?",true
+parent_health,mother work-limiting health problem,year5,mother,m4j2,Do you have serious health problem limits amt/kind work you can do?,true
+parent_health,mother self-rated health,year9,mother,m5g1,G1. Your health status in general,true
+parent_health,mother work-limiting health problem,year9,mother,m5g2,G2. You have a serious health problem that limits the work you can do,true
+parent_health,mother depression medication,year9,mother,m5g2b1d,G2B1D. You take prescribed medication for Depression,true
+parent_health,mother anxiety medication,year9,mother,m5g2b1e,G2B1E. You take prescribed medication for Anxiety,true
+parent_health,mother smoking,year9,mother,m5g17,G17. You smoked cigarettes in the past month,true
+parent_health,mother heavy drinking frequency,year9,mother,m5g19a,G19A. Frequency you had 4 or more drinks in one day in past 12 months,true
+parent_health,mother drug use frequency,year9,mother,m5g21k,G21K. Frequency you used those drugs in past 12 months,true
+parent_health,mother anxiety attack,year9,mother,m5g24,G24. Ever had a spell/attack when you felt frightened/anxious/uneasy,true
+parent_health,mother longest anxious period,year9,mother,m5g25a,G25A. The longest period you felt worried or anxious,true
+social_support,father promised support,baseline,mother,m1b21,Has BF told you that he will provide support for the baby?,true
+social_support,family or friend income support,baseline,mother,m1j1d,In last yr did you have income from from family/friends?,true
+social_support,financial support other than father,year1,mother,m2g5,Have you received any fin. support from other than father since birth?,true
+social_support,parents gave financial help,year1,mother,m2g5a1,Who gave you financial help/money?-respondent's Parents,true
+social_support,maternal relatives gave financial help,year1,mother,m2g5a2,Who gave you financial help/money?-Other maternal relatives,true
+social_support,friends gave financial help,year1,mother,m2g5a5,Who gave you financial help/money?-Friends,true
+social_support,emergency child care help,year1,mother,m2g6c,Could you count on someone to help w/emergency child care?,true
+social_support,borrowed from friends or family,year3,mother,m3i23e,"In past year, did you borrow money from friends/family?",true
+social_support,financial help other than father,year9,mother,m5e2,E2. Financial help or money from anyone other than father,true
+social_support,can borrow 200 dollars,year9,mother,m5e3,E3. Mother could count on someone to loan her $200 during the next year,true
+social_support,can get place to live,year9,mother,m5e4,E4. Mother could count on someone to provide her with a place to live,true
+social_support,emergency child care help,year9,mother,m5e5,E5. Mother could count on someone to help her with emergency child care,true
+social_support,dependable special person,year9,mother,m5e7,E7. Any special person mother feels close with and can depend on,true
+social_support,parents gave financial help,year9,mother,m5e2a_1,E2A_1. Respondent's parents gave financial help,true
+social_support,friends gave financial help,year9,mother,m5e2a_5,E2A_5. Friends gave financial help,true
+social_support,church members gave financial help,year9,mother,m5e2a_102,E2A_102. Church members gave financial help,true
+social_support,friends/neighbors/coworkers advice support,year9,mother,m5e8_5,E8_5. You could ask friends/neighbors/co-workers for help/advice,true
+neighborhood,street safety at night,baseline,mother,m1f5,How safe are the streets around your home at night?,true
+neighborhood,close-knit neighborhood,year5,mother,m4i0n2,Agree/disagree: This is a close-knit neighborhood,true
+neighborhood,gangs problem in neighborhood,year5,mother,m4i0n5,Agree/disagree: Gangs are a problem in this neighborhood,true
+neighborhood,neighborhood safety problem,year9,mother,m5a3a1_11,A3A1_11. There were problems with neighborhood safety,true
+neighborhood,close-knit neighborhood,year9,primary caregiver,p5m3b,M3B. Amount agree close knit neighborhood,true
+neighborhood,neighborhood does not get along,year9,primary caregiver,p5m3c,M3C. Amount agree people in neighborhood do not get along,true
+neighborhood,neighborhood does not share values,year9,primary caregiver,p5m3d,M3D. Amount agree people in neighborhood do not share values,true
+neighborhood,gangs problem in neighborhood,year9,primary caregiver,p5m3e,M3E. Amount agree gangs are problem in neighborhood,true
+neighborhood,afraid child outside because violence,year9,primary caregiver,p5m4,M4. Afraid to let child go outside because of violence in neighborhood,true
+neighborhood,crime problem in neighborhood,year9,teacher,t5f4a,F4A. How much of a problem is crime in the neighborhood,true
+neighborhood,gunshot noise problem,year9,teacher,t5f4d,F4D. How much of a problem is gunshot noise in the neighborhood,true
+neighborhood,child felt safe at school,year9,child,k5e1d,E1D. Frequency you felt safe at your school,true
+child_early_status,child sex,baseline,child,cm1bsex,Constructed - Focal baby's gender,true
+child_early_status,low birth weight,baseline,child,cm1lbw,Constructed - Low Birth Weight?,true
+child_early_status,number of babies at birth,baseline,child,cm1numb,Constructed - Number of babies born at current birth,true
+child_early_status,child health,year1,mother,m2b2,How is the child's health?,true
+child_early_status,cerebral palsy diagnosis,year1,mother,m2b4a,What type of physical disability?-Cerebral Palsy,true
+child_early_status,child health,year3,mother,m3b2,How is your child's health?,true
+child_early_status,child health,year5,mother,m4b2,"In general, how would you describe child's health?",true
+child_early_status,child attention problem,year5,mother,m4b4b1,"True/not true: child can't concentrate, can't pay attention for long?",true
+child_early_status,child disobedience,year5,mother,m4b4b5,True/not true: child is disobedient?,true
+child_early_status,child nervous tense,year5,mother,m4b4b9,"True/not true: child is nervous, high strung, or tense?",true
+child_early_status,child health,year9,primary caregiver,p5h1,H1. Description of child's health,true
+child_early_status,child ADHD diagnosis,year9,primary caregiver,p5h2a,H2A. Doctor has diagnosed ADD/ADHD,true
+child_early_status,child autism diagnosis,year9,primary caregiver,p5h2f,H2F. Doctor has diagnosed autism,true
+child_early_status,child concentration problem,year9,primary caregiver,p5q3g,"Q3G. Child can't concentrate, can't pay attention for long",true
+child_early_status,child hyperactivity,year9,primary caregiver,p5q3i,"Q3I. Child can't sit still, is restless, or hyperactive",true
+child_early_status,child poor school work,year9,primary caregiver,p5q3bg,Q3BG. Child does poor school work,true
+child_early_status,child attention difficulty,year9,child,k5g2d,G2D. It's hard for me to pay attention,true
+child_early_status,child sadness,year9,child,k5g2g,G2G. I feel sad a lot of the time,true
+child_early_status,child self-rated health,year9,child,k5h1,H1. Condition of health in general,true
+child_early_status,school mobility,year9,primary caregiver,p5l10,L10. Number of schools child attended since first grade,true
+child_early_status,school absences,year9,primary caregiver,p5l11,L11. Number of times child was absent from school during school year,true

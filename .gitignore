@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors
+.vscode/
+.idea/
+*~
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+dist/
+build/
+*.egg-info/
+
+# Data / experiments
+data/
+datasets/
+outputs/
+results/
+runs/
+logs/
+
+# Env / secrets
+.env
+.env.*
+
+# Logs
+*.log
