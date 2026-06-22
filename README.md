@@ -31,37 +31,6 @@ It depends on the observed data, included predictors, model family, split, and
 extrapolation assumptions; it is not claimed to be a model-independent measure
 of Bayes error or a literal measurement of luck.
 
-## Zheng Cheng's contributions
-
-- Built the end-to-end Python structural replication of the paper's cumulative
-  Aset1/Aset2/Bset1/Bset2 comparison, including OLS, Ridge, Lasso, XGBoost, and
-  BART model support.
-- Designed and implemented four new experimental directions not reported in
-  the source paper: incremental feature-count tests, domain-wise prediction,
-  SHAP-based feature-ordering experiments, and sample-size learning curves.
-- Implemented constrained power-law fitting with bootstrap intervals and
-  stability diagnostics to estimate and audit the conditional error floor.
-- Added reproducible experiment identities, data hashes, metadata-rich CSV
-  checkpoints, safe resume behaviour, and per-model failure recording for
-  long-running jobs.
-- Added regression tests for model configuration, evaluation metrics,
-  checkpoint isolation, SHAP ordering, power-law recovery, and notebook
-  integrity.
-- Made the workflow portable across local Python, Google Colab, and SLURM job
-  arrays without committing restricted NLSY79 data or user-specific paths.
-
-## What is replicated and what is new
-
-- `overall_prediction.py` is the source-aligned component. It reproduces the
-  cumulative Aset1/Aset2/Bset1/Bset2 predictor-set comparison with a 70/30
-  split and seed `12345`.
-- `feature_sets.py`, `domain_wise.py`, `SHAP_vals.py`, `SHAP_experiment.py`,
-  and `sample_size.py` are extensions developed in this repository. They are
-  not analyses reported in the Zheng–Cheng paper.
-- The implementation is a Python structural replication, not a byte-for-byte
-  reproduction of the original R/Stata workflow. Identical numeric seeds do
-  not produce identical row splits across R and Python.
-
 ## Repository layout
 
 ```text
