@@ -1,9 +1,12 @@
-# Aleatoric Luck: Zheng–Cheng Predictive Approach
+# Aleatoric Luck: Zheng–Cheng Replication and Predictive Extensions
 
-This is an independent research implementation inspired by Zheng and Cheng's
-predictive approach to social rigidity. The first complete case study predicts
-the Fragile Families Challenge Year 15 `materialHardship` outcome from ICPSR
-31622 DS15 Challenge files.
+This independent repository contains two clearly separated analyses:
+
+1. `nlsy_replication/` works with the authors' processed NLSY79 tables and
+   includes a source-aligned cumulative predictor-set comparison plus new
+   feature-count, SHAP, and learning-curve extensions.
+2. `ffcws_predict/` applies a separate prediction and error-floor pipeline to
+   the Fragile Families Challenge Year 15 `materialHardship` outcome.
 
 The target is treated as a continuous proportion score. The main evaluation
 metric is holdout MSE, and learning curves are fit with a power-law form to
@@ -21,6 +24,11 @@ uncertainty.
 
 ```text
 aleatoric_luck-Zheng-Cheng/
+├── nlsy_replication/
+│   ├── src/
+│   ├── slurm/
+│   ├── colab_run.ipynb
+│   └── README.md
 ├── configs/
 │   ├── feature_dictionary_material_hardship_v1.csv
 │   └── material_hardship.yaml
@@ -36,7 +44,22 @@ aleatoric_luck-Zheng-Cheng/
 └── requirements.txt
 ```
 
-## Data
+## NLSY79 replication and extensions
+
+See [`nlsy_replication/README.md`](nlsy_replication/README.md) for the data
+requirements, source-aligned analysis, Colab runner, and portable SLURM job
+arrays. NLSY data are not included.
+
+The NLSY source-aligned entry point is:
+
+```bash
+cd nlsy_replication
+python src/overall_prediction.py --models ols ridge lasso xgboost bart
+```
+
+## FFCWS material-hardship application
+
+### Data
 
 The framework expects a local ICPSR 31622 DS15 download. It does not log into
 ICPSR and does not reconstruct Year 15 labels from questionnaire items.
@@ -52,7 +75,7 @@ The included portable configuration expects the following files under
 Rows where the truth file has non-missing `materialHardship` define the final
 holdout for this outcome.
 
-## Workflow
+### Workflow
 
 Run the full local DS15 workflow with:
 
@@ -78,7 +101,7 @@ Core outputs are written to `runs/material_hardship/` and are ignored by Git:
 - `power_law_fit.csv`
 - `summary_report.md`
 
-## Feature Dictionary
+### Feature Dictionary
 
 `configs/feature_dictionary_material_hardship_v1.csv` is a hand-built domain
 dictionary with exact DS15 `background.csv` column names. The domains are:
@@ -96,7 +119,7 @@ dictionary with exact DS15 `background.csv` column names. The domains are:
 Duplicate cross-domain columns are de-duplicated for modeling and marked as
 `cross_domain` in the resolved dictionary.
 
-## Models
+### Models
 
 The training command evaluates:
 
@@ -129,7 +152,7 @@ python -m unittest discover -s tests -p 'test_*.py'
 Syntax checking:
 
 ```bash
-python -m compileall ffcws_predict tests
+python -m compileall ffcws_predict nlsy_replication/src tests
 ```
 
 ## Reference
