@@ -2,8 +2,8 @@
 #SBATCH --job-name=al-samples-light
 #SBATCH --output=logs/%x-%A_%a.out
 #SBATCH --error=logs/%x-%A_%a.err
-#SBATCH --time=36:00:00
-#SBATCH --cpus-per-task=8
+#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=20
 #SBATCH --mem=32G
 #SBATCH --array=0-6
 

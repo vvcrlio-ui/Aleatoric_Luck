@@ -23,6 +23,7 @@ build/
 # Data / experiments
 **/data/
 datasets/
+**/outputs
 outputs/
 results/
 runs/
@@ -34,4 +35,5 @@ logs/*
 .env.*
 
 # Logs
+**/logs
 *.log
