@@ -84,15 +84,25 @@ sample; it does not capture population sampling or holdout uncertainty.
 The scripts in `slurm/` use job arrays, contain no user-specific cluster path,
 and write one output per model. Submit them from `nlsy_replication/`; the tracked
 `logs/` directory lets Slurm open stdout and stderr before the script starts.
-Set these variables when cluster defaults differ:
+`VENV` defaults to `$PROJECT_DIR/.venv`, matching the `Environment` setup
+above, so anyone who follows those steps can submit jobs with no extra
+configuration. Set these variables when cluster defaults differ instead, e.g.
+if your venv lives somewhere else:
 
 ```bash
 export PROJECT_DIR=/path/to/aleatoric_luck-Zheng-Cheng/nlsy_replication
-export VENV=$HOME/venvs/aleatoric-luck
+export VENV=/path/to/your/venv
 export PYTHON_MODULE=Python/3.11
 sbatch slurm/run_overall.sbatch
-sbatch slurm/run_sample_size.sbatch
+sbatch slurm/run_sample_size_light.sbatch
+sbatch slurm/run_sample_size_bart.sbatch
 ```
+
+`run_sample_size_light.sbatch` arrays over the non-BART models with the
+same resources as the other extension scripts. `run_sample_size_bart.sbatch`
+runs BART alone, with more memory and deliberately low concurrency, because
+it is far heavier than the other models and was previously OOM-killed when
+sharing a job's memory budget with them.
 
 Adjust time, memory, partition, account, and module names for the target
 cluster. Merge model-specific CSVs only after all array tasks finish.
