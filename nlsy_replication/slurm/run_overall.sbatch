@@ -10,7 +10,11 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}}"
-VENV="${VENV:-$HOME/venvs/aleatoric-luck}"
+VENV="${VENV:-$PROJECT_DIR/.venv}"
+if [ ! -f "$VENV/bin/activate" ]; then
+  echo "VENV not found at $VENV/bin/activate -- see nlsy_replication/README.md Environment section, or export VENV=/path/to/your/venv" >&2
+  exit 1
+fi
 if command -v module >/dev/null 2>&1; then
   module purge
   module load "${PYTHON_MODULE:-Python/3.11}"

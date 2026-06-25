@@ -21,8 +21,9 @@ build/
 *.egg-info/
 
 # Data / experiments
-data/
+**/data/
 datasets/
+**/outputs
 outputs/
 results/
 runs/
@@ -34,4 +35,5 @@ logs/*
 .env.*
 
 # Logs
+**/logs
 *.log

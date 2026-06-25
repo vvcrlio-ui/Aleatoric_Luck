@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=al-domains
+#SBATCH --job-name=al-samples-light
 #SBATCH --output=logs/%x-%A_%a.out
 #SBATCH --error=logs/%x-%A_%a.err
-#SBATCH --time=36:00:00
-#SBATCH --cpus-per-task=8
+#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=20
 #SBATCH --mem=32G
-#SBATCH --array=0-7
+#SBATCH --array=0-6
 
 set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}}"
@@ -21,9 +21,23 @@ fi
 source "$VENV/bin/activate"
 cd "$PROJECT_DIR"
 mkdir -p logs outputs
-MODELS=(xgboost lightgbm ols ridge lasso elastic_net random_forest bart)
+
+# BART runs separately via run_sample_size_bart.sbatch: it needs more memory
+# and far less concurrency than these models, so it is never in this array.
+MODELS=(xgboost lightgbm ols ridge lasso elastic_net random_forest)
 MODEL="${MODELS[$SLURM_ARRAY_TASK_ID]}"
-python src/domain_wise.py \
+python src/sample_size.py \
+  --data data/asample2_withlag.csv \
+  --outcome Cm_lhourlywage \
   --models "$MODEL" \
+  --seed 12345 \
+  --test-size 0.3 \
+  --n-sizes 10 \
+  --n-draws 20 \
+  --min-fraction 0.1 \
+  --max-fraction 1.0 \
+  --bootstrap-iterations 500 \
+  --batch-size 20 \
   --n-jobs "$SLURM_CPUS_PER_TASK" \
-  --out "outputs/domain_wise_${MODEL}.csv"
+  --out "outputs/sample_size_${MODEL}.csv" \
+  --power-law-out "outputs/sample_size_power_law_${MODEL}.csv"
