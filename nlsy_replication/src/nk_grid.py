@@ -70,6 +70,19 @@ METRIC_COLUMNS = (
     "pinball_q10",
     "pinball_q90",
     "d2_absolute_error",
+    "pinball_q05",
+    "pinball_q25",
+    "pinball_q50",
+    "pinball_q75",
+    "pinball_q95",
+    "ks_statistic",
+    "wasserstein_distance",
+    "top_decile_hit_rate",
+    "bottom_decile_hit_rate",
+    "rsr",
+    "cv_rmse",
+    "mase",
+    "pearson_r2",
 )
 
 
@@ -197,18 +210,30 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
     train = _as_float_array(y_train)
     mse = float(mean_squared_error(y_true, preds))
     rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true, preds))
     y_range = float(np.max(y_true) - np.min(y_true))
-    r2_test = float(r2_against_training_mean(mse, y_true, train))
+    try:
+        r2_test = float(r2_against_training_mean(mse, y_true, train))
+    except ZeroDivisionError:
+        r2_test = np.nan
+    pearson_r = _correlation_statistic(y_true, preds, stats.pearsonr)
+    y_std = float(np.std(y_true))
+    y_mean = float(np.mean(y_true))
+    train_mean_absolute_error = float(np.mean(np.abs(y_true - np.mean(train))))
+    top_true = y_true >= np.quantile(y_true, 0.90)
+    top_pred = preds >= np.quantile(preds, 0.90)
+    bottom_true = y_true <= np.quantile(y_true, 0.10)
+    bottom_pred = preds <= np.quantile(preds, 0.10)
     return {
         "r2_test": r2_test,
         "skill_score_pct": 100.0 * r2_test,
         "rmse": rmse,
-        "mae": float(mean_absolute_error(y_true, preds)),
+        "mae": mae,
         "medae": float(median_absolute_error(y_true, preds)),
         "max_error": float(max_error(y_true, preds)),
         "nrmse": rmse / y_range if y_range > 0 else np.nan,
         "spearman_rho": _correlation_statistic(y_true, preds, stats.spearmanr),
-        "pearson_r": _correlation_statistic(y_true, preds, stats.pearsonr),
+        "pearson_r": pearson_r,
         "kendall_tau": _correlation_statistic(y_true, preds, stats.kendalltau),
         "ccc": float(_concordance_correlation_coefficient(y_true, preds)),
         "explained_variance": float(explained_variance_score(y_true, preds)),
@@ -217,6 +242,31 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
         "pinball_q10": float(mean_pinball_loss(y_true, preds, alpha=0.10)),
         "pinball_q90": float(mean_pinball_loss(y_true, preds, alpha=0.90)),
         "d2_absolute_error": float(d2_absolute_error_score(y_true, preds)),
+        "pinball_q05": float(mean_pinball_loss(y_true, preds, alpha=0.05)),
+        "pinball_q25": float(mean_pinball_loss(y_true, preds, alpha=0.25)),
+        "pinball_q50": float(mean_pinball_loss(y_true, preds, alpha=0.50)),
+        "pinball_q75": float(mean_pinball_loss(y_true, preds, alpha=0.75)),
+        "pinball_q95": float(mean_pinball_loss(y_true, preds, alpha=0.95)),
+        "ks_statistic": float(stats.ks_2samp(y_true, preds).statistic),
+        "wasserstein_distance": float(stats.wasserstein_distance(y_true, preds)),
+        "top_decile_hit_rate": (
+            float(np.sum(top_true & top_pred) / np.sum(top_true))
+            if np.sum(top_true) > 0
+            else np.nan
+        ),
+        "bottom_decile_hit_rate": (
+            float(np.sum(bottom_true & bottom_pred) / np.sum(bottom_true))
+            if np.sum(bottom_true) > 0
+            else np.nan
+        ),
+        "rsr": rmse / y_std if y_std != 0 else np.nan,
+        "cv_rmse": rmse / y_mean if y_mean != 0 else np.nan,
+        "mase": (
+            mae / train_mean_absolute_error
+            if train_mean_absolute_error != 0
+            else np.nan
+        ),
+        "pearson_r2": pearson_r**2 if np.isfinite(pearson_r) else np.nan,
     }
 
 

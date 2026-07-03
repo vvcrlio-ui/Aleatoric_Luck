@@ -25,6 +25,7 @@ from nlsy_replication.src.experiment import (
 from nlsy_replication.src.feature_sets import main as feature_sets_main
 from nlsy_replication.src.model_registry import MODEL_NAMES, make_model
 from nlsy_replication.src.nk_grid import (
+    METRIC_COLUMNS,
     NKGridConfig,
     compute_regression_metrics,
     draw_orders,
@@ -200,10 +201,29 @@ class NLSYReplicationTests(unittest.TestCase):
             y_pred=np.array([1.0, 2.0, 4.0]),
             y_train=np.array([1.0, 2.0, 3.0]),
         )
+        self.assertEqual(len(metrics), 30)
+        self.assertEqual(len(METRIC_COLUMNS), 30)
         self.assertAlmostEqual(metrics["r2_test"], 0.5)
         self.assertAlmostEqual(metrics["rmse"], np.sqrt(1.0 / 3.0))
         self.assertAlmostEqual(metrics["spearman_rho"], 1.0)
         self.assertAlmostEqual(metrics["pinball_q10"], 0.3)
+        self.assertAlmostEqual(metrics["pinball_q50"], 0.5 * metrics["mae"])
+        self.assertAlmostEqual(metrics["pearson_r2"], metrics["pearson_r"] ** 2)
+        self.assertAlmostEqual(metrics["rsr"], metrics["rmse"] / np.std([1.0, 2.0, 3.0]))
+        self.assertAlmostEqual(metrics["top_decile_hit_rate"], 1.0)
+        self.assertAlmostEqual(metrics["bottom_decile_hit_rate"], 1.0)
+        self.assertAlmostEqual(metrics["wasserstein_distance"], 1.0 / 3.0)
+        self.assertAlmostEqual(metrics["ks_statistic"], 1.0 / 3.0)
+        self.assertAlmostEqual(metrics["mase"], 0.5)
+
+    def test_nk_regression_metrics_degenerate_inputs_return_nan(self):
+        metrics = compute_regression_metrics(
+            y_test=np.array([0.0, 0.0, 0.0]),
+            y_pred=np.array([0.0, 0.0, 0.0]),
+            y_train=np.array([0.0, 0.0, 0.0]),
+        )
+        for key in ("spearman_rho", "pearson_r", "pearson_r2", "kendall_tau", "rsr", "cv_rmse", "mase"):
+            self.assertTrue(np.isnan(metrics[key]), key)
 
     def test_nk_seed_changes_split_and_draw_changes_subsample(self):
         frame = pd.DataFrame(
@@ -278,6 +298,19 @@ class NLSYReplicationTests(unittest.TestCase):
                 "pinball_q10",
                 "pinball_q90",
                 "d2_absolute_error",
+                "pinball_q05",
+                "pinball_q25",
+                "pinball_q50",
+                "pinball_q75",
+                "pinball_q95",
+                "ks_statistic",
+                "wasserstein_distance",
+                "top_decile_hit_rate",
+                "bottom_decile_hit_rate",
+                "rsr",
+                "cv_rmse",
+                "mase",
+                "pearson_r2",
                 "status",
                 "error",
                 "experiment_kind",
@@ -324,6 +357,49 @@ class NLSYReplicationTests(unittest.TestCase):
                 len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
                 8,
             )
+
+    def test_nk_grid_failed_rows_include_expanded_metrics_as_nan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ridge",),
+                seed=30,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=1,
+                max_k=1,
+                batch_size=1,
+                n_jobs=1,
+            )
+            run_nk_grid(config)
+            saved = pd.read_csv(out_path)
+            self.assertEqual(saved.loc[0, "status"], "failed")
+            expanded_metrics = [
+                "pinball_q05",
+                "pinball_q25",
+                "pinball_q50",
+                "pinball_q75",
+                "pinball_q95",
+                "ks_statistic",
+                "wasserstein_distance",
+                "top_decile_hit_rate",
+                "bottom_decile_hit_rate",
+                "rsr",
+                "cv_rmse",
+                "mase",
+                "pearson_r2",
+            ]
+            self.assertTrue(saved.loc[0, expanded_metrics].isna().all())
 
     def _write_nk_synthetic_data(self, data_path: Path) -> None:
         rng = np.random.default_rng(33)
