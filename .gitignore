@@ -27,6 +27,7 @@ datasets/
 outputs/
 results/
 runs/
+plans/
 logs/*
 !nlsy_replication/logs/.gitkeep
 
