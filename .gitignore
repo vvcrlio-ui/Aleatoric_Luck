@@ -29,7 +29,8 @@ results/
 runs/
 plans/
 logs/*
-!nk_grid_pipeline/logs/.gitkeep
+!NK_Grid/logs/.gitkeep
+!Zheng_Cheng_Replication/logs/.gitkeep
 
 # Env / secrets
 .env

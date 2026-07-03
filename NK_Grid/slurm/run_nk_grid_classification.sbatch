@@ -11,7 +11,7 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}}"
 VENV="${VENV:-$PROJECT_DIR/.venv}"
 if [ ! -f "$VENV/bin/activate" ]; then
-  echo "VENV not found at $VENV/bin/activate -- see nk_grid_pipeline/README.md Environment section, or export VENV=/path/to/your/venv" >&2
+  echo "VENV not found at $VENV/bin/activate -- see NK_Grid/README.md Environment section, or export VENV=/path/to/your/venv" >&2
   exit 1
 fi
 if command -v module >/dev/null 2>&1; then

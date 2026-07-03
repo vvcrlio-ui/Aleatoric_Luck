@@ -1,56 +1,43 @@
-# Aleatoric Luck: Zheng–Cheng Replication and Extensions
+# Aleatoric Luck: NK Grid and Zheng-Cheng Replication
 
-This repository contains only the NLSY79 work based on Zheng and Cheng (2025).
-It uses the authors' processed NLSY79 analysis tables for a Python structural
-replication and a set of clearly labelled predictive extensions.
+This repository contains two self-contained Python subprojects:
 
-> **Author and implementation:** Zheng Cheng. This repository's Python
-> replication, experimental extensions, validation framework, and computing
-> workflow were developed by Zheng Cheng. The cited paper supplies the research
-> design being replicated and the processed-data specification; the extensions
-> below are original work in this repository.
+- [`NK_Grid/`](NK_Grid/README.md): joint sample-size (N) by feature-count (K)
+  sweeps for regression and classification prediction metrics.
+- [`Zheng_Cheng_Replication/`](Zheng_Cheng_Replication/README.md): the
+  Zheng and Cheng replication workflow plus the early predictive extensions
+  for overall, sample-size, feature-set, domain-wise, and SHAP analyses.
 
----
-
-## Overview
-
-The project studies how much predictive error remains as the amount of training
-data increases. It first reconstructs the cumulative predictor-set comparison
-from Zheng and Cheng (2025), then extends that design to examine feature count,
-predictor domains, SHAP-ranked feature orderings, and sample-size learning
-curves across several model families.
-
-For the learning-curve extension, test error is modelled as:
-
-```text
-E(n) = c * n^(-alpha) + epsilon
-```
-
-Here, `epsilon` is treated conservatively as a conditional error-floor proxy.
-It depends on the observed data, included predictors, model family, split, and
-extrapolation assumptions; it is not claimed to be a model-independent measure
-of Bayes error or a literal measurement of luck.
+Each subproject has its own `src/`, `slurm/`, `data` symlink, logs marker, and
+requirements file. The shared support modules are intentionally copied into
+both directories so either subproject can run independently.
 
 ## Repository layout
 
 ```text
 aleatoric_luck-Zheng-Cheng/
-├── nk_grid_pipeline/
-│   ├── src/                    # Replication and extension scripts
-│   ├── slurm/                  # Portable SLURM job arrays
-│   ├── colab_run.ipynb         # Colab runner
+├── NK_Grid/
+│   ├── src/
+│   ├── slurm/
+│   ├── panels.json
 │   ├── requirements.txt
-│   └── README.md               # Detailed data and workflow documentation
+│   └── README.md
+├── Zheng_Cheng_Replication/
+│   ├── src/
+│   ├── slurm/
+│   ├── colab_run.ipynb
+│   ├── requirements.txt
+│   ├── requirements-notebook.txt
+│   └── README.md
 ├── tests/
-│   └── test_nk_grid_pipeline.py
+│   ├── test_nk_grid.py
+│   └── test_zheng_cheng_replication.py
 ├── requirements.txt
 └── README.md
 ```
 
-NLSY data are not included. See
-[`nk_grid_pipeline/README.md`](nk_grid_pipeline/README.md) for required input
-files, model settings, checkpoint behaviour, Colab instructions, and SLURM
-usage.
+NLSY data are not committed. Both subprojects track a `data` symlink pointing
+to the same cluster data directory.
 
 ## Quick start
 
@@ -60,19 +47,22 @@ Python 3.11 is recommended.
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-
-cd nk_grid_pipeline
-python src/overall_prediction.py --models ols ridge lasso xgboost bart
 ```
 
-Extension entry points are:
+Run the NK grid:
 
 ```bash
-python src/feature_sets.py --models xgboost ridge lasso
-python src/domain_wise.py --models xgboost ridge lasso
-python src/sample_size.py --models xgboost ridge lasso
-python src/SHAP_vals.py
-python src/SHAP_experiment.py
+cd NK_Grid
+python src/nk_grid.py --help
+python src/run_panels.py --dry-run
+```
+
+Run the replication workflow:
+
+```bash
+cd Zheng_Cheng_Replication
+python src/overall_prediction.py --help
+python src/overall_prediction.py --models ols ridge lasso xgboost bart
 ```
 
 ## Tests
@@ -80,11 +70,11 @@ python src/SHAP_experiment.py
 From the repository root:
 
 ```bash
-python -m unittest discover -s tests -p 'test_*.py'
-python -m compileall nk_grid_pipeline/src tests
+python -m pytest -q
+python -m compileall NK_Grid/src Zheng_Cheng_Replication/src tests
 ```
 
 ## Reference
 
 Zheng, H., & Cheng, S. (2025). Social Rigidity Across and Within Generations:
-A Predictive Approach. *Sociological Methods & Research, 54*(4), 1683–1725.
+A Predictive Approach. *Sociological Methods & Research, 54*(4), 1683-1725.

@@ -1,1 +1,2 @@
--r nk_grid_pipeline/requirements.txt
+-r NK_Grid/requirements.txt
+-r Zheng_Cheng_Replication/requirements.txt
