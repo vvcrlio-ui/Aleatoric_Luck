@@ -14,12 +14,19 @@ import pandas as pd
 from joblib import Parallel, delayed
 from scipy import stats
 from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
     explained_variance_score,
+    f1_score,
+    log_loss,
     max_error,
     mean_absolute_error,
     mean_pinball_loss,
     mean_squared_error,
     median_absolute_error,
+    roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
 
@@ -85,6 +92,17 @@ METRIC_COLUMNS = (
     "pearson_r2",
 )
 
+CLASSIFICATION_METRIC_COLUMNS = (
+    "roc_auc",
+    "pr_auc",
+    "brier",
+    "log_loss",
+    "balanced_accuracy",
+    "f1",
+    "accuracy",
+    "mcfadden_pseudo_r2",
+)
+
 
 @dataclass(frozen=True)
 class NKGridConfig:
@@ -104,6 +122,7 @@ class NKGridConfig:
     batch_size: int
     n_jobs: int
     group_split_col: str | None = None
+    task: str = "regression"
 
 
 @dataclass(frozen=True)
@@ -147,12 +166,15 @@ def split_frame(
     *,
     test_size: float,
     seed: int,
+    task: str = "regression",
 ) -> SplitData:
+    y = frame[outcome]
     X_train, X_test, y_train, y_test = train_test_split(
         frame.loc[:, list(predictors)],
-        frame[outcome],
+        y,
         test_size=test_size,
         random_state=seed,
+        stratify=y if task == "classification" else None,
     )
     return SplitData(X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test)
 
@@ -270,8 +292,74 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
     }
 
 
+def compute_classification_metrics(y_test, y_score, y_train) -> dict[str, float]:
+    """Compute binary classification metrics from positive-class probabilities."""
+
+    y_true = np.asarray(y_test, dtype=int)
+    score = np.asarray(y_score, dtype=float)
+    train = np.asarray(y_train, dtype=int)
+    labels = (score >= 0.5).astype(int)
+    has_two_test_classes = len(np.unique(y_true)) == 2
+    finite_scores = np.all(np.isfinite(score))
+    if finite_scores:
+        clipped = np.clip(score, 1e-15, 1 - 1e-15)
+    else:
+        clipped = score
+
+    positive_rate = float(np.mean(train)) if len(train) else np.nan
+    if (
+        has_two_test_classes
+        and finite_scores
+        and np.isfinite(positive_rate)
+        and 0.0 < positive_rate < 1.0
+    ):
+        model_loglik = float(
+            np.sum(y_true * np.log(clipped) + (1 - y_true) * np.log(1 - clipped))
+        )
+        null_loglik = float(
+            np.sum(
+                y_true * np.log(positive_rate)
+                + (1 - y_true) * np.log(1 - positive_rate)
+            )
+        )
+        mcfadden = 1.0 - model_loglik / null_loglik if null_loglik != 0 else np.nan
+    else:
+        mcfadden = np.nan
+
+    return {
+        "roc_auc": (
+            float(roc_auc_score(y_true, score))
+            if has_two_test_classes and finite_scores
+            else np.nan
+        ),
+        "pr_auc": (
+            float(average_precision_score(y_true, score))
+            if has_two_test_classes and finite_scores
+            else np.nan
+        ),
+        "brier": float(brier_score_loss(y_true, score)) if finite_scores else np.nan,
+        "log_loss": (
+            float(log_loss(y_true, clipped, labels=[0, 1]))
+            if has_two_test_classes and finite_scores
+            else np.nan
+        ),
+        "balanced_accuracy": (
+            float(balanced_accuracy_score(y_true, labels))
+            if has_two_test_classes
+            else np.nan
+        ),
+        "f1": float(f1_score(y_true, labels, zero_division=0)),
+        "accuracy": float(accuracy_score(y_true, labels)),
+        "mcfadden_pseudo_r2": float(mcfadden),
+    }
+
+
 def _empty_metrics() -> dict[str, float]:
     return {column: np.nan for column in METRIC_COLUMNS}
+
+
+def _empty_classification_metrics() -> dict[str, float]:
+    return {column: np.nan for column in CLASSIFICATION_METRIC_COLUMNS}
 
 
 def _model_seed(seed: int, draw: int, n_samples: int, k_features: int) -> int:
@@ -312,7 +400,25 @@ def _base_row(
     }
 
 
+def _positive_class_probability(model, X) -> np.ndarray:
+    if not hasattr(model, "predict_proba"):
+        return np.full(len(X), np.nan)
+    probabilities = np.asarray(model.predict_proba(X), dtype=float)
+    if probabilities.ndim != 2:
+        return np.full(len(X), np.nan)
+    classes = np.asarray(getattr(model, "classes_", []))
+    if classes.size and 1 in classes:
+        return probabilities[:, int(np.where(classes == 1)[0][0])]
+    if probabilities.shape[1] == 2:
+        return probabilities[:, 1]
+    if classes.size == 1:
+        return np.ones(len(X)) if classes[0] == 1 else np.zeros(len(X))
+    return np.full(len(X), np.nan)
+
+
 def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
+    if config.task not in {"regression", "classification"}:
+        raise ValueError("task must be 'regression' or 'classification'")
     if config.group_split_col:
         raise NotImplementedError(
             "--group-split-col is reserved for the sibling-clustering confirmation item."
@@ -329,24 +435,35 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
     predictors = _predictor_columns(frame)
     if not predictors:
         raise ValueError("No Aset/Bset predictors found in the input data.")
+    if config.task == "classification":
+        classes = set(pd.Series(frame[config.outcome]).dropna().unique())
+        if not classes.issubset({0, 1, False, True}) or len(classes) > 2:
+            raise ValueError(
+                "--task classification requires a binary 0/1 outcome column. "
+                "The real employment column name could not be verified locally; "
+                "pass the confirmed column via --outcome."
+            )
 
+    metadata_extra = {
+        "dataset": config.dataset,
+        "n_seeds": config.n_seeds,
+        "n_draws": config.n_draws,
+        "n_sizes_n": config.n_sizes_n,
+        "n_sizes_k": config.n_sizes_k,
+        "max_n": config.max_n,
+        "max_k": config.max_k,
+        "group_split_col": config.group_split_col,
+        **model_run_settings(config.models),
+    }
+    if config.task == "classification":
+        metadata_extra["task"] = config.task
     metadata = build_experiment_metadata(
-        kind="nk_grid",
+        kind="nk_grid" if config.task == "regression" else "nk_grid_classification",
         data_path=data_path,
         outcome=config.outcome,
         test_size=config.test_size,
         split_seed=config.seed,
-        extra={
-            "dataset": config.dataset,
-            "n_seeds": config.n_seeds,
-            "n_draws": config.n_draws,
-            "n_sizes_n": config.n_sizes_n,
-            "n_sizes_k": config.n_sizes_k,
-            "max_n": config.max_n,
-            "max_k": config.max_k,
-            "group_split_col": config.group_split_col,
-            **model_run_settings(config.models),
-        },
+        extra=metadata_extra,
     )
 
     split_seeds = [config.seed + offset for offset in range(config.n_seeds)]
@@ -357,6 +474,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             config.outcome,
             test_size=config.test_size,
             seed=seed,
+            task=config.task,
         )
         for seed in split_seeds
     }
@@ -424,8 +542,21 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                 model_name,
                 seed=_model_seed(seed, draw, n_samples, k_features),
                 n_jobs=1,
+                task=config.task,
             )
             model.fit(X_sub, y_sub)
+            if config.task == "classification":
+                scores = _positive_class_probability(model, X_test)
+                return add_metadata(
+                    {
+                        **row,
+                        "task": config.task,
+                        **compute_classification_metrics(split.y_test, scores, y_sub),
+                        "status": "ok",
+                        "error": "",
+                    },
+                    metadata,
+                )
             preds = model.predict(X_test)
             return add_metadata(
                 {
@@ -440,7 +571,12 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             return add_metadata(
                 {
                     **row,
-                    **_empty_metrics(),
+                    **(
+                        _empty_metrics()
+                        if config.task == "regression"
+                        else _empty_classification_metrics()
+                    ),
+                    **({"task": config.task} if config.task == "classification" else {}),
                     "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
                 },
@@ -471,8 +607,9 @@ def parse_args() -> NKGridConfig:
         description="Run joint log-scale N x K prediction-quality sweeps."
     )
     parser.add_argument("--data", default=str(ROOT / "data" / "asample2_withlag.csv"))
-    parser.add_argument("--outcome", default="Cm_lhourlywage")
-    parser.add_argument("--out", default=str(ROOT / "outputs" / "nk_grid.csv"))
+    parser.add_argument("--task", default="regression", choices=("regression", "classification"))
+    parser.add_argument("--outcome", default=None)
+    parser.add_argument("--out", default=None)
     parser.add_argument("--dataset", default="asample2_withlag")
     parser.add_argument("--models", nargs="+", default=["xgboost"], choices=MODEL_NAMES)
     parser.add_argument("--seed", type=int, default=12345)
@@ -491,11 +628,27 @@ def parse_args() -> NKGridConfig:
         default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
     )
     args = parser.parse_args()
+    if args.outcome is None:
+        if args.task == "classification":
+            raise ValueError(
+                "--task classification requires --outcome because the real "
+                "employment column name could not be verified locally."
+            )
+        outcome = "Cm_lhourlywage"
+    else:
+        outcome = args.outcome
+    out = args.out
+    if out is None:
+        out = str(
+            ROOT
+            / "outputs"
+            / ("nk_grid.csv" if args.task == "regression" else "nk_grid_clf.csv")
+        )
     return NKGridConfig(
         data=Path(args.data),
-        out=Path(args.out),
+        out=Path(out),
         dataset=args.dataset,
-        outcome=args.outcome,
+        outcome=outcome,
         models=tuple(args.models),
         seed=args.seed,
         test_size=args.test_size,
@@ -508,6 +661,7 @@ def parse_args() -> NKGridConfig:
         batch_size=args.batch_size,
         n_jobs=args.n_jobs,
         group_split_col=args.group_split_col,
+        task=args.task,
     )
 
 

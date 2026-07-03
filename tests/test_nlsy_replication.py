@@ -25,8 +25,10 @@ from nlsy_replication.src.experiment import (
 from nlsy_replication.src.feature_sets import main as feature_sets_main
 from nlsy_replication.src.model_registry import MODEL_NAMES, make_model
 from nlsy_replication.src.nk_grid import (
+    CLASSIFICATION_METRIC_COLUMNS,
     METRIC_COLUMNS,
     NKGridConfig,
+    compute_classification_metrics,
     compute_regression_metrics,
     draw_orders,
     log2_size_grid,
@@ -46,6 +48,17 @@ class NLSYReplicationTests(unittest.TestCase):
         self.assertEqual(model.predict(X).shape, (60,))
         self.assertIn("lightgbm", MODEL_NAMES)
         self.assertIn("bart", MODEL_NAMES)
+
+    def test_classification_registry_model_predicts_probabilities(self):
+        rng = np.random.default_rng(17)
+        X = pd.DataFrame(rng.normal(size=(80, 4)), columns=list("abcd"))
+        y = (X["a"] - 0.5 * X["b"] > 0).astype(int)
+        for model_name in ("ols", "ridge", "lasso", "elastic_net", "random_forest"):
+            model = make_model(model_name, seed=12345, n_jobs=1, task="classification")
+            model.fit(X, y)
+            probabilities = model.predict_proba(X)
+            self.assertEqual(probabilities.shape, (80, 2), model_name)
+            self.assertTrue(np.all((probabilities >= 0) & (probabilities <= 1)), model_name)
 
     def test_bart_defaults_match_paper_and_use_process_parallelism(self):
         model = make_model("bart", seed=12345, n_jobs=1)
@@ -225,6 +238,29 @@ class NLSYReplicationTests(unittest.TestCase):
         for key in ("spearman_rho", "pearson_r", "pearson_r2", "kendall_tau", "rsr", "cv_rmse", "mase"):
             self.assertTrue(np.isnan(metrics[key]), key)
 
+    def test_nk_classification_metrics_known_values(self):
+        y_test = np.array([0, 0, 1, 1])
+        probabilities = np.array([0.1, 0.4, 0.35, 0.8])
+        y_train = np.array([0, 1, 0, 1])
+        metrics = compute_classification_metrics(y_test, probabilities, y_train)
+        model_loglik = np.log(0.9) + np.log(0.6) + np.log(0.35) + np.log(0.8)
+        null_loglik = 4 * np.log(0.5)
+        self.assertEqual(len(metrics), 8)
+        self.assertEqual(len(CLASSIFICATION_METRIC_COLUMNS), 8)
+        self.assertAlmostEqual(metrics["roc_auc"], 0.75)
+        self.assertAlmostEqual(metrics["brier"], 0.158125)
+        self.assertAlmostEqual(metrics["accuracy"], 0.75)
+        self.assertAlmostEqual(metrics["mcfadden_pseudo_r2"], 1.0 - model_loglik / null_loglik)
+
+    def test_nk_classification_metrics_single_class_probability_metrics_nan(self):
+        metrics = compute_classification_metrics(
+            y_test=np.array([1, 1, 1]),
+            y_score=np.array([0.2, 0.8, 0.9]),
+            y_train=np.array([0, 1, 1, 0]),
+        )
+        for key in ("roc_auc", "pr_auc", "log_loss"):
+            self.assertTrue(np.isnan(metrics[key]), key)
+
     def test_nk_seed_changes_split_and_draw_changes_subsample(self):
         frame = pd.DataFrame(
             {
@@ -241,6 +277,25 @@ class NLSYReplicationTests(unittest.TestCase):
         order_a = draw_orders(first.X_train.index, predictors, seed=1, draw=0)
         order_b = draw_orders(first.X_train.index, predictors, seed=1, draw=1)
         self.assertNotEqual(list(order_a.row_index), list(order_b.row_index))
+
+    def test_nk_classification_split_is_stratified(self):
+        frame = pd.DataFrame(
+            {
+                "Aset1_a": np.arange(100),
+                "Bset1_b": np.arange(100) * 2,
+                "employed": np.r_[np.zeros(70, dtype=int), np.ones(30, dtype=int)],
+            }
+        )
+        split = split_frame(
+            frame,
+            ["Aset1_a", "Bset1_b"],
+            "employed",
+            test_size=0.3,
+            seed=4,
+            task="classification",
+        )
+        self.assertAlmostEqual(split.y_train.mean(), 0.3, delta=0.05)
+        self.assertAlmostEqual(split.y_test.mean(), 0.3, delta=0.05)
 
     def test_nk_grid_end_to_end_schema_and_row_count(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -401,6 +456,96 @@ class NLSYReplicationTests(unittest.TestCase):
             ]
             self.assertTrue(saved.loc[0, expanded_metrics].isna().all())
 
+    def test_nk_classification_grid_end_to_end_schema_and_row_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid_clf.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="employed",
+                models=("ols",),
+                seed=40,
+                test_size=0.3,
+                n_seeds=2,
+                n_draws=2,
+                n_sizes_n=1,
+                n_sizes_k=2,
+                max_n=30,
+                max_k=3,
+                batch_size=4,
+                n_jobs=1,
+                task="classification",
+            )
+            run_nk_grid(config)
+            saved = pd.read_csv(out_path)
+            self.assertEqual(len(saved), 8)
+            expected_columns = {
+                "experiment_id",
+                "dataset",
+                "outcome",
+                "task",
+                "model",
+                "seed",
+                "draw",
+                "N",
+                "K",
+                "split_random_state",
+                "n_train_total",
+                "n_features_total",
+                "roc_auc",
+                "pr_auc",
+                "brier",
+                "log_loss",
+                "balanced_accuracy",
+                "f1",
+                "accuracy",
+                "mcfadden_pseudo_r2",
+                "status",
+                "error",
+            }
+            self.assertTrue(expected_columns.issubset(saved.columns))
+            self.assertEqual(set(saved["task"]), {"classification"})
+            self.assertEqual(set(saved["status"]), {"ok"})
+
+    def test_nk_classification_checkpoint_resume_completes_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid_clf.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="employed",
+                models=("ols",),
+                seed=50,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=2,
+                n_sizes_n=1,
+                n_sizes_k=2,
+                max_n=30,
+                max_k=3,
+                batch_size=2,
+                n_jobs=1,
+                task="classification",
+            )
+            run_nk_grid(config, max_jobs=2)
+            partial = pd.read_csv(out_path)
+            self.assertEqual(len(partial), 2)
+            run_nk_grid(config)
+            saved = pd.read_csv(out_path)
+            self.assertEqual(len(saved), 4)
+            self.assertEqual(
+                len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
+                4,
+            )
+
     def _write_nk_synthetic_data(self, data_path: Path) -> None:
         rng = np.random.default_rng(33)
         frame = pd.DataFrame(
@@ -410,6 +555,9 @@ class NLSYReplicationTests(unittest.TestCase):
         frame["outcome"] = (
             0.7 * frame["Aset1_a"] - 0.4 * frame["Bset1_d"] + rng.normal(0, 0.1, len(frame))
         )
+        frame["employed"] = (
+            frame["Aset1_a"] - 0.5 * frame["Bset1_d"] + rng.normal(0, 0.2, len(frame)) > 0
+        ).astype(int)
         frame.to_csv(data_path, index=False)
 
 

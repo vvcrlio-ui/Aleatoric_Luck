@@ -9,9 +9,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import ElasticNetCV, LassoCV, LinearRegression, RidgeCV
+from sklearn.linear_model import (
+    ElasticNetCV,
+    LassoCV,
+    LinearRegression,
+    LogisticRegression,
+    RidgeCV,
+)
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -246,8 +252,115 @@ class BartPyRegressor(BaseEstimator, RegressorMixin):
         return np.asarray(self.model_.predict(X_frame))
 
 
-def make_model(model_name: str, seed: int, n_jobs: int = 1):
+class BartPyClassifier(BaseEstimator):
+    """Placeholder for BART classification until a supported backend is available."""
+
+    def __init__(self, random_state: int | None = None, n_jobs: int = 1):
+        self.random_state = random_state
+        self.n_jobs = n_jobs
+
+    def fit(self, X, y):
+        raise NotImplementedError("BART classification is not supported by this backend.")
+
+
+def _make_classification_model(model_name: str, seed: int, n_jobs: int = 1):
+    name = model_name.lower()
+    if name == "xgboost":
+        import xgboost as xgb
+
+        return xgb.XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            max_depth=2,
+            learning_rate=0.3,
+            n_estimators=int(os.environ.get("XGB_MAX_ROUNDS", "90")),
+            n_jobs=n_jobs,
+            random_state=seed,
+        )
+    if name == "lightgbm":
+        import lightgbm as lgb
+
+        return lgb.LGBMClassifier(
+            objective="binary",
+            learning_rate=0.05,
+            num_leaves=10,
+            min_data_in_leaf=20,
+            n_estimators=int(os.environ.get("LGBM_MAX_ROUNDS", "200")),
+            n_jobs=n_jobs,
+            random_state=seed,
+            verbosity=-1,
+        )
+    if name == "ols":
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            StandardScaler(),
+            LogisticRegression(
+                C=1e12,
+                l1_ratio=0.0,
+                solver="lbfgs",
+                max_iter=20000,
+                random_state=seed,
+            ),
+        )
+    if name == "ridge":
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            StandardScaler(),
+            LogisticRegression(
+                C=1.0,
+                l1_ratio=0.0,
+                solver="lbfgs",
+                max_iter=20000,
+                random_state=seed,
+            ),
+        )
+    if name == "lasso":
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            StandardScaler(),
+            LogisticRegression(
+                C=1.0,
+                l1_ratio=1.0,
+                solver="saga",
+                max_iter=20000,
+                random_state=seed,
+            ),
+        )
+    if name == "elastic_net":
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            StandardScaler(),
+            LogisticRegression(
+                C=1.0,
+                solver="saga",
+                l1_ratio=0.5,
+                max_iter=20000,
+                random_state=seed,
+            ),
+        )
+    if name == "random_forest":
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            RandomForestClassifier(
+                n_estimators=int(os.environ.get("RF_N_ESTIMATORS", "500")),
+                max_features=os.environ.get("RF_MAX_FEATURES", "sqrt"),
+                min_samples_leaf=int(os.environ.get("RF_MIN_SAMPLES_LEAF", "1")),
+                n_jobs=n_jobs,
+                random_state=seed,
+            ),
+        )
+    if name == "bart":
+        return BartPyClassifier(random_state=seed, n_jobs=n_jobs)
+    raise ValueError(f"Unknown model '{model_name}'. Choose from: {', '.join(MODEL_NAMES)}")
+
+
+def make_model(model_name: str, seed: int, n_jobs: int = 1, task: str = "regression"):
     """Construct one model using source-aligned or documented extension settings."""
+
+    if task == "classification":
+        return _make_classification_model(model_name, seed=seed, n_jobs=n_jobs)
+    if task != "regression":
+        raise ValueError("task must be 'regression' or 'classification'")
 
     name = model_name.lower()
     if name == "xgboost":
