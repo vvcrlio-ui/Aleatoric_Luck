@@ -24,6 +24,14 @@ from nlsy_replication.src.experiment import (
 )
 from nlsy_replication.src.feature_sets import main as feature_sets_main
 from nlsy_replication.src.model_registry import MODEL_NAMES, make_model
+from nlsy_replication.src.nk_grid import (
+    NKGridConfig,
+    compute_regression_metrics,
+    draw_orders,
+    log2_size_grid,
+    split_frame,
+    run_nk_grid,
+)
 from nlsy_replication.src.sample_size import fit_power_law
 
 
@@ -176,6 +184,157 @@ class NLSYReplicationTests(unittest.TestCase):
         code_cells = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
         self.assertTrue(code_cells)
         self.assertTrue(all(cell.get("outputs") == [] for cell in code_cells))
+
+    def test_nk_log2_size_grid_is_deduplicated_and_clipped(self):
+        grid = log2_size_grid(total=1_000, n_sizes=8, max_size=100)
+        self.assertEqual(grid[0], 1)
+        self.assertEqual(grid[-1], 100)
+        self.assertEqual(len(grid), len(set(grid)))
+        self.assertTrue(np.all(np.diff(np.log2(grid)) > 0))
+        self.assertTrue(np.all(grid <= 100))
+        self.assertTrue(np.array_equal(log2_size_grid(10, 1), np.array([10])))
+
+    def test_nk_regression_metrics_known_values(self):
+        metrics = compute_regression_metrics(
+            y_test=np.array([1.0, 2.0, 3.0]),
+            y_pred=np.array([1.0, 2.0, 4.0]),
+            y_train=np.array([1.0, 2.0, 3.0]),
+        )
+        self.assertAlmostEqual(metrics["r2_test"], 0.5)
+        self.assertAlmostEqual(metrics["rmse"], np.sqrt(1.0 / 3.0))
+        self.assertAlmostEqual(metrics["spearman_rho"], 1.0)
+        self.assertAlmostEqual(metrics["pinball_q10"], 0.3)
+
+    def test_nk_seed_changes_split_and_draw_changes_subsample(self):
+        frame = pd.DataFrame(
+            {
+                "Aset1_a": np.arange(30),
+                "Bset1_b": np.arange(30) * 2,
+                "outcome": np.arange(30, dtype=float),
+            }
+        )
+        predictors = ["Aset1_a", "Bset1_b"]
+        first = split_frame(frame, predictors, "outcome", test_size=0.3, seed=1)
+        second = split_frame(frame, predictors, "outcome", test_size=0.3, seed=2)
+        self.assertNotEqual(list(first.X_train.index), list(second.X_train.index))
+
+        order_a = draw_orders(first.X_train.index, predictors, seed=1, draw=0)
+        order_b = draw_orders(first.X_train.index, predictors, seed=1, draw=1)
+        self.assertNotEqual(list(order_a.row_index), list(order_b.row_index))
+
+    def test_nk_grid_end_to_end_schema_and_row_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=10,
+                test_size=0.3,
+                n_seeds=2,
+                n_draws=2,
+                n_sizes_n=2,
+                n_sizes_k=2,
+                max_n=20,
+                max_k=3,
+                batch_size=4,
+                n_jobs=1,
+            )
+            run_nk_grid(config)
+            saved = pd.read_csv(out_path)
+            self.assertEqual(len(saved), 16)
+            expected_columns = {
+                "experiment_id",
+                "dataset",
+                "outcome",
+                "model",
+                "seed",
+                "draw",
+                "N",
+                "K",
+                "split_random_state",
+                "n_train_total",
+                "n_features_total",
+                "r2_test",
+                "skill_score_pct",
+                "rmse",
+                "mae",
+                "medae",
+                "max_error",
+                "nrmse",
+                "spearman_rho",
+                "pearson_r",
+                "kendall_tau",
+                "ccc",
+                "explained_variance",
+                "mean_bias",
+                "median_bias",
+                "pinball_q10",
+                "pinball_q90",
+                "d2_absolute_error",
+                "status",
+                "error",
+                "experiment_kind",
+                "data_sha256",
+                "data_path",
+                "test_size",
+                "split_seed",
+            }
+            self.assertTrue(expected_columns.issubset(saved.columns))
+            self.assertEqual(set(saved["status"]), {"ok"})
+            self.assertTrue((saved["N"] <= saved["n_train_total"]).all())
+            self.assertTrue((saved["K"] <= saved["n_features_total"]).all())
+
+    def test_nk_grid_checkpoint_resume_completes_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=20,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=2,
+                n_sizes_n=2,
+                n_sizes_k=2,
+                max_n=20,
+                max_k=3,
+                batch_size=2,
+                n_jobs=1,
+            )
+            run_nk_grid(config, max_jobs=4)
+            partial = pd.read_csv(out_path)
+            self.assertEqual(len(partial), 4)
+            run_nk_grid(config)
+            saved = pd.read_csv(out_path)
+            self.assertEqual(len(saved), 8)
+            self.assertEqual(
+                len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
+                8,
+            )
+
+    def _write_nk_synthetic_data(self, data_path: Path) -> None:
+        rng = np.random.default_rng(33)
+        frame = pd.DataFrame(
+            rng.normal(size=(80, 5)),
+            columns=["Aset1_a", "Aset2_b", "Aset3_c", "Bset1_d", "Bset2_e"],
+        )
+        frame["outcome"] = (
+            0.7 * frame["Aset1_a"] - 0.4 * frame["Bset1_d"] + rng.normal(0, 0.1, len(frame))
+        )
+        frame.to_csv(data_path, index=False)
 
 
 if __name__ == "__main__":
