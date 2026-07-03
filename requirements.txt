@@ -1,1 +1,1 @@
--r nlsy_replication/requirements.txt
+-r nk_grid_pipeline/requirements.txt

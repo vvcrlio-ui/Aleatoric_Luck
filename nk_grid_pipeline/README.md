@@ -19,7 +19,7 @@ the original R/Stata workflow. R's `set.seed(12345)` and Python's
 ## Data
 
 Data are not committed. Obtain or construct these files using the authors'
-public data-management code and place them under `nlsy_replication/data/`:
+public data-management code and place them under `nk_grid_pipeline/data/`:
 
 - `asample1_noincomelag.csv`
 - `asample2_withlag.csv`
@@ -32,7 +32,7 @@ The default scripts use `asample2_withlag.csv` and `Cm_lhourlywage`.
 Python 3.11 is recommended:
 
 ```bash
-cd nlsy_replication
+cd nk_grid_pipeline
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -124,6 +124,8 @@ python src/nk_grid.py \
 | `--max-n` | `100` | Upper cap on N. Use `0` (or any value `<=0`) to uncap and use the full training set. | `100` (or similar) for dev; `0` for the production run so the grid reaches the full training set. |
 | `--max-k` | `100` | Upper cap on K. Use `0` (or any value `<=0`) to uncap and use all available predictors. | Same pattern as `--max-n`: small for dev, `0` for production. |
 | `--batch-size` | `20` | Number of (model, seed, draw, N, K) jobs processed per checkpoint write. | Larger batches write the checkpoint less often (slightly faster); smaller batches checkpoint more often (safer against interruption). |
+| `--bart-min-n` | `10` | Minimum N required before fitting BART. Smaller BART cells are marked `skipped`. | Keep the default unless a future BART backend handles tiny samples safely. |
+| `--bart-min-k` | `2` | Minimum K required before fitting BART. Smaller BART cells are marked `skipped`. | Keep the default unless a future BART backend handles single-predictor trees safely. |
 | `--group-split-col` | `None` | Reserved for a future family/sibling-grouped split (e.g. to avoid NLSY79 sibling leakage). | Leave unset; currently raises `NotImplementedError` if provided — not yet implemented. |
 | `--n-jobs` | `$SLURM_CPUS_PER_TASK` or `1` | Parallel worker count for `joblib`. | Set to the number of available CPU cores; on SLURM this is picked up automatically from the job's `--cpus-per-task`. |
 
@@ -142,17 +144,41 @@ without changing any code — only the CLI flags:
 ### Checkpointing and failure handling
 
 Each (model, seed, draw, N, K) combination is written as its own row.
-Successful fits are marked `status=ok`; a model that raises an exception for a
-specific grid cell (e.g. too few training rows for a shrinkage model, or a
-known BART/`bartpy2` limitation at very small N or K) is marked
-`status=failed` with the exception recorded in `error`, and the sweep
-continues rather than aborting. Re-running the same `--out` path resumes from
-the checkpoint and skips combinations already recorded as `ok`.
+Successful fits are marked `status=ok`. BART cells below `--bart-min-n` or
+`--bart-min-k` are not fitted and are marked `status=skipped` with
+`error=below BART minimum N/K floor`. A model that is actually attempted and
+raises an exception is marked `status=failed` with the exception recorded in
+`error`, and the sweep continues rather than aborting. Re-running the same
+`--out` path resumes from the checkpoint and skips combinations already
+recorded as `ok` or `skipped`.
+
+## Multi-panel runner (`run_panels.py`)
+
+`run_panels.py` reads a declarative JSON manifest and runs one independent
+`nk_grid.py` configuration per figure or panel. Presets centralize the common
+grid sizes:
+
+- `dev`: `n_seeds=2, n_draws=2, n_sizes_n=4, n_sizes_k=4, max_n=100, max_k=100`
+- `medium`: `n_seeds=2, n_draws=2, n_sizes_n=4, n_sizes_k=4, max_n=100, max_k=100`
+- `production`: `n_seeds=100, n_draws=50, n_sizes_n=20, n_sizes_k=20, max_n=0, max_k=0`
+
+Each panel may override any preset value. The default manifest is
+`panels.json`:
+
+```bash
+python src/run_panels.py --dry-run
+python src/run_panels.py --only smr_income
+python src/run_panels.py --manifest panels.json
+```
+
+Each panel writes to its own CSV and resumes through the same checkpoint
+mechanism as `nk_grid.py`, so interrupted panel runs can be repeated without
+duplicating completed rows.
 
 ## SLURM
 
 The scripts in `slurm/` use job arrays, contain no user-specific cluster path,
-and write one output per model. Submit them from `nlsy_replication/`; the tracked
+and write one output per model. Submit them from `nk_grid_pipeline/`; the tracked
 `logs/` directory lets Slurm open stdout and stderr before the script starts.
 `VENV` defaults to `$PROJECT_DIR/.venv`, matching the `Environment` setup
 above, so anyone who follows those steps can submit jobs with no extra
@@ -160,7 +186,7 @@ configuration. Set these variables when cluster defaults differ instead, e.g.
 if your venv lives somewhere else:
 
 ```bash
-export PROJECT_DIR=/path/to/aleatoric_luck-Zheng-Cheng/nlsy_replication
+export PROJECT_DIR=/path/to/aleatoric_luck-Zheng-Cheng/nk_grid_pipeline
 export VENV=/path/to/your/venv
 export PYTHON_MODULE=Python/3.11
 sbatch slurm/run_overall.sbatch

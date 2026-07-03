@@ -1,30 +1,32 @@
 from __future__ import annotations
 
 import json
+import io
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
-from nlsy_replication.src.SHAP_experiment import evaluate_feature_count
-from nlsy_replication.src.evaluation import (
+from nk_grid_pipeline.src.SHAP_experiment import evaluate_feature_count
+from nk_grid_pipeline.src.evaluation import (
     r2_against_training_mean,
     training_mean_null_mse,
 )
-from nlsy_replication.src.experiment import (
+from nk_grid_pipeline.src.experiment import (
     add_metadata,
     build_experiment_metadata,
     load_checkpoint,
     parallel_preference,
     write_checkpoint,
 )
-from nlsy_replication.src.feature_sets import main as feature_sets_main
-from nlsy_replication.src.model_registry import MODEL_NAMES, make_model
-from nlsy_replication.src.nk_grid import (
+from nk_grid_pipeline.src.feature_sets import main as feature_sets_main
+from nk_grid_pipeline.src.model_registry import MODEL_NAMES, make_model
+from nk_grid_pipeline.src.nk_grid import (
     CLASSIFICATION_METRIC_COLUMNS,
     METRIC_COLUMNS,
     NKGridConfig,
@@ -35,7 +37,8 @@ from nlsy_replication.src.nk_grid import (
     split_frame,
     run_nk_grid,
 )
-from nlsy_replication.src.sample_size import fit_power_law
+from nk_grid_pipeline.src.run_panels import main as run_panels_main
+from nk_grid_pipeline.src.sample_size import fit_power_law
 
 
 class NLSYReplicationTests(unittest.TestCase):
@@ -202,7 +205,7 @@ class NLSYReplicationTests(unittest.TestCase):
         self.assertEqual(failed["status"], "fit_failed")
 
     def test_colab_notebook_is_valid_json_without_saved_outputs(self):
-        path = Path(__file__).parents[1] / "nlsy_replication" / "colab_run.ipynb"
+        path = Path(__file__).parents[1] / "nk_grid_pipeline" / "colab_run.ipynb"
         notebook = json.loads(path.read_text())
         self.assertEqual(notebook["nbformat"], 4)
         code_cells = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
@@ -423,6 +426,72 @@ class NLSYReplicationTests(unittest.TestCase):
                 8,
             )
 
+    def test_nk_grid_skips_bart_below_minimum_without_fitting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("bart",),
+                seed=22,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=5,
+                max_k=1,
+                batch_size=1,
+                n_jobs=1,
+                bart_min_n=10,
+                bart_min_k=2,
+            )
+            with patch("nk_grid_pipeline.src.nk_grid.make_model") as make_model_mock:
+                run_nk_grid(config)
+            make_model_mock.assert_not_called()
+            saved = pd.read_csv(out_path)
+            self.assertEqual(saved.loc[0, "status"], "skipped")
+            self.assertEqual(saved.loc[0, "error"], "below BART minimum N/K floor")
+            self.assertTrue(saved.loc[0, list(METRIC_COLUMNS)].isna().all())
+
+    def test_nk_grid_logs_progress_to_stderr(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=25,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=20,
+                max_k=3,
+                batch_size=1,
+                n_jobs=1,
+            )
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                run_nk_grid(config)
+            logs = stderr.getvalue()
+            self.assertIn("[nk_grid]", logs)
+            self.assertIn("loaded data", logs)
+            self.assertIn("jobs total=1", logs)
+            self.assertIn("batch 1/1", logs)
+            self.assertIn("wrote checkpoint", logs)
+
     def test_nk_grid_failed_rows_include_expanded_metrics_as_nan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -556,6 +625,61 @@ class NLSYReplicationTests(unittest.TestCase):
                 4,
             )
 
+    def test_run_panels_dry_run_prints_resolved_config_without_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                run_panels_main(["--manifest", str(manifest), "--dry-run"])
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual([panel["name"] for panel in payload["panels"]], ["reg_panel", "clf_panel"])
+            first_config = payload["panels"][0]["config"]
+            self.assertEqual(first_config["n_seeds"], 2)
+            self.assertEqual(first_config["n_draws"], 2)
+            self.assertEqual(first_config["n_sizes_n"], 2)
+            self.assertEqual(first_config["n_sizes_k"], 2)
+            self.assertFalse((root / "outputs" / "reg.csv").exists())
+            self.assertFalse((root / "outputs" / "clf.csv").exists())
+
+    def test_run_panels_only_runs_selected_panel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            run_panels_main(["--manifest", str(manifest), "--only", "reg_panel"])
+            self.assertTrue((root / "outputs" / "reg.csv").exists())
+            self.assertFalse((root / "outputs" / "clf.csv").exists())
+
+    def test_run_panels_runs_two_panels_with_independent_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            run_panels_main(["--manifest", str(manifest)])
+            reg = pd.read_csv(root / "outputs" / "reg.csv")
+            clf = pd.read_csv(root / "outputs" / "clf.csv")
+            self.assertEqual(len(reg), 16)
+            self.assertEqual(len(clf), 16)
+            self.assertIn("r2_test", reg.columns)
+            self.assertIn("roc_auc", clf.columns)
+            self.assertEqual(set(clf["task"]), {"classification"})
+            self.assertEqual(set(reg["status"]), {"ok"})
+            self.assertEqual(set(clf["status"]), {"ok"})
+
+    def test_run_panels_resume_does_not_duplicate_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            run_panels_main(["--manifest", str(manifest), "--only", "reg_panel", "--max-jobs", "3"])
+            partial = pd.read_csv(root / "outputs" / "reg.csv")
+            self.assertEqual(len(partial), 3)
+            run_panels_main(["--manifest", str(manifest), "--only", "reg_panel"])
+            saved = pd.read_csv(root / "outputs" / "reg.csv")
+            self.assertEqual(len(saved), 16)
+            self.assertEqual(
+                len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
+                16,
+            )
+
     def _write_nk_synthetic_data(self, data_path: Path) -> None:
         rng = np.random.default_rng(33)
         frame = pd.DataFrame(
@@ -569,6 +693,50 @@ class NLSYReplicationTests(unittest.TestCase):
             frame["Aset1_a"] - 0.5 * frame["Bset1_d"] + rng.normal(0, 0.2, len(frame)) > 0
         ).astype(int)
         frame.to_csv(data_path, index=False)
+
+    def _write_panel_manifest(self, root: Path) -> Path:
+        data_path = root / "synthetic.csv"
+        self._write_nk_synthetic_data(data_path)
+        manifest = root / "panels.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "panels": [
+                        {
+                            "name": "reg_panel",
+                            "data": str(data_path),
+                            "dataset": "synthetic",
+                            "outcome": "outcome",
+                            "task": "regression",
+                            "models": ["ols"],
+                            "preset": "dev",
+                            "out": str(root / "outputs" / "reg.csv"),
+                            "n_sizes_n": 2,
+                            "n_sizes_k": 2,
+                            "max_n": 20,
+                            "max_k": 3,
+                            "batch_size": 3,
+                        },
+                        {
+                            "name": "clf_panel",
+                            "data": str(data_path),
+                            "dataset": "synthetic",
+                            "outcome": "employed",
+                            "task": "classification",
+                            "models": ["ols"],
+                            "preset": "dev",
+                            "out": str(root / "outputs" / "clf.csv"),
+                            "n_sizes_n": 1,
+                            "n_sizes_k": 4,
+                            "max_n": 30,
+                            "max_k": 5,
+                            "batch_size": 4,
+                        },
+                    ]
+                }
+            )
+        )
+        return manifest
 
 
 if __name__ == "__main__":

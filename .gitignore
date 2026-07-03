@@ -29,7 +29,7 @@ results/
 runs/
 plans/
 logs/*
-!nlsy_replication/logs/.gitkeep
+!nk_grid_pipeline/logs/.gitkeep
 
 # Env / secrets
 .env

@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -104,6 +105,11 @@ CLASSIFICATION_METRIC_COLUMNS = (
 )
 
 
+def log_progress(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[nk_grid] {timestamp} {message}", file=sys.stderr, flush=True)
+
+
 @dataclass(frozen=True)
 class NKGridConfig:
     data: Path
@@ -123,6 +129,8 @@ class NKGridConfig:
     n_jobs: int
     group_split_col: str | None = None
     task: str = "regression"
+    bart_min_n: int = 10
+    bart_min_k: int = 2
 
 
 @dataclass(frozen=True)
@@ -435,6 +443,11 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
     predictors = _predictor_columns(frame)
     if not predictors:
         raise ValueError("No Aset/Bset predictors found in the input data.")
+    log_progress(
+        "loaded data "
+        f"path={data_path} rows={len(frame)} predictors={len(predictors)} "
+        f"outcome={config.outcome} task={config.task}"
+    )
     if config.task == "classification":
         classes = set(pd.Series(frame[config.outcome]).dropna().unique())
         if not classes.issubset({0, 1, False, True}) or len(classes) > 2:
@@ -453,6 +466,8 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         "max_n": config.max_n,
         "max_k": config.max_k,
         "group_split_col": config.group_split_col,
+        "bart_min_n": config.bart_min_n,
+        "bart_min_k": config.bart_min_k,
         **model_run_settings(config.models),
     }
     if config.task == "classification":
@@ -484,6 +499,11 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         config.max_n,
     )
     k_grid = log2_size_grid(len(predictors), config.n_sizes_k, config.max_k)
+    log_progress(
+        "grid "
+        f"N={n_grid.tolist()} K={k_grid.tolist()} "
+        f"seeds={split_seeds} draws={config.n_draws} models={list(config.models)}"
+    )
 
     jobs = [
         (model_name, seed, draw, int(n_samples), int(k_features))
@@ -498,7 +518,11 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
     current = rows_for_experiment(existing, metadata["experiment_id"])
     completed = set()
     if not current.empty:
-        ok = current[current["status"].eq("ok")] if "status" in current else current
+        ok = (
+            current[current["status"].isin(("ok", "skipped"))]
+            if "status" in current
+            else current
+        )
         completed = set(
             zip(
                 ok["model"],
@@ -511,6 +535,10 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
     pending = [job for job in jobs if job not in completed]
     if max_jobs is not None:
         pending = pending[: int(max_jobs)]
+    log_progress(
+        f"jobs total={len(jobs)} completed={len(completed)} "
+        f"pending={len(pending)} batch_size={config.batch_size} n_jobs={config.n_jobs}"
+    )
 
     def run_one(
         model_name: str,
@@ -531,6 +559,24 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             n_train_total=len(split.X_train),
             n_features_total=len(predictors),
         )
+        if (
+            model_name == "bart"
+            and (n_samples < config.bart_min_n or k_features < config.bart_min_k)
+        ):
+            return add_metadata(
+                {
+                    **row,
+                    **(
+                        _empty_metrics()
+                        if config.task == "regression"
+                        else _empty_classification_metrics()
+                    ),
+                    **({"task": config.task} if config.task == "classification" else {}),
+                    "status": "skipped",
+                    "error": "below BART minimum N/K floor",
+                },
+                metadata,
+            )
         try:
             orders = draw_orders(split.X_train.index, predictors, seed=seed, draw=draw)
             selected_rows = orders.row_index[:n_samples]
@@ -584,8 +630,13 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             )
 
     rows: list[dict] = []
-    for start in range(0, len(pending), config.batch_size):
+    total_batches = int(np.ceil(len(pending) / config.batch_size)) if pending else 0
+    for batch_index, start in enumerate(range(0, len(pending), config.batch_size), start=1):
         batch = pending[start : start + config.batch_size]
+        log_progress(
+            f"batch {batch_index}/{total_batches} starting "
+            f"jobs={len(batch)} first={batch[0]}"
+        )
         rows.extend(
             Parallel(
                 n_jobs=config.n_jobs,
@@ -600,6 +651,17 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             key_columns=["model", "seed", "draw", "N", "K"],
             sort_columns=["model", "seed", "draw", "N", "K"],
         )
+        new_rows = rows[-len(batch) :] if batch else []
+        ok_count = sum(row.get("status") == "ok" for row in new_rows)
+        failed_count = sum(row.get("status") == "failed" for row in new_rows)
+        skipped_count = sum(row.get("status") == "skipped" for row in new_rows)
+        log_progress(
+            f"batch {batch_index}/{total_batches} wrote checkpoint "
+            f"new_rows={len(new_rows)} ok={ok_count} failed={failed_count} "
+            f"skipped={skipped_count} total_new_rows={len(rows)} out={out_path}"
+        )
+    if not pending:
+        log_progress("no pending jobs; checkpoint is already complete")
 
 
 def parse_args() -> NKGridConfig:
@@ -621,6 +683,8 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--max-n", type=int, default=100, help="Use <=0 for full train set.")
     parser.add_argument("--max-k", type=int, default=100, help="Use <=0 for all features.")
     parser.add_argument("--batch-size", type=int, default=20)
+    parser.add_argument("--bart-min-n", type=int, default=10)
+    parser.add_argument("--bart-min-k", type=int, default=2)
     parser.add_argument("--group-split-col", default=None)
     parser.add_argument(
         "--n-jobs",
@@ -662,6 +726,8 @@ def parse_args() -> NKGridConfig:
         n_jobs=args.n_jobs,
         group_split_col=args.group_split_col,
         task=args.task,
+        bart_min_n=args.bart_min_n,
+        bart_min_k=args.bart_min_k,
     )
 
 

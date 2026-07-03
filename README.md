@@ -35,20 +35,20 @@ of Bayes error or a literal measurement of luck.
 
 ```text
 aleatoric_luck-Zheng-Cheng/
-├── nlsy_replication/
+├── nk_grid_pipeline/
 │   ├── src/                    # Replication and extension scripts
 │   ├── slurm/                  # Portable SLURM job arrays
 │   ├── colab_run.ipynb         # Colab runner
 │   ├── requirements.txt
 │   └── README.md               # Detailed data and workflow documentation
 ├── tests/
-│   └── test_nlsy_replication.py
+│   └── test_nk_grid_pipeline.py
 ├── requirements.txt
 └── README.md
 ```
 
 NLSY data are not included. See
-[`nlsy_replication/README.md`](nlsy_replication/README.md) for required input
+[`nk_grid_pipeline/README.md`](nk_grid_pipeline/README.md) for required input
 files, model settings, checkpoint behaviour, Colab instructions, and SLURM
 usage.
 
@@ -61,7 +61,7 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 
-cd nlsy_replication
+cd nk_grid_pipeline
 python src/overall_prediction.py --models ols ridge lasso xgboost bart
 ```
 
@@ -81,7 +81,7 @@ From the repository root:
 
 ```bash
 python -m unittest discover -s tests -p 'test_*.py'
-python -m compileall nlsy_replication/src tests
+python -m compileall nk_grid_pipeline/src tests
 ```
 
 ## Reference

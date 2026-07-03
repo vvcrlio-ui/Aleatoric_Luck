@@ -1,0 +1,24 @@
+{
+  "panels": [
+    {
+      "name": "smr_income",
+      "data": "data/asample2_withlag.csv",
+      "dataset": "asample2_withlag",
+      "outcome": "Cm_lhourlywage",
+      "task": "regression",
+      "models": ["ols", "ridge", "lasso", "elastic_net", "random_forest", "xgboost", "lightgbm", "bart"],
+      "preset": "production",
+      "out": "outputs/nk_grid_smr_income.csv"
+    },
+    {
+      "name": "smr_employment",
+      "data": "data/asample2_withlag.csv",
+      "dataset": "asample2_withlag",
+      "outcome": "<TBD employment column>",
+      "task": "classification",
+      "models": ["ols", "ridge", "lasso", "elastic_net", "random_forest", "xgboost", "lightgbm"],
+      "preset": "production",
+      "out": "outputs/nk_grid_clf_smr_employment.csv"
+    }
+  ]
+}
