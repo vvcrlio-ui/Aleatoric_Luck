@@ -13,7 +13,7 @@ panels:
       - xgboost
       - lightgbm
       - bart
-    preset: production
+    preset: dev
     out: outputs/nk_grid_smr_income.csv
   - name: smr_employment
     data: data/asample2_withlag.csv
@@ -28,5 +28,5 @@ panels:
       - random_forest
       - xgboost
       - lightgbm
-    preset: production
+    preset: dev
     out: outputs/nk_grid_clf_smr_employment.csv
