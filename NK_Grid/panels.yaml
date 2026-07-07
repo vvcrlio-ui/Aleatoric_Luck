@@ -1,5 +1,5 @@
 panels:
-  - name: smr_income
+  - name: smr_hourlywage
     data: data/asample2_withlag.csv
     dataset: asample2_withlag
     outcome: Cm_lhourlywage
@@ -12,14 +12,15 @@ panels:
       - random_forest
       - xgboost
       - lightgbm
-      - bart
+      # - bart # too heavy to run locally
     preset: dev
-    out: outputs/nk_grid_smr_income.csv
-  - name: smr_employment
+    out: outputs/nk_grid_smr_hourlywage.csv
+
+  - name: smr_totalincome
     data: data/asample2_withlag.csv
     dataset: asample2_withlag
-    outcome: <TBD employment column>
-    task: classification
+    outcome: Cm_ltotalincome
+    task: regression
     models:
       - ols
       - ridge
@@ -28,5 +29,23 @@ panels:
       - random_forest
       - xgboost
       - lightgbm
+      # - bart # too heavy to run locally
     preset: dev
-    out: outputs/nk_grid_clf_smr_employment.csv
+    out: outputs/nk_grid_smr_totalincome.csv
+
+  # - name: Binary Classification
+  #   data: TBD
+  #   dataset: TBD
+  #   outcome: TBD
+  #   task: classification
+  #   models:
+  #     - ols
+  #     - ridge
+  #     - lasso
+  #     - elastic_net
+  #     - random_forest
+  #     - xgboost
+  #     - lightgbm
+  #     - bart
+  #   preset: dev
+  #   out: outputs/TBD.csv
