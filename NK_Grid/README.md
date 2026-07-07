@@ -5,6 +5,12 @@ base-2 log grid. It writes long-format CSV output where each row is one
 `(model, seed, draw, N, K)` combination. The same entry point supports
 continuous-outcome regression and binary-outcome classification tasks.
 
+The tool is dataset-agnostic: the outcome column (`--outcome`) and the
+predictor-column naming convention (`--predictor-prefix`) are both plain CLI
+arguments, so the same script can be pointed at a different paper's analysis
+table without any code changes. The defaults below match this repository's
+Zheng-Cheng replication data (`Aset`/`Bset`-prefixed columns).
+
 ## Data
 
 Data are not committed. The tracked `data` path is a symlink to the shared
@@ -14,7 +20,10 @@ cluster data directory:
 /gpfs3/users/mills/tej036/aleatoric-luck/data
 ```
 
-The default scripts use `data/asample2_withlag.csv` and `Cm_lhourlywage`.
+The example commands below use `data/asample2_withlag.csv` and
+`Cm_lhourlywage` as the Zheng-Cheng replication defaults, but `--data`,
+`--outcome`, and `--predictor-prefix` can all be pointed at a different
+dataset.
 
 ## Environment
 
@@ -53,7 +62,8 @@ python src/nk_grid.py \
 |---|---|---|---|
 | `--data` | `data/asample2_withlag.csv` | Path to the analysis CSV. | Point at whichever `asample*.csv` you're sweeping. |
 | `--task` | `regression` | `regression` (continuous outcome, 30 continuous metrics) or `classification` (binary outcome, 8 classification metrics incl. ROC-AUC). | Pick based on the outcome column's type. |
-| `--outcome` | `Cm_lhourlywage` for regression; **required** for classification | Outcome column name. | For `classification`, pass the confirmed binary (0/1) column explicitly; the script refuses to guess one. |
+| `--outcome` | **required** (both tasks) | Outcome column name. | Pass any continuous column for `regression`, or a confirmed binary 0/1 column for `classification`; the script never guesses one. |
+| `--predictor-prefix` | `Aset Bset` | One or more column-name prefixes that select the predictor (feature) columns. | Matches this repository's Zheng-Cheng data by default; pass your own dataset's prefixes (e.g. `--predictor-prefix Feat Cov`) to run on another paper's table. |
 | `--out` | `outputs/nk_grid.csv` (regression) / `outputs/nk_grid_clf.csv` (classification) | Output CSV path. | Give each figure, panel, or dataset its own path so runs do not overwrite each other. |
 | `--dataset` | `asample2_withlag` | Free-text label written into the `dataset` column. | Set to something that identifies the source table in the output CSV. |
 | `--models` | `xgboost` | One or more registered model names: `ols, ridge, lasso, elastic_net, random_forest, xgboost, lightgbm, bart`. | Pass the models you want compared; each gets its own row per `(seed, draw, N, K)`. |

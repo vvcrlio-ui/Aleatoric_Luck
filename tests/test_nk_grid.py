@@ -300,6 +300,66 @@ class NKGridTests(unittest.TestCase):
             self.assertTrue((saved["N"] <= saved["n_train_total"]).all())
             self.assertTrue((saved["K"] <= saved["n_features_total"]).all())
 
+    def test_nk_grid_predictor_prefix_is_configurable_for_other_datasets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "other_paper.csv"
+            out_path = root / "nk_grid.csv"
+            rng = np.random.default_rng(41)
+            frame = pd.DataFrame(
+                rng.normal(size=(80, 4)),
+                columns=["Feat_income", "Feat_age", "Cov_region", "Cov_edu"],
+            )
+            frame["target"] = (
+                0.6 * frame["Feat_income"] - 0.3 * frame["Cov_region"]
+                + rng.normal(0, 0.1, len(frame))
+            )
+            frame.to_csv(data_path, index=False)
+
+            default_prefix_config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="other_paper",
+                outcome="target",
+                models=("ols",),
+                seed=11,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=20,
+                max_k=2,
+                batch_size=1,
+                n_jobs=1,
+            )
+            with self.assertRaisesRegex(ValueError, "No predictor columns found"):
+                run_nk_grid(default_prefix_config)
+
+            custom_prefix_config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="other_paper",
+                outcome="target",
+                models=("ols",),
+                seed=11,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=20,
+                max_k=2,
+                batch_size=1,
+                n_jobs=1,
+                predictor_prefix=("Feat", "Cov"),
+            )
+            run_nk_grid(custom_prefix_config)
+            saved = pd.read_csv(out_path)
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved.loc[0, "status"], "ok")
+            self.assertEqual(saved.loc[0, "n_features_total"], 4)
+
     def test_nk_grid_checkpoint_resume_completes_without_duplicates(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -131,6 +131,7 @@ class NKGridConfig:
     task: str = "regression"
     bart_min_n: int = 10
     bart_min_k: int = 2
+    predictor_prefix: tuple[str, ...] = ("Aset", "Bset")
 
 
 @dataclass(frozen=True)
@@ -378,8 +379,11 @@ def _model_seed(seed: int, draw: int, n_samples: int, k_features: int) -> int:
     )
 
 
-def _predictor_columns(frame: pd.DataFrame) -> list[str]:
-    return [col for col in frame.columns if col.startswith(("Aset", "Bset"))]
+def _predictor_columns(
+    frame: pd.DataFrame, prefixes: Sequence[str] = ("Aset", "Bset")
+) -> list[str]:
+    prefix_tuple = tuple(prefixes)
+    return [col for col in frame.columns if col.startswith(prefix_tuple)]
 
 
 def _base_row(
@@ -440,9 +444,13 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
     frame = pd.read_csv(data_path)
     if config.outcome not in frame:
         raise KeyError(f"Outcome not found: {config.outcome}")
-    predictors = _predictor_columns(frame)
+    predictors = _predictor_columns(frame, config.predictor_prefix)
     if not predictors:
-        raise ValueError("No Aset/Bset predictors found in the input data.")
+        raise ValueError(
+            "No predictor columns found in the input data for prefixes "
+            f"{list(config.predictor_prefix)}. Pass --predictor-prefix to match "
+            "your dataset's feature column names."
+        )
     log_progress(
         "loaded data "
         f"path={data_path} rows={len(frame)} predictors={len(predictors)} "
@@ -465,6 +473,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         "n_sizes_k": config.n_sizes_k,
         "max_n": config.max_n,
         "max_k": config.max_k,
+        "predictor_prefix": ",".join(config.predictor_prefix),
         "group_split_col": config.group_split_col,
         "bart_min_n": config.bart_min_n,
         "bart_min_k": config.bart_min_k,
@@ -687,20 +696,28 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--bart-min-k", type=int, default=2)
     parser.add_argument("--group-split-col", default=None)
     parser.add_argument(
+        "--predictor-prefix",
+        nargs="+",
+        default=["Aset", "Bset"],
+        help=(
+            "Column-name prefixes that select the predictor (feature) columns. "
+            "Defaults to the Zheng-Cheng Aset/Bset naming; pass your own dataset's "
+            "prefixes to run on another paper's data."
+        ),
+    )
+    parser.add_argument(
         "--n-jobs",
         type=int,
         default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
     )
     args = parser.parse_args()
     if args.outcome is None:
-        if args.task == "classification":
-            raise ValueError(
-                "--task classification requires --outcome because the real "
-                "employment column name could not be verified locally."
-            )
-        outcome = "Cm_lhourlywage"
-    else:
-        outcome = args.outcome
+        raise ValueError(
+            "--outcome is required: pass the name of the outcome column to predict "
+            "(a continuous column for --task regression, or a binary 0/1 column for "
+            "--task classification)."
+        )
+    outcome = args.outcome
     out = args.out
     if out is None:
         out = str(
@@ -728,6 +745,7 @@ def parse_args() -> NKGridConfig:
         task=args.task,
         bart_min_n=args.bart_min_n,
         bart_min_k=args.bart_min_k,
+        predictor_prefix=tuple(args.predictor_prefix),
     )
 
 
