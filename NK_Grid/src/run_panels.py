@@ -24,18 +24,18 @@ except ImportError:
 
 PRESETS: dict[str, dict[str, int]] = {
     "dev": {
-        "n_seeds": 2,
-        "n_draws": 2,
-        "n_sizes_n": 5,
-        "n_sizes_k": 5,
+        "n_seeds": 5,
+        "n_draws": 5,
+        "n_sizes_n": 8,
+        "n_sizes_k": 8,
         "max_n": 100,
         "max_k": 100,
     },
     "medium": {
-        "n_seeds": 2,
-        "n_draws": 2,
-        "n_sizes_n": 4,
-        "n_sizes_k": 4,
+        "n_seeds": 8,
+        "n_draws": 8,
+        "n_sizes_n": 10,
+        "n_sizes_k": 10,
         "max_n": 100,
         "max_k": 100,
     },
