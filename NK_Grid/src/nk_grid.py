@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -138,6 +140,7 @@ class NKGridConfig:
     bart_min_n: int = 10
     bart_min_k: int = 2
     predictor_prefix: tuple[str, ...] = ("Aset", "Bset")
+    preset: str | None = None
 
 
 @dataclass(frozen=True)
@@ -385,6 +388,64 @@ def _model_seed(seed: int, draw: int, n_samples: int, k_features: int) -> int:
     )
 
 
+def _completed_jobs_for_experiment(existing: pd.DataFrame, experiment_id: str) -> set[tuple]:
+    current = rows_for_experiment(existing, experiment_id)
+    if current.empty:
+        return set()
+    ok = (
+        current[current["status"].isin(("ok", "skipped"))]
+        if "status" in current
+        else current
+    )
+    return set(
+        zip(
+            ok["model"],
+            ok["seed"].astype(int),
+            ok["draw"].astype(int),
+            ok["N"].astype(int),
+            ok["K"].astype(int),
+        )
+    )
+
+
+def _timestamped_out_path(directory: Path, stem: str, preset: str, suffix: str) -> Path:
+    while True:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = directory / f"{stem}_{preset}_{timestamp}{suffix}"
+        if not out_path.exists():
+            return out_path
+        time.sleep(1.0)
+
+
+def _select_output_path(
+    declared: Path,
+    *,
+    preset: str | None,
+    experiment_id: str,
+    jobs: list[tuple],
+) -> Path:
+    if preset is None:
+        return declared
+
+    # With a panel preset, config.out is only a template for directory/stem.
+    # Actual writes go to {stem}_{preset}_{timestamp}{suffix}.
+    directory = declared.parent
+    stem = declared.stem
+    suffix = declared.suffix
+    all_jobs = set(jobs)
+    candidates = sorted(
+        directory.glob(f"{stem}_{preset}_*{suffix}"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        existing = load_checkpoint(candidate)
+        completed = _completed_jobs_for_experiment(existing, experiment_id)
+        if completed and not all_jobs.issubset(completed):
+            return candidate
+    return _timestamped_out_path(directory, stem, preset, suffix)
+
+
 def _predictor_columns(
     frame: pd.DataFrame, prefixes: Sequence[str] = ("Aset", "Bset")
 ) -> list[str]:
@@ -445,8 +506,6 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
     if not data_path.exists():
         raise FileNotFoundError(f"NLSY analysis data not found: {data_path}")
 
-    out_path = Path(config.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     frame = pd.read_csv(data_path)
     if config.outcome not in frame:
         raise KeyError(f"Outcome not found: {config.outcome}")
@@ -529,24 +588,15 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         for model_name in config.models
     ]
 
+    out_path = _select_output_path(
+        Path(config.out),
+        preset=config.preset,
+        experiment_id=metadata["experiment_id"],
+        jobs=jobs,
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     existing = load_checkpoint(out_path)
-    current = rows_for_experiment(existing, metadata["experiment_id"])
-    completed = set()
-    if not current.empty:
-        ok = (
-            current[current["status"].isin(("ok", "skipped"))]
-            if "status" in current
-            else current
-        )
-        completed = set(
-            zip(
-                ok["model"],
-                ok["seed"].astype(int),
-                ok["draw"].astype(int),
-                ok["N"].astype(int),
-                ok["K"].astype(int),
-            )
-        )
+    completed = _completed_jobs_for_experiment(existing, metadata["experiment_id"])
     pending = [job for job in jobs if job not in completed]
     if max_jobs is not None:
         pending = pending[: int(max_jobs)]

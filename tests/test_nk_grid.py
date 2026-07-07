@@ -36,6 +36,7 @@ from NK_Grid.src.nk_grid import (
     run_nk_grid,
 )
 from NK_Grid.src.run_panels import main as run_panels_main
+from NK_Grid.src.run_panels import resolve_panel
 
 
 class DummyRegressor:
@@ -842,6 +843,147 @@ class NKGridTests(unittest.TestCase):
                 4,
             )
 
+    def test_nk_grid_preset_creates_timestamped_output_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_template = root / "outputs" / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_template,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=60,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=20,
+                max_k=3,
+                batch_size=1,
+                n_jobs=1,
+                preset="dev",
+            )
+            run_nk_grid(config)
+            self.assertFalse(out_template.exists())
+            output = self._single_output(root / "outputs", "nk_grid_dev_*.csv")
+            self.assertRegex(output.name, r"^nk_grid_dev_\d{8}-\d{6}\.csv$")
+            saved = pd.read_csv(output)
+            self.assertEqual(len(saved), 1)
+
+    def test_nk_grid_preset_resumes_incomplete_timestamped_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_template = root / "outputs" / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_template,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=61,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=2,
+                n_sizes_n=1,
+                n_sizes_k=2,
+                max_n=20,
+                max_k=3,
+                batch_size=2,
+                n_jobs=1,
+                preset="dev",
+            )
+            run_nk_grid(config, max_jobs=2)
+            output = self._single_output(root / "outputs", "nk_grid_dev_*.csv")
+            partial = pd.read_csv(output)
+            self.assertEqual(len(partial), 2)
+            run_nk_grid(config)
+            outputs = sorted((root / "outputs").glob("nk_grid_dev_*.csv"))
+            self.assertEqual(outputs, [output])
+            saved = pd.read_csv(output)
+            self.assertEqual(len(saved), 4)
+            self.assertEqual(
+                len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
+                4,
+            )
+
+    def test_nk_grid_preset_complete_rerun_creates_new_output_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_template = root / "outputs" / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_template,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=62,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=2,
+                max_n=20,
+                max_k=3,
+                batch_size=2,
+                n_jobs=1,
+                preset="dev",
+            )
+            run_nk_grid(config)
+            first = self._single_output(root / "outputs", "nk_grid_dev_*.csv")
+            run_nk_grid(config)
+            outputs = sorted((root / "outputs").glob("nk_grid_dev_*.csv"))
+            self.assertEqual(len(outputs), 2)
+            self.assertNotEqual(outputs[0], outputs[1])
+            for output in outputs:
+                saved = pd.read_csv(output)
+                self.assertEqual(len(saved), 2)
+                self.assertEqual(saved["experiment_id"].nunique(), 1)
+            self.assertIn(first, outputs)
+
+    def test_nk_grid_preset_config_change_creates_separate_output_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_template = root / "outputs" / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            common = dict(
+                data=data_path,
+                out=out_template,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=63,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                max_n=20,
+                max_k=3,
+                batch_size=2,
+                n_jobs=1,
+                preset="dev",
+            )
+            run_nk_grid(NKGridConfig(**common, n_sizes_n=1, n_sizes_k=1))
+            run_nk_grid(NKGridConfig(**common, n_sizes_n=2, n_sizes_k=1))
+            outputs = sorted((root / "outputs").glob("nk_grid_dev_*.csv"))
+            self.assertEqual(len(outputs), 2)
+            row_counts = sorted(len(pd.read_csv(output)) for output in outputs)
+            self.assertEqual(row_counts, [1, 2])
+            for output in outputs:
+                saved = pd.read_csv(output)
+                self.assertEqual(saved["experiment_id"].nunique(), 1)
+                self.assertEqual(
+                    len(saved[["model", "seed", "draw", "N", "K"]]),
+                    len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
+                )
+
     def test_helpers_logging_is_shared_by_nk_grid_and_run_panels(self):
         from NK_Grid.src import helpers_logging
         from NK_Grid.src import nk_grid as nk_grid_module
@@ -875,8 +1017,43 @@ class NKGridTests(unittest.TestCase):
             self.assertEqual(first_config["n_draws"], 2)
             self.assertEqual(first_config["n_sizes_n"], 2)
             self.assertEqual(first_config["n_sizes_k"], 2)
+            self.assertEqual(first_config["preset"], "dev")
             self.assertFalse((root / "outputs" / "reg.csv").exists())
             self.assertFalse((root / "outputs" / "clf.csv").exists())
+            self.assertEqual(list((root / "outputs").glob("*.csv")), [])
+
+    def test_run_panels_resolve_panel_sets_explicit_and_default_preset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            self._write_nk_synthetic_data(data_path)
+            explicit_name, explicit_config = resolve_panel(
+                {
+                    "name": "medium_panel",
+                    "data": str(data_path),
+                    "dataset": "synthetic",
+                    "outcome": "outcome",
+                    "models": ["ols"],
+                    "preset": "medium",
+                    "out": str(root / "outputs" / "medium.csv"),
+                },
+                root,
+            )
+            default_name, default_config = resolve_panel(
+                {
+                    "name": "default_panel",
+                    "data": str(data_path),
+                    "dataset": "synthetic",
+                    "outcome": "outcome",
+                    "models": ["ols"],
+                    "out": str(root / "outputs" / "default.csv"),
+                },
+                root,
+            )
+            self.assertEqual(explicit_name, "medium_panel")
+            self.assertEqual(explicit_config.preset, "medium")
+            self.assertEqual(default_name, "default_panel")
+            self.assertEqual(default_config.preset, "dev")
 
     def test_run_panels_yaml_manifest_without_grid_overrides_uses_dev_five_points(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -924,16 +1101,18 @@ class NKGridTests(unittest.TestCase):
             root = Path(temp_dir)
             manifest = self._write_panel_manifest(root)
             run_panels_main(["--manifest", str(manifest), "--only", "reg_panel"])
-            self.assertTrue((root / "outputs" / "reg.csv").exists())
-            self.assertFalse((root / "outputs" / "clf.csv").exists())
+            reg_outputs = sorted((root / "outputs").glob("reg_dev_*.csv"))
+            clf_outputs = sorted((root / "outputs").glob("clf_dev_*.csv"))
+            self.assertEqual(len(reg_outputs), 1)
+            self.assertEqual(clf_outputs, [])
 
     def test_run_panels_runs_two_panels_with_independent_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest = self._write_panel_manifest(root)
             run_panels_main(["--manifest", str(manifest)])
-            reg = pd.read_csv(root / "outputs" / "reg.csv")
-            clf = pd.read_csv(root / "outputs" / "clf.csv")
+            reg = pd.read_csv(self._single_output(root / "outputs", "reg_dev_*.csv"))
+            clf = pd.read_csv(self._single_output(root / "outputs", "clf_dev_*.csv"))
             self.assertEqual(len(reg), 16)
             self.assertEqual(len(clf), 16)
             self.assertIn("r2_test", reg.columns)
@@ -947,15 +1126,22 @@ class NKGridTests(unittest.TestCase):
             root = Path(temp_dir)
             manifest = self._write_panel_manifest(root)
             run_panels_main(["--manifest", str(manifest), "--only", "reg_panel", "--max-jobs", "3"])
-            partial = pd.read_csv(root / "outputs" / "reg.csv")
+            output = self._single_output(root / "outputs", "reg_dev_*.csv")
+            partial = pd.read_csv(output)
             self.assertEqual(len(partial), 3)
             run_panels_main(["--manifest", str(manifest), "--only", "reg_panel"])
-            saved = pd.read_csv(root / "outputs" / "reg.csv")
+            self.assertEqual(sorted((root / "outputs").glob("reg_dev_*.csv")), [output])
+            saved = pd.read_csv(output)
             self.assertEqual(len(saved), 16)
             self.assertEqual(
                 len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
                 16,
             )
+
+    def _single_output(self, directory: Path, pattern: str) -> Path:
+        outputs = sorted(directory.glob(pattern))
+        self.assertEqual(len(outputs), 1)
+        return outputs[0]
 
     def _write_nk_synthetic_data(self, data_path: Path) -> None:
         rng = np.random.default_rng(33)

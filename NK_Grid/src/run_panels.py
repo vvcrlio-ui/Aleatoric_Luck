@@ -90,7 +90,7 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
 
     values = {**DEFAULTS, **PRESETS[preset_name], **panel}
     values.pop("name", None)
-    values.pop("preset", None)
+    values["preset"] = preset_name
     unknown = sorted(set(values) - CONFIG_FIELDS)
     if unknown:
         raise ValueError(f"Unknown config keys for panel {name}: {', '.join(unknown)}")
