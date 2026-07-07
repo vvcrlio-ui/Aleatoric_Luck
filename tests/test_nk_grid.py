@@ -593,6 +593,25 @@ class NKGridTests(unittest.TestCase):
                 4,
             )
 
+    def test_helpers_logging_is_shared_by_nk_grid_and_run_panels(self):
+        from NK_Grid.src import helpers_logging
+        from NK_Grid.src import nk_grid as nk_grid_module
+        from NK_Grid.src import run_panels as run_panels_module
+
+        self.assertIs(nk_grid_module.log_progress, helpers_logging.log_progress)
+        self.assertIs(run_panels_module.log_progress, helpers_logging.log_progress)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            helpers_logging.log_progress("x")
+        self.assertRegex(stderr.getvalue(), r"^\[nk_grid\] \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} x\n$")
+
+    def test_dev_preset_uses_five_n_and_k_grid_points(self):
+        from NK_Grid.src.run_panels import PRESETS
+
+        self.assertEqual(PRESETS["dev"]["n_sizes_n"], 5)
+        self.assertEqual(PRESETS["dev"]["n_sizes_k"], 5)
+
     def test_run_panels_dry_run_prints_resolved_config_without_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -609,6 +628,47 @@ class NKGridTests(unittest.TestCase):
             self.assertEqual(first_config["n_sizes_k"], 2)
             self.assertFalse((root / "outputs" / "reg.csv").exists())
             self.assertFalse((root / "outputs" / "clf.csv").exists())
+
+    def test_run_panels_yaml_manifest_without_grid_overrides_uses_dev_five_points(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            self._write_nk_synthetic_data(data_path)
+            manifest = root / "panels.yaml"
+            manifest.write_text(
+                "\n".join(
+                    [
+                        "panels:",
+                        "  - name: dev_panel",
+                        f"    data: {data_path}",
+                        "    dataset: synthetic",
+                        "    outcome: outcome",
+                        "    task: regression",
+                        "    models:",
+                        "      - ols",
+                        "    preset: dev",
+                        f"    out: {root / 'outputs' / 'dev.csv'}",
+                        "    max_n: 20",
+                        "    max_k: 3",
+                        "    batch_size: 3",
+                        "",
+                    ]
+                )
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                run_panels_main(["--manifest", str(manifest), "--dry-run"])
+            payload = json.loads(stdout.getvalue())
+            config = payload["panels"][0]["config"]
+            self.assertEqual(config["n_sizes_n"], 5)
+            self.assertEqual(config["n_sizes_k"], 5)
+
+    def test_run_panels_yaml_manifest_missing_panels_has_clear_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = Path(temp_dir) / "panels.yaml"
+            manifest.write_text("not_panels: []\n")
+            with self.assertRaisesRegex(ValueError, "YAML object with a 'panels' list"):
+                run_panels_main(["--manifest", str(manifest), "--dry-run"])
 
     def test_run_panels_only_runs_selected_panel(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -665,43 +725,41 @@ class NKGridTests(unittest.TestCase):
     def _write_panel_manifest(self, root: Path) -> Path:
         data_path = root / "synthetic.csv"
         self._write_nk_synthetic_data(data_path)
-        manifest = root / "panels.json"
+        manifest = root / "panels.yaml"
         manifest.write_text(
-            json.dumps(
-                {
-                    "panels": [
-                        {
-                            "name": "reg_panel",
-                            "data": str(data_path),
-                            "dataset": "synthetic",
-                            "outcome": "outcome",
-                            "task": "regression",
-                            "models": ["ols"],
-                            "preset": "dev",
-                            "out": str(root / "outputs" / "reg.csv"),
-                            "n_sizes_n": 2,
-                            "n_sizes_k": 2,
-                            "max_n": 20,
-                            "max_k": 3,
-                            "batch_size": 3,
-                        },
-                        {
-                            "name": "clf_panel",
-                            "data": str(data_path),
-                            "dataset": "synthetic",
-                            "outcome": "employed",
-                            "task": "classification",
-                            "models": ["ols"],
-                            "preset": "dev",
-                            "out": str(root / "outputs" / "clf.csv"),
-                            "n_sizes_n": 1,
-                            "n_sizes_k": 4,
-                            "max_n": 30,
-                            "max_k": 5,
-                            "batch_size": 4,
-                        },
-                    ]
-                }
+            "\n".join(
+                [
+                    "panels:",
+                    "  - name: reg_panel",
+                    f"    data: {data_path}",
+                    "    dataset: synthetic",
+                    "    outcome: outcome",
+                    "    task: regression",
+                    "    models:",
+                    "      - ols",
+                    "    preset: dev",
+                    f"    out: {root / 'outputs' / 'reg.csv'}",
+                    "    n_sizes_n: 2",
+                    "    n_sizes_k: 2",
+                    "    max_n: 20",
+                    "    max_k: 3",
+                    "    batch_size: 3",
+                    "  - name: clf_panel",
+                    f"    data: {data_path}",
+                    "    dataset: synthetic",
+                    "    outcome: employed",
+                    "    task: classification",
+                    "    models:",
+                    "      - ols",
+                    "    preset: dev",
+                    f"    out: {root / 'outputs' / 'clf.csv'}",
+                    "    n_sizes_n: 1",
+                    "    n_sizes_k: 4",
+                    "    max_n: 30",
+                    "    max_k: 5",
+                    "    batch_size: 4",
+                    "",
+                ]
             )
         )
         return manifest

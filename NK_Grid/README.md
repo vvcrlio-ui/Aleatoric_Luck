@@ -98,26 +98,27 @@ combinations already recorded as `ok` or `skipped`.
 
 ## Multi-panel runner
 
-`run_panels.py` reads a declarative JSON manifest and runs one independent
+`run_panels.py` reads a declarative YAML manifest and runs one independent
 `nk_grid.py` configuration per figure or panel. Presets centralize the common
 grid sizes:
 
-- `dev`: `n_seeds=2, n_draws=2, n_sizes_n=4, n_sizes_k=4, max_n=100, max_k=100`
+- `dev`: `n_seeds=2, n_draws=2, n_sizes_n=5, n_sizes_k=5, max_n=100, max_k=100`
 - `medium`: `n_seeds=2, n_draws=2, n_sizes_n=4, n_sizes_k=4, max_n=100, max_k=100`
 - `production`: `n_seeds=100, n_draws=50, n_sizes_n=20, n_sizes_k=20, max_n=0, max_k=0`
 
 Each panel may override any preset value. The default manifest is
-`panels.json`:
+`panels.yaml`:
 
 ```bash
 python src/run_panels.py --dry-run
 python src/run_panels.py --only smr_income
-python src/run_panels.py --manifest panels.json
+python src/run_panels.py --manifest panels.yaml
 ```
 
 Each panel writes to its own CSV and resumes through the same checkpoint
 mechanism as `nk_grid.py`, so interrupted panel runs can be repeated without
 duplicating completed rows.
+Progress logs are emitted through the shared `helpers_logging.py` helper.
 
 ## SLURM
 
