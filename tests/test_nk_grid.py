@@ -27,6 +27,7 @@ from NK_Grid.src.nk_grid import (
     CLASSIFICATION_METRIC_COLUMNS,
     METRIC_COLUMNS,
     NKGridConfig,
+    REGRESSION_CV_MIN_N,
     compute_classification_metrics,
     compute_regression_metrics,
     draw_orders,
@@ -35,6 +36,30 @@ from NK_Grid.src.nk_grid import (
     run_nk_grid,
 )
 from NK_Grid.src.run_panels import main as run_panels_main
+
+
+class DummyRegressor:
+    def fit(self, X, y):
+        return self
+
+    def predict(self, X):
+        return np.zeros(len(X), dtype=float)
+
+
+class DummyClassifier:
+    def fit(self, X, y):
+        return self
+
+    def predict_proba(self, X):
+        probabilities = np.zeros((len(X), 2), dtype=float)
+        probabilities[:, 0] = 0.6
+        probabilities[:, 1] = 0.4
+        return probabilities
+
+
+class FailingRegressor:
+    def fit(self, X, y):
+        raise ValueError("synthetic fit failure")
 
 
 class NKGridTests(unittest.TestCase):
@@ -427,6 +452,225 @@ class NKGridTests(unittest.TestCase):
             self.assertEqual(saved.loc[0, "error"], "below BART minimum N/K floor")
             self.assertTrue(saved.loc[0, list(METRIC_COLUMNS)].isna().all())
 
+    def test_regression_cv_min_n_constants_match_internal_cv_requirements(self):
+        self.assertEqual(
+            REGRESSION_CV_MIN_N,
+            {
+                "ridge": 2,
+                "lasso": 2,
+                "elastic_net": 2,
+                "lightgbm": 5,
+            },
+        )
+
+    def test_nk_grid_skips_regression_cv_models_below_minimum_without_fitting(self):
+        for model_name, min_n in REGRESSION_CV_MIN_N.items():
+            with (
+                self.subTest(model=model_name),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                data_path = root / "synthetic.csv"
+                out_path = root / "nk_grid.csv"
+                self._write_nk_synthetic_data(data_path)
+                config = NKGridConfig(
+                    data=data_path,
+                    out=out_path,
+                    dataset="synthetic",
+                    outcome="outcome",
+                    models=(model_name,),
+                    seed=30,
+                    test_size=0.3,
+                    n_seeds=1,
+                    n_draws=1,
+                    n_sizes_n=1,
+                    n_sizes_k=1,
+                    max_n=min_n - 1,
+                    max_k=2,
+                    batch_size=1,
+                    n_jobs=1,
+                )
+                with patch("NK_Grid.src.nk_grid.make_model") as make_model_mock:
+                    run_nk_grid(config)
+                make_model_mock.assert_not_called()
+                saved = pd.read_csv(out_path)
+                self.assertEqual(saved.loc[0, "status"], "skipped")
+                self.assertEqual(
+                    saved.loc[0, "error"],
+                    (
+                        f"below minimum N for {model_name}'s internal CV "
+                        f"(requires N>={min_n})"
+                    ),
+                )
+                self.assertTrue(saved.loc[0, list(METRIC_COLUMNS)].isna().all())
+
+    def test_nk_grid_attempts_regression_cv_models_at_minimum_n(self):
+        for model_name, min_n in REGRESSION_CV_MIN_N.items():
+            with (
+                self.subTest(model=model_name),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                data_path = root / "synthetic.csv"
+                out_path = root / "nk_grid.csv"
+                self._write_nk_synthetic_data(data_path)
+                config = NKGridConfig(
+                    data=data_path,
+                    out=out_path,
+                    dataset="synthetic",
+                    outcome="outcome",
+                    models=(model_name,),
+                    seed=31,
+                    test_size=0.3,
+                    n_seeds=1,
+                    n_draws=1,
+                    n_sizes_n=1,
+                    n_sizes_k=1,
+                    max_n=min_n,
+                    max_k=2,
+                    batch_size=1,
+                    n_jobs=1,
+                )
+                with patch(
+                    "NK_Grid.src.nk_grid.make_model",
+                    return_value=DummyRegressor(),
+                ) as make_model_mock:
+                    run_nk_grid(config)
+                make_model_mock.assert_called_once()
+                saved = pd.read_csv(out_path)
+                self.assertEqual(saved.loc[0, "N"], min_n)
+                self.assertEqual(saved.loc[0, "status"], "ok")
+
+    def test_nk_grid_does_not_apply_regression_cv_floor_to_classification(self):
+        for model_name, min_n in REGRESSION_CV_MIN_N.items():
+            with (
+                self.subTest(model=model_name),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                data_path = root / "synthetic.csv"
+                out_path = root / "nk_grid.csv"
+                self._write_nk_synthetic_data(data_path)
+                config = NKGridConfig(
+                    data=data_path,
+                    out=out_path,
+                    dataset="synthetic",
+                    outcome="employed",
+                    models=(model_name,),
+                    seed=32,
+                    test_size=0.3,
+                    n_seeds=1,
+                    n_draws=1,
+                    n_sizes_n=1,
+                    n_sizes_k=1,
+                    max_n=min_n - 1,
+                    max_k=2,
+                    batch_size=1,
+                    n_jobs=1,
+                    task="classification",
+                )
+                with patch(
+                    "NK_Grid.src.nk_grid.make_model",
+                    return_value=DummyClassifier(),
+                ) as make_model_mock:
+                    run_nk_grid(config)
+                make_model_mock.assert_called_once()
+                saved = pd.read_csv(out_path)
+                self.assertEqual(saved.loc[0, "status"], "ok")
+                self.assertEqual(saved.loc[0, "task"], "classification")
+
+    def test_nk_grid_does_not_apply_regression_cv_floor_to_other_models(self):
+        for model_name in ("ols", "random_forest", "xgboost", "bart"):
+            with (
+                self.subTest(model=model_name),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                data_path = root / "synthetic.csv"
+                out_path = root / "nk_grid.csv"
+                self._write_nk_synthetic_data(data_path)
+                config = NKGridConfig(
+                    data=data_path,
+                    out=out_path,
+                    dataset="synthetic",
+                    outcome="outcome",
+                    models=(model_name,),
+                    seed=33,
+                    test_size=0.3,
+                    n_seeds=1,
+                    n_draws=1,
+                    n_sizes_n=1,
+                    n_sizes_k=1,
+                    max_n=1,
+                    max_k=1,
+                    batch_size=1,
+                    n_jobs=1,
+                    bart_min_n=0,
+                    bart_min_k=0,
+                )
+                with patch(
+                    "NK_Grid.src.nk_grid.make_model",
+                    return_value=DummyRegressor(),
+                ) as make_model_mock:
+                    run_nk_grid(config)
+                make_model_mock.assert_called_once()
+                saved = pd.read_csv(out_path)
+                self.assertEqual(saved.loc[0, "status"], "ok")
+
+    def test_nk_grid_end_to_end_marks_tiny_regression_cv_cells_skipped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=tuple(REGRESSION_CV_MIN_N),
+                seed=34,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=3,
+                n_sizes_k=1,
+                max_n=10,
+                max_k=2,
+                batch_size=12,
+                n_jobs=1,
+            )
+            with patch(
+                "NK_Grid.src.nk_grid.make_model",
+                return_value=DummyRegressor(),
+            ):
+                run_nk_grid(config)
+            saved = pd.read_csv(out_path)
+            self.assertEqual(set(saved["N"]), {1, 3, 10})
+            expected_skipped = {
+                ("ridge", 1, 2),
+                ("lasso", 1, 2),
+                ("elastic_net", 1, 2),
+                ("lightgbm", 1, 5),
+                ("lightgbm", 3, 5),
+            }
+            for model_name, n_samples, min_n in expected_skipped:
+                row = saved[
+                    (saved["model"] == model_name) & (saved["N"] == n_samples)
+                ].iloc[0]
+                self.assertEqual(row["status"], "skipped")
+                self.assertIn(model_name, row["error"])
+                self.assertIn(f"N>={min_n}", row["error"])
+            for _, row in saved.iterrows():
+                row_key = (
+                    row["model"],
+                    row["N"],
+                    REGRESSION_CV_MIN_N[row["model"]],
+                )
+                if row_key in expected_skipped:
+                    continue
+                self.assertEqual(row["status"], "ok")
+
     def test_nk_grid_logs_progress_to_stderr(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -471,7 +715,7 @@ class NKGridTests(unittest.TestCase):
                 out=out_path,
                 dataset="synthetic",
                 outcome="outcome",
-                models=("ridge",),
+                models=("ols",),
                 seed=30,
                 test_size=0.3,
                 n_seeds=1,
@@ -483,9 +727,14 @@ class NKGridTests(unittest.TestCase):
                 batch_size=1,
                 n_jobs=1,
             )
-            run_nk_grid(config)
+            with patch(
+                "NK_Grid.src.nk_grid.make_model",
+                return_value=FailingRegressor(),
+            ):
+                run_nk_grid(config)
             saved = pd.read_csv(out_path)
             self.assertEqual(saved.loc[0, "status"], "failed")
+            self.assertIn("synthetic fit failure", saved.loc[0, "error"])
             expanded_metrics = [
                 "pinball_q05",
                 "pinball_q25",

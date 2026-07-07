@@ -64,6 +64,14 @@ from experiment import (
 from model_registry import MODEL_NAMES, make_model
 
 
+REGRESSION_CV_MIN_N = {
+    "ridge": 2,
+    "lasso": 2,
+    "elastic_net": 2,
+    "lightgbm": 5,
+}
+
+
 METRIC_COLUMNS = (
     "r2_test",
     "skill_score_pct",
@@ -581,6 +589,24 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                     **({"task": config.task} if config.task == "classification" else {}),
                     "status": "skipped",
                     "error": "below BART minimum N/K floor",
+                },
+                metadata,
+            )
+        if (
+            config.task == "regression"
+            and model_name in REGRESSION_CV_MIN_N
+            and n_samples < REGRESSION_CV_MIN_N[model_name]
+        ):
+            min_n = REGRESSION_CV_MIN_N[model_name]
+            return add_metadata(
+                {
+                    **row,
+                    **_empty_metrics(),
+                    "status": "skipped",
+                    "error": (
+                        f"below minimum N for {model_name}'s internal CV "
+                        f"(requires N>={min_n})"
+                    ),
                 },
                 metadata,
             )
