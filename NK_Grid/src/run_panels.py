@@ -9,18 +9,25 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from nk_grid import NKGridConfig, log_progress, run_nk_grid
+try:
+    from .helpers_logging import log_progress
+    from .nk_grid import NKGridConfig, run_nk_grid
+except ImportError:
+    from helpers_logging import log_progress
+    from nk_grid import NKGridConfig, run_nk_grid
 
 
 PRESETS: dict[str, dict[str, int]] = {
     "dev": {
         "n_seeds": 2,
         "n_draws": 2,
-        "n_sizes_n": 4,
-        "n_sizes_k": 4,
+        "n_sizes_n": 5,
+        "n_sizes_k": 5,
         "max_n": 100,
         "max_k": 100,
     },
@@ -63,11 +70,13 @@ def _resolve_path(value: str | Path, manifest_dir: Path) -> Path:
 
 def load_manifest(path: Path) -> dict[str, Any]:
     with path.open() as handle:
-        manifest = json.load(handle)
-    if isinstance(manifest, list):
-        return {"panels": manifest}
-    if not isinstance(manifest, dict) or "panels" not in manifest:
-        raise ValueError("Manifest must be a JSON object with a 'panels' list.")
+        manifest = yaml.safe_load(handle)
+    if (
+        not isinstance(manifest, dict)
+        or "panels" not in manifest
+        or not isinstance(manifest["panels"], list)
+    ):
+        raise ValueError("Manifest must be a YAML object with a 'panels' list.")
     return manifest
 
 
@@ -127,7 +136,7 @@ def config_to_json(config: NKGridConfig) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run declared N x K grid panels.")
-    parser.add_argument("--manifest", default=str(ROOT / "panels.json"))
+    parser.add_argument("--manifest", default=str(ROOT / "panels.yaml"))
     parser.add_argument("--only", nargs="+", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-jobs", type=int, default=None)

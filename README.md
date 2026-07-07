@@ -19,7 +19,7 @@ aleatoric_luck-Zheng-Cheng/
 ├── NK_Grid/
 │   ├── src/
 │   ├── slurm/
-│   ├── panels.json
+│   ├── panels.yaml
 │   ├── requirements.txt
 │   └── README.md
 ├── Zheng_Cheng_Replication/

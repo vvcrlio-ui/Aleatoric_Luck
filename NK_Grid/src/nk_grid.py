@@ -6,7 +6,6 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -46,6 +45,11 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:
+    from .helpers_logging import log_progress
+except ImportError:
+    from helpers_logging import log_progress
 
 from evaluation import r2_against_training_mean
 from experiment import (
@@ -103,12 +107,6 @@ CLASSIFICATION_METRIC_COLUMNS = (
     "accuracy",
     "mcfadden_pseudo_r2",
 )
-
-
-def log_progress(message: str) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[nk_grid] {timestamp} {message}", file=sys.stderr, flush=True)
-
 
 @dataclass(frozen=True)
 class NKGridConfig:
