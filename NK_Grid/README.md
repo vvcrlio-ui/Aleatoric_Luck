@@ -25,6 +25,16 @@ The example commands below use `data/asample2_withlag.csv` and
 `--outcome`, and `--predictor-prefix` can all be pointed at a different
 dataset.
 
+`data/...` paths in commands and in `panels.yaml` are always resolved
+relative to `NK_Grid/`. This path never needs to change between machines:
+what changes is what actually sits at `NK_Grid/data` on each machine (the
+tracked cluster symlink, or a real local copy). To test locally with a real
+copy of the data instead of the symlink, replace `NK_Grid/data` with a real
+directory containing the same filenames, then run
+`git update-index --skip-worktree NK_Grid/data` so git stops tracking that
+local substitution (undo with `--no-skip-worktree` later). Never commit real
+data through this path — `**/data/` is gitignored for exactly this reason.
+
 ## Environment
 
 Python 3.11 is recommended:
@@ -118,7 +128,17 @@ python src/run_panels.py --manifest panels.yaml
 Each panel writes to its own CSV and resumes through the same checkpoint
 mechanism as `nk_grid.py`, so interrupted panel runs can be repeated without
 duplicating completed rows.
-Progress logs are emitted through the shared `helpers_logging.py` helper.
+
+Panels with an outcome column that isn't confirmed yet ship with a
+placeholder value (e.g. `<TBD employment column>`) instead of a guessed
+column name. Edit `panels.yaml` to fill in the real column name before
+running that panel; running it with the placeholder still in place fails
+immediately with a clear "outcome not found" error rather than a wrong
+guess.
+
+Progress logs (via `helpers_logging.py`) print live to the terminal
+(stderr) and are not saved automatically. To keep a copy, redirect when you
+run either script, e.g. `python src/run_panels.py 2>&1 | tee run.log`.
 
 ## SLURM
 
