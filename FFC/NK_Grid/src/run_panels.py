@@ -26,8 +26,8 @@ PRESETS: dict[str, dict[str, int]] = {
     "dev": {
         "n_seeds": 5,
         "n_draws": 5,
-        "n_sizes_n": 8,
-        "n_sizes_k": 8,
+        "n_sizes_n": 5,
+        "n_sizes_k": 5,
         "max_n": 100,
         "max_k": 100,
     },
@@ -108,6 +108,10 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
     values["data"] = _resolve_path(values["data"], manifest_dir)
     if values.get("test_data") is not None:
         values["test_data"] = _resolve_path(values["test_data"], manifest_dir)
+    if values.get("feature_manifest") is not None:
+        values["feature_manifest"] = _resolve_path(
+            values["feature_manifest"], manifest_dir
+        )
     values["out"] = _resolve_path(values["out"], manifest_dir)
     values["models"] = tuple(values["models"])
     return str(name), NKGridConfig(**values)

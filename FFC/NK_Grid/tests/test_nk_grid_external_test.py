@@ -133,6 +133,47 @@ def test_parse_args_accepts_test_data(tmp_path):
     assert config.test_data == tmp_path / "test.csv"
 
 
+def test_feature_manifest_groups_expanded_columns_under_source_variables(tmp_path):
+    train = _regression_frame(40).rename(columns={"X_a": "X_a", "X_b": "C_b__0"})
+    train["M_a__missing"] = 0
+    train["C_b__1"] = 1 - (train["C_b__0"] > 0).astype(int)
+    test = _regression_frame(15, offset=100.0).rename(
+        columns={"X_a": "X_a", "X_b": "C_b__0"}
+    )
+    test["M_a__missing"] = 0
+    test["C_b__1"] = 1 - (test["C_b__0"] > 0).astype(int)
+
+    train_path = _write_csv(tmp_path, "train.csv", train)
+    test_path = _write_csv(tmp_path, "test.csv", test)
+    manifest_path = tmp_path / "feature_manifest.csv"
+    pd.DataFrame(
+        {
+            "source_column": ["a", "a", "b", "b"],
+            "feature_name": ["X_a", "M_a__missing", "C_b__0", "C_b__1"],
+            "keep": [True, True, True, True],
+        }
+    ).to_csv(manifest_path, index=False)
+    out_path = tmp_path / "grouped_results.csv"
+
+    run_nk_grid(
+        _config(
+            tmp_path,
+            data=train_path,
+            test_data=test_path,
+            out=out_path,
+            predictor_prefix=("X_", "C_", "M_"),
+            feature_manifest=manifest_path,
+        )
+    )
+
+    row = pd.read_csv(out_path).iloc[0]
+    assert row["status"] == "ok"
+    assert row["K"] == 2
+    assert row["K_expanded"] == 4
+    assert row["n_features_total"] == 2
+    assert row["n_expanded_features_total"] == 4
+
+
 def test_external_mode_aligns_test_predictors_and_uses_all_test_rows(tmp_path):
     train = _regression_frame(40)
     test = _regression_frame(15, offset=100.0)
