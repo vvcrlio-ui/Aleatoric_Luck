@@ -31,6 +31,7 @@ from NK_Grid.src.nk_grid import (
     compute_classification_metrics,
     compute_regression_metrics,
     draw_orders,
+    external_test_split,
     log2_size_grid,
     split_frame,
     run_nk_grid,
@@ -244,6 +245,52 @@ class NKGridTests(unittest.TestCase):
         self.assertAlmostEqual(split.y_train.mean(), 0.3, delta=0.05)
         self.assertAlmostEqual(split.y_test.mean(), 0.3, delta=0.05)
 
+    def test_external_test_split_drops_missing_outcomes_independently(self):
+        train = pd.DataFrame(
+            {
+                "Aset1_a": [1, 2, 3],
+                "Bset1_b": [4, 5, 6],
+                "outcome": [10.0, np.nan, 30.0],
+            },
+            index=[10, 11, 12],
+        )
+        test = pd.DataFrame(
+            {
+                "Aset1_a": [7, 8, 9],
+                "Bset1_b": [10, 11, 12],
+                "outcome": [np.nan, 80.0, 90.0],
+            },
+            index=[20, 21, 22],
+        )
+        split = external_test_split(train, test, ["Aset1_a", "Bset1_b"], "outcome")
+
+        self.assertEqual(list(split.X_train.index), [10, 12])
+        self.assertEqual(list(split.X_test.index), [21, 22])
+        self.assertEqual(list(split.y_train), [10.0, 30.0])
+        self.assertEqual(list(split.y_test), [80.0, 90.0])
+
+    def test_external_test_split_validates_required_columns(self):
+        train = pd.DataFrame({"Aset1_a": [1], "outcome": [2]})
+        test = pd.DataFrame({"outcome": [3]})
+        with self.assertRaisesRegex(KeyError, "Predictor not found in test data: Aset1_a"):
+            external_test_split(train, test, ["Aset1_a"], "outcome")
+
+    def test_external_test_split_aligns_test_columns_to_training_order(self):
+        train = pd.DataFrame(
+            {"Aset1_a": [1, 2], "Bset1_b": [3, 4], "outcome": [5, 6]}
+        )
+        test = pd.DataFrame(
+            {
+                "extra": [99, 98],
+                "Bset1_b": [7, 8],
+                "Aset1_a": [9, 10],
+                "outcome": [11, 12],
+            }
+        )
+        split = external_test_split(train, test, ["Aset1_a", "Bset1_b"], "outcome")
+        self.assertEqual(list(split.X_test.columns), ["Aset1_a", "Bset1_b"])
+        self.assertEqual(split.X_test.to_dict("list"), {"Aset1_a": [9, 10], "Bset1_b": [7, 8]})
+
     def test_nk_grid_end_to_end_schema_and_row_count(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -325,6 +372,121 @@ class NKGridTests(unittest.TestCase):
             self.assertEqual(set(saved["status"]), {"ok"})
             self.assertTrue((saved["N"] <= saved["n_train_total"]).all())
             self.assertTrue((saved["K"] <= saved["n_features_total"]).all())
+
+    def test_nk_grid_external_test_file_uses_fixed_split_for_all_seeds(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train_path = root / "train.csv"
+            test_path = root / "test.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(train_path)
+            test_frame = pd.read_csv(train_path).iloc[:20].copy()
+            test_frame["outcome"] = test_frame["outcome"] + 1.0
+            test_frame.to_csv(test_path, index=False)
+
+            config = NKGridConfig(
+                data=train_path,
+                test_data=test_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=70,
+                test_size=0.9,
+                n_seeds=2,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=30,
+                max_k=3,
+                batch_size=2,
+                n_jobs=1,
+            )
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                run_nk_grid(config)
+            saved = pd.read_csv(out_path)
+
+            self.assertEqual(len(saved), 2)
+            self.assertEqual(set(saved["split_mode"]), {"external_test"})
+            self.assertEqual(saved["test_data_sha256"].nunique(), 1)
+            self.assertTrue(saved["test_data_sha256"].str.fullmatch(r"[0-9a-f]{64}").all())
+            self.assertEqual(set(saved["n_train_total"]), {80})
+            self.assertEqual(set(saved["n_test_total"]), {20})
+            self.assertEqual(set(saved["n_features_total"]), {5})
+            self.assertIn("ignoring --test-size", stderr.getvalue())
+
+    def test_nk_grid_external_test_file_validates_predictor_alignment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train_path = root / "train.csv"
+            test_path = root / "test.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(train_path)
+            test_frame = pd.read_csv(train_path).drop(columns=["Bset2_e"])
+            test_frame.to_csv(test_path, index=False)
+            config = NKGridConfig(
+                data=train_path,
+                test_data=test_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols",),
+                seed=71,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=20,
+                max_k=3,
+                batch_size=1,
+                n_jobs=1,
+            )
+            with self.assertRaisesRegex(ValueError, "missing predictor columns"):
+                run_nk_grid(config)
+
+    def test_nk_grid_external_test_file_handles_classification_and_isolates_checkpoints(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train_path = root / "train.csv"
+            test_path = root / "test.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(train_path)
+            test_frame = pd.read_csv(train_path).iloc[:16].copy()
+            test_frame["employed"] = [0, 1] * 8
+            test_frame.to_csv(test_path, index=False)
+            common = dict(
+                data=train_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="employed",
+                models=("ols",),
+                seed=72,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=30,
+                max_k=3,
+                batch_size=1,
+                n_jobs=1,
+                task="classification",
+            )
+
+            run_nk_grid(NKGridConfig(**common))
+            run_nk_grid(NKGridConfig(**common, test_data=test_path))
+            saved = pd.read_csv(out_path)
+
+            self.assertEqual(set(saved["split_mode"]), {"internal_random", "external_test"})
+            self.assertEqual(saved["experiment_id"].nunique(), 2)
+            external = saved[saved["split_mode"].eq("external_test")].iloc[0]
+            internal = saved[saved["split_mode"].eq("internal_random")].iloc[0]
+            self.assertEqual(external["n_test_total"], 16)
+            self.assertRegex(external["test_data_sha256"], r"^[0-9a-f]{64}$")
+            self.assertNotEqual(external["test_data_sha256"], internal["test_data_sha256"])
+            self.assertEqual(external["status"], "ok")
 
     def test_nk_grid_predictor_prefix_is_configurable_for_other_datasets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -564,7 +726,7 @@ class NKGridTests(unittest.TestCase):
                     n_draws=1,
                     n_sizes_n=1,
                     n_sizes_k=1,
-                    max_n=min_n - 1,
+                    max_n=max(4, min_n - 1),
                     max_k=2,
                     batch_size=1,
                     n_jobs=1,
@@ -579,6 +741,50 @@ class NKGridTests(unittest.TestCase):
                 saved = pd.read_csv(out_path)
                 self.assertEqual(saved.loc[0, "status"], "ok")
                 self.assertEqual(saved.loc[0, "task"], "classification")
+
+    def test_nk_grid_skips_single_class_classification_sample_without_fitting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid_clf.csv"
+            frame = pd.DataFrame(
+                {
+                    "Aset1_a": np.arange(20),
+                    "Bset1_b": np.arange(20) * 2,
+                    "employed": [0] * 10 + [1] * 10,
+                }
+            )
+            frame.to_csv(data_path, index=False)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="employed",
+                models=("ols",),
+                seed=32,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=1,
+                max_k=1,
+                batch_size=1,
+                n_jobs=1,
+                task="classification",
+            )
+            with patch("NK_Grid.src.nk_grid.make_model") as make_model_mock:
+                run_nk_grid(config)
+            make_model_mock.assert_not_called()
+            saved = pd.read_csv(out_path)
+            self.assertEqual(saved.loc[0, "status"], "skipped")
+            self.assertEqual(
+                saved.loc[0, "error"],
+                "single-class training sample for classification",
+            )
+            self.assertTrue(
+                saved.loc[0, list(CLASSIFICATION_METRIC_COLUMNS)].isna().all()
+            )
 
     def test_nk_grid_does_not_apply_regression_cv_floor_to_other_models(self):
         for model_name in ("ols", "random_forest", "xgboost", "bart"):
@@ -997,11 +1203,13 @@ class NKGridTests(unittest.TestCase):
             helpers_logging.log_progress("x")
         self.assertRegex(stderr.getvalue(), r"^\[nk_grid\] \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} x\n$")
 
-    def test_dev_preset_uses_five_n_and_k_grid_points(self):
+    def test_dev_preset_keeps_canonical_grid_points(self):
         from NK_Grid.src.run_panels import PRESETS
 
-        self.assertEqual(PRESETS["dev"]["n_sizes_n"], 5)
-        self.assertEqual(PRESETS["dev"]["n_sizes_k"], 5)
+        self.assertEqual(PRESETS["dev"]["n_seeds"], 5)
+        self.assertEqual(PRESETS["dev"]["n_draws"], 5)
+        self.assertEqual(PRESETS["dev"]["n_sizes_n"], 8)
+        self.assertEqual(PRESETS["dev"]["n_sizes_k"], 8)
 
     def test_run_panels_dry_run_prints_resolved_config_without_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1013,8 +1221,8 @@ class NKGridTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             self.assertEqual([panel["name"] for panel in payload["panels"]], ["reg_panel", "clf_panel"])
             first_config = payload["panels"][0]["config"]
-            self.assertEqual(first_config["n_seeds"], 2)
-            self.assertEqual(first_config["n_draws"], 2)
+            self.assertEqual(first_config["n_seeds"], 5)
+            self.assertEqual(first_config["n_draws"], 5)
             self.assertEqual(first_config["n_sizes_n"], 2)
             self.assertEqual(first_config["n_sizes_k"], 2)
             self.assertEqual(first_config["preset"], "dev")
@@ -1055,7 +1263,49 @@ class NKGridTests(unittest.TestCase):
             self.assertEqual(default_name, "default_panel")
             self.assertEqual(default_config.preset, "dev")
 
-    def test_run_panels_yaml_manifest_without_grid_overrides_uses_dev_five_points(self):
+    def test_run_panels_resolve_panel_maps_test_to_test_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            test_path = root / "external" / "test.csv"
+            test_path.parent.mkdir()
+            self._write_nk_synthetic_data(data_path)
+            self._write_nk_synthetic_data(test_path)
+            _, config = resolve_panel(
+                {
+                    "name": "external_panel",
+                    "data": "synthetic.csv",
+                    "test": "external/test.csv",
+                    "dataset": "synthetic",
+                    "outcome": "outcome",
+                    "models": ["ols"],
+                    "out": "outputs/external.csv",
+                },
+                root,
+            )
+            self.assertEqual(config.test_data, test_path)
+
+    def test_run_panels_resolve_panel_rejects_test_and_test_data_together(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            self._write_nk_synthetic_data(data_path)
+            with self.assertRaisesRegex(ValueError, "test and test_data"):
+                resolve_panel(
+                    {
+                        "name": "external_panel",
+                        "data": str(data_path),
+                        "test": "test.csv",
+                        "test_data": "test2.csv",
+                        "dataset": "synthetic",
+                        "outcome": "outcome",
+                        "models": ["ols"],
+                        "out": str(root / "outputs" / "external.csv"),
+                    },
+                    root,
+                )
+
+    def test_run_panels_yaml_manifest_without_grid_overrides_uses_canonical_dev_points(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_path = root / "synthetic.csv"
@@ -1086,8 +1336,8 @@ class NKGridTests(unittest.TestCase):
                 run_panels_main(["--manifest", str(manifest), "--dry-run"])
             payload = json.loads(stdout.getvalue())
             config = payload["panels"][0]["config"]
-            self.assertEqual(config["n_sizes_n"], 5)
-            self.assertEqual(config["n_sizes_k"], 5)
+            self.assertEqual(config["n_sizes_n"], 8)
+            self.assertEqual(config["n_sizes_k"], 8)
 
     def test_run_panels_yaml_manifest_missing_panels_has_clear_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1113,8 +1363,8 @@ class NKGridTests(unittest.TestCase):
             run_panels_main(["--manifest", str(manifest)])
             reg = pd.read_csv(self._single_output(root / "outputs", "reg_dev_*.csv"))
             clf = pd.read_csv(self._single_output(root / "outputs", "clf_dev_*.csv"))
-            self.assertEqual(len(reg), 16)
-            self.assertEqual(len(clf), 16)
+            self.assertEqual(len(reg), 100)
+            self.assertEqual(len(clf), 100)
             self.assertIn("r2_test", reg.columns)
             self.assertIn("roc_auc", clf.columns)
             self.assertEqual(set(clf["task"]), {"classification"})
@@ -1132,10 +1382,10 @@ class NKGridTests(unittest.TestCase):
             run_panels_main(["--manifest", str(manifest), "--only", "reg_panel"])
             self.assertEqual(sorted((root / "outputs").glob("reg_dev_*.csv")), [output])
             saved = pd.read_csv(output)
-            self.assertEqual(len(saved), 16)
+            self.assertEqual(len(saved), 100)
             self.assertEqual(
                 len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
-                16,
+                100,
             )
 
     def _single_output(self, directory: Path, pattern: str) -> Path:

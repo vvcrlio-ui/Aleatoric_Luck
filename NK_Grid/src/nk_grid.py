@@ -57,6 +57,7 @@ from evaluation import r2_against_training_mean
 from experiment import (
     add_metadata,
     build_experiment_metadata,
+    file_sha256,
     load_checkpoint,
     model_run_settings,
     parallel_preference,
@@ -135,6 +136,7 @@ class NKGridConfig:
     max_k: int
     batch_size: int
     n_jobs: int
+    test_data: Path | None = None
     group_split_col: str | None = None
     task: str = "regression"
     bart_min_n: int = 10
@@ -195,6 +197,30 @@ def split_frame(
         stratify=y if task == "classification" else None,
     )
     return SplitData(X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test)
+
+
+def external_test_split(
+    train_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+    predictors: Sequence[str],
+    outcome: str,
+) -> SplitData:
+    for label, frame in (("training data", train_frame), ("test data", test_frame)):
+        if outcome not in frame:
+            raise KeyError(f"Outcome not found in {label}: {outcome}")
+        for predictor in predictors:
+            if predictor not in frame:
+                raise KeyError(f"Predictor not found in {label}: {predictor}")
+
+    train_complete = train_frame.dropna(subset=[outcome])
+    test_complete = test_frame.dropna(subset=[outcome])
+    predictor_list = list(predictors)
+    return SplitData(
+        X_train=train_complete.loc[:, predictor_list],
+        X_test=test_complete.loc[:, predictor_list],
+        y_train=train_complete[outcome],
+        y_test=test_complete[outcome],
+    )
 
 
 def draw_orders(
@@ -463,6 +489,7 @@ def _base_row(
     n_samples: int,
     k_features: int,
     n_train_total: int,
+    n_test_total: int,
     n_features_total: int,
 ) -> dict:
     return {
@@ -475,8 +502,19 @@ def _base_row(
         "K": int(k_features),
         "split_random_state": int(seed),
         "n_train_total": int(n_train_total),
+        "n_test_total": int(n_test_total),
         "n_features_total": int(n_features_total),
     }
+
+
+def _validate_classification_outcome(frame: pd.DataFrame, outcome: str) -> None:
+    classes = set(pd.Series(frame[outcome]).dropna().unique())
+    if not classes.issubset({0, 1, False, True}) or len(classes) > 2:
+        raise ValueError(
+            "--task classification requires a binary 0/1 outcome column. "
+            "The real employment column name could not be verified locally; "
+            "pass the confirmed column via --outcome."
+        )
 
 
 def _positive_class_probability(model, X) -> np.ndarray:
@@ -522,13 +560,40 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         f"outcome={config.outcome} task={config.task}"
     )
     if config.task == "classification":
-        classes = set(pd.Series(frame[config.outcome]).dropna().unique())
-        if not classes.issubset({0, 1, False, True}) or len(classes) > 2:
+        _validate_classification_outcome(frame, config.outcome)
+
+    split_mode = "internal_random"
+    test_data_sha256 = ""
+    test_path: Path | None = None
+    fixed_split: SplitData | None = None
+    if config.test_data is not None:
+        split_mode = "external_test"
+        test_path = Path(config.test_data)
+        if not test_path.exists():
+            raise FileNotFoundError(f"NLSY external test data not found: {test_path}")
+        test_frame = pd.read_csv(test_path)
+        if config.outcome not in test_frame:
+            raise KeyError(f"Outcome not found: {config.outcome}")
+        missing_predictors = [col for col in predictors if col not in test_frame]
+        if missing_predictors:
             raise ValueError(
-                "--task classification requires a binary 0/1 outcome column. "
-                "The real employment column name could not be verified locally; "
-                "pass the confirmed column via --outcome."
+                "External test data is missing predictor columns from the "
+                f"training data: {missing_predictors}"
             )
+        if config.task == "classification":
+            _validate_classification_outcome(test_frame, config.outcome)
+        if not np.isclose(config.test_size, 0.3):
+            log_progress(
+                "external test data supplied; ignoring --test-size because the "
+                "test split is fixed by --test-data"
+            )
+        fixed_split = external_test_split(frame, test_frame, predictors, config.outcome)
+        test_data_sha256 = file_sha256(test_path)
+        log_progress(
+            "loaded external test data "
+            f"path={test_path} rows={len(test_frame)} "
+            f"usable_test_rows={len(fixed_split.X_test)}"
+        )
 
     metadata_extra = {
         "dataset": config.dataset,
@@ -542,6 +607,8 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         "group_split_col": config.group_split_col,
         "bart_min_n": config.bart_min_n,
         "bart_min_k": config.bart_min_k,
+        "split_mode": split_mode,
+        "test_data_sha256": test_data_sha256,
         **model_run_settings(config.models),
     }
     if config.task == "classification":
@@ -554,19 +621,24 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         split_seed=config.seed,
         extra=metadata_extra,
     )
+    metadata["split_mode"] = split_mode
+    metadata["test_data_sha256"] = test_data_sha256
 
     split_seeds = [config.seed + offset for offset in range(config.n_seeds)]
-    splits = {
-        seed: split_frame(
-            frame,
-            predictors,
-            config.outcome,
-            test_size=config.test_size,
-            seed=seed,
-            task=config.task,
-        )
-        for seed in split_seeds
-    }
+    if fixed_split is None:
+        splits = {
+            seed: split_frame(
+                frame,
+                predictors,
+                config.outcome,
+                test_size=config.test_size,
+                seed=seed,
+                task=config.task,
+            )
+            for seed in split_seeds
+        }
+    else:
+        splits = {seed: fixed_split for seed in split_seeds}
     n_grid = log2_size_grid(
         len(next(iter(splits.values())).X_train),
         config.n_sizes_n,
@@ -622,6 +694,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             n_samples=n_samples,
             k_features=k_features,
             n_train_total=len(split.X_train),
+            n_test_total=len(split.X_test),
             n_features_total=len(predictors),
         )
         if (
@@ -667,6 +740,17 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             X_sub = split.X_train.loc[selected_rows, selected_cols]
             y_sub = split.y_train.loc[selected_rows]
             X_test = split.X_test.loc[:, selected_cols]
+            if config.task == "classification" and len(np.unique(y_sub)) < 2:
+                return add_metadata(
+                    {
+                        **row,
+                        **_empty_classification_metrics(),
+                        "task": config.task,
+                        "status": "skipped",
+                        "error": "single-class training sample for classification",
+                    },
+                    metadata,
+                )
             model = make_model(
                 model_name,
                 seed=_model_seed(seed, draw, n_samples, k_features),
@@ -752,6 +836,7 @@ def parse_args() -> NKGridConfig:
         description="Run joint log-scale N x K prediction-quality sweeps."
     )
     parser.add_argument("--data", default=str(ROOT / "data" / "asample2_withlag.csv"))
+    parser.add_argument("--test-data", default=None)
     parser.add_argument("--task", default="regression", choices=("regression", "classification"))
     parser.add_argument("--outcome", default=None)
     parser.add_argument("--out", default=None)
@@ -801,6 +886,7 @@ def parse_args() -> NKGridConfig:
         )
     return NKGridConfig(
         data=Path(args.data),
+        test_data=Path(args.test_data) if args.test_data is not None else None,
         out=Path(out),
         dataset=args.dataset,
         outcome=outcome,

@@ -88,7 +88,13 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
     if preset_name not in PRESETS:
         raise ValueError(f"Unknown preset for panel {name}: {preset_name}")
 
-    values = {**DEFAULTS, **PRESETS[preset_name], **panel}
+    if "test" in panel and "test_data" in panel:
+        raise ValueError(f"Panel {name} cannot define both test and test_data.")
+    panel_values = dict(panel)
+    if "test" in panel_values:
+        panel_values["test_data"] = panel_values.pop("test")
+
+    values = {**DEFAULTS, **PRESETS[preset_name], **panel_values}
     values.pop("name", None)
     values["preset"] = preset_name
     unknown = sorted(set(values) - CONFIG_FIELDS)
@@ -100,6 +106,8 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
             raise ValueError(f"Panel {name} requires '{required}'.")
 
     values["data"] = _resolve_path(values["data"], manifest_dir)
+    if values.get("test_data") is not None:
+        values["test_data"] = _resolve_path(values["test_data"], manifest_dir)
     values["out"] = _resolve_path(values["out"], manifest_dir)
     values["models"] = tuple(values["models"])
     return str(name), NKGridConfig(**values)
