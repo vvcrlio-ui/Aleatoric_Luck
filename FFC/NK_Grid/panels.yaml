@@ -18,13 +18,13 @@ panels:
       - xgboost
       - lightgbm
     # - bart
-    preset: dev
+    preset: production
     out: outputs/nk_grid_ffc_gpa.csv
 
   - name: ffc_grit
     data: data/intermediate_files/nk_inputs/ffc_train_grit.csv
     test: data/intermediate_files/nk_inputs/ffc_test_grit.csv
-    dataset: ffc_background_clean_v1
+    dataset: ffc_background_clean
     outcome: grit
     task: regression
     predictor_prefix:
@@ -40,13 +40,13 @@ panels:
       - xgboost
       - lightgbm
     # - bart
-    preset: dev
+    preset: production
     out: outputs/nk_grid_ffc_grit.csv
 
   - name: ffc_materialHardship
     data: data/intermediate_files/nk_inputs/ffc_train_materialHardship.csv
     test: data/intermediate_files/nk_inputs/ffc_test_materialHardship.csv
-    dataset: ffc_background_clean_v1
+    dataset: ffc_background_clean
     outcome: materialHardship
     task: regression
     predictor_prefix:
@@ -62,13 +62,13 @@ panels:
       - xgboost
       - lightgbm
     # - bart
-    preset: dev
+    preset: production
     out: outputs/nk_grid_ffc_materialHardship.csv
 
   - name: ffc_eviction
     data: data/intermediate_files/nk_inputs/ffc_train_eviction.csv
     test: data/intermediate_files/nk_inputs/ffc_test_eviction.csv
-    dataset: ffc_background_clean_v1
+    dataset: ffc_background_clean
     outcome: eviction
     task: classification
     predictor_prefix:
@@ -84,13 +84,13 @@ panels:
       - xgboost
       - lightgbm
     # - bart
-    preset: dev
+    preset: production
     out: outputs/nk_grid_ffc_eviction.csv
 
   - name: ffc_layoff
     data: data/intermediate_files/nk_inputs/ffc_train_layoff.csv
     test: data/intermediate_files/nk_inputs/ffc_test_layoff.csv
-    dataset: ffc_background_clean_v1
+    dataset: ffc_background_clean
     outcome: layoff
     task: classification
     predictor_prefix:
@@ -106,13 +106,13 @@ panels:
       - xgboost
       - lightgbm
     # - bart
-    preset: dev
+    preset: production
     out: outputs/nk_grid_ffc_layoff.csv
 
   - name: ffc_jobTraining
     data: data/intermediate_files/nk_inputs/ffc_train_jobTraining.csv
     test: data/intermediate_files/nk_inputs/ffc_test_jobTraining.csv
-    dataset: ffc_background_clean_v1
+    dataset: ffc_background_clean
     outcome: jobTraining
     task: classification
     predictor_prefix:
@@ -128,5 +128,5 @@ panels:
       - xgboost
       - lightgbm
     # - bart
-    preset: dev
+    preset: production
     out: outputs/nk_grid_ffc_jobTraining.csv
