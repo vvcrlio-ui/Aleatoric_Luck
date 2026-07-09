@@ -1,80 +1,37 @@
-# Aleatoric Luck: NK Grid and Zheng-Cheng Replication
+# Aleatoric Luck
 
-This repository contains two self-contained Python subprojects:
-
-- [`NK_Grid/`](NK_Grid/README.md): joint sample-size (N) by feature-count (K)
-  sweeps for regression and classification prediction metrics.
-- [`Zheng_Cheng_Replication/`](Zheng_Cheng_Replication/README.md): the
-  Zheng and Cheng replication workflow plus the early predictive extensions
-  for overall, sample-size, feature-set, domain-wise, and SHAP analyses.
-
-Each subproject has its own `src/`, `slurm/`, `data` symlink, logs marker, and
-requirements file. The shared support modules are intentionally copied into
-both directories so either subproject can run independently.
-
-## Repository layout
+Predictability research infrastructure, organized by paper/dataset.
 
 ```text
-aleatoric_luck-Zheng-Cheng/
-├── NK_Grid/
-│   ├── src/
-│   ├── slurm/
-│   ├── panels.yaml
-│   ├── requirements.txt
-│   └── README.md
-├── Zheng_Cheng_Replication/
-│   ├── src/
-│   ├── slurm/
-│   ├── colab_run.ipynb
-│   ├── requirements.txt
-│   ├── requirements-notebook.txt
-│   └── README.md
-├── tests/
-│   ├── test_nk_grid.py
-│   └── test_zheng_cheng_replication.py
-├── requirements.txt
-└── README.md
+Aleatoric_Luck/
+├── FFC/     — Fragile Families Challenge predictability (see FFC/README.md)
+└── SMR/     — SMR income predictability + Zheng-Cheng replication (see SMR/README.md)
 ```
 
-NLSY data are not committed. Both subprojects track a `data` symlink pointing
-to the same cluster data directory.
+Each top-level directory is self-contained: its own `NK_Grid/` copy (the N x K
+predictability sweep tool), its own `data/` (gitignored, not committed), and
+its own setup instructions. `NK_Grid` is intentionally **not** shared as a
+single root-level package — each paper's copy can diverge (e.g. FFC's copy
+adds background-data cleaning and a fixed external test-split mode that SMR
+does not need). When a change to `NK_Grid` itself is broadly useful, port it
+across copies deliberately rather than assuming they stay in sync.
 
-## Quick start
+## Layout
 
-Python 3.11 is recommended.
+- [`FFC/`](FFC/README.md)
+  - `NK_Grid/` — N x K sweep adapted for FFC's six outcomes, official
+    train/test split, and cleaned `background.dta` feature matrix.
+  - `ffc_replication-master/` — vendored copy of the original paper's own
+    replication materials (third-party code, not ours; see its README).
+- [`SMR/`](SMR/README.md)
+  - `NK_Grid/` — N x K sweep for the SMR hourly-wage / total-income panels.
+  - `Zheng_Cheng_Replication/` — the Zheng & Cheng (2025) replication
+    workflow. Unrelated to the predictability-sweep work; shares no code
+    with `NK_Grid/` beyond copied support modules.
+  - `tests/` — covers both subprojects above.
 
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-```
+## Data
 
-Run the NK grid:
-
-```bash
-cd NK_Grid
-python src/nk_grid.py --help
-python src/run_panels.py --dry-run
-```
-
-Run the replication workflow:
-
-```bash
-cd Zheng_Cheng_Replication
-python src/overall_prediction.py --help
-python src/overall_prediction.py --models ols ridge lasso xgboost bart
-```
-
-## Tests
-
-From the repository root:
-
-```bash
-python -m pytest -q
-python -m compileall NK_Grid/src Zheng_Cheng_Replication/src tests
-```
-
-## Reference
-
-Zheng, H., & Cheng, S. (2025). Social Rigidity Across and Within Generations:
-A Predictive Approach. *Sociological Methods & Research, 54*(4), 1683-1725.
+No raw or derived data is committed anywhere in this repository (`**/data/`
+is gitignored repo-wide). Each subproject documents how to obtain or
+regenerate its own data in its own README.

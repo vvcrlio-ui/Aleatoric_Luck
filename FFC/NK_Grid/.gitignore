@@ -1,0 +1,18 @@
+# Environments / caches
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+
+# Data: private/restricted FFC data, large derived/cleaned files, regenerable outputs
+data/
+
+# NK_Grid run outputs (regenerable, large)
+outputs/
+
+# Local planning/scratch docs, not for version history
+plans/
+
+# Generated logs
+logs/*
+!logs/.gitkeep

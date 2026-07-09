@@ -19,6 +19,12 @@ venv/
 dist/
 build/
 *.egg-info/
+.pytest_cache/
+
+# R (vendored ffc_replication-master)
+.Rhistory
+.Rapp.history
+.RData
 
 # Data / experiments
 **/data/
@@ -26,11 +32,13 @@ datasets/
 **/outputs
 outputs/
 results/
+!FFC/ffc_replication-master/results/
 runs/
 plans/
 logs/*
-!NK_Grid/logs/.gitkeep
-!Zheng_Cheng_Replication/logs/.gitkeep
+!SMR/NK_Grid/logs/.gitkeep
+!SMR/Zheng_Cheng_Replication/logs/.gitkeep
+!FFC/NK_Grid/logs/.gitkeep
 
 # Env / secrets
 .env
