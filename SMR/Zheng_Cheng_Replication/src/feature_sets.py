@@ -25,7 +25,7 @@ from experiment import (
     rows_for_experiment,
     write_checkpoint,
 )
-from model_registry import MODEL_NAMES, make_model
+from model_registry import SUPPORTED_MODEL_NAMES, make_model
 
 
 def parse_args():
@@ -33,7 +33,9 @@ def parse_args():
     parser.add_argument("--data", default=str(ROOT / "data" / "asample2_withlag.csv"))
     parser.add_argument("--outcome", default="Cm_lhourlywage")
     parser.add_argument("--out", default=str(ROOT / "outputs" / "feature_sets.csv"))
-    parser.add_argument("--models", nargs="+", default=["xgboost"], choices=MODEL_NAMES)
+    parser.add_argument(
+        "--models", nargs="+", default=["xgboost"], choices=SUPPORTED_MODEL_NAMES
+    )
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--test-size", type=float, default=0.3)
     parser.add_argument("--n-sizes", type=int, default=20)

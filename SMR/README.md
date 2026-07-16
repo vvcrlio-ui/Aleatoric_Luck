@@ -13,6 +13,11 @@ This directory contains two self-contained Python subprojects:
   Zheng and Cheng replication workflow plus the early predictive extensions
   for overall, sample-size, feature-set, domain-wise, and SHAP analyses.
 
+The expanded model space is shared by both subprojects: OLS, Ridge, Lasso,
+Elastic Net, Random Forest, XGBoost, LightGBM, a one-hidden-layer neural
+network, Extra Trees, and a stacked Super Learner. BART remains available as
+a legacy replication model but is not part of the expanded ten-model space.
+
 Each subproject has its own `src/`, `slurm/`, `data` directory, logs marker, and
 requirements file. The shared support modules are intentionally copied into
 both directories so either subproject can run independently.
@@ -67,7 +72,7 @@ Run the replication workflow:
 ```bash
 cd Zheng_Cheng_Replication
 python src/overall_prediction.py --help
-python src/overall_prediction.py --models ols ridge lasso xgboost bart
+python src/overall_prediction.py --models ols ridge lasso xgboost extra_trees super_learner
 ```
 
 ## Tests

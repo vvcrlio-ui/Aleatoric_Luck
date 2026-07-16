@@ -5,7 +5,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
-#SBATCH --array=0-7
+#SBATCH --array=0-9
 
 set -euo pipefail
 
@@ -23,7 +23,7 @@ source "$VENV/bin/activate"
 cd "$PROJECT_DIR"
 mkdir -p logs outputs
 
-MODELS=(xgboost lightgbm ols ridge lasso elastic_net random_forest bart)
+MODELS=(ols ridge lasso elastic_net random_forest xgboost lightgbm shallow_neural_network extra_trees super_learner)
 MODEL="${MODELS[$SLURM_ARRAY_TASK_ID]}"
 python src/overall_prediction.py \
   --models "$MODEL" \

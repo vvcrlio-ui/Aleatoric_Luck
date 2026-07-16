@@ -1,3 +1,5 @@
+model_params: model_params.yaml
+
 panels:
   - name: smr_hourlywage
     data: data/asample2_withlag.csv
@@ -12,7 +14,10 @@ panels:
       - random_forest
       - xgboost
       - lightgbm
-      # - bart # too heavy to run locally
+      - shallow_neural_network
+      - extra_trees
+      - super_learner
+      # - bart # legacy replication model; too heavy to run locally
     preset: dev
     out: outputs/nk_grid_smr_hourlywage.csv
 
@@ -29,7 +34,10 @@ panels:
       - random_forest
       - xgboost
       - lightgbm
-      # - bart # too heavy to run locally
+      - shallow_neural_network
+      - extra_trees
+      - super_learner
+      # - bart # legacy replication model; too heavy to run locally
     preset: dev
     out: outputs/nk_grid_smr_totalincome.csv
 
@@ -46,6 +54,9 @@ panels:
   #     - random_forest
   #     - xgboost
   #     - lightgbm
-  #     - bart
+  #     - shallow_neural_network
+  #     - extra_trees
+  #     - super_learner
+  #     # - bart # legacy replication model; classification unsupported
   #   preset: dev
   #   out: outputs/TBD.csv

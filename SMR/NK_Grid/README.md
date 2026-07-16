@@ -5,6 +5,18 @@ writing one row per `(model, seed, draw, N, K)` combination to a CSV.
 Supports regression and classification outcomes. Dataset-agnostic via
 `--outcome`/`--predictor-prefix`.
 
+Shared regression/classification model defaults live in `model_params.yaml`.
+`panels.yaml` references that file once, while each panel's `models` list still
+controls which models run.
+
+The ten-model space is `ols`, `ridge`, `lasso`, `elastic_net`,
+`random_forest`, `xgboost`, `lightgbm`, `shallow_neural_network`,
+`extra_trees`, and `super_learner`. The Super Learner stacks four model
+families using out-of-fold predictions: tuned Ridge (`RidgeCV`), Extra Trees,
+a compact fixed-hyperparameter LightGBM (without nested CV), and a shallow
+neural network. Regression neural networks standardize the target during
+fitting. Legacy `bart` remains accepted for reproducibility.
+
 ## Data
 
 Point `--data` at a CSV: one row per subject, an outcome column, and
@@ -104,7 +116,7 @@ reason.
   max-n=0 max-k=0` (uncapped).
 
 `run_panels.py`'s own `dev` preset (see Multi-panel runs) uses
-`n-sizes-n/k=5`, not `4` — it's a separately tuned, independent layer, not
+`n-sizes-n/k=8`, not `4` — it's a separately tuned, independent layer, not
 a typo.
 
 Production scale is large: with ~5,000 training rows and ~4,000 predictors
@@ -122,9 +134,12 @@ grid size and model list at dev scale before submitting a production run.
 Under `--task classification`, model names map to classifiers, not
 regressors: `ols`/`ridge`/`lasso`/`elastic_net` become logistic regression
 variants (unpenalized / L2 / L1 / elastic-net); `random_forest`/`xgboost`/
-`lightgbm` become their classifier counterparts; `bart` is not supported
-for classification (fails clearly). See `model_registry.py` for the exact
-mapping.
+`lightgbm`/`extra_trees` become their classifier counterparts, and
+`shallow_neural_network` uses an MLP classifier. `super_learner` stacks
+logistic regression, Extra Trees, fixed-hyperparameter LightGBM, and the
+shallow neural network using out-of-fold predicted probabilities. Legacy
+`bart` is not supported for classification (fails clearly). See
+`model_registry.py` for the exact mapping.
 
 </details>
 
@@ -140,9 +155,10 @@ all metric columns empty.
 <details>
 <summary>The log grid, --batch-size, and --test-size</summary>
 
-N and K values are spaced evenly in log2 space from 1 up to the cap,
-deduplicated to integers, so small values are sampled densely and large
-values sparsely.
+N values are spaced evenly in log2 space from `--min-n` (default `10`) up to
+the cap. K retains the original log2 grid from 1 up to its cap. Both grids are
+deduplicated to integers, so small values are sampled densely and large values
+sparsely.
 
 `--batch-size` (default `20`) is how many pending combinations are grouped
 into one checkpoint-write cycle, globally across the run — not per
@@ -170,7 +186,7 @@ python src/run_panels.py 2>&1 | tee run.log
 <details>
 <summary>SLURM resource sizing and output layout</summary>
 
-`slurm/*.sbatch` submit an 8-way job array (one array task per model, 8
+`slurm/*.sbatch` submit a 10-way job array (one array task per model, 8
 CPUs / 48G mem / 4-day time limit per task — edit the scripts to adjust).
 Each array task writes its own CSV (`outputs/nk_grid_<model>.csv`) — this
 differs from running `nk_grid.py`/`run_panels.py` directly with multiple
@@ -193,13 +209,15 @@ does). Cancel with `scancel <job-id>`; check status with `squeue --me`.
 | `--predictor-prefix` | `Aset Bset` | Prefixes selecting predictor columns. |
 | `--out` | `outputs/nk_grid.csv` / `outputs/nk_grid_clf.csv` | Output CSV path. |
 | `--dataset` | `asample2_withlag` | Free-text label in the `dataset` column. |
-| `--models` | `xgboost` | `ols, ridge, lasso, elastic_net, random_forest, xgboost, lightgbm, bart`. |
+| `--models` | `xgboost` | `ols, ridge, lasso, elastic_net, random_forest, xgboost, lightgbm, shallow_neural_network, extra_trees, super_learner`; legacy `bart` is also accepted. |
 | `--seed` | `12345` | Base seed; each of `n-seeds` runs uses `seed + offset`. |
 | `--test-size` | `0.3` | Test-set fraction of the split. |
 | `--n-seeds` | `2` | Independent train/test splits. |
 | `--n-draws` | `2` | Repeated subsamples per seed. |
 | `--n-sizes-n` / `--n-sizes-k` | `4` / `4` | Points on the log-scale N / K grid. |
+| `--min-n` | `10` | Minimum N grid value; K still starts at 1. |
 | `--max-n` / `--max-k` | `100` / `100` | Grid ceiling; `<=0` uncaps. |
+| `--model-params` | `model_params.yaml` | Task-specific defaults used to construct models. |
 | `--batch-size` | `20` | Combinations per checkpoint write. |
 | `--bart-min-n` / `--bart-min-k` | `10` / `2` | BART cells below this are `skipped`. |
 | `--group-split-col` | `None` | Reserved; raises `NotImplementedError` if set. |

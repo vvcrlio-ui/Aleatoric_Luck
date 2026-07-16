@@ -1,0 +1,152 @@
+regression:
+  ols:
+    fit_intercept: true
+  ridge:
+    alpha_log10_min: -4
+    alpha_log10_max: 4
+    n_alphas: 50
+    max_cv_folds: 5
+    scoring: neg_mean_squared_error
+  lasso:
+    alpha_log10_min: -4
+    alpha_log10_max: 1
+    n_alphas: 50
+    max_cv_folds: 5
+    max_iter: 20000
+  elastic_net:
+    alpha_log10_min: -4
+    alpha_log10_max: 1
+    n_alphas: 50
+    l1_ratio:
+      - 0.1
+      - 0.5
+      - 0.9
+    max_cv_folds: 5
+    max_iter: 20000
+  random_forest:
+    n_estimators: 500
+    max_features: sqrt
+    min_samples_leaf: 1
+  extra_trees:
+    n_estimators: 500
+    max_features: sqrt
+    min_samples_leaf: 1
+  shallow_neural_network:
+    hidden_layer_sizes:
+      - 64
+    activation: relu
+    solver: adam
+    alpha: 0.0001
+    learning_rate_init: 0.001
+    max_iter: 500
+    early_stopping: false
+  super_learner:
+    cv: 5
+    passthrough: false
+    n_estimators: 300
+    max_features: sqrt
+    min_samples_leaf: 1
+    hidden_layer_sizes:
+      - 64
+    alpha: 0.0001
+    learning_rate_init: 0.001
+    max_iter: 500
+    positive: true
+    lgbm_n_estimators: 200
+    lgbm_learning_rate: 0.05
+    lgbm_num_leaves: 10
+    lgbm_min_data_in_leaf: 20
+  xgboost:
+    objective: reg:squarederror
+    eval_metric: rmse
+    max_depth: 2
+    eta: 0.3
+    max_rounds: 90
+    cv_folds: 5
+  lightgbm:
+    objective: regression
+    metric: rmse
+    learning_rate: 0.05
+    num_leaves: 10
+    min_data_in_leaf: 20
+    verbosity: -1
+    max_rounds: 200
+    cv_folds: 5
+    early_stopping_rounds: 10
+  bart:
+    n_trees: 200
+    n_samples: 1000
+    n_burn: 100
+    thin: 1.0
+    n_chains: 1
+
+classification:
+  ols:
+    C: 1.0e+12
+    l1_ratio: 0.0
+    solver: lbfgs
+    max_iter: 20000
+  ridge:
+    C: 1.0
+    l1_ratio: 0.0
+    solver: lbfgs
+    max_iter: 20000
+  lasso:
+    penalty: l1
+    C: 1.0
+    l1_ratio: 1.0
+    solver: saga
+    max_iter: 20000
+  elastic_net:
+    penalty: elasticnet
+    C: 1.0
+    solver: saga
+    l1_ratio: 0.5
+    max_iter: 20000
+  random_forest:
+    n_estimators: 500
+    max_features: sqrt
+    min_samples_leaf: 1
+  extra_trees:
+    n_estimators: 500
+    max_features: sqrt
+    min_samples_leaf: 1
+  shallow_neural_network:
+    hidden_layer_sizes:
+      - 64
+    activation: relu
+    solver: adam
+    alpha: 0.0001
+    learning_rate_init: 0.001
+    max_iter: 500
+    early_stopping: false
+  super_learner:
+    cv: 5
+    passthrough: false
+    n_estimators: 300
+    max_features: sqrt
+    min_samples_leaf: 1
+    hidden_layer_sizes:
+      - 64
+    alpha: 0.0001
+    learning_rate_init: 0.001
+    max_iter: 500
+    C: 1.0
+    lgbm_n_estimators: 200
+    lgbm_learning_rate: 0.05
+    lgbm_num_leaves: 10
+    lgbm_min_data_in_leaf: 20
+  xgboost:
+    objective: binary:logistic
+    eval_metric: logloss
+    max_depth: 2
+    learning_rate: 0.3
+    n_estimators: 90
+  lightgbm:
+    objective: binary
+    learning_rate: 0.05
+    num_leaves: 10
+    min_data_in_leaf: 20
+    n_estimators: 200
+    verbosity: -1
+  bart: {}

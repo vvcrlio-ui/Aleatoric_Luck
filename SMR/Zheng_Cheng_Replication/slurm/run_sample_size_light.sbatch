@@ -5,7 +5,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=20
 #SBATCH --mem=32G
-#SBATCH --array=0-6
+#SBATCH --array=0-9
 
 set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}}"
@@ -24,7 +24,7 @@ mkdir -p logs outputs
 
 # BART runs separately via run_sample_size_bart.sbatch: it needs more memory
 # and far less concurrency than these models, so it is never in this array.
-MODELS=(xgboost lightgbm ols ridge lasso elastic_net random_forest)
+MODELS=(ols ridge lasso elastic_net random_forest xgboost lightgbm shallow_neural_network extra_trees super_learner)
 MODEL="${MODELS[$SLURM_ARRAY_TASK_ID]}"
 python src/sample_size.py \
   --data data/asample2_withlag.csv \

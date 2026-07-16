@@ -5,7 +5,7 @@
 #SBATCH --time=4-00:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --array=0-7
+#SBATCH --array=0-9
 
 set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}}"
@@ -22,7 +22,7 @@ source "$VENV/bin/activate"
 cd "$PROJECT_DIR"
 mkdir -p logs outputs
 
-MODELS=(xgboost lightgbm ols ridge lasso elastic_net random_forest bart)
+MODELS=(ols ridge lasso elastic_net random_forest xgboost lightgbm shallow_neural_network extra_trees super_learner)
 MODEL="${MODELS[$SLURM_ARRAY_TASK_ID]}"
 python src/nk_grid.py \
   --data data/asample2_withlag.csv \

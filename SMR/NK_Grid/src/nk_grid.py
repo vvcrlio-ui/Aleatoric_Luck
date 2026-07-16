@@ -64,7 +64,12 @@ from experiment import (
     rows_for_experiment,
     write_checkpoint,
 )
-from model_registry import MODEL_NAMES, make_model
+from model_registry import (
+    DEFAULT_MODEL_PARAMS_PATH,
+    SUPPORTED_MODEL_NAMES,
+    load_model_params,
+    make_model,
+)
 
 
 REGRESSION_CV_MIN_N = {
@@ -72,6 +77,8 @@ REGRESSION_CV_MIN_N = {
     "lasso": 2,
     "elastic_net": 2,
     "lightgbm": 5,
+    # Keep this aligned with super_learner.cv in model_params.yaml.
+    "super_learner": 5,
 }
 
 
@@ -136,6 +143,8 @@ class NKGridConfig:
     max_k: int
     batch_size: int
     n_jobs: int
+    min_n: int = 10
+    model_params: Path = DEFAULT_MODEL_PARAMS_PATH
     test_data: Path | None = None
     group_split_col: str | None = None
     task: str = "regression"
@@ -159,21 +168,36 @@ class DrawOrders:
     feature_names: np.ndarray
 
 
-def log2_size_grid(total: int, n_sizes: int, max_size: int | None = None) -> np.ndarray:
+def log2_size_grid(
+    total: int,
+    n_sizes: int,
+    max_size: int | None = None,
+    *,
+    min_size: int = 1,
+) -> np.ndarray:
     """Return unique integer sizes on the shared base-2 log grid."""
 
     if total < 1:
         raise ValueError("total must be at least 1")
     if n_sizes < 1:
         raise ValueError("n_sizes must be at least 1")
+    if min_size < 1:
+        raise ValueError("min_size must be at least 1")
     upper = int(total if max_size is None or max_size <= 0 else min(total, max_size))
-    upper = max(1, upper)
+    if upper < min_size:
+        raise ValueError(
+            f"grid upper bound {upper} is below minimum size {min_size}"
+        )
     if n_sizes == 1:
         return np.array([upper], dtype=int)
     return np.unique(
         np.clip(
-            np.round(np.logspace(0, np.log2(upper), num=n_sizes, base=2)).astype(int),
-            1,
+            np.round(
+                np.logspace(
+                    np.log2(min_size), np.log2(upper), num=n_sizes, base=2
+                )
+            ).astype(int),
+            min_size,
             upper,
         )
     )
@@ -545,6 +569,12 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         raise FileNotFoundError(f"NLSY analysis data not found: {data_path}")
 
     frame = pd.read_csv(data_path)
+    model_params_path = Path(config.model_params)
+    selected_model_params = load_model_params(
+        model_params_path,
+        task=config.task,
+        models=config.models,
+    )
     if config.outcome not in frame:
         raise KeyError(f"Outcome not found: {config.outcome}")
     predictors = _predictor_columns(frame, config.predictor_prefix)
@@ -601,6 +631,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         "n_draws": config.n_draws,
         "n_sizes_n": config.n_sizes_n,
         "n_sizes_k": config.n_sizes_k,
+        "min_n": config.min_n,
         "max_n": config.max_n,
         "max_k": config.max_k,
         "predictor_prefix": ",".join(config.predictor_prefix),
@@ -609,6 +640,9 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         "bart_min_k": config.bart_min_k,
         "split_mode": split_mode,
         "test_data_sha256": test_data_sha256,
+        "model_params_path": str(model_params_path),
+        "model_params_sha256": file_sha256(model_params_path),
+        "model_params": selected_model_params,
         **model_run_settings(config.models),
     }
     if config.task == "classification":
@@ -643,6 +677,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         len(next(iter(splits.values())).X_train),
         config.n_sizes_n,
         config.max_n,
+        min_size=config.min_n,
     )
     k_grid = log2_size_grid(len(predictors), config.n_sizes_k, config.max_k)
     log_progress(
@@ -751,11 +786,28 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                     },
                     metadata,
                 )
+            if config.task == "classification" and model_name == "super_learner":
+                min_class_count = int(y_sub.value_counts().min())
+                if min_class_count < 2:
+                    return add_metadata(
+                        {
+                            **row,
+                            **_empty_classification_metrics(),
+                            "task": config.task,
+                            "status": "skipped",
+                            "error": (
+                                "below minimum per-class count for "
+                                "super_learner CV"
+                            ),
+                        },
+                        metadata,
+                    )
             model = make_model(
                 model_name,
                 seed=_model_seed(seed, draw, n_samples, k_features),
                 n_jobs=1,
                 task=config.task,
+                params=selected_model_params[model_name],
             )
             model.fit(X_sub, y_sub)
             if config.task == "classification":
@@ -841,18 +893,22 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--outcome", default=None)
     parser.add_argument("--out", default=None)
     parser.add_argument("--dataset", default="asample2_withlag")
-    parser.add_argument("--models", nargs="+", default=["xgboost"], choices=MODEL_NAMES)
+    parser.add_argument(
+        "--models", nargs="+", default=["xgboost"], choices=SUPPORTED_MODEL_NAMES
+    )
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--test-size", type=float, default=0.3)
     parser.add_argument("--n-seeds", type=int, default=2)
     parser.add_argument("--n-draws", type=int, default=2)
     parser.add_argument("--n-sizes-n", type=int, default=4)
     parser.add_argument("--n-sizes-k", type=int, default=4)
+    parser.add_argument("--min-n", type=int, default=10)
     parser.add_argument("--max-n", type=int, default=100, help="Use <=0 for full train set.")
     parser.add_argument("--max-k", type=int, default=100, help="Use <=0 for all features.")
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--bart-min-n", type=int, default=10)
     parser.add_argument("--bart-min-k", type=int, default=2)
+    parser.add_argument("--model-params", default=str(DEFAULT_MODEL_PARAMS_PATH))
     parser.add_argument("--group-split-col", default=None)
     parser.add_argument(
         "--predictor-prefix",
@@ -897,12 +953,14 @@ def parse_args() -> NKGridConfig:
         n_draws=args.n_draws,
         n_sizes_n=args.n_sizes_n,
         n_sizes_k=args.n_sizes_k,
+        min_n=args.min_n,
         max_n=args.max_n,
         max_k=args.max_k,
         batch_size=args.batch_size,
         n_jobs=args.n_jobs,
         group_split_col=args.group_split_col,
         task=args.task,
+        model_params=Path(args.model_params),
         bart_min_n=args.bart_min_n,
         bart_min_k=args.bart_min_k,
         predictor_prefix=tuple(args.predictor_prefix),

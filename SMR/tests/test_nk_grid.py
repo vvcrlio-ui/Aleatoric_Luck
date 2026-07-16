@@ -10,7 +10,10 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.metrics import r2_score
 
+from NK_Grid.src import model_registry as model_registry_module
 from NK_Grid.src.evaluation import (
     r2_against_training_mean,
     training_mean_null_mse,
@@ -22,7 +25,7 @@ from NK_Grid.src.experiment import (
     parallel_preference,
     write_checkpoint,
 )
-from NK_Grid.src.model_registry import MODEL_NAMES, make_model
+from NK_Grid.src.model_registry import MODEL_NAMES, SUPPORTED_MODEL_NAMES, make_model
 from NK_Grid.src.nk_grid import (
     CLASSIFICATION_METRIC_COLUMNS,
     METRIC_COLUMNS,
@@ -65,6 +68,23 @@ class FailingRegressor:
 
 
 class NKGridTests(unittest.TestCase):
+    @staticmethod
+    def _fast_new_model_params(task: str, model_name: str) -> dict:
+        params = model_registry_module.load_model_params(
+            model_registry_module.DEFAULT_MODEL_PARAMS_PATH,
+            task=task,
+            models=[model_name],
+        )[model_name]
+        if model_name == "extra_trees":
+            params["n_estimators"] = 20
+        elif model_name == "shallow_neural_network":
+            params["max_iter"] = 50
+        elif model_name == "super_learner":
+            params["n_estimators"] = 20
+            params["lgbm_n_estimators"] = 20
+            params["max_iter"] = 50
+        return params
+
     def test_linear_registry_model_fits(self):
         rng = np.random.default_rng(7)
         X = pd.DataFrame(rng.normal(size=(60, 4)), columns=list("abcd"))
@@ -73,7 +93,162 @@ class NKGridTests(unittest.TestCase):
         model.fit(X, y)
         self.assertEqual(model.predict(X).shape, (60,))
         self.assertIn("lightgbm", MODEL_NAMES)
-        self.assertIn("bart", MODEL_NAMES)
+        self.assertIn("bart", SUPPORTED_MODEL_NAMES)
+
+    def test_expanded_model_space_matches_specification(self):
+        self.assertEqual(
+            MODEL_NAMES,
+            (
+                "ols",
+                "ridge",
+                "lasso",
+                "elastic_net",
+                "random_forest",
+                "xgboost",
+                "lightgbm",
+                "shallow_neural_network",
+                "extra_trees",
+                "super_learner",
+            ),
+        )
+
+    def test_new_models_fit_regression_and_classification(self):
+        rng = np.random.default_rng(29)
+        X = pd.DataFrame(
+            rng.normal(size=(40, 8)), columns=[f"x{index}" for index in range(8)]
+        )
+        y = X["x0"] - 0.4 * X["x1"] + rng.normal(0, 0.1, len(X))
+        y_binary = (y > np.median(y)).astype(int)
+
+        for model_name in (
+            "shallow_neural_network",
+            "extra_trees",
+            "super_learner",
+        ):
+            regressor = make_model(
+                model_name,
+                seed=12345,
+                n_jobs=1,
+                params=self._fast_new_model_params("regression", model_name),
+            )
+            regressor.fit(X, y)
+            self.assertEqual(regressor.predict(X).shape, (40,), model_name)
+
+            classifier = make_model(
+                model_name,
+                seed=12345,
+                n_jobs=1,
+                task="classification",
+                params=self._fast_new_model_params("classification", model_name),
+            )
+            classifier.fit(X, y_binary)
+            probabilities = classifier.predict_proba(X)
+            self.assertEqual(probabilities.shape, (40, 2), model_name)
+            self.assertTrue(
+                np.all((probabilities >= 0) & (probabilities <= 1)), model_name
+            )
+
+    def test_super_learner_has_four_plain_base_families(self):
+        rng = np.random.default_rng(31)
+        X = pd.DataFrame(rng.normal(size=(40, 8)))
+        y = X[0] - 0.25 * X[1] + rng.normal(0, 0.1, len(X))
+        y_binary = (y > np.median(y)).astype(int)
+
+        regressor = make_model(
+            "super_learner",
+            seed=12345,
+            n_jobs=1,
+            params=self._fast_new_model_params("regression", "super_learner"),
+        ).fit(X, y)
+        regression_bases = dict(regressor.model_.estimators)
+        self.assertEqual(
+            set(regression_bases),
+            {"ridge", "extra_trees", "lightgbm", "shallow_nn"},
+        )
+        self.assertIsInstance(
+            regression_bases["ridge"][-1], model_registry_module.RidgeCV
+        )
+        self.assertIsInstance(
+            regression_bases["shallow_nn"][-1], TransformedTargetRegressor
+        )
+        self.assertNotIsInstance(
+            regression_bases["lightgbm"][-1],
+            model_registry_module.LightGBMCVRegressor,
+        )
+
+        classifier = make_model(
+            "super_learner",
+            seed=12345,
+            n_jobs=1,
+            task="classification",
+            params=self._fast_new_model_params("classification", "super_learner"),
+        ).fit(X, y_binary)
+        classification_bases = dict(classifier.model_.estimators)
+        self.assertEqual(
+            set(classification_bases),
+            {"logistic", "extra_trees", "lightgbm", "shallow_nn"},
+        )
+        self.assertIsInstance(
+            classifier.model_.final_estimator_, model_registry_module.LogisticRegression
+        )
+        self.assertNotIsInstance(
+            classification_bases["lightgbm"][-1],
+            model_registry_module.LightGBMCVRegressor,
+        )
+
+    def test_shallow_nn_regression_standardizes_large_scale_target(self):
+        rng = np.random.default_rng(37)
+        X = pd.DataFrame(rng.normal(size=(40, 8)))
+        y = 10.0 + X[0] - 0.5 * X[1] + rng.normal(0, 0.1, len(X))
+        model = make_model(
+            "shallow_neural_network",
+            seed=12345,
+            n_jobs=1,
+            params=self._fast_new_model_params(
+                "regression", "shallow_neural_network"
+            ),
+        )
+
+        self.assertIsInstance(model[-1], TransformedTargetRegressor)
+        predictions = model.fit(X, y).predict(X)
+        self.assertTrue(np.isfinite(r2_score(y, predictions)))
+
+    def test_super_learner_passthrough_rejects_nan_features(self):
+        X = pd.DataFrame({"x1": [0.0, 1.0, np.nan, 3.0], "x2": [1, 0, 1, 0]})
+        outcomes = {
+            "regression": pd.Series([0.0, 1.0, 2.0, 3.0]),
+            "classification": pd.Series([0, 0, 1, 1]),
+        }
+        for task, y in outcomes.items():
+            with self.subTest(task=task):
+                params = self._fast_new_model_params(task, "super_learner")
+                params["passthrough"] = True
+                model = make_model(
+                    "super_learner",
+                    seed=12345,
+                    n_jobs=1,
+                    task=task,
+                    params=params,
+                )
+                with self.assertRaisesRegex(ValueError, "passthrough=True.*NaN"):
+                    model.fit(X, y)
+
+        regression_params = self._fast_new_model_params(
+            "regression", "super_learner"
+        )
+        make_model(
+            "super_learner",
+            seed=12345,
+            n_jobs=1,
+            params=regression_params,
+        ).fit(X, outcomes["regression"])
+        regression_params["passthrough"] = True
+        make_model(
+            "super_learner",
+            seed=12345,
+            n_jobs=1,
+            params=regression_params,
+        ).fit(X.fillna(2.0), outcomes["regression"])
 
     def test_classification_registry_model_predicts_probabilities(self):
         rng = np.random.default_rng(17)
@@ -155,6 +330,49 @@ class NKGridTests(unittest.TestCase):
         self.assertTrue(np.all(np.diff(np.log2(grid)) > 0))
         self.assertTrue(np.all(grid <= 100))
         self.assertTrue(np.array_equal(log2_size_grid(10, 1), np.array([10])))
+
+    def test_n_grid_can_start_at_ten_while_k_grid_still_starts_at_one(self):
+        n_grid = log2_size_grid(100, 8, min_size=10)
+        k_grid = log2_size_grid(100, 8)
+
+        self.assertEqual(n_grid[0], 10)
+        self.assertEqual(k_grid[0], 1)
+
+    def test_model_params_yaml_covers_active_models_for_both_tasks(self):
+        models = {
+            "ols",
+            "ridge",
+            "lasso",
+            "elastic_net",
+            "random_forest",
+            "xgboost",
+            "lightgbm",
+            "shallow_neural_network",
+            "extra_trees",
+            "super_learner",
+        }
+        path = Path(__file__).resolve().parents[1] / "NK_Grid" / "model_params.yaml"
+
+        regression = model_registry_module.load_model_params(
+            path, task="regression", models=models
+        )
+        classification = model_registry_module.load_model_params(
+            path, task="classification", models=models
+        )
+
+        self.assertEqual(set(regression), models)
+        self.assertEqual(set(classification), models)
+        self.assertEqual(regression["random_forest"]["n_estimators"], 500)
+        self.assertEqual(regression["xgboost"]["max_rounds"], 90)
+        self.assertEqual(classification["elastic_net"]["l1_ratio"], 0.5)
+        expected_lgbm_keys = {
+            "lgbm_n_estimators",
+            "lgbm_learning_rate",
+            "lgbm_num_leaves",
+            "lgbm_min_data_in_leaf",
+        }
+        self.assertTrue(expected_lgbm_keys.issubset(regression["super_learner"]))
+        self.assertTrue(expected_lgbm_keys.issubset(classification["super_learner"]))
 
     def test_nk_regression_metrics_known_values(self):
         metrics = compute_regression_metrics(
@@ -370,6 +588,7 @@ class NKGridTests(unittest.TestCase):
             }
             self.assertTrue(expected_columns.issubset(saved.columns))
             self.assertEqual(set(saved["status"]), {"ok"})
+            self.assertTrue(saved["N"].ge(10).all())
             self.assertTrue((saved["N"] <= saved["n_train_total"]).all())
             self.assertTrue((saved["K"] <= saved["n_features_total"]).all())
 
@@ -600,6 +819,7 @@ class NKGridTests(unittest.TestCase):
                 n_draws=1,
                 n_sizes_n=1,
                 n_sizes_k=1,
+                min_n=1,
                 max_n=5,
                 max_k=1,
                 batch_size=1,
@@ -623,6 +843,7 @@ class NKGridTests(unittest.TestCase):
                 "lasso": 2,
                 "elastic_net": 2,
                 "lightgbm": 5,
+                "super_learner": 5,
             },
         )
 
@@ -648,6 +869,7 @@ class NKGridTests(unittest.TestCase):
                     n_draws=1,
                     n_sizes_n=1,
                     n_sizes_k=1,
+                    min_n=1,
                     max_n=min_n - 1,
                     max_k=2,
                     batch_size=1,
@@ -689,6 +911,7 @@ class NKGridTests(unittest.TestCase):
                     n_draws=1,
                     n_sizes_n=1,
                     n_sizes_k=1,
+                    min_n=1,
                     max_n=min_n,
                     max_k=2,
                     batch_size=1,
@@ -726,6 +949,7 @@ class NKGridTests(unittest.TestCase):
                     n_draws=1,
                     n_sizes_n=1,
                     n_sizes_k=1,
+                    min_n=1,
                     max_n=max(4, min_n - 1),
                     max_k=2,
                     batch_size=1,
@@ -737,9 +961,17 @@ class NKGridTests(unittest.TestCase):
                     return_value=DummyClassifier(),
                 ) as make_model_mock:
                     run_nk_grid(config)
-                make_model_mock.assert_called_once()
                 saved = pd.read_csv(out_path)
-                self.assertEqual(saved.loc[0, "status"], "ok")
+                if model_name == "super_learner":
+                    make_model_mock.assert_not_called()
+                    self.assertEqual(saved.loc[0, "status"], "skipped")
+                    self.assertEqual(
+                        saved.loc[0, "error"],
+                        "below minimum per-class count for super_learner CV",
+                    )
+                else:
+                    make_model_mock.assert_called_once()
+                    self.assertEqual(saved.loc[0, "status"], "ok")
                 self.assertEqual(saved.loc[0, "task"], "classification")
 
     def test_nk_grid_skips_single_class_classification_sample_without_fitting(self):
@@ -767,6 +999,7 @@ class NKGridTests(unittest.TestCase):
                 n_draws=1,
                 n_sizes_n=1,
                 n_sizes_k=1,
+                min_n=1,
                 max_n=1,
                 max_k=1,
                 batch_size=1,
@@ -808,6 +1041,7 @@ class NKGridTests(unittest.TestCase):
                     n_draws=1,
                     n_sizes_n=1,
                     n_sizes_k=1,
+                    min_n=1,
                     max_n=1,
                     max_k=1,
                     batch_size=1,
@@ -842,6 +1076,7 @@ class NKGridTests(unittest.TestCase):
                 n_draws=1,
                 n_sizes_n=3,
                 n_sizes_k=1,
+                min_n=1,
                 max_n=10,
                 max_k=2,
                 batch_size=12,
@@ -860,6 +1095,8 @@ class NKGridTests(unittest.TestCase):
                 ("elastic_net", 1, 2),
                 ("lightgbm", 1, 5),
                 ("lightgbm", 3, 5),
+                ("super_learner", 1, 5),
+                ("super_learner", 3, 5),
             }
             for model_name, n_samples, min_n in expected_skipped:
                 row = saved[
@@ -877,6 +1114,58 @@ class NKGridTests(unittest.TestCase):
                 if row_key in expected_skipped:
                     continue
                 self.assertEqual(row["status"], "ok")
+
+    def test_nk_grid_marks_tiny_super_learner_class_skipped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "train.csv"
+            test_path = root / "test.csv"
+            out_path = root / "nk_grid.csv"
+            pd.DataFrame(
+                {
+                    "outcome": [0, 0, 0, 0, 1],
+                    "X_feature": [0.0, 0.1, 0.2, 0.3, 1.0],
+                }
+            ).to_csv(data_path, index=False)
+            pd.DataFrame(
+                {
+                    "outcome": [0, 0, 1, 1],
+                    "X_feature": [0.05, 0.25, 0.8, 1.1],
+                }
+            ).to_csv(test_path, index=False)
+            config = NKGridConfig(
+                data=data_path,
+                test_data=test_path,
+                out=out_path,
+                dataset="tiny_classification",
+                outcome="outcome",
+                models=("super_learner",),
+                seed=41,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                min_n=1,
+                max_n=5,
+                max_k=1,
+                batch_size=1,
+                n_jobs=1,
+                task="classification",
+                predictor_prefix=("X_",),
+            )
+
+            run_nk_grid(config)
+
+            saved = pd.read_csv(out_path)
+            self.assertEqual(saved.loc[0, "status"], "skipped")
+            self.assertEqual(
+                saved.loc[0, "error"],
+                "below minimum per-class count for super_learner CV",
+            )
+            self.assertTrue(
+                saved.loc[0, list(CLASSIFICATION_METRIC_COLUMNS)].isna().all()
+            )
 
     def test_nk_grid_logs_progress_to_stderr(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -929,6 +1218,7 @@ class NKGridTests(unittest.TestCase):
                 n_draws=1,
                 n_sizes_n=1,
                 n_sizes_k=1,
+                min_n=1,
                 max_n=1,
                 max_k=1,
                 batch_size=1,
@@ -1210,6 +1500,26 @@ class NKGridTests(unittest.TestCase):
         self.assertEqual(PRESETS["dev"]["n_draws"], 5)
         self.assertEqual(PRESETS["dev"]["n_sizes_n"], 8)
         self.assertEqual(PRESETS["dev"]["n_sizes_k"], 8)
+        self.assertEqual(PRESETS["dev"]["min_n"], 10)
+        self.assertEqual(PRESETS["production"]["min_n"], 10)
+
+    def test_run_panels_resolves_model_params_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, config = resolve_panel(
+                {
+                    "name": "params_panel",
+                    "data": "synthetic.csv",
+                    "dataset": "synthetic",
+                    "outcome": "outcome",
+                    "models": ["ols"],
+                    "model_params": "params.yaml",
+                    "out": "outputs/results.csv",
+                },
+                root,
+            )
+
+            self.assertEqual(config.model_params, root / "params.yaml")
 
     def test_run_panels_dry_run_prints_resolved_config_without_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

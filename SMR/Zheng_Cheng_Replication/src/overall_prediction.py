@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from evaluation import r2_against_training_mean, training_mean_null_mse
 from experiment import parallel_preference
-from model_registry import MODEL_NAMES, make_model
+from model_registry import SUPPORTED_MODEL_NAMES, make_model
 
 
 PREDICTOR_SETS = {
@@ -40,7 +40,7 @@ def parse_args():
         "--models",
         nargs="+",
         default=["ols", "ridge", "lasso", "xgboost", "bart"],
-        choices=MODEL_NAMES,
+        choices=SUPPORTED_MODEL_NAMES,
     )
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--test-size", type=float, default=0.3)

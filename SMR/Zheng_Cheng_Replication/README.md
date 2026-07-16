@@ -46,11 +46,19 @@ python -m pip install -r requirements.txt
 
 For Colab, use `requirements-notebook.txt` and `colab_run.ipynb`.
 
+The expanded model space is `ols`, `ridge`, `lasso`, `elastic_net`,
+`random_forest`, `xgboost`, `lightgbm`, `shallow_neural_network`,
+`extra_trees`, and `super_learner`. The Super Learner combines tuned Ridge,
+Extra Trees, fixed-hyperparameter LightGBM, and the shallow neural network
+using out-of-fold predictions. Regression neural networks standardize the
+target during fitting. BART is retained separately as a legacy
+source-replication model.
+
 ## Source-aligned cumulative comparison
 
 ```bash
 python src/overall_prediction.py \
-  --models ols ridge lasso xgboost bart
+  --models ols ridge lasso xgboost extra_trees super_learner
 ```
 
 XGBoost uses `max_depth=2`, `eta=0.3`, and five-fold CV to choose up to 90
@@ -62,9 +70,9 @@ BartPy's random-number generator is process-global.
 ## Extensions
 
 ```bash
-python src/feature_sets.py --models xgboost ridge lasso
-python src/domain_wise.py --models xgboost ridge lasso
-python src/sample_size.py --models xgboost ridge lasso
+python src/feature_sets.py --models xgboost extra_trees super_learner
+python src/domain_wise.py --models xgboost extra_trees super_learner
+python src/sample_size.py --models xgboost extra_trees super_learner
 python src/SHAP_vals.py
 python src/SHAP_experiment.py
 ```

@@ -27,7 +27,7 @@ from experiment import (
     rows_for_experiment,
     write_checkpoint,
 )
-from model_registry import MODEL_NAMES, make_model
+from model_registry import SUPPORTED_MODEL_NAMES, make_model
 
 
 def power_law(n, c, alpha, epsilon):
@@ -149,7 +149,9 @@ def parse_args():
         "--power-law-out",
         default=str(ROOT / "outputs" / "sample_size_power_law.csv"),
     )
-    parser.add_argument("--models", nargs="+", default=["xgboost"], choices=MODEL_NAMES)
+    parser.add_argument(
+        "--models", nargs="+", default=["xgboost"], choices=SUPPORTED_MODEL_NAMES
+    )
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--test-size", type=float, default=0.3)
     parser.add_argument("--n-sizes", type=int, default=10)
