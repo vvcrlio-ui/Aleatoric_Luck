@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -58,17 +59,27 @@ from experiment import (
     add_metadata,
     build_experiment_metadata,
     file_sha256,
+    checkpoint_parts_dir,
+    core_environment,
+    diagnostics_summary,
+    git_state,
     load_checkpoint,
+    manifest_path,
+    merge_checkpoint_parts,
     model_run_settings,
     parallel_preference,
     rows_for_experiment,
-    write_checkpoint,
+    utc_now,
+    write_checkpoint_part,
+    write_json_atomic,
 )
 from model_registry import (
     DEFAULT_MODEL_PARAMS_PATH,
     SUPPORTED_MODEL_NAMES,
+    load_algorithm_version,
     load_model_params,
     make_model,
+    resolved_model_params,
 )
 
 
@@ -80,6 +91,12 @@ REGRESSION_CV_MIN_N = {
     # Keep this aligned with super_learner.cv in model_params.yaml.
     "super_learner": 5,
 }
+
+LARGE_RUN_THRESHOLD = 250_000
+
+# Super Learner fits each of its 4 base learners once per CV fold plus one final
+# refit on the full subsample: 4 x (cv + 1) with cv=5.
+SUPER_LEARNER_FITS_PER_CELL = 24
 
 
 METRIC_COLUMNS = (
@@ -152,6 +169,8 @@ class NKGridConfig:
     bart_min_k: int = 2
     predictor_prefix: tuple[str, ...] = ("Aset", "Bset")
     preset: str | None = None
+    allow_large_run: bool = False
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -430,6 +449,71 @@ def _empty_classification_metrics() -> dict[str, float]:
     return {column: np.nan for column in CLASSIFICATION_METRIC_COLUMNS}
 
 
+def _empty_diagnostics() -> dict[str, float | bool]:
+    return {
+        "K_varying": np.nan,
+        "constant_prediction": False,
+        "underdetermined": False,
+        "converged": False,
+        "_fit_seconds": np.nan,
+        "_best_rounds": np.nan,
+    }
+
+
+def _constant_prediction(values: Sequence[float]) -> bool:
+    array = np.asarray(values, dtype=float)
+    finite = array[np.isfinite(array)]
+    return bool(len(np.unique(finite)) < 2)
+
+
+def _model_converged(model) -> bool:
+    """Read deterministic iteration limits through fitted estimator wrappers."""
+
+    statuses: list[bool] = []
+    seen: set[int] = set()
+
+    def visit(estimator) -> None:
+        if estimator is None or id(estimator) in seen:
+            return
+        seen.add(id(estimator))
+
+        if hasattr(estimator, "n_iter_") and hasattr(estimator, "max_iter"):
+            iterations = np.asarray(getattr(estimator, "n_iter_"), dtype=float)
+            finite = iterations[np.isfinite(iterations)]
+            if finite.size:
+                statuses.append(bool(np.max(finite) < float(estimator.max_iter)))
+
+        if hasattr(estimator, "steps"):
+            for _, step in estimator.steps:
+                visit(step)
+        if hasattr(estimator, "regressor_"):
+            visit(estimator.regressor_)
+        if hasattr(estimator, "model_"):
+            visit(estimator.model_)
+        if hasattr(estimator, "final_estimator_"):
+            visit(estimator.final_estimator_)
+            for fitted_estimator in getattr(estimator, "estimators_", ()):
+                visit(fitted_estimator)
+
+    visit(model)
+    return all(statuses) if statuses else True
+
+
+def _model_best_rounds(model) -> float:
+    """Find a fitted boosting round count through common wrapper layers."""
+
+    for attribute in ("best_rounds_", "best_iteration_"):
+        if hasattr(model, attribute):
+            value = getattr(model, attribute)
+            if value is not None:
+                return float(value)
+    if hasattr(model, "steps") and model.steps:
+        return _model_best_rounds(model.steps[-1][1])
+    if hasattr(model, "regressor_"):
+        return _model_best_rounds(model.regressor_)
+    return np.nan
+
+
 def _model_seed(seed: int, draw: int, n_samples: int, k_features: int) -> int:
     return int(
         np.random.SeedSequence(
@@ -483,9 +567,18 @@ def _select_output_path(
     stem = declared.stem
     suffix = declared.suffix
     all_jobs = set(jobs)
+    candidates_by_path = {
+        path: path.stat().st_mtime
+        for path in directory.glob(f"{stem}_{preset}_*{suffix}")
+    }
+    for candidate_manifest in directory.glob(f"{stem}_{preset}_*.manifest.json"):
+        candidate = candidate_manifest.with_name(
+            candidate_manifest.name.removesuffix(".manifest.json") + suffix
+        )
+        candidates_by_path[candidate] = candidate_manifest.stat().st_mtime
     candidates = sorted(
-        directory.glob(f"{stem}_{preset}_*{suffix}"),
-        key=lambda path: path.stat().st_mtime,
+        candidates_by_path,
+        key=lambda path: candidates_by_path[path],
         reverse=True,
     )
     for candidate in candidates:
@@ -494,6 +587,112 @@ def _select_output_path(
         if completed and not all_jobs.issubset(completed):
             return candidate
     return _timestamped_out_path(directory, stem, preset, suffix)
+
+
+def estimate_run_size(config: NKGridConfig) -> dict[str, int]:
+    """Return a conservative pre-data estimate for panel dry-runs."""
+
+    top_level = (
+        len(config.models)
+        * config.n_seeds
+        * config.n_draws
+        * config.n_sizes_n
+        * config.n_sizes_k
+    )
+    super_cells = top_level // len(config.models) if "super_learner" in config.models else 0
+    return {
+        "top_level_model_cells": int(top_level),
+        "expected_output_rows": int(top_level),
+        "estimated_super_learner_internal_fits": int(super_cells * SUPER_LEARNER_FITS_PER_CELL),
+        "estimated_checkpoint_parts": int(np.ceil(top_level / config.batch_size)),
+    }
+
+
+def _relative_path(path: Path) -> str:
+    try:
+        return os.path.relpath(path.resolve(), ROOT)
+    except OSError:
+        return str(path)
+
+
+def _manifest_payload(
+    *,
+    config: NKGridConfig,
+    metadata: dict,
+    out_path: Path,
+    data_path: Path,
+    test_path: Path | None,
+    model_params_path: Path,
+    selected_model_params: dict,
+    frame: pd.DataFrame,
+    predictors: Sequence[str],
+    split_seeds: list[int],
+    splits: dict[int, SplitData],
+    n_grid: np.ndarray,
+    k_grid: np.ndarray,
+    expected_rows: int,
+    results: pd.DataFrame,
+    started_at: str,
+) -> dict:
+    current_results = rows_for_experiment(results, metadata["experiment_id"])
+    statuses = current_results.get("status", pd.Series(dtype=str))
+    completed = int(statuses.isin(("ok", "skipped")).sum())
+    failed = int(statuses.eq("failed").sum())
+    if len(current_results) != expected_rows:
+        completion_status = "incomplete"
+    elif failed:
+        completion_status = "complete_with_failures"
+    else:
+        completion_status = "complete"
+    return {
+        "schema_version": "1",
+        "experiment_id": metadata["experiment_id"],
+        "algorithm_version": metadata["algorithm_version"],
+        "created_at": started_at,
+        "updated_at": utc_now(),
+        "task": config.task,
+        "outcome": config.outcome,
+        "dataset": config.dataset,
+        "git": git_state(ROOT),
+        "data": {
+            "input_path": _relative_path(data_path),
+            "input_sha256": metadata["data_sha256"],
+            "test_path": _relative_path(test_path) if test_path is not None else None,
+            "test_sha256": metadata.get("test_data_sha256") or None,
+            "rows": int(len(frame)),
+            "features": int(len(predictors)),
+            "train_rows": int(len(next(iter(splits.values())).X_train)),
+            "test_rows": int(len(next(iter(splits.values())).X_test)),
+        },
+        "design": {
+            "preset": config.preset,
+            "test_size": float(config.test_size),
+            "split_mode": metadata["split_mode"],
+            "split_seeds": split_seeds,
+            "n_draws": int(config.n_draws),
+            "n_grid": [int(value) for value in n_grid],
+            "k_grid": [int(value) for value in k_grid],
+            "models": list(config.models),
+        },
+        "model_parameters": {
+            "source": _relative_path(model_params_path),
+            "sha256": file_sha256(model_params_path),
+            "resolved": resolved_model_params(selected_model_params),
+        },
+        "environment": core_environment(),
+        "output": {
+            "csv": out_path.name,
+            "parts_directory": checkpoint_parts_dir(out_path).name,
+        },
+        "completion": {
+            "expected_rows": int(expected_rows),
+            "materialized_rows": int(len(current_results)),
+            "completed_rows": completed,
+            "failed_rows": failed,
+            "status": completion_status,
+        },
+        "diagnostics": diagnostics_summary(current_results),
+    }
 
 
 def _predictor_columns(
@@ -542,24 +741,46 @@ def _validate_classification_outcome(frame: pd.DataFrame, outcome: str) -> None:
 
 
 def _positive_class_probability(model, X) -> np.ndarray:
-    if not hasattr(model, "predict_proba"):
-        return np.full(len(X), np.nan)
+    # Callers guarantee a two-class training sample (single-class cells are
+    # skipped upstream), so the fitted classifier exposes predict_proba with
+    # both classes. A contract violation raises here and surfaces as a failed
+    # cell rather than silently producing NaN metrics.
     probabilities = np.asarray(model.predict_proba(X), dtype=float)
-    if probabilities.ndim != 2:
-        return np.full(len(X), np.nan)
     classes = np.asarray(getattr(model, "classes_", []))
     if classes.size and 1 in classes:
         return probabilities[:, int(np.where(classes == 1)[0][0])]
     if probabilities.shape[1] == 2:
         return probabilities[:, 1]
-    if classes.size == 1:
-        return np.ones(len(X)) if classes[0] == 1 else np.zeros(len(X))
-    return np.full(len(X), np.nan)
+    raise ValueError(
+        f"cannot locate positive class in predict_proba output "
+        f"(classes_={classes}, shape={probabilities.shape})"
+    )
 
 
-def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
+def run_nk_grid(
+    config: NKGridConfig,
+    *,
+    max_jobs: int | None = None,
+    allow_large_run: bool | None = None,
+    dry_run: bool | None = None,
+) -> Path | dict[str, int]:
+    allow_large_run = config.allow_large_run if allow_large_run is None else allow_large_run
+    dry_run = config.dry_run if dry_run is None else dry_run
     if config.task not in {"regression", "classification"}:
         raise ValueError("task must be 'regression' or 'classification'")
+    declared_size = estimate_run_size(config)
+    if dry_run:
+        print(json.dumps(declared_size, indent=2, sort_keys=True))
+        return declared_size
+    if (
+        declared_size["top_level_model_cells"] > LARGE_RUN_THRESHOLD
+        and not allow_large_run
+    ):
+        raise ValueError(
+            "Large run requires --allow-large-run: declared grid contains "
+            f"{declared_size['top_level_model_cells']:,} top-level model cells, "
+            f"above the {LARGE_RUN_THRESHOLD:,} safety threshold."
+        )
     if config.group_split_col:
         raise NotImplementedError(
             "--group-split-col is reserved for the sibling-clustering confirmation item."
@@ -575,6 +796,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         task=config.task,
         models=config.models,
     )
+    algorithm_version = load_algorithm_version(model_params_path)
     if config.outcome not in frame:
         raise KeyError(f"Outcome not found: {config.outcome}")
     predictors = _predictor_columns(frame, config.predictor_prefix)
@@ -640,8 +862,6 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         "bart_min_k": config.bart_min_k,
         "split_mode": split_mode,
         "test_data_sha256": test_data_sha256,
-        "model_params_path": str(model_params_path),
-        "model_params_sha256": file_sha256(model_params_path),
         "model_params": selected_model_params,
         **model_run_settings(config.models),
     }
@@ -653,6 +873,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         outcome=config.outcome,
         test_size=config.test_size,
         split_seed=config.seed,
+        algorithm_version=algorithm_version,
         extra=metadata_extra,
     )
     metadata["split_mode"] = split_mode
@@ -694,6 +915,26 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         for n_samples in n_grid
         for model_name in config.models
     ]
+    size_estimate = {
+        "top_level_model_cells": len(jobs),
+        "expected_output_rows": len(jobs),
+        "estimated_super_learner_internal_fits": (
+            (len(jobs) // len(config.models)) * 24
+            if "super_learner" in config.models
+            else 0
+        ),
+        "estimated_checkpoint_parts": int(np.ceil(len(jobs) / config.batch_size)),
+    }
+    if len(jobs) > LARGE_RUN_THRESHOLD and not allow_large_run:
+        raise ValueError(
+            f"Large run requires --allow-large-run: {len(jobs):,} top-level model "
+            f"cells exceeds the {LARGE_RUN_THRESHOLD:,} safety threshold."
+        )
+    state = git_state(ROOT)
+    if config.preset == "production" and state.get("dirty") is not False:
+        raise ValueError(
+            "Production runs require a clean Git worktree; commit or stash changes first."
+        )
 
     out_path = _select_output_path(
         Path(config.out),
@@ -707,6 +948,36 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
     pending = [job for job in jobs if job not in completed]
     if max_jobs is not None:
         pending = pending[: int(max_jobs)]
+    if pending and not existing.empty and not checkpoint_parts_dir(out_path).exists():
+        write_checkpoint_part(existing.to_dict("records"), out_path)
+    started_at = utc_now()
+    current_manifest_path = manifest_path(out_path)
+    if current_manifest_path.exists():
+        try:
+            prior_manifest = json.loads(current_manifest_path.read_text(encoding="utf-8"))
+            if prior_manifest.get("experiment_id") == metadata["experiment_id"]:
+                started_at = prior_manifest.get("created_at", started_at)
+        except (OSError, json.JSONDecodeError):
+            pass
+    initial_manifest = _manifest_payload(
+        config=config,
+        metadata=metadata,
+        out_path=out_path,
+        data_path=data_path,
+        test_path=test_path,
+        model_params_path=model_params_path,
+        selected_model_params=selected_model_params,
+        frame=frame,
+        predictors=predictors,
+        split_seeds=split_seeds,
+        splits=splits,
+        n_grid=n_grid,
+        k_grid=k_grid,
+        expected_rows=len(jobs),
+        results=existing,
+        started_at=started_at,
+    )
+    write_json_atomic(current_manifest_path, initial_manifest)
     log_progress(
         f"jobs total={len(jobs)} completed={len(completed)} "
         f"pending={len(pending)} batch_size={config.batch_size} n_jobs={config.n_jobs}"
@@ -732,6 +1003,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             n_test_total=len(split.X_test),
             n_features_total=len(predictors),
         )
+        diagnostics = _empty_diagnostics()
         if (
             model_name == "bart"
             and (n_samples < config.bart_min_n or k_features < config.bart_min_k)
@@ -744,6 +1016,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                         if config.task == "regression"
                         else _empty_classification_metrics()
                     ),
+                    **diagnostics,
                     **({"task": config.task} if config.task == "classification" else {}),
                     "status": "skipped",
                     "error": "below BART minimum N/K floor",
@@ -760,6 +1033,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                 {
                     **row,
                     **_empty_metrics(),
+                    **diagnostics,
                     "status": "skipped",
                     "error": (
                         f"below minimum N for {model_name}'s internal CV "
@@ -775,11 +1049,19 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             X_sub = split.X_train.loc[selected_rows, selected_cols]
             y_sub = split.y_train.loc[selected_rows]
             X_test = split.X_test.loc[:, selected_cols]
+            k_varying = int((X_sub.nunique(dropna=True) > 1).sum())
+            diagnostics["K_varying"] = k_varying
+            diagnostics["underdetermined"] = bool(
+                config.task == "regression"
+                and model_name == "ols"
+                and k_varying >= len(X_sub)
+            )
             if config.task == "classification" and len(np.unique(y_sub)) < 2:
                 return add_metadata(
                     {
                         **row,
                         **_empty_classification_metrics(),
+                        **diagnostics,
                         "task": config.task,
                         "status": "skipped",
                         "error": "single-class training sample for classification",
@@ -793,6 +1075,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                         {
                             **row,
                             **_empty_classification_metrics(),
+                            **diagnostics,
                             "task": config.task,
                             "status": "skipped",
                             "error": (
@@ -809,24 +1092,35 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                 task=config.task,
                 params=selected_model_params[model_name],
             )
+            fit_started = time.perf_counter()
             model.fit(X_sub, y_sub)
             if config.task == "classification":
-                scores = _positive_class_probability(model, X_test)
+                predictions = _positive_class_probability(model, X_test)
+            else:
+                predictions = model.predict(X_test)
+            diagnostics["_fit_seconds"] = time.perf_counter() - fit_started
+            diagnostics["_best_rounds"] = _model_best_rounds(model)
+            diagnostics["converged"] = _model_converged(model)
+            diagnostics["constant_prediction"] = _constant_prediction(predictions)
+            if config.task == "classification":
+                scores = predictions
                 return add_metadata(
                     {
                         **row,
                         "task": config.task,
                         **compute_classification_metrics(split.y_test, scores, y_sub),
+                        **diagnostics,
                         "status": "ok",
                         "error": "",
                     },
                     metadata,
                 )
-            preds = model.predict(X_test)
+            preds = predictions
             return add_metadata(
                 {
                     **row,
                     **compute_regression_metrics(split.y_test, preds, y_sub),
+                    **diagnostics,
                     "status": "ok",
                     "error": "",
                 },
@@ -841,6 +1135,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                         if config.task == "regression"
                         else _empty_classification_metrics()
                     ),
+                    **diagnostics,
                     **({"task": config.task} if config.task == "classification" else {}),
                     "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
@@ -848,7 +1143,6 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                 metadata,
             )
 
-    rows: list[dict] = []
     total_batches = int(np.ceil(len(pending) / config.batch_size)) if pending else 0
     for batch_index, start in enumerate(range(0, len(pending), config.batch_size), start=1):
         batch = pending[start : start + config.batch_size]
@@ -856,31 +1150,47 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             f"batch {batch_index}/{total_batches} starting "
             f"jobs={len(batch)} first={batch[0]}"
         )
-        rows.extend(
-            Parallel(
+        batch_rows = Parallel(
                 n_jobs=config.n_jobs,
                 batch_size=1,
                 prefer=parallel_preference(config.models),
             )(delayed(run_one)(*job) for job in batch)
-        )
-        write_checkpoint(
-            existing,
-            rows,
-            out_path,
-            key_columns=["model", "seed", "draw", "N", "K"],
-            sort_columns=["model", "seed", "draw", "N", "K"],
-        )
-        new_rows = rows[-len(batch) :] if batch else []
+        part = write_checkpoint_part(batch_rows, out_path)
+        new_rows = batch_rows
         ok_count = sum(row.get("status") == "ok" for row in new_rows)
         failed_count = sum(row.get("status") == "failed" for row in new_rows)
         skipped_count = sum(row.get("status") == "skipped" for row in new_rows)
         log_progress(
             f"batch {batch_index}/{total_batches} wrote checkpoint "
             f"new_rows={len(new_rows)} ok={ok_count} failed={failed_count} "
-            f"skipped={skipped_count} total_new_rows={len(rows)} out={out_path}"
+            f"skipped={skipped_count} part={part.name if part else 'none'} out={out_path}"
         )
     if not pending:
         log_progress("no pending jobs; checkpoint is already complete")
+    results = merge_checkpoint_parts(
+        out_path,
+        drop_output_columns=["_fit_seconds", "_best_rounds"],
+    )
+    final_manifest = _manifest_payload(
+        config=config,
+        metadata=metadata,
+        out_path=out_path,
+        data_path=data_path,
+        test_path=test_path,
+        model_params_path=model_params_path,
+        selected_model_params=selected_model_params,
+        frame=frame,
+        predictors=predictors,
+        split_seeds=split_seeds,
+        splits=splits,
+        n_grid=n_grid,
+        k_grid=k_grid,
+        expected_rows=len(jobs),
+        results=results,
+        started_at=started_at,
+    )
+    write_json_atomic(current_manifest_path, final_manifest)
+    return out_path
 
 
 def parse_args() -> NKGridConfig:
@@ -910,6 +1220,8 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--bart-min-k", type=int, default=2)
     parser.add_argument("--model-params", default=str(DEFAULT_MODEL_PARAMS_PATH))
     parser.add_argument("--group-split-col", default=None)
+    parser.add_argument("--allow-large-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--predictor-prefix",
         nargs="+",
@@ -964,6 +1276,8 @@ def parse_args() -> NKGridConfig:
         bart_min_n=args.bart_min_n,
         bart_min_k=args.bart_min_k,
         predictor_prefix=tuple(args.predictor_prefix),
+        allow_large_run=args.allow_large_run,
+        dry_run=args.dry_run,
     )
 
 

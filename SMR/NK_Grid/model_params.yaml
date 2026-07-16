@@ -1,3 +1,5 @@
+algorithm_version: nk-grid-v2
+
 regression:
   ols:
     fit_intercept: true

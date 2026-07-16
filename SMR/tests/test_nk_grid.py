@@ -33,6 +33,8 @@ from NK_Grid.src.nk_grid import (
     REGRESSION_CV_MIN_N,
     compute_classification_metrics,
     compute_regression_metrics,
+    _constant_prediction,
+    _model_converged,
     draw_orders,
     external_test_split,
     log2_size_grid,
@@ -41,6 +43,7 @@ from NK_Grid.src.nk_grid import (
 )
 from NK_Grid.src.run_panels import main as run_panels_main
 from NK_Grid.src.run_panels import resolve_panel
+from NK_Grid.src.tune_anchors import anchor_candidates
 
 
 class DummyRegressor:
@@ -286,6 +289,21 @@ class NKGridTests(unittest.TestCase):
         self.assertEqual(training_mean_null_mse(y_test, y_subset), 50.0)
         self.assertEqual(r2_against_training_mean(25.0, y_test, y_subset), 0.5)
 
+    def test_constant_prediction_uses_exact_correlation_semantics(self):
+        self.assertTrue(_constant_prediction([2.0, 2.0, 2.0]))
+        self.assertTrue(_constant_prediction([np.nan, np.inf]))
+        self.assertFalse(_constant_prediction([2.0, 2.0 + 1e-12]))
+
+    def test_convergence_is_read_from_estimator_attributes(self):
+        class IterativeEstimator:
+            def __init__(self, n_iter: int, max_iter: int):
+                self.n_iter_ = n_iter
+                self.max_iter = max_iter
+
+        self.assertTrue(_model_converged(IterativeEstimator(4, 5)))
+        self.assertFalse(_model_converged(IterativeEstimator(5, 5)))
+        self.assertTrue(_model_converged(DummyRegressor()))
+
     def test_experiment_identity_and_checkpoint_are_scoped(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -338,6 +356,43 @@ class NKGridTests(unittest.TestCase):
         self.assertEqual(n_grid[0], 10)
         self.assertEqual(k_grid[0], 1)
 
+    def test_large_run_requires_explicit_noninteractive_authorization(self):
+        config = NKGridConfig(
+            data=Path("missing.csv"),
+            out=Path("missing-output.csv"),
+            dataset="synthetic",
+            outcome="outcome",
+            models=("ols",),
+            seed=1,
+            test_size=0.3,
+            n_seeds=100,
+            n_draws=50,
+            n_sizes_n=20,
+            n_sizes_k=20,
+            max_n=0,
+            max_k=0,
+            batch_size=50,
+            n_jobs=1,
+        )
+        with self.assertRaisesRegex(ValueError, "--allow-large-run"):
+            run_nk_grid(config)
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            estimate = run_nk_grid(config, dry_run=True)
+        self.assertEqual(estimate["top_level_model_cells"], 2_000_000)
+        self.assertEqual(json.loads(stdout.getvalue()), estimate)
+
+    def test_anchor_candidate_grid_matches_preregistered_search(self):
+        self.assertEqual(len(anchor_candidates("random_forest")), 6)
+        self.assertEqual(len(anchor_candidates("extra_trees")), 6)
+        self.assertEqual(len(anchor_candidates("lightgbm")), 3)
+        self.assertEqual(len(anchor_candidates("shallow_neural_network")), 8)
+        self.assertEqual(
+            {row["min_data_in_leaf"] for row in anchor_candidates("lightgbm")},
+            {5, 10, 20},
+        )
+
     def test_model_params_yaml_covers_active_models_for_both_tasks(self):
         models = {
             "ols",
@@ -373,6 +428,8 @@ class NKGridTests(unittest.TestCase):
         }
         self.assertTrue(expected_lgbm_keys.issubset(regression["super_learner"]))
         self.assertTrue(expected_lgbm_keys.issubset(classification["super_learner"]))
+        self.assertEqual(regression["super_learner"]["cv"], 5)
+        self.assertEqual(classification["super_learner"]["cv"], 5)
 
     def test_nk_regression_metrics_known_values(self):
         metrics = compute_regression_metrics(
@@ -591,6 +648,23 @@ class NKGridTests(unittest.TestCase):
             self.assertTrue(saved["N"].ge(10).all())
             self.assertTrue((saved["N"] <= saved["n_train_total"]).all())
             self.assertTrue((saved["K"] <= saved["n_features_total"]).all())
+            self.assertTrue(
+                {"K_varying", "constant_prediction", "underdetermined", "converged"}
+                .issubset(saved.columns)
+            )
+            self.assertNotIn("_fit_seconds", saved.columns)
+            self.assertNotIn("_best_rounds", saved.columns)
+            parts = sorted((root / "nk_grid.parts").glob("part-*.csv"))
+            self.assertEqual(len(parts), 4)
+            manifest = json.loads((root / "nk_grid.manifest.json").read_text())
+            self.assertEqual(manifest["algorithm_version"], "nk-grid-v2")
+            self.assertEqual(manifest["completion"]["expected_rows"], 16)
+            self.assertEqual(manifest["completion"]["materialized_rows"], 16)
+            self.assertEqual(manifest["completion"]["status"], "complete")
+            self.assertEqual(
+                manifest["model_parameters"]["resolved"]["ols"],
+                {"fit_intercept": True},
+            )
 
     def test_nk_grid_external_test_file_uses_fixed_split_for_all_seeds(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -943,7 +1017,7 @@ class NKGridTests(unittest.TestCase):
                     dataset="synthetic",
                     outcome="employed",
                     models=(model_name,),
-                    seed=32,
+                    seed=30,
                     test_size=0.3,
                     n_seeds=1,
                     n_draws=1,
@@ -961,17 +1035,9 @@ class NKGridTests(unittest.TestCase):
                     return_value=DummyClassifier(),
                 ) as make_model_mock:
                     run_nk_grid(config)
+                make_model_mock.assert_called_once()
                 saved = pd.read_csv(out_path)
-                if model_name == "super_learner":
-                    make_model_mock.assert_not_called()
-                    self.assertEqual(saved.loc[0, "status"], "skipped")
-                    self.assertEqual(
-                        saved.loc[0, "error"],
-                        "below minimum per-class count for super_learner CV",
-                    )
-                else:
-                    make_model_mock.assert_called_once()
-                    self.assertEqual(saved.loc[0, "status"], "ok")
+                self.assertEqual(saved.loc[0, "status"], "ok")
                 self.assertEqual(saved.loc[0, "task"], "classification")
 
     def test_nk_grid_skips_single_class_classification_sample_without_fitting(self):

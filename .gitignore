@@ -32,6 +32,9 @@ datasets/
 **/outputs
 outputs/
 results/
+!SMR/NK_Grid/outputs/
+SMR/NK_Grid/outputs/*
+!SMR/NK_Grid/outputs/README.md
 !FFC/ffc_replication-master/results/
 runs/
 plans/

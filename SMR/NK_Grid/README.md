@@ -28,10 +28,14 @@ Notes.
 
 ```bash
 cd NK_Grid
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
+./setup_env.sh
+source ./activate_env.sh
 ```
+
+Both helpers locate the environment relative to `NK_Grid/`. On a cluster,
+create a fresh Linux `.venv` with `setup_env.sh`; do not copy a macOS virtual
+environment. Set `PYTHON_BIN` before setup if the cluster's Python executable
+has a different name, or set `VENV` to use a shared environment location.
 
 ## Quick start
 
@@ -71,9 +75,39 @@ from checkpoint. Full column reference in Notes.
 ## Multi-panel runs
 
 ```bash
-python src/run_panels.py --dry-run          # preview
+python src/run_panels.py --dry-run          # preview configs and run-size estimates
 python src/run_panels.py                    # run every panel in panels.yaml
 python src/run_panels.py --only smr_income  # run one named panel
+```
+
+Runs above 250,000 top-level model cells require explicit non-interactive
+authorization with `--allow-large-run`. Output CSVs retain all established metrics
+and add four filterable diagnostics: `K_varying`, `constant_prediction`,
+`underdetermined`, and `converged`. Each CSV is paired with a minimal
+`.manifest.json` and an atomic `.parts/` checkpoint directory; see
+[`outputs/README.md`](outputs/README.md).
+
+Fixed tree/LightGBM/NN parameters are selected once, before pilot/research runs,
+using training-only anchor-cell CV. Preview that separate tuning budget with:
+
+```bash
+python src/tune_anchors.py \
+  --outcomes Cm_lhourlywage Cm_ltotalincome \
+  --dry-run
+```
+
+The tuning command writes a reviewable JSON recommendation and never edits
+`model_params.yaml` automatically. After approval, copy the selected fixed values
+into the YAML and increment `algorithm_version`; dev, pilot, and research runs then
+reuse them without retuning.
+
+The declared full anchor search currently exceeds its 1,000-fit safety threshold;
+start it explicitly with the same non-interactive authorization convention:
+
+```bash
+python src/tune_anchors.py \
+  --outcomes Cm_lhourlywage Cm_ltotalincome \
+  --allow-large-run
 ```
 
 Edit `panels.yaml` to fill in any placeholder outcome column before running

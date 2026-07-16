@@ -80,6 +80,7 @@ MODEL_PARAM_KEYS = {
         "shallow_neural_network": {
             "hidden_layer_sizes", "activation", "solver", "alpha",
             "learning_rate_init", "max_iter", "early_stopping",
+            "validation_fraction", "n_iter_no_change",
         },
         "super_learner": {
             "cv", "passthrough", "n_estimators", "max_features",
@@ -109,6 +110,7 @@ MODEL_PARAM_KEYS = {
         "shallow_neural_network": {
             "hidden_layer_sizes", "activation", "solver", "alpha",
             "learning_rate_init", "max_iter", "early_stopping",
+            "validation_fraction", "n_iter_no_change",
         },
         "super_learner": {
             "cv", "passthrough", "n_estimators", "max_features",
@@ -194,6 +196,34 @@ def load_model_params(
             )
         selected[model_name] = _validated_params(task, model_name, model_params)
     return selected
+
+
+def load_algorithm_version(path: Path) -> str:
+    """Load the manually maintained methodological version from the YAML root."""
+
+    params_path = Path(path)
+    try:
+        with params_path.open(encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid model parameter YAML {params_path}: {exc}") from exc
+    version = document.get("algorithm_version") if isinstance(document, dict) else None
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError(
+            f"Model parameter YAML requires a non-empty algorithm_version: {params_path}"
+        )
+    return version.strip()
+
+
+def resolved_model_params(
+    params: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Apply documented environment overrides for manifest recording."""
+
+    return {
+        model_name: _apply_environment_overrides(model_name, model_params)
+        for model_name, model_params in params.items()
+    }
 
 
 def _apply_environment_overrides(

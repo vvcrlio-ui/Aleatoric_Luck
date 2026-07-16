@@ -16,10 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
     from .helpers_logging import log_progress
-    from .nk_grid import NKGridConfig, run_nk_grid
+    from .nk_grid import NKGridConfig, estimate_run_size, run_nk_grid
 except ImportError:
     from helpers_logging import log_progress
-    from nk_grid import NKGridConfig, run_nk_grid
+    from nk_grid import NKGridConfig, estimate_run_size, run_nk_grid
 
 
 PRESETS: dict[str, dict[str, int]] = {
@@ -62,6 +62,8 @@ DEFAULTS: dict[str, Any] = {
     "bart_min_n": 10,
     "bart_min_k": 2,
     "model_params": ROOT / "model_params.yaml",
+    "allow_large_run": False,
+    "dry_run": False,
 }
 
 CONFIG_FIELDS = set(NKGridConfig.__dataclass_fields__)
@@ -156,6 +158,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--only", nargs="+", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-jobs", type=int, default=None)
+    parser.add_argument("--allow-large-run", action="store_true")
     args = parser.parse_args(argv)
 
     manifest_path = Path(args.manifest)
@@ -169,7 +172,11 @@ def main(argv: list[str] | None = None) -> None:
                 {
                     "manifest": str(manifest_path),
                     "panels": [
-                        {"name": name, "config": config_to_json(config)}
+                        {
+                            "name": name,
+                            "config": config_to_json(config),
+                            "estimate": estimate_run_size(config),
+                        }
                         for name, config in panels
                     ],
                 },
@@ -181,7 +188,11 @@ def main(argv: list[str] | None = None) -> None:
 
     for name, config in panels:
         log_progress(f"panel {name} starting out={config.out}")
-        run_nk_grid(config, max_jobs=args.max_jobs)
+        run_nk_grid(
+            config,
+            max_jobs=args.max_jobs,
+            allow_large_run=args.allow_large_run,
+        )
         log_progress(f"panel {name} finished out={config.out}")
 
 

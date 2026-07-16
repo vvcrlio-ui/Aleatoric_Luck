@@ -10,15 +10,15 @@
 set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}}"
 VENV="${VENV:-$PROJECT_DIR/.venv}"
-if [ ! -f "$VENV/bin/activate" ]; then
-  echo "VENV not found at $VENV/bin/activate -- see NK_Grid/README.md Environment section, or export VENV=/path/to/your/venv" >&2
+PYTHON="${PYTHON:-$VENV/bin/python}"
+if [ ! -x "$PYTHON" ]; then
+  echo "Python not found at $PYTHON -- run ./setup_env.sh or export VENV=/path/to/your/venv" >&2
   exit 1
 fi
 if command -v module >/dev/null 2>&1; then
   module purge
   module load "${PYTHON_MODULE:-Python/3.11}"
 fi
-source "$VENV/bin/activate"
 cd "$PROJECT_DIR"
 mkdir -p logs outputs
 
@@ -26,7 +26,7 @@ mkdir -p logs outputs
 
 MODELS=(ols ridge lasso elastic_net random_forest xgboost lightgbm shallow_neural_network extra_trees super_learner)
 MODEL="${MODELS[$SLURM_ARRAY_TASK_ID]}"
-python src/nk_grid.py \
+"$PYTHON" src/nk_grid.py \
   --task classification \
   --data data/asample2_withlag.csv \
   --dataset asample2_withlag \
@@ -42,4 +42,5 @@ python src/nk_grid.py \
   --max-k 0 \
   --batch-size "${BATCH_SIZE:-50}" \
   --n-jobs "$SLURM_CPUS_PER_TASK" \
+  --allow-large-run \
   --out "outputs/nk_grid_clf_${MODEL}.csv"
