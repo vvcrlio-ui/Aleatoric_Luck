@@ -137,12 +137,27 @@ Before running a panel, fill in any placeholder outcome columns in `panels.yaml`
 ```bash
 export PROJECT_DIR=/path/to/aleatoric_luck/src/smr/NK_GRID
 export VENV=/path/to/your/venv
-sbatch slurm/run_nk_grid.sbatch
-export CLASSIFICATION_OUTCOME=employment_binary
-sbatch slurm/run_nk_grid_classification.sbatch
+
+# Preview the panel/model array without submitting it
+./slurm/submit_nk_grid.sh --dry-run
+
+# Submit every active regression and classification panel
+./slurm/submit_nk_grid.sh
 ```
 
-See “Notes” for resource settings and per-model output behavior.
+For a production preset, explicitly authorize large array tasks:
+
+```bash
+./slurm/submit_nk_grid.sh --allow-large-run
+```
+
+The submitter reads `panels.yaml` and creates one array task for each active
+`(panel, model)` pair. At submission time it writes a read-only, fully resolved job
+snapshot under `logs/slurm-specs/`; queued workers use that snapshot, so later
+edits to `panels.yaml` cannot change array-index assignments. Submission is
+rejected if two jobs would write to the same output path. Do not submit
+`run_nk_grid.sbatch` directly; it is the worker used by `submit_nk_grid.sh`. See
+“Notes” for resource settings and per-model output behavior.
 
 ## Notes
 
@@ -259,13 +274,20 @@ python src/run_panels.py 2>&1 | tee run.log
 <details>
 <summary>SLURM resource settings and output behavior</summary>
 
-`slurm/*.sbatch` submits a job array with 10 tasks, one array task per model. By
-default, each task uses 8 CPUs and 48 GB of memory, with a maximum runtime of 4
-days; edit the relevant script to adjust these settings. Each array task creates a
-separate CSV, such as `outputs/nk_grid_<model>.csv` for regression or
-`outputs/nk_grid_clf_<model>.csv` for classification. This differs from running
-`nk_grid.py` or `run_panels.py` directly with multiple `--models`, which writes
-multiple models to a single CSV.
+`slurm/submit_nk_grid.sh` reads all active panels from `panels.yaml` and submits a
+dynamic job array with one task per `(panel, model)` pair. For example, two panels
+with ten models each produce 20 array tasks. A missing or commented-out panel
+produces no tasks, so unused classification or regression jobs are not submitted.
+The submitter freezes the expanded mapping in `logs/slurm-specs/` before calling
+`sbatch`; all workers in that submission therefore see the same configuration.
+
+By default, each task uses 8 CPUs and 48 GB of memory, with a maximum runtime of 4
+days; edit `slurm/run_nk_grid.sbatch` to adjust these settings. Each task creates a
+separate timestamped CSV whose filename includes the panel output stem, model, and
+preset, for example
+`outputs/nk_grid_smr_hourlywage_ridge_dev_YYYYMMDD-HHMMSS.csv`. This differs from
+running `run_panels.py` locally, which writes all models from one panel to a shared
+CSV.
 
 Standard output and error logs are stored in
 `logs/<job-name>-<job-id>_<array-index>.out/.err`. The Git-tracked `logs/`
