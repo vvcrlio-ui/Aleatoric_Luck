@@ -123,9 +123,11 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
 def resolved_panels(manifest_path: Path, only: set[str] | None = None) -> list[tuple[str, NKGridConfig]]:
     manifest = load_manifest(manifest_path)
     manifest_dir = manifest_path.parent
-    shared_values = {}
-    if "model_params" in manifest:
-        shared_values["model_params"] = manifest["model_params"]
+    shared_values = {
+        key: manifest[key]
+        for key in ("model_params", "preset")
+        if key in manifest
+    }
     panels = [
         resolve_panel({**shared_values, **panel}, manifest_dir)
         for panel in manifest["panels"]

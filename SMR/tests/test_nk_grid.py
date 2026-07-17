@@ -657,7 +657,7 @@ class NKGridTests(unittest.TestCase):
             parts = sorted((root / "nk_grid.parts").glob("part-*.csv"))
             self.assertEqual(len(parts), 4)
             manifest = json.loads((root / "nk_grid.manifest.json").read_text())
-            self.assertEqual(manifest["algorithm_version"], "nk-grid-v2")
+            self.assertEqual(manifest["algorithm_version"], "nk-grid-v3")
             self.assertEqual(manifest["completion"]["expected_rows"], 16)
             self.assertEqual(manifest["completion"]["materialized_rows"], 16)
             self.assertEqual(manifest["completion"]["status"], "complete")
@@ -1639,6 +1639,26 @@ class NKGridTests(unittest.TestCase):
             self.assertEqual(default_name, "default_panel")
             self.assertEqual(default_config.preset, "dev")
 
+    def test_run_panels_top_level_preset_applies_to_every_panel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            manifest.write_text(
+                manifest.read_text().replace("preset: dev", "preset: medium", 1)
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                run_panels_main(["--manifest", str(manifest), "--dry-run"])
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(
+                [panel["config"]["preset"] for panel in payload["panels"]],
+                ["medium", "medium"],
+            )
+            self.assertEqual(
+                [panel["config"]["n_seeds"] for panel in payload["panels"]],
+                [8, 8],
+            )
+
     def test_run_panels_resolve_panel_maps_test_to_test_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1690,6 +1710,7 @@ class NKGridTests(unittest.TestCase):
             manifest.write_text(
                 "\n".join(
                     [
+                        "preset: dev",
                         "panels:",
                         "  - name: dev_panel",
                         f"    data: {data_path}",
@@ -1698,7 +1719,6 @@ class NKGridTests(unittest.TestCase):
                         "    task: regression",
                         "    models:",
                         "      - ols",
-                        "    preset: dev",
                         f"    out: {root / 'outputs' / 'dev.csv'}",
                         "    max_n: 20",
                         "    max_k: 3",
@@ -1790,6 +1810,7 @@ class NKGridTests(unittest.TestCase):
         manifest.write_text(
             "\n".join(
                 [
+                    "preset: dev",
                     "panels:",
                     "  - name: reg_panel",
                     f"    data: {data_path}",
@@ -1798,7 +1819,6 @@ class NKGridTests(unittest.TestCase):
                     "    task: regression",
                     "    models:",
                     "      - ols",
-                    "    preset: dev",
                     f"    out: {root / 'outputs' / 'reg.csv'}",
                     "    n_sizes_n: 2",
                     "    n_sizes_k: 2",
@@ -1812,7 +1832,6 @@ class NKGridTests(unittest.TestCase):
                     "    task: classification",
                     "    models:",
                     "      - ols",
-                    "    preset: dev",
                     f"    out: {root / 'outputs' / 'clf.csv'}",
                     "    n_sizes_n: 1",
                     "    n_sizes_k: 4",

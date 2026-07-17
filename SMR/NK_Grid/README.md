@@ -6,8 +6,9 @@ Supports regression and classification outcomes. Dataset-agnostic via
 `--outcome`/`--predictor-prefix`.
 
 Shared regression/classification model defaults live in `model_params.yaml`.
-`panels.yaml` references that file once, while each panel's `models` list still
-controls which models run.
+`panels.yaml` references that file once and declares one top-level `preset`
+(`dev`, `medium`, or `production`) for every panel, while each panel's `models`
+list still controls which models run.
 
 The ten-model space is `ols`, `ridge`, `lasso`, `elastic_net`,
 `random_forest`, `xgboost`, `lightgbm`, `shallow_neural_network`,
@@ -73,6 +74,14 @@ exception, recorded in `error`). Re-running the same `--out` path resumes
 from checkpoint. Full column reference in Notes.
 
 ## Multi-panel runs
+
+Select the scale once at the top of `panels.yaml`; the setting applies to every
+declared outcome:
+
+```yaml
+model_params: model_params.yaml
+preset: medium
+```
 
 ```bash
 python src/run_panels.py --dry-run          # preview configs and run-size estimates

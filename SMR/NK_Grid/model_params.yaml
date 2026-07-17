@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v2
+algorithm_version: nk-grid-v3
 
 regression:
   ols:
@@ -28,36 +28,36 @@ regression:
   random_forest:
     n_estimators: 500
     max_features: sqrt
-    min_samples_leaf: 1
+    min_samples_leaf: 5
   extra_trees:
     n_estimators: 500
     max_features: sqrt
-    min_samples_leaf: 1
+    min_samples_leaf: 5
   shallow_neural_network:
     hidden_layer_sizes:
-      - 64
+      - 32
     activation: relu
     solver: adam
-    alpha: 0.0001
+    alpha: 0.01
     learning_rate_init: 0.001
     max_iter: 500
     early_stopping: false
   super_learner:
     cv: 5
     passthrough: false
-    n_estimators: 300
+    n_estimators: 500
     max_features: sqrt
-    min_samples_leaf: 1
+    min_samples_leaf: 5
     hidden_layer_sizes:
-      - 64
-    alpha: 0.0001
+      - 32
+    alpha: 0.01
     learning_rate_init: 0.001
     max_iter: 500
     positive: true
     lgbm_n_estimators: 200
     lgbm_learning_rate: 0.05
     lgbm_num_leaves: 10
-    lgbm_min_data_in_leaf: 20
+    lgbm_min_data_in_leaf: 10
   xgboost:
     objective: reg:squarederror
     eval_metric: rmse
@@ -70,7 +70,7 @@ regression:
     metric: rmse
     learning_rate: 0.05
     num_leaves: 10
-    min_data_in_leaf: 20
+    min_data_in_leaf: 10
     verbosity: -1
     max_rounds: 200
     cv_folds: 5

@@ -1,4 +1,5 @@
 model_params: model_params.yaml
+preset: medium
 
 panels:
   - name: smr_hourlywage
@@ -18,7 +19,6 @@ panels:
       - extra_trees
       - super_learner
       # - bart # legacy replication model; too heavy to run locally
-    preset: dev
     out: outputs/nk_grid_smr_hourlywage.csv
 
   - name: smr_totalincome
@@ -38,7 +38,6 @@ panels:
       - extra_trees
       - super_learner
       # - bart # legacy replication model; too heavy to run locally
-    preset: dev
     out: outputs/nk_grid_smr_totalincome.csv
 
   # - name: Binary Classification
@@ -58,5 +57,4 @@ panels:
   #     - extra_trees
   #     - super_learner
   #     # - bart # legacy replication model; classification unsupported
-  #   preset: dev
   #   out: outputs/TBD.csv
