@@ -41,6 +41,16 @@ PRESETS: dict[str, dict[str, int]] = {
         "max_n": 100,
         "max_k": 100,
     },
+    "pilot_full": {
+        "n_seeds": 10,
+        "n_draws": 5,
+        "n_sizes_n": 12,
+        "n_sizes_k": 12,
+        "min_n": 10,
+        "max_n": 0,
+        "max_k": 0,
+        "batch_size": 500,
+    },
     "production": {
         "n_seeds": 100,
         "n_draws": 50,

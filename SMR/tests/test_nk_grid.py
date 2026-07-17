@@ -28,6 +28,7 @@ from NK_Grid.src.experiment import (
 from NK_Grid.src.model_registry import MODEL_NAMES, SUPPORTED_MODEL_NAMES, make_model
 from NK_Grid.src.nk_grid import (
     CLASSIFICATION_METRIC_COLUMNS,
+    LARGE_RUN_THRESHOLD,
     METRIC_COLUMNS,
     NKGridConfig,
     REGRESSION_CV_MIN_N,
@@ -36,6 +37,7 @@ from NK_Grid.src.nk_grid import (
     _constant_prediction,
     _model_converged,
     draw_orders,
+    estimate_run_size,
     external_test_split,
     log2_size_grid,
     split_frame,
@@ -1568,6 +1570,58 @@ class NKGridTests(unittest.TestCase):
         self.assertEqual(PRESETS["dev"]["n_sizes_k"], 8)
         self.assertEqual(PRESETS["dev"]["min_n"], 10)
         self.assertEqual(PRESETS["production"]["min_n"], 10)
+
+    def test_pilot_full_preset_values_and_uncapped_semantics(self):
+        from NK_Grid.src.run_panels import PRESETS
+
+        self.assertEqual(
+            PRESETS["pilot_full"],
+            {
+                "n_seeds": 10,
+                "n_draws": 5,
+                "n_sizes_n": 12,
+                "n_sizes_k": 12,
+                "min_n": 10,
+                "max_n": 0,
+                "max_k": 0,
+                "batch_size": 500,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, config = resolve_panel(
+                {
+                    "name": "pilot_full_panel",
+                    "data": "synthetic.csv",
+                    "dataset": "synthetic",
+                    "outcome": "outcome",
+                    "models": list(MODEL_NAMES),
+                    "preset": "pilot_full",
+                    "out": "outputs/pilot.csv",
+                },
+                root,
+            )
+
+        self.assertEqual(config.batch_size, 500)
+        self.assertEqual(config.max_n, 0)
+        self.assertEqual(config.max_k, 0)
+        self.assertEqual(
+            log2_size_grid(
+                5_000,
+                config.n_sizes_n,
+                config.max_n,
+                min_size=config.min_n,
+            )[-1],
+            5_000,
+        )
+        self.assertEqual(
+            log2_size_grid(4_000, config.n_sizes_k, config.max_k)[-1],
+            4_000,
+        )
+        declared_cells = estimate_run_size(config)["top_level_model_cells"]
+        self.assertEqual(declared_cells, 72_000)
+        self.assertLess(declared_cells, LARGE_RUN_THRESHOLD)
 
     def test_run_panels_resolves_model_params_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
