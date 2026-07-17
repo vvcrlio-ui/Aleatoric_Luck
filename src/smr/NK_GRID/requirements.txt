@@ -1,0 +1,12 @@
+bartpy2==0.0.2
+joblib==1.5.3
+lightgbm==4.6.0
+matplotlib==3.10.9
+numpy==2.4.4
+pandas==3.0.2
+pyyaml==6.0.2
+scikit-learn==1.8.0
+scipy==1.17.1
+seaborn==0.13.2
+shap==0.51.0
+xgboost==3.2.0
