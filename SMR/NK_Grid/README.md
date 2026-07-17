@@ -62,7 +62,7 @@ python src/nk_grid.py --task classification \
 ```
 
 Run `python src/nk_grid.py --help` for all flags, or see Notes for the full
-reference. See Notes for the dev/production scale presets and classification
+reference. See Notes for the dev/pilot/production scale presets and classification
 model mapping before submitting a large run.
 
 ## Output
@@ -142,10 +142,16 @@ reason.
 </details>
 
 <details>
-<summary>Dev vs. production scale, and why the two "dev" presets differ</summary>
+<summary>Dev, pilot, and production scale, and why the two "dev" presets differ</summary>
 
 - **Dev** (`nk_grid.py`'s own CLI defaults): `n-seeds=2 n-draws=2
   n-sizes-n=4 n-sizes-k=4 max-n=100 max-k=100` — minutes.
+- **Pilot full** (`run_panels.py` preset `pilot_full`): `n-seeds=10 n-draws=5
+  n-sizes-n=12 n-sizes-k=12 min-n=10 max-n=0 max-k=0 batch-size=500`.
+  Zero caps run through the full available N and K ranges. This is the only
+  uncapped non-production preset. With all ten models it declares 72,000 model
+  cells per outcome, below the 250,000-cell large-run threshold, so it does not
+  require `--allow-large-run`.
 - **Production**: `n-seeds=100 n-draws=50 n-sizes-n=20 n-sizes-k=20
   max-n=0 max-k=0` (uncapped).
 
