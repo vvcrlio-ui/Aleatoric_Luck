@@ -155,9 +155,9 @@ content of `NK_GRID/data`: it may be a symbolic link to a shared data location o
 a local directory containing files with the same names. The YAML and command-line
 arguments do not need to change between machines.
 
-To test locally with a real copy of the data, create `NK_GRID/data` and place the
-required files there. Do not commit real data; the project ignores `**/data/`
-through `.gitignore`.
+To test locally with a real copy of the data, place the required files in the
+existing `NK_GRID/data` directory. Do not commit real data; the project ignores
+the directory contents except for `data/.gitkeep`.
 
 </details>
 
