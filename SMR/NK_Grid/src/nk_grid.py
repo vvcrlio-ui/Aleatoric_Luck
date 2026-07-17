@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -171,6 +172,7 @@ class NKGridConfig:
     preset: str | None = None
     allow_large_run: bool = False
     dry_run: bool = False
+    prune_parts: bool = False
 
 
 @dataclass(frozen=True)
@@ -695,6 +697,60 @@ def _manifest_payload(
     }
 
 
+def _prune_checkpoint_parts(out_path: Path, manifest: dict) -> bool:
+    """Drop checkpoint shards, but only for a verified-complete experiment.
+
+    Shards are the authoritative source and the CSV is the derived view, so
+    pruning is opt-in and refuses to run unless every declared cell landed
+    without failures. Resume still works afterwards via the CSV fallback.
+    """
+
+    status = manifest["completion"]["status"]
+    if status != "complete":
+        log_progress(
+            f"--prune-parts skipped: completion status is {status!r}, "
+            "shards are kept as the authoritative checkpoint"
+        )
+        return False
+    directory = checkpoint_parts_dir(out_path)
+    if not directory.exists():
+        return False
+    shutil.rmtree(directory)
+    log_progress(f"pruned checkpoint shards after complete run: {directory.name}")
+    return True
+
+
+def _read_prior_manifest(path: Path, experiment_id: str) -> dict | None:
+    """Return the previous manifest for this experiment, if it is readable."""
+
+    if not path.exists():
+        return None
+    try:
+        prior = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return prior if prior.get("experiment_id") == experiment_id else None
+
+
+def _preserve_prior_timings(payload: dict, prior: dict | None) -> dict:
+    """Carry per-model timings forward when shards can no longer supply them.
+
+    ``_fit_seconds``/``_best_rounds`` live only in checkpoint shards, so once the
+    shards are pruned a later merge cannot recompute them. Keep whatever the
+    previous manifest recorded instead of dropping the fields.
+    """
+
+    if prior is None:
+        return payload
+    prior_models = prior.get("diagnostics", {}).get("by_model", {})
+    for model, summary in payload.get("diagnostics", {}).get("by_model", {}).items():
+        prior_summary = prior_models.get(model, {})
+        for key in ("fit_seconds_total", "fit_seconds_median", "best_rounds"):
+            if key not in summary and key in prior_summary:
+                summary[key] = prior_summary[key]
+    return payload
+
+
 def _predictor_columns(
     frame: pd.DataFrame, prefixes: Sequence[str] = ("Aset", "Bset")
 ) -> list[str]:
@@ -763,9 +819,11 @@ def run_nk_grid(
     max_jobs: int | None = None,
     allow_large_run: bool | None = None,
     dry_run: bool | None = None,
+    prune_parts: bool | None = None,
 ) -> Path | dict[str, int]:
     allow_large_run = config.allow_large_run if allow_large_run is None else allow_large_run
     dry_run = config.dry_run if dry_run is None else dry_run
+    prune_parts = config.prune_parts if prune_parts is None else prune_parts
     if config.task not in {"regression", "classification"}:
         raise ValueError("task must be 'regression' or 'classification'")
     declared_size = estimate_run_size(config)
@@ -952,13 +1010,11 @@ def run_nk_grid(
         write_checkpoint_part(existing.to_dict("records"), out_path)
     started_at = utc_now()
     current_manifest_path = manifest_path(out_path)
-    if current_manifest_path.exists():
-        try:
-            prior_manifest = json.loads(current_manifest_path.read_text(encoding="utf-8"))
-            if prior_manifest.get("experiment_id") == metadata["experiment_id"]:
-                started_at = prior_manifest.get("created_at", started_at)
-        except (OSError, json.JSONDecodeError):
-            pass
+    prior_manifest = _read_prior_manifest(
+        current_manifest_path, metadata["experiment_id"]
+    )
+    if prior_manifest is not None:
+        started_at = prior_manifest.get("created_at", started_at)
     initial_manifest = _manifest_payload(
         config=config,
         metadata=metadata,
@@ -977,7 +1033,10 @@ def run_nk_grid(
         results=existing,
         started_at=started_at,
     )
-    write_json_atomic(current_manifest_path, initial_manifest)
+    write_json_atomic(
+        current_manifest_path,
+        _preserve_prior_timings(initial_manifest, prior_manifest),
+    )
     log_progress(
         f"jobs total={len(jobs)} completed={len(completed)} "
         f"pending={len(pending)} batch_size={config.batch_size} n_jobs={config.n_jobs}"
@@ -1189,7 +1248,10 @@ def run_nk_grid(
         results=results,
         started_at=started_at,
     )
+    _preserve_prior_timings(final_manifest, prior_manifest)
     write_json_atomic(current_manifest_path, final_manifest)
+    if prune_parts:
+        _prune_checkpoint_parts(out_path, final_manifest)
     return out_path
 
 
@@ -1222,6 +1284,15 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--group-split-col", default=None)
     parser.add_argument("--allow-large-run", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--prune-parts",
+        action="store_true",
+        help=(
+            "Delete checkpoint shards after a verified-complete merge. Shards are "
+            "the authoritative checkpoint and hold per-cell timings that the final "
+            "CSV omits; resume still works from the CSV once they are gone."
+        ),
+    )
     parser.add_argument(
         "--predictor-prefix",
         nargs="+",
@@ -1278,6 +1349,7 @@ def parse_args() -> NKGridConfig:
         predictor_prefix=tuple(args.predictor_prefix),
         allow_large_run=args.allow_large_run,
         dry_run=args.dry_run,
+        prune_parts=args.prune_parts,
     )
 
 
