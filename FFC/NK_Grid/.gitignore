@@ -16,3 +16,4 @@ plans/
 # Generated logs
 logs/*
 !logs/.gitkeep
+.DS_Store

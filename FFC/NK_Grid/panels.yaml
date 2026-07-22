@@ -1,7 +1,30 @@
+model_params: model_params.yaml
+
+_preprocessing_strategy_defaults:
+  median_mode: &median_mode_defaults
+    feature_manifest: data/intermediate_files/preprocessing/median_mode/feature_manifest.csv
+    dataset: ffc_median_mode
+    predictor_prefix: [X_, C_]
+    models: [ols, ridge, lasso, elastic_net, random_forest, xgboost, lightgbm]
+    preset: dev
+  median_missing_indicator: &median_missing_indicator_defaults
+    feature_manifest: data/intermediate_files/preprocessing/median_missing_indicator/feature_manifest.csv
+    dataset: ffc_median_missing_indicator
+    predictor_prefix: [X_, C_, M_]
+    models: [ols, ridge, lasso, elastic_net, random_forest, xgboost, lightgbm]
+    preset: dev
+  tree_ordinal: &tree_ordinal_defaults
+    feature_manifest: data/intermediate_files/preprocessing/tree_ordinal/feature_manifest.csv
+    dataset: ffc_tree_ordinal
+    predictor_prefix: [X_, C_]
+    models: [xgboost, lightgbm]
+    preset: dev
+
 panels:
   - name: ffc_gpa
     data: data/intermediate_files/nk_inputs/ffc_train_gpa.csv
     test: data/intermediate_files/nk_inputs/ffc_test_gpa.csv
+    feature_manifest: data/intermediate_files/ffc_background_clean_feature_manifest.csv
     dataset: ffc_background_clean_v1
     outcome: gpa
     task: regression
@@ -24,7 +47,8 @@ panels:
   - name: ffc_grit
     data: data/intermediate_files/nk_inputs/ffc_train_grit.csv
     test: data/intermediate_files/nk_inputs/ffc_test_grit.csv
-    dataset: ffc_background_clean_v1
+    feature_manifest: data/intermediate_files/ffc_background_clean_feature_manifest.csv
+    dataset: ffc_background_clean
     outcome: grit
     task: regression
     predictor_prefix:
@@ -46,7 +70,8 @@ panels:
   - name: ffc_materialHardship
     data: data/intermediate_files/nk_inputs/ffc_train_materialHardship.csv
     test: data/intermediate_files/nk_inputs/ffc_test_materialHardship.csv
-    dataset: ffc_background_clean_v1
+    feature_manifest: data/intermediate_files/ffc_background_clean_feature_manifest.csv
+    dataset: ffc_background_clean
     outcome: materialHardship
     task: regression
     predictor_prefix:
@@ -68,7 +93,8 @@ panels:
   - name: ffc_eviction
     data: data/intermediate_files/nk_inputs/ffc_train_eviction.csv
     test: data/intermediate_files/nk_inputs/ffc_test_eviction.csv
-    dataset: ffc_background_clean_v1
+    feature_manifest: data/intermediate_files/ffc_background_clean_feature_manifest.csv
+    dataset: ffc_background_clean
     outcome: eviction
     task: classification
     predictor_prefix:
@@ -90,7 +116,8 @@ panels:
   - name: ffc_layoff
     data: data/intermediate_files/nk_inputs/ffc_train_layoff.csv
     test: data/intermediate_files/nk_inputs/ffc_test_layoff.csv
-    dataset: ffc_background_clean_v1
+    feature_manifest: data/intermediate_files/ffc_background_clean_feature_manifest.csv
+    dataset: ffc_background_clean
     outcome: layoff
     task: classification
     predictor_prefix:
@@ -112,7 +139,8 @@ panels:
   - name: ffc_jobTraining
     data: data/intermediate_files/nk_inputs/ffc_train_jobTraining.csv
     test: data/intermediate_files/nk_inputs/ffc_test_jobTraining.csv
-    dataset: ffc_background_clean_v1
+    feature_manifest: data/intermediate_files/ffc_background_clean_feature_manifest.csv
+    dataset: ffc_background_clean
     outcome: jobTraining
     task: classification
     predictor_prefix:
@@ -130,3 +158,150 @@ panels:
     # - bart
     preset: dev
     out: outputs/nk_grid_ffc_jobTraining.csv
+
+  # Preprocessing search: median_mode
+  - <<: *median_mode_defaults
+    name: ffc_median_mode_gpa
+    data: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_train_gpa.csv
+    test: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_test_gpa.csv
+    outcome: gpa
+    task: regression
+    out: outputs/nk_grid_ffc_median_mode_gpa.csv
+
+  - <<: *median_mode_defaults
+    name: ffc_median_mode_grit
+    data: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_train_grit.csv
+    test: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_test_grit.csv
+    outcome: grit
+    task: regression
+    out: outputs/nk_grid_ffc_median_mode_grit.csv
+
+  - <<: *median_mode_defaults
+    name: ffc_median_mode_materialHardship
+    data: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_train_materialHardship.csv
+    test: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_test_materialHardship.csv
+    outcome: materialHardship
+    task: regression
+    out: outputs/nk_grid_ffc_median_mode_materialHardship.csv
+
+  - <<: *median_mode_defaults
+    name: ffc_median_mode_eviction
+    data: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_train_eviction.csv
+    test: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_test_eviction.csv
+    outcome: eviction
+    task: classification
+    out: outputs/nk_grid_ffc_median_mode_eviction.csv
+
+  - <<: *median_mode_defaults
+    name: ffc_median_mode_layoff
+    data: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_train_layoff.csv
+    test: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_test_layoff.csv
+    outcome: layoff
+    task: classification
+    out: outputs/nk_grid_ffc_median_mode_layoff.csv
+
+  - <<: *median_mode_defaults
+    name: ffc_median_mode_jobTraining
+    data: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_train_jobTraining.csv
+    test: data/intermediate_files/preprocessing/median_mode/nk_inputs/ffc_test_jobTraining.csv
+    outcome: jobTraining
+    task: classification
+    out: outputs/nk_grid_ffc_median_mode_jobTraining.csv
+
+  # Preprocessing search: median_missing_indicator
+  - <<: *median_missing_indicator_defaults
+    name: ffc_median_missing_indicator_gpa
+    data: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_train_gpa.csv
+    test: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_test_gpa.csv
+    outcome: gpa
+    task: regression
+    out: outputs/nk_grid_ffc_median_missing_indicator_gpa.csv
+
+  - <<: *median_missing_indicator_defaults
+    name: ffc_median_missing_indicator_grit
+    data: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_train_grit.csv
+    test: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_test_grit.csv
+    outcome: grit
+    task: regression
+    out: outputs/nk_grid_ffc_median_missing_indicator_grit.csv
+
+  - <<: *median_missing_indicator_defaults
+    name: ffc_median_missing_indicator_materialHardship
+    data: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_train_materialHardship.csv
+    test: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_test_materialHardship.csv
+    outcome: materialHardship
+    task: regression
+    out: outputs/nk_grid_ffc_median_missing_indicator_materialHardship.csv
+
+  - <<: *median_missing_indicator_defaults
+    name: ffc_median_missing_indicator_eviction
+    data: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_train_eviction.csv
+    test: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_test_eviction.csv
+    outcome: eviction
+    task: classification
+    out: outputs/nk_grid_ffc_median_missing_indicator_eviction.csv
+
+  - <<: *median_missing_indicator_defaults
+    name: ffc_median_missing_indicator_layoff
+    data: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_train_layoff.csv
+    test: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_test_layoff.csv
+    outcome: layoff
+    task: classification
+    out: outputs/nk_grid_ffc_median_missing_indicator_layoff.csv
+
+  - <<: *median_missing_indicator_defaults
+    name: ffc_median_missing_indicator_jobTraining
+    data: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_train_jobTraining.csv
+    test: data/intermediate_files/preprocessing/median_missing_indicator/nk_inputs/ffc_test_jobTraining.csv
+    outcome: jobTraining
+    task: classification
+    out: outputs/nk_grid_ffc_median_missing_indicator_jobTraining.csv
+
+  # Preprocessing search: tree_ordinal (common-envelope models only)
+  - <<: *tree_ordinal_defaults
+    name: ffc_tree_ordinal_gpa
+    data: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_train_gpa.parquet
+    test: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_test_gpa.parquet
+    outcome: gpa
+    task: regression
+    out: outputs/nk_grid_ffc_tree_ordinal_gpa.csv
+
+  - <<: *tree_ordinal_defaults
+    name: ffc_tree_ordinal_grit
+    data: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_train_grit.parquet
+    test: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_test_grit.parquet
+    outcome: grit
+    task: regression
+    out: outputs/nk_grid_ffc_tree_ordinal_grit.csv
+
+  - <<: *tree_ordinal_defaults
+    name: ffc_tree_ordinal_materialHardship
+    data: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_train_materialHardship.parquet
+    test: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_test_materialHardship.parquet
+    outcome: materialHardship
+    task: regression
+    out: outputs/nk_grid_ffc_tree_ordinal_materialHardship.csv
+
+  - <<: *tree_ordinal_defaults
+    name: ffc_tree_ordinal_eviction
+    data: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_train_eviction.parquet
+    test: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_test_eviction.parquet
+    outcome: eviction
+    task: classification
+    out: outputs/nk_grid_ffc_tree_ordinal_eviction.csv
+
+  - <<: *tree_ordinal_defaults
+    name: ffc_tree_ordinal_layoff
+    data: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_train_layoff.parquet
+    test: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_test_layoff.parquet
+    outcome: layoff
+    task: classification
+    out: outputs/nk_grid_ffc_tree_ordinal_layoff.csv
+
+  - <<: *tree_ordinal_defaults
+    name: ffc_tree_ordinal_jobTraining
+    data: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_train_jobTraining.parquet
+    test: data/intermediate_files/preprocessing/tree_ordinal/nk_inputs/ffc_test_jobTraining.parquet
+    outcome: jobTraining
+    task: classification
+    out: outputs/nk_grid_ffc_tree_ordinal_jobTraining.csv

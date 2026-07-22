@@ -12,8 +12,14 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import nk_grid
 from model_registry import make_model
-from nk_grid import NKGridConfig, compute_regression_metrics, parse_args, run_nk_grid
-from run_panels import resolve_panel
+from nk_grid import (
+    NKGridConfig,
+    compute_regression_metrics,
+    log2_size_grid,
+    parse_args,
+    run_nk_grid,
+)
+from run_panels import PRESETS, resolve_panel
 
 
 def _regression_frame(n_rows: int, *, offset: float = 0.0) -> pd.DataFrame:
@@ -72,6 +78,19 @@ def _config(tmp_path: Path, **overrides) -> NKGridConfig:
     }
     values.update(overrides)
     return NKGridConfig(**values)
+
+
+def test_n_grid_starts_at_ten_while_k_grid_still_starts_at_one():
+    n_grid = log2_size_grid(100, 5, min_size=10)
+    k_grid = log2_size_grid(100, 5)
+
+    assert n_grid.tolist() == [10, 18, 32, 56, 100]
+    assert k_grid[0] == 1
+
+
+@pytest.mark.parametrize("preset_name", ["dev", "production"])
+def test_sweep_presets_set_minimum_n_to_ten(preset_name):
+    assert PRESETS[preset_name]["min_n"] == 10
 
 
 def test_resolve_panel_accepts_relative_test_path(tmp_path):
@@ -133,6 +152,47 @@ def test_parse_args_accepts_test_data(tmp_path):
     assert config.test_data == tmp_path / "test.csv"
 
 
+def test_feature_manifest_groups_expanded_columns_under_source_variables(tmp_path):
+    train = _regression_frame(40).rename(columns={"X_a": "X_a", "X_b": "C_b__0"})
+    train["M_a__missing"] = 0
+    train["C_b__1"] = 1 - (train["C_b__0"] > 0).astype(int)
+    test = _regression_frame(15, offset=100.0).rename(
+        columns={"X_a": "X_a", "X_b": "C_b__0"}
+    )
+    test["M_a__missing"] = 0
+    test["C_b__1"] = 1 - (test["C_b__0"] > 0).astype(int)
+
+    train_path = _write_csv(tmp_path, "train.csv", train)
+    test_path = _write_csv(tmp_path, "test.csv", test)
+    manifest_path = tmp_path / "feature_manifest.csv"
+    pd.DataFrame(
+        {
+            "source_column": ["a", "a", "b", "b"],
+            "feature_name": ["X_a", "M_a__missing", "C_b__0", "C_b__1"],
+            "keep": [True, True, True, True],
+        }
+    ).to_csv(manifest_path, index=False)
+    out_path = tmp_path / "grouped_results.csv"
+
+    run_nk_grid(
+        _config(
+            tmp_path,
+            data=train_path,
+            test_data=test_path,
+            out=out_path,
+            predictor_prefix=("X_", "C_", "M_"),
+            feature_manifest=manifest_path,
+        )
+    )
+
+    row = pd.read_csv(out_path).iloc[0]
+    assert row["status"] == "ok"
+    assert row["K"] == 2
+    assert row["K_expanded"] == 4
+    assert row["n_features_total"] == 2
+    assert row["n_expanded_features_total"] == 4
+
+
 def test_external_mode_aligns_test_predictors_and_uses_all_test_rows(tmp_path):
     train = _regression_frame(40)
     test = _regression_frame(15, offset=100.0)
@@ -168,7 +228,8 @@ def test_external_mode_aligns_test_predictors_and_uses_all_test_rows(tmp_path):
     expected = compute_regression_metrics(test["y"], preds, train["y"])
     assert full_rows["rmse"].tolist() == pytest.approx([expected["rmse"], expected["rmse"]])
 
-    subsampled = results[(results["N"] == 1) & (results["K"] == 1)].sort_values("seed")
+    assert results["N"].ge(10).all()
+    subsampled = results[(results["N"] == 10) & (results["K"] == 1)].sort_values("seed")
     assert len(subsampled) == 2
     assert subsampled["rmse"].nunique() == 2
 
@@ -230,7 +291,7 @@ def test_external_mode_warns_when_test_size_is_ignored(tmp_path):
                 data=train_path,
                 test_data=test_path,
                 test_size=0.5,
-                max_n=2,
+                max_n=10,
                 max_k=1,
             ),
             max_jobs=0,
@@ -284,7 +345,7 @@ def test_classification_one_class_training_sample_is_skipped(tmp_path):
             n_draws=1,
             n_sizes_n=1,
             n_sizes_k=1,
-            max_n=1,
+            max_n=10,
             max_k=1,
         )
     )

@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+import yaml
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
@@ -37,7 +39,174 @@ MODEL_NAMES = (
     "bart",
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL_PARAMS_PATH = ROOT / "model_params.yaml"
+
+MODEL_PARAM_KEYS = {
+    "regression": {
+        "ols": {"fit_intercept"},
+        "ridge": {
+            "alpha_log10_min",
+            "alpha_log10_max",
+            "n_alphas",
+            "max_cv_folds",
+            "scoring",
+        },
+        "lasso": {
+            "alpha_log10_min",
+            "alpha_log10_max",
+            "n_alphas",
+            "max_cv_folds",
+            "max_iter",
+        },
+        "elastic_net": {
+            "alpha_log10_min",
+            "alpha_log10_max",
+            "n_alphas",
+            "l1_ratio",
+            "max_cv_folds",
+            "max_iter",
+        },
+        "random_forest": {"n_estimators", "max_features", "min_samples_leaf"},
+        "xgboost": {
+            "objective",
+            "eval_metric",
+            "max_depth",
+            "eta",
+            "max_rounds",
+            "cv_folds",
+        },
+        "lightgbm": {
+            "objective",
+            "metric",
+            "learning_rate",
+            "num_leaves",
+            "min_data_in_leaf",
+            "verbosity",
+            "max_rounds",
+            "cv_folds",
+            "early_stopping_rounds",
+        },
+    },
+    "classification": {
+        "ols": {"C", "l1_ratio", "solver", "max_iter"},
+        "ridge": {"C", "l1_ratio", "solver", "max_iter"},
+        "lasso": {"penalty", "C", "l1_ratio", "solver", "max_iter"},
+        "elastic_net": {"penalty", "C", "solver", "l1_ratio", "max_iter"},
+        "random_forest": {"n_estimators", "max_features", "min_samples_leaf"},
+        "xgboost": {
+            "objective",
+            "eval_metric",
+            "max_depth",
+            "learning_rate",
+            "n_estimators",
+        },
+        "lightgbm": {
+            "objective",
+            "learning_rate",
+            "num_leaves",
+            "min_data_in_leaf",
+            "n_estimators",
+            "verbosity",
+        },
+    },
+}
+
 _BART_RANDOM_LOCK = threading.Lock()
+
+
+def load_model_params(
+    path: Path,
+    *,
+    task: str,
+    models: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Load task-specific parameters for exactly the selected models."""
+
+    params_path = Path(path)
+    if not params_path.exists():
+        raise FileNotFoundError(f"Model parameter YAML not found: {params_path}")
+    try:
+        with params_path.open(encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid model parameter YAML {params_path}: {exc}") from exc
+
+    if not isinstance(document, dict):
+        raise ValueError(f"Model parameter YAML must contain a mapping: {params_path}")
+    task_params = document.get(task)
+    if not isinstance(task_params, dict):
+        raise ValueError(
+            f"Model parameter YAML is missing a '{task}' mapping: {params_path}"
+        )
+
+    normalized_models = [str(model).lower() for model in models]
+    missing = sorted(set(normalized_models) - set(task_params))
+    if missing:
+        raise ValueError(
+            f"Model parameter YAML {task} section is missing selected model(s): "
+            f"{', '.join(missing)}"
+        )
+
+    selected: dict[str, dict[str, Any]] = {}
+    for model_name in normalized_models:
+        model_params = task_params[model_name]
+        if not isinstance(model_params, dict):
+            raise ValueError(
+                f"Parameters for {task} model '{model_name}' must be a mapping."
+            )
+        selected[model_name] = _validated_params(task, model_name, model_params)
+    return selected
+
+
+def _validated_params(
+    task: str,
+    model_name: str,
+    params: Mapping[str, Any],
+) -> dict[str, Any]:
+    allowed = MODEL_PARAM_KEYS.get(task, {}).get(model_name)
+    if allowed is None:
+        if model_name == "bart":
+            return dict(params)
+        raise ValueError(
+            f"Unknown {task} model '{model_name}'. Choose from: "
+            f"{', '.join(MODEL_NAMES)}"
+        )
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Invalid parameters for {task} model '{model_name}': "
+            f"{', '.join(unknown)}"
+        )
+    return dict(params)
+
+
+def _apply_environment_overrides(
+    model_name: str,
+    params: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Preserve the established cluster environment overrides."""
+
+    result = dict(params)
+    env_key = None
+    parameter = None
+    if model_name == "xgboost":
+        env_key = "XGB_MAX_ROUNDS"
+        parameter = "max_rounds" if "max_rounds" in result else "n_estimators"
+    elif model_name == "lightgbm":
+        env_key = "LGBM_MAX_ROUNDS"
+        parameter = "max_rounds" if "max_rounds" in result else "n_estimators"
+    if env_key is not None and parameter is not None and env_key in os.environ:
+        result[parameter] = int(os.environ[env_key])
+
+    if model_name == "random_forest":
+        if "RF_N_ESTIMATORS" in os.environ:
+            result["n_estimators"] = int(os.environ["RF_N_ESTIMATORS"])
+        if "RF_MAX_FEATURES" in os.environ:
+            result["max_features"] = os.environ["RF_MAX_FEATURES"]
+        if "RF_MIN_SAMPLES_LEAF" in os.environ:
+            result["min_samples_leaf"] = int(os.environ["RF_MIN_SAMPLES_LEAF"])
+    return result
 
 
 def _median_imputer() -> SimpleImputer:
@@ -47,20 +216,36 @@ def _median_imputer() -> SimpleImputer:
 class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
     """Source-aligned XGBoost: depth 2, eta .3, CV-selected rounds <= 90."""
 
-    def __init__(self, seed: int = 333, n_jobs: int = 1, max_rounds: int = 90):
+    def __init__(
+        self,
+        seed: int,
+        n_jobs: int,
+        *,
+        objective: str,
+        eval_metric: str,
+        max_depth: int,
+        eta: float,
+        max_rounds: int,
+        cv_folds: int,
+    ):
         self.seed = seed
         self.n_jobs = n_jobs
+        self.objective = objective
+        self.eval_metric = eval_metric
+        self.max_depth = max_depth
+        self.eta = eta
         self.max_rounds = max_rounds
+        self.cv_folds = cv_folds
 
     def fit(self, X, y):
         import xgboost as xgb
 
         dtrain = xgb.DMatrix(X, label=np.asarray(y, dtype=float))
         self.params_ = {
-            "objective": "reg:squarederror",
-            "eval_metric": "rmse",
-            "max_depth": 2,
-            "eta": 0.3,
+            "objective": self.objective,
+            "eval_metric": self.eval_metric,
+            "max_depth": self.max_depth,
+            "eta": self.eta,
             "nthread": self.n_jobs,
             "seed": self.seed,
         }
@@ -68,7 +253,7 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
             self.params_,
             dtrain,
             num_boost_round=self.max_rounds,
-            nfold=5,
+            nfold=self.cv_folds,
             seed=self.seed,
             shuffle=True,
             verbose_eval=False,
@@ -88,33 +273,57 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
 class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
     """LightGBM extension with CV-selected boosting rounds."""
 
-    def __init__(self, seed: int = 333, n_jobs: int = 1, max_rounds: int = 200):
+    def __init__(
+        self,
+        seed: int,
+        n_jobs: int,
+        *,
+        objective: str,
+        metric: str,
+        learning_rate: float,
+        num_leaves: int,
+        min_data_in_leaf: int,
+        verbosity: int,
+        max_rounds: int,
+        cv_folds: int,
+        early_stopping_rounds: int,
+    ):
         self.seed = seed
         self.n_jobs = n_jobs
+        self.objective = objective
+        self.metric = metric
+        self.learning_rate = learning_rate
+        self.num_leaves = num_leaves
+        self.min_data_in_leaf = min_data_in_leaf
+        self.verbosity = verbosity
         self.max_rounds = max_rounds
+        self.cv_folds = cv_folds
+        self.early_stopping_rounds = early_stopping_rounds
 
     def fit(self, X, y):
         import lightgbm as lgb
 
         train = lgb.Dataset(X, label=np.asarray(y, dtype=float))
         self.params_ = {
-            "objective": "regression",
-            "metric": "rmse",
-            "learning_rate": 0.05,
-            "num_leaves": 10,
-            "min_data_in_leaf": 20,
+            "objective": self.objective,
+            "metric": self.metric,
+            "learning_rate": self.learning_rate,
+            "num_leaves": self.num_leaves,
+            "min_data_in_leaf": self.min_data_in_leaf,
             "num_threads": self.n_jobs,
             "seed": self.seed,
-            "verbosity": -1,
+            "verbosity": self.verbosity,
         }
         cv = lgb.cv(
             self.params_,
             train,
             num_boost_round=self.max_rounds,
-            nfold=5,
+            nfold=self.cv_folds,
             stratified=False,
             seed=self.seed,
-            callbacks=[lgb.early_stopping(10, verbose=False)],
+            callbacks=[
+                lgb.early_stopping(self.early_stopping_rounds, verbose=False)
+            ],
         )
         metric_key = next(key for key in cv if key.endswith("rmse-mean"))
         self.best_rounds_ = int(np.argmin(cv[metric_key])) + 1
@@ -128,14 +337,31 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
 
 
 class AdaptiveRidgeCV(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        *,
+        alpha_log10_min: float,
+        alpha_log10_max: float,
+        n_alphas: int,
+        max_cv_folds: int,
+        scoring: str,
+    ):
+        self.alpha_log10_min = alpha_log10_min
+        self.alpha_log10_max = alpha_log10_max
+        self.n_alphas = n_alphas
+        self.max_cv_folds = max_cv_folds
+        self.scoring = scoring
+
     def fit(self, X, y):
-        cv = min(5, len(y))
+        cv = min(self.max_cv_folds, len(y))
         if cv < 2:
             raise ValueError("Ridge requires at least two training rows.")
         self.model_ = RidgeCV(
-            alphas=np.logspace(-4, 4, 50),
+            alphas=np.logspace(
+                self.alpha_log10_min, self.alpha_log10_max, self.n_alphas
+            ),
             cv=cv,
-            scoring="neg_mean_squared_error",
+            scoring=self.scoring,
         ).fit(X, y)
         return self
 
@@ -144,18 +370,35 @@ class AdaptiveRidgeCV(BaseEstimator, RegressorMixin):
 
 
 class AdaptiveLassoCV(BaseEstimator, RegressorMixin):
-    def __init__(self, seed: int = 12345, n_jobs: int = 1):
+    def __init__(
+        self,
+        seed: int,
+        n_jobs: int,
+        *,
+        alpha_log10_min: float,
+        alpha_log10_max: float,
+        n_alphas: int,
+        max_cv_folds: int,
+        max_iter: int,
+    ):
         self.seed = seed
         self.n_jobs = n_jobs
+        self.alpha_log10_min = alpha_log10_min
+        self.alpha_log10_max = alpha_log10_max
+        self.n_alphas = n_alphas
+        self.max_cv_folds = max_cv_folds
+        self.max_iter = max_iter
 
     def fit(self, X, y):
-        cv = min(5, len(y))
+        cv = min(self.max_cv_folds, len(y))
         if cv < 2:
             raise ValueError("Lasso requires at least two training rows.")
         self.model_ = LassoCV(
-            alphas=np.logspace(-4, 1, 50),
+            alphas=np.logspace(
+                self.alpha_log10_min, self.alpha_log10_max, self.n_alphas
+            ),
             cv=cv,
-            max_iter=20000,
+            max_iter=self.max_iter,
             n_jobs=self.n_jobs,
             random_state=self.seed,
         ).fit(X, y)
@@ -166,19 +409,38 @@ class AdaptiveLassoCV(BaseEstimator, RegressorMixin):
 
 
 class AdaptiveElasticNetCV(BaseEstimator, RegressorMixin):
-    def __init__(self, seed: int = 12345, n_jobs: int = 1):
+    def __init__(
+        self,
+        seed: int,
+        n_jobs: int,
+        *,
+        alpha_log10_min: float,
+        alpha_log10_max: float,
+        n_alphas: int,
+        l1_ratio: Sequence[float],
+        max_cv_folds: int,
+        max_iter: int,
+    ):
         self.seed = seed
         self.n_jobs = n_jobs
+        self.alpha_log10_min = alpha_log10_min
+        self.alpha_log10_max = alpha_log10_max
+        self.n_alphas = n_alphas
+        self.l1_ratio = l1_ratio
+        self.max_cv_folds = max_cv_folds
+        self.max_iter = max_iter
 
     def fit(self, X, y):
-        cv = min(5, len(y))
+        cv = min(self.max_cv_folds, len(y))
         if cv < 2:
             raise ValueError("Elastic Net requires at least two training rows.")
         self.model_ = ElasticNetCV(
-            alphas=np.logspace(-4, 1, 50),
-            l1_ratio=[0.1, 0.5, 0.9],
+            alphas=np.logspace(
+                self.alpha_log10_min, self.alpha_log10_max, self.n_alphas
+            ),
+            l1_ratio=self.l1_ratio,
             cv=cv,
-            max_iter=20000,
+            max_iter=self.max_iter,
             n_jobs=self.n_jobs,
             random_state=self.seed,
         ).fit(X, y)
@@ -267,17 +529,18 @@ class BartPyClassifier(BaseEstimator):
         raise NotImplementedError("BART classification is not supported by this backend.")
 
 
-def _make_classification_model(model_name: str, seed: int, n_jobs: int = 1):
+def _make_classification_model(
+    model_name: str,
+    seed: int,
+    n_jobs: int,
+    params: Mapping[str, Any],
+):
     name = model_name.lower()
     if name == "xgboost":
         import xgboost as xgb
 
         return xgb.XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="logloss",
-            max_depth=2,
-            learning_rate=0.3,
-            n_estimators=int(os.environ.get("XGB_MAX_ROUNDS", "90")),
+            **params,
             n_jobs=n_jobs,
             random_state=seed,
         )
@@ -285,24 +548,16 @@ def _make_classification_model(model_name: str, seed: int, n_jobs: int = 1):
         import lightgbm as lgb
 
         return lgb.LGBMClassifier(
-            objective="binary",
-            learning_rate=0.05,
-            num_leaves=10,
-            min_data_in_leaf=20,
-            n_estimators=int(os.environ.get("LGBM_MAX_ROUNDS", "200")),
+            **params,
             n_jobs=n_jobs,
             random_state=seed,
-            verbosity=-1,
         )
     if name == "ols":
         return make_pipeline(
             _median_imputer(),
             StandardScaler(),
             LogisticRegression(
-                C=1e12,
-                l1_ratio=0.0,
-                solver="lbfgs",
-                max_iter=20000,
+                **params,
                 random_state=seed,
             ),
         )
@@ -311,10 +566,7 @@ def _make_classification_model(model_name: str, seed: int, n_jobs: int = 1):
             _median_imputer(),
             StandardScaler(),
             LogisticRegression(
-                C=1.0,
-                l1_ratio=0.0,
-                solver="lbfgs",
-                max_iter=20000,
+                **params,
                 random_state=seed,
             ),
         )
@@ -323,11 +575,7 @@ def _make_classification_model(model_name: str, seed: int, n_jobs: int = 1):
             _median_imputer(),
             StandardScaler(),
             LogisticRegression(
-                penalty="l1",
-                C=1.0,
-                l1_ratio=1.0,
-                solver="saga",
-                max_iter=20000,
+                **params,
                 random_state=seed,
             ),
         )
@@ -336,11 +584,7 @@ def _make_classification_model(model_name: str, seed: int, n_jobs: int = 1):
             _median_imputer(),
             StandardScaler(),
             LogisticRegression(
-                penalty="elasticnet",
-                C=1.0,
-                solver="saga",
-                l1_ratio=0.5,
-                max_iter=20000,
+                **params,
                 random_state=seed,
             ),
         )
@@ -348,9 +592,7 @@ def _make_classification_model(model_name: str, seed: int, n_jobs: int = 1):
         return make_pipeline(
             _median_imputer(),
             RandomForestClassifier(
-                n_estimators=int(os.environ.get("RF_N_ESTIMATORS", "500")),
-                max_features=os.environ.get("RF_MAX_FEATURES", "sqrt"),
-                min_samples_leaf=int(os.environ.get("RF_MIN_SAMPLES_LEAF", "1")),
+                **params,
                 n_jobs=n_jobs,
                 random_state=seed,
             ),
@@ -360,58 +602,77 @@ def _make_classification_model(model_name: str, seed: int, n_jobs: int = 1):
     raise ValueError(f"Unknown model '{model_name}'. Choose from: {', '.join(MODEL_NAMES)}")
 
 
-def make_model(model_name: str, seed: int, n_jobs: int = 1, task: str = "regression"):
+def make_model(
+    model_name: str,
+    seed: int,
+    n_jobs: int = 1,
+    task: str = "regression",
+    params: Mapping[str, Any] | None = None,
+):
     """Construct one model using source-aligned or documented extension settings."""
 
-    if task == "classification":
-        return _make_classification_model(model_name, seed=seed, n_jobs=n_jobs)
-    if task != "regression":
+    if task not in {"regression", "classification"}:
         raise ValueError("task must be 'regression' or 'classification'")
 
     name = model_name.lower()
+    if params is None:
+        params = load_model_params(
+            DEFAULT_MODEL_PARAMS_PATH,
+            task=task,
+            models=[name],
+        )[name]
+    resolved_params = _validated_params(task, name, params)
+    resolved_params = _apply_environment_overrides(name, resolved_params)
+
+    if task == "classification":
+        return _make_classification_model(
+            name,
+            seed=seed,
+            n_jobs=n_jobs,
+            params=resolved_params,
+        )
+
     if name == "xgboost":
         return XGBoostCVRegressor(
             seed=seed,
             n_jobs=n_jobs,
-            max_rounds=int(os.environ.get("XGB_MAX_ROUNDS", "90")),
+            **resolved_params,
         )
     if name == "lightgbm":
         return LightGBMCVRegressor(
             seed=seed,
             n_jobs=n_jobs,
-            max_rounds=int(os.environ.get("LGBM_MAX_ROUNDS", "200")),
+            **resolved_params,
         )
     if name == "ols":
         return make_pipeline(
             _median_imputer(),
             StandardScaler(),
-            LinearRegression(),
+            LinearRegression(**resolved_params),
         )
     if name == "ridge":
         return make_pipeline(
             _median_imputer(),
             StandardScaler(),
-            AdaptiveRidgeCV(),
+            AdaptiveRidgeCV(**resolved_params),
         )
     if name == "lasso":
         return make_pipeline(
             _median_imputer(),
             StandardScaler(),
-            AdaptiveLassoCV(seed=seed, n_jobs=n_jobs),
+            AdaptiveLassoCV(seed=seed, n_jobs=n_jobs, **resolved_params),
         )
     if name == "elastic_net":
         return make_pipeline(
             _median_imputer(),
             StandardScaler(),
-            AdaptiveElasticNetCV(seed=seed, n_jobs=n_jobs),
+            AdaptiveElasticNetCV(seed=seed, n_jobs=n_jobs, **resolved_params),
         )
     if name == "random_forest":
         return make_pipeline(
             _median_imputer(),
             RandomForestRegressor(
-                n_estimators=int(os.environ.get("RF_N_ESTIMATORS", "500")),
-                max_features=os.environ.get("RF_MAX_FEATURES", "sqrt"),
-                min_samples_leaf=int(os.environ.get("RF_MIN_SAMPLES_LEAF", "1")),
+                **resolved_params,
                 n_jobs=n_jobs,
                 random_state=seed,
             ),

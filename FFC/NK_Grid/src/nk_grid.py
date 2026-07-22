@@ -64,7 +64,12 @@ from experiment import (
     rows_for_experiment,
     write_checkpoint,
 )
-from model_registry import MODEL_NAMES, make_model
+from model_registry import (
+    DEFAULT_MODEL_PARAMS_PATH,
+    MODEL_NAMES,
+    load_model_params,
+    make_model,
+)
 
 
 REGRESSION_CV_MIN_N = {
@@ -136,6 +141,8 @@ class NKGridConfig:
     max_k: int
     batch_size: int
     n_jobs: int
+    min_n: int = 10
+    model_params: Path = DEFAULT_MODEL_PARAMS_PATH
     group_split_col: str | None = None
     task: str = "regression"
     bart_min_n: int = 10
@@ -143,6 +150,7 @@ class NKGridConfig:
     predictor_prefix: tuple[str, ...] = ("Aset", "Bset")
     preset: str | None = None
     test_data: Path | None = None
+    feature_manifest: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -159,21 +167,39 @@ class DrawOrders:
     feature_names: np.ndarray
 
 
-def log2_size_grid(total: int, n_sizes: int, max_size: int | None = None) -> np.ndarray:
+def log2_size_grid(
+    total: int,
+    n_sizes: int,
+    max_size: int | None = None,
+    *,
+    min_size: int = 1,
+) -> np.ndarray:
     """Return unique integer sizes on the shared base-2 log grid."""
 
     if total < 1:
         raise ValueError("total must be at least 1")
     if n_sizes < 1:
         raise ValueError("n_sizes must be at least 1")
+    if min_size < 1:
+        raise ValueError("min_size must be at least 1")
     upper = int(total if max_size is None or max_size <= 0 else min(total, max_size))
-    upper = max(1, upper)
+    if upper < min_size:
+        raise ValueError(
+            f"grid upper bound {upper} is below minimum size {min_size}"
+        )
     if n_sizes == 1:
         return np.array([upper], dtype=int)
     return np.unique(
         np.clip(
-            np.round(np.logspace(0, np.log2(upper), num=n_sizes, base=2)).astype(int),
-            1,
+            np.round(
+                np.logspace(
+                    np.log2(min_size),
+                    np.log2(upper),
+                    num=n_sizes,
+                    base=2,
+                )
+            ).astype(int),
+            min_size,
             upper,
         )
     )
@@ -479,11 +505,67 @@ def _select_output_path(
     return _timestamped_out_path(directory, stem, preset, suffix)
 
 
+def read_table(path: Path) -> pd.DataFrame:
+    """Read a supported NK input table based on its file suffix."""
+
+    suffix = Path(path).suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix in {".parquet", ".pq"}:
+        return pd.read_parquet(path)
+    raise ValueError(
+        f"Unsupported NK input format '{suffix}' for {path}; "
+        "supported suffixes are .csv, .parquet, and .pq"
+    )
+
+
 def _predictor_columns(
     frame: pd.DataFrame, prefixes: Sequence[str] = ("Aset", "Bset")
 ) -> list[str]:
     prefix_tuple = tuple(prefixes)
     return [col for col in frame.columns if col.startswith(prefix_tuple)]
+
+
+def _feature_groups(
+    predictors: Sequence[str],
+    feature_manifest: Path | None = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Return selectable feature units and their expanded predictor columns."""
+
+    predictor_list = list(predictors)
+    if feature_manifest is None:
+        return predictor_list, {column: [column] for column in predictor_list}
+
+    manifest = pd.read_csv(feature_manifest)
+    required_columns = {"source_column", "feature_name"}
+    missing_columns = required_columns - set(manifest.columns)
+    if missing_columns:
+        raise ValueError(
+            "Feature manifest is missing required column(s): "
+            f"{', '.join(sorted(missing_columns))}"
+        )
+    if "keep" in manifest.columns:
+        manifest = manifest[manifest["keep"].astype(bool)]
+
+    predictor_set = set(predictor_list)
+    grouped: dict[str, list[str]] = {}
+    for row in manifest.loc[:, ["source_column", "feature_name"]].itertuples(index=False):
+        source = str(row.source_column)
+        feature_name = str(row.feature_name)
+        if feature_name not in predictor_set:
+            continue
+        grouped.setdefault(source, []).append(feature_name)
+
+    grouped_predictors = {
+        feature_name for feature_names in grouped.values() for feature_name in feature_names
+    }
+    missing_predictors = [column for column in predictor_list if column not in grouped_predictors]
+    if missing_predictors:
+        raise ValueError(
+            "Feature manifest does not map selected predictor column(s): "
+            f"{', '.join(missing_predictors[:10])}"
+        )
+    return list(grouped), grouped
 
 
 def _validate_classification_outcome(values: pd.Series, *, context: str) -> None:
@@ -508,6 +590,8 @@ def _base_row(
     n_train_total: int,
     n_test_total: int,
     n_features_total: int,
+    k_expanded: int,
+    n_expanded_features_total: int,
 ) -> dict:
     return {
         "dataset": dataset,
@@ -521,6 +605,8 @@ def _base_row(
         "n_train_total": int(n_train_total),
         "n_test_total": int(n_test_total),
         "n_features_total": int(n_features_total),
+        "K_expanded": int(k_expanded),
+        "n_expanded_features_total": int(n_expanded_features_total),
     }
 
 
@@ -551,14 +637,20 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
     if not data_path.exists():
         raise FileNotFoundError(f"NLSY analysis data not found: {data_path}")
 
-    frame = pd.read_csv(data_path)
+    frame = read_table(data_path)
+    model_params_path = Path(config.model_params)
+    selected_model_params = load_model_params(
+        model_params_path,
+        task=config.task,
+        models=config.models,
+    )
     external_mode = config.test_data is not None
     test_path = Path(config.test_data) if config.test_data is not None else None
     test_frame = None
     if external_mode:
         if not test_path.exists():
             raise FileNotFoundError(f"External test data not found: {test_path}")
-        test_frame = pd.read_csv(test_path)
+        test_frame = read_table(test_path)
         if config.outcome not in frame:
             raise KeyError(f"Outcome not found in training data: {config.outcome}")
         if config.outcome not in test_frame:
@@ -572,6 +664,10 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             f"{list(config.predictor_prefix)}. Pass --predictor-prefix to match "
             "your dataset's feature column names."
         )
+    feature_manifest_path = (
+        Path(config.feature_manifest) if config.feature_manifest is not None else None
+    )
+    feature_units, feature_groups = _feature_groups(predictors, feature_manifest_path)
     if external_mode:
         missing_predictors = [column for column in predictors if column not in test_frame]
         if missing_predictors:
@@ -614,14 +710,22 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         "n_draws": config.n_draws,
         "n_sizes_n": config.n_sizes_n,
         "n_sizes_k": config.n_sizes_k,
+        "min_n": config.min_n,
         "max_n": config.max_n,
         "max_k": config.max_k,
         "predictor_prefix": ",".join(config.predictor_prefix),
+        "feature_manifest": str(feature_manifest_path) if feature_manifest_path else None,
+        "feature_manifest_sha256": (
+            file_sha256(feature_manifest_path) if feature_manifest_path else None
+        ),
         "group_split_col": config.group_split_col,
         "bart_min_n": config.bart_min_n,
         "bart_min_k": config.bart_min_k,
         "split_mode": split_mode,
         "test_data_sha256": test_data_sha256,
+        "model_params_path": str(model_params_path),
+        "model_params_sha256": file_sha256(model_params_path),
+        "model_params": selected_model_params,
         **model_run_settings(config.models),
     }
     if config.task == "classification":
@@ -656,8 +760,9 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         len(next(iter(splits.values())).X_train),
         config.n_sizes_n,
         config.max_n,
+        min_size=config.min_n,
     )
-    k_grid = log2_size_grid(len(predictors), config.n_sizes_k, config.max_k)
+    k_grid = log2_size_grid(len(feature_units), config.n_sizes_k, config.max_k)
     log_progress(
         "grid "
         f"N={n_grid.tolist()} K={k_grid.tolist()} "
@@ -698,6 +803,14 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
         k_features: int,
     ) -> dict:
         split = splits[seed]
+        orders = draw_orders(split.X_train.index, feature_units, seed=seed, draw=draw)
+        selected_rows = orders.row_index[:n_samples]
+        selected_units = orders.feature_names[:k_features]
+        selected_cols = [
+            column
+            for unit in selected_units
+            for column in feature_groups[str(unit)]
+        ]
         row = _base_row(
             dataset=config.dataset,
             outcome=config.outcome,
@@ -708,7 +821,9 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
             k_features=k_features,
             n_train_total=len(split.X_train),
             n_test_total=len(split.X_test),
-            n_features_total=len(predictors),
+            n_features_total=len(feature_units),
+            k_expanded=len(selected_cols),
+            n_expanded_features_total=len(predictors),
         )
         if (
             model_name == "bart"
@@ -747,9 +862,6 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                 metadata,
             )
         try:
-            orders = draw_orders(split.X_train.index, predictors, seed=seed, draw=draw)
-            selected_rows = orders.row_index[:n_samples]
-            selected_cols = orders.feature_names[:k_features]
             X_sub = split.X_train.loc[selected_rows, selected_cols]
             y_sub = split.y_train.loc[selected_rows]
             X_test = split.X_test.loc[:, selected_cols]
@@ -769,6 +881,7 @@ def run_nk_grid(config: NKGridConfig, *, max_jobs: int | None = None) -> None:
                 seed=_model_seed(seed, draw, n_samples, k_features),
                 n_jobs=1,
                 task=config.task,
+                params=selected_model_params[model_name],
             )
             model.fit(X_sub, y_sub)
             if config.task == "classification":
@@ -850,6 +963,7 @@ def parse_args() -> NKGridConfig:
     )
     parser.add_argument("--data", default=str(ROOT / "data" / "asample2_withlag.csv"))
     parser.add_argument("--test-data", default=None)
+    parser.add_argument("--feature-manifest", default=None)
     parser.add_argument("--task", default="regression", choices=("regression", "classification"))
     parser.add_argument("--outcome", default=None)
     parser.add_argument("--out", default=None)
@@ -861,11 +975,13 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--n-draws", type=int, default=2)
     parser.add_argument("--n-sizes-n", type=int, default=4)
     parser.add_argument("--n-sizes-k", type=int, default=4)
+    parser.add_argument("--min-n", type=int, default=10)
     parser.add_argument("--max-n", type=int, default=100, help="Use <=0 for full train set.")
     parser.add_argument("--max-k", type=int, default=100, help="Use <=0 for all features.")
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--bart-min-n", type=int, default=10)
     parser.add_argument("--bart-min-k", type=int, default=2)
+    parser.add_argument("--model-params", default=str(DEFAULT_MODEL_PARAMS_PATH))
     parser.add_argument("--group-split-col", default=None)
     parser.add_argument(
         "--predictor-prefix",
@@ -900,6 +1016,9 @@ def parse_args() -> NKGridConfig:
     return NKGridConfig(
         data=Path(args.data),
         test_data=Path(args.test_data) if args.test_data is not None else None,
+        feature_manifest=(
+            Path(args.feature_manifest) if args.feature_manifest is not None else None
+        ),
         out=Path(out),
         dataset=args.dataset,
         outcome=outcome,
@@ -910,12 +1029,14 @@ def parse_args() -> NKGridConfig:
         n_draws=args.n_draws,
         n_sizes_n=args.n_sizes_n,
         n_sizes_k=args.n_sizes_k,
+        min_n=args.min_n,
         max_n=args.max_n,
         max_k=args.max_k,
         batch_size=args.batch_size,
         n_jobs=args.n_jobs,
         group_split_col=args.group_split_col,
         task=args.task,
+        model_params=Path(args.model_params),
         bart_min_n=args.bart_min_n,
         bart_min_k=args.bart_min_k,
         predictor_prefix=tuple(args.predictor_prefix),

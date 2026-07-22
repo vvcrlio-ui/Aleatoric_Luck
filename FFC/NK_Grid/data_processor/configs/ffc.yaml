@@ -1,0 +1,29 @@
+paths:
+  background: ../../data/private/background.dta
+  train: ../../data/private/train.csv
+  test: ../../data/private/test.csv
+  output_root: ../../data/intermediate_files/preprocessing
+
+id_column: challengeID
+outcomes:
+  - gpa
+  - grit
+  - materialHardship
+  - eviction
+  - layoff
+  - jobTraining
+
+strategies:
+  - median_mode
+  - median_missing_indicator
+  - tree_ordinal
+
+schema:
+  min_valid_rate: 0.5
+  min_numeric_fraction: 0.95
+  categorical_max_levels: 15
+  min_binary_prevalence: 0.01
+
+# Test-only unknown categories are normally reported and mapped to NaN.
+# This ceiling is intentionally high and catches broken mappings/joins.
+unknown_rate_threshold: 0.95
