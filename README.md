@@ -61,10 +61,19 @@ recovery semantics.
 - Schemas are the only semantic authority; panel files contain run controls
   only.
 
-See [`docs/upstream-adapter-spec.md`](docs/upstream-adapter-spec.md) for the
-contract (including the checklist for wiring a new article) and
+## Adding an article
+
+[`docs/writing-an-adapter.md`](docs/writing-an-adapter.md) is the step-by-step
+guide: what belongs to the adapter versus the engine, how to produce an ARD,
+feature manifest, feature universe, schema and provenance, and what the
+fail-fast validator rejects. `SMR/adapter/` is the minimal reference (all
+continuous, internal split); `FFCWS/adapter/` is the full one (external test
+set, typed manifests).
+
+The normative contract is
+[`docs/upstream-adapter-spec.md`](docs/upstream-adapter-spec.md), and
 [`docs/split-nk-grid-engine-adapter.md`](docs/split-nk-grid-engine-adapter.md)
-for the migration design.
+records the migration design.
 
 ## Data
 
