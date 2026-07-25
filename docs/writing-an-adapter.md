@@ -1,7 +1,5 @@
 # Writing an adapter for the NK Grid engine
 
-*中文版:[`writing-an-adapter.zh-CN.md`](writing-an-adapter.zh-CN.md)*
-
 This guide walks through connecting a new dataset to the shared
 `aleatoric_nk_grid` engine. It is written for someone who has a dataset and a
 research question, not for someone modifying the engine.
