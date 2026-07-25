@@ -1,0 +1,39 @@
+{
+  "continuous_priors": null,
+  "dataset": "asample2_withlag",
+  "exchangeable": true,
+  "feature_manifest": null,
+  "feature_manifest_version": null,
+  "feature_universe": {
+    "definition_file": "asample2_withlag.feature_universe.json",
+    "definition_sha256": "2d261c5d6502945af05db990f632399739b258bedf6f618abbbba324a5e551da",
+    "mode": "fixed_a_priori"
+  },
+  "group_column": null,
+  "id_column": null,
+  "imputation": {
+    "continuous": "median",
+    "model_overrides": {
+      "lightgbm": "passthrough",
+      "xgboost": "passthrough"
+    },
+    "onehot_group": "atomic_mode",
+    "ordinal": "most_frequent"
+  },
+  "max_test_outcome_missing_ratio": 0.5,
+  "max_train_outcome_missing_ratio": 0.5,
+  "outcome_columns": [
+    "Cm_lhourlywage",
+    "Cm_ltotalincome"
+  ],
+  "predictor_columns": null,
+  "predictor_prefix": [
+    "Aset",
+    "Bset"
+  ],
+  "schema_version": 1,
+  "split_mode": "internal_random",
+  "table": "../data/ard/asample2_withlag/data.csv",
+  "task": "regression",
+  "test_table": null
+}

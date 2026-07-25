@@ -1,0 +1,1 @@
+# Keep this directory so Slurm can open configured stdout/stderr files.

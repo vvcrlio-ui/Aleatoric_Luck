@@ -1,5 +1,5 @@
 model_params: model_params.yaml
-preset: medium
+preset: dev
 
 panels:
   - name: smr_hourlywage

@@ -8,6 +8,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -30,6 +32,8 @@ MODEL_ENV_KEYS = (
 CHECKPOINT_KEY_COLUMNS = ["model", "seed", "draw", "N", "K"]
 CHECKPOINT_SORT_COLUMNS = ["model", "seed", "draw", "N", "K"]
 MANIFEST_SCHEMA_VERSION = "1"
+COMPLETED_CHECKPOINT_STATUSES = frozenset({"ok", "skipped"})
+SERIAL_OUTER_MODELS = frozenset({"lightgbm", "super_learner"})
 
 
 def file_sha256(path: Path) -> str:
@@ -83,8 +87,8 @@ def load_checkpoint(path: Path) -> pd.DataFrame:
         frame = pd.concat((pd.read_csv(part) for part in parts), ignore_index=True)
         if frame.empty:
             return frame
-        frame = frame.drop_duplicates(
-            ["experiment_id", *CHECKPOINT_KEY_COLUMNS], keep="last"
+        frame = _prefer_completed_checkpoint_rows(
+            frame, ["experiment_id", *CHECKPOINT_KEY_COLUMNS]
         )
         return frame.sort_values(
             ["experiment_id", *CHECKPOINT_SORT_COLUMNS]
@@ -98,6 +102,28 @@ def load_checkpoint(path: Path) -> pd.DataFrame:
             "Remove it or choose a new --out path before resuming."
         )
     return frame
+
+
+def _prefer_completed_checkpoint_rows(
+    frame: pd.DataFrame, key_columns: list[str]
+) -> pd.DataFrame:
+    """Deduplicate cells without allowing a failed retry to hide a success."""
+
+    if frame.empty:
+        return frame
+    if "status" not in frame:
+        return frame.drop_duplicates(key_columns, keep="last")
+    priority_column = "_checkpoint_status_priority"
+    prioritized = frame.assign(
+        **{
+            priority_column: frame["status"]
+            .isin(COMPLETED_CHECKPOINT_STATUSES)
+            .astype("int8")
+        }
+    ).sort_values(priority_column, kind="stable")
+    return prioritized.drop_duplicates(key_columns, keep="last").drop(
+        columns=priority_column
+    )
 
 
 def rows_for_experiment(frame: pd.DataFrame, experiment_id: str) -> pd.DataFrame:
@@ -125,7 +151,9 @@ def write_checkpoint(
     if not frames:
         return
     result = pd.concat(frames, ignore_index=True)
-    result = result.drop_duplicates(["experiment_id", *key_columns], keep="last")
+    result = _prefer_completed_checkpoint_rows(
+        result, ["experiment_id", *key_columns]
+    )
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     result.sort_values(["experiment_id", *sort_columns]).to_csv(tmp, index=False)
     tmp.replace(out_path)
@@ -143,22 +171,30 @@ def checkpoint_parts(out_path: Path) -> list[Path]:
 
 
 def write_checkpoint_part(rows: Iterable[dict[str, Any]], out_path: Path) -> Path | None:
-    """Atomically append one immutable checkpoint shard."""
+    """Atomically append one checkpoint shard without rewriting prior shards."""
 
     frame = pd.DataFrame(list(rows))
     if frame.empty:
         return None
     directory = checkpoint_parts_dir(out_path)
     directory.mkdir(parents=True, exist_ok=True)
-    existing = checkpoint_parts(out_path)
-    next_index = 1
-    if existing:
-        next_index = max(int(path.stem.split("-")[-1]) for path in existing) + 1
-    part = directory / f"part-{next_index:06d}.csv"
-    tmp = part.with_suffix(part.suffix + ".tmp")
-    frame.to_csv(tmp, index=False)
-    tmp.replace(part)
-    return part
+    token = uuid.uuid4().hex
+    tmp = directory / f".part-{token}.tmp"
+    while True:
+        try:
+            descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            os.close(descriptor)
+            break
+        except FileExistsError:
+            token = uuid.uuid4().hex
+            tmp = directory / f".part-{token}.tmp"
+    try:
+        frame.to_csv(tmp, index=False)
+        part = directory / f"part-{time.time_ns():020d}-{uuid.uuid4().hex}.csv"
+        os.replace(tmp, part)
+        return part
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def merge_checkpoint_parts(
@@ -168,7 +204,7 @@ def merge_checkpoint_parts(
     sort_columns: list[str] | None = None,
     drop_output_columns: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Atomically materialize the final CSV from immutable checkpoint shards."""
+    """Atomically materialize the final CSV from append-only checkpoint shards."""
 
     key_columns = key_columns or CHECKPOINT_KEY_COLUMNS
     sort_columns = sort_columns or CHECKPOINT_SORT_COLUMNS
@@ -307,6 +343,12 @@ def parallel_preference(models: Iterable[str]) -> str:
     """Isolate BART's process-global RNG when jobs run concurrently."""
 
     return "processes" if "bart" in set(models) else "threads"
+
+
+def effective_outer_n_jobs(model_name: str, configured_n_jobs: int) -> int:
+    """Return safe Joblib parallelism for one selected model."""
+
+    return 1 if model_name in SERIAL_OUTER_MODELS else configured_n_jobs
 
 
 def model_run_settings(models: Iterable[str]) -> dict[str, Any]:

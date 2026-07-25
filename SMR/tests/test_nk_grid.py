@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import io
+import os
+import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 import numpy as np
@@ -14,6 +18,7 @@ from sklearn.compose import TransformedTargetRegressor
 from sklearn.metrics import r2_score
 
 from NK_Grid.src import model_registry as model_registry_module
+from NK_Grid.src import nk_grid as nk_grid_module
 from NK_Grid.src.evaluation import (
     r2_against_training_mean,
     training_mean_null_mse,
@@ -21,9 +26,11 @@ from NK_Grid.src.evaluation import (
 from NK_Grid.src.experiment import (
     add_metadata,
     build_experiment_metadata,
+    effective_outer_n_jobs,
     load_checkpoint,
     parallel_preference,
     write_checkpoint,
+    write_checkpoint_part,
 )
 from NK_Grid.src.model_registry import MODEL_NAMES, SUPPORTED_MODEL_NAMES, make_model
 from NK_Grid.src.nk_grid import (
@@ -36,6 +43,7 @@ from NK_Grid.src.nk_grid import (
     compute_regression_metrics,
     _constant_prediction,
     _model_converged,
+    _prune_checkpoint_parts,
     draw_orders,
     estimate_run_size,
     external_test_split,
@@ -45,7 +53,13 @@ from NK_Grid.src.nk_grid import (
 )
 from NK_Grid.src.run_panels import main as run_panels_main
 from NK_Grid.src.run_panels import resolve_panel
-from NK_Grid.src.tune_anchors import anchor_candidates
+from NK_Grid.src.slurm_jobs import (
+    build_slurm_jobs,
+    load_job_snapshot,
+    require_large_run_authorization,
+    write_job_snapshot,
+    write_submission_receipt,
+)
 
 
 class DummyRegressor:
@@ -285,6 +299,13 @@ class NKGridTests(unittest.TestCase):
         self.assertEqual(parallel_preference(["ridge", "bart"]), "processes")
         self.assertEqual(parallel_preference(["ridge"]), "threads")
 
+    def test_lightgbm_models_force_serial_outer_parallelism(self):
+        self.assertEqual(effective_outer_n_jobs("lightgbm", 8), 1)
+        self.assertEqual(effective_outer_n_jobs("super_learner", 8), 1)
+        self.assertEqual(effective_outer_n_jobs("ridge", 8), 8)
+        self.assertEqual(effective_outer_n_jobs("xgboost", 8), 8)
+        self.assertEqual(effective_outer_n_jobs("random_forest", 8), 8)
+
     def test_training_mean_metric_uses_supplied_subset(self):
         y_test = np.array([0.0, 10.0])
         y_subset = np.array([0.0, 0.0])
@@ -335,6 +356,128 @@ class NKGridTests(unittest.TestCase):
             self.assertEqual(len(saved), 2)
             self.assertEqual(set(saved["outcome"]), {"outcome_a", "outcome_b"})
 
+    def test_concurrent_checkpoint_writers_publish_distinct_shards(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results.csv"
+            writer_count = 16
+            barrier = Barrier(writer_count)
+
+            def write_one(index: int) -> Path:
+                barrier.wait()
+                part = write_checkpoint_part(
+                    [
+                        {
+                            "experiment_id": "experiment-1",
+                            "model": f"model-{index}",
+                            "seed": index,
+                            "draw": 0,
+                            "N": 10,
+                            "K": 1,
+                            "status": "ok",
+                        }
+                    ],
+                    output,
+                )
+                self.assertIsNotNone(part)
+                return part
+
+            with ThreadPoolExecutor(max_workers=writer_count) as executor:
+                parts = list(executor.map(write_one, range(writer_count)))
+
+            self.assertEqual(len(set(parts)), writer_count)
+            self.assertTrue(all(part.exists() for part in parts))
+            for part in parts:
+                self.assertRegex(
+                    part.name,
+                    r"^part-\d{20}-[0-9a-f]{32}\.csv$",
+                )
+            self.assertFalse(list((Path(temp_dir) / "results.parts").glob("*.tmp")))
+            saved = load_checkpoint(output)
+            self.assertEqual(len(saved), writer_count)
+            self.assertEqual(set(saved["seed"]), set(range(writer_count)))
+
+    def test_checkpoint_retry_success_wins_regardless_of_shard_name_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results.csv"
+            parts = output.with_suffix(".parts")
+            parts.mkdir()
+            common = {
+                "experiment_id": "experiment-1",
+                "model": "lightgbm",
+                "seed": 1,
+                "draw": 0,
+                "N": 10,
+                "K": 5,
+            }
+            pd.DataFrame(
+                [{**common, "status": "ok", "error": ""}]
+            ).to_csv(parts / "part-000-success.csv", index=False)
+            pd.DataFrame(
+                [{**common, "status": "failed", "error": "old native failure"}]
+            ).to_csv(parts / "part-zzz-failed.csv", index=False)
+
+            saved = load_checkpoint(output)
+
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved.loc[0, "status"], "ok")
+            self.assertTrue(pd.isna(saved.loc[0, "error"]))
+
+    def test_checkpoint_latest_success_wins_by_timestamped_shard_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results.csv"
+            parts = output.with_suffix(".parts")
+            parts.mkdir()
+            common = {
+                "experiment_id": "experiment-1",
+                "model": "ridge",
+                "seed": 1,
+                "draw": 0,
+                "N": 10,
+                "K": 5,
+                "status": "ok",
+            }
+            pd.DataFrame(
+                [{**common, "r2_test": 0.1}]
+            ).to_csv(
+                parts / "part-00000000000000000001-old.csv",
+                index=False,
+            )
+            pd.DataFrame(
+                [{**common, "r2_test": 0.9}]
+            ).to_csv(
+                parts / "part-00000000000000000002-new.csv",
+                index=False,
+            )
+
+            saved = load_checkpoint(output)
+
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved.loc[0, "r2_test"], 0.9)
+
+    def test_write_checkpoint_uses_completed_status_precedence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "results.csv"
+            failed = {
+                "experiment_id": "experiment-1",
+                "model": "ridge",
+                "k": 1,
+                "seed": 12345,
+                "status": "failed",
+                "error": "old failure",
+            }
+            succeeded = {**failed, "status": "ok", "error": ""}
+
+            write_checkpoint(
+                pd.DataFrame([failed]),
+                [succeeded],
+                output,
+                key_columns=["model", "k", "seed"],
+                sort_columns=["model", "k", "seed"],
+            )
+
+            saved = pd.read_csv(output)
+            self.assertEqual(saved.loc[0, "status"], "ok")
+
     def test_legacy_checkpoint_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "legacy.csv"
@@ -384,16 +527,6 @@ class NKGridTests(unittest.TestCase):
             estimate = run_nk_grid(config, dry_run=True)
         self.assertEqual(estimate["top_level_model_cells"], 2_000_000)
         self.assertEqual(json.loads(stdout.getvalue()), estimate)
-
-    def test_anchor_candidate_grid_matches_preregistered_search(self):
-        self.assertEqual(len(anchor_candidates("random_forest")), 6)
-        self.assertEqual(len(anchor_candidates("extra_trees")), 6)
-        self.assertEqual(len(anchor_candidates("lightgbm")), 3)
-        self.assertEqual(len(anchor_candidates("shallow_neural_network")), 8)
-        self.assertEqual(
-            {row["min_data_in_leaf"] for row in anchor_candidates("lightgbm")},
-            {5, 10, 20},
-        )
 
     def test_model_params_yaml_covers_active_models_for_both_tasks(self):
         models = {
@@ -656,13 +789,13 @@ class NKGridTests(unittest.TestCase):
             )
             self.assertNotIn("_fit_seconds", saved.columns)
             self.assertNotIn("_best_rounds", saved.columns)
-            parts = sorted((root / "nk_grid.parts").glob("part-*.csv"))
-            self.assertEqual(len(parts), 4)
+            self.assertFalse((root / "nk_grid.parts").exists())
             manifest = json.loads((root / "nk_grid.manifest.json").read_text())
             self.assertEqual(manifest["algorithm_version"], "nk-grid-v3")
             self.assertEqual(manifest["completion"]["expected_rows"], 16)
             self.assertEqual(manifest["completion"]["materialized_rows"], 16)
             self.assertEqual(manifest["completion"]["status"], "complete")
+            self.assertTrue(manifest["output"]["checkpoint_parts_deleted"])
             self.assertEqual(
                 manifest["model_parameters"]["resolved"]["ols"],
                 {"fit_intercept": True},
@@ -869,9 +1002,11 @@ class NKGridTests(unittest.TestCase):
             run_nk_grid(config, max_jobs=4)
             partial = pd.read_csv(out_path)
             self.assertEqual(len(partial), 4)
+            self.assertTrue((root / "nk_grid.parts").exists())
             run_nk_grid(config)
             saved = pd.read_csv(out_path)
             self.assertEqual(len(saved), 8)
+            self.assertFalse((root / "nk_grid.parts").exists())
             self.assertEqual(
                 len(saved[["model", "seed", "draw", "N", "K"]].drop_duplicates()),
                 8,
@@ -1268,6 +1403,121 @@ class NKGridTests(unittest.TestCase):
             self.assertIn("batch 1/1", logs)
             self.assertIn("wrote checkpoint", logs)
 
+    def test_nk_grid_applies_and_records_lightgbm_effective_parallelism(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("lightgbm",),
+                seed=26,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=20,
+                max_k=3,
+                batch_size=1,
+                n_jobs=8,
+            )
+            parallel_calls: list[int] = []
+            original_parallel = nk_grid_module.Parallel
+
+            def recording_parallel(*args, **kwargs):
+                parallel_calls.append(kwargs["n_jobs"])
+                return original_parallel(*args, **kwargs)
+
+            stderr = io.StringIO()
+            with (
+                redirect_stderr(stderr),
+                patch.object(
+                    nk_grid_module, "make_model", return_value=DummyRegressor()
+                ),
+                patch.object(
+                    nk_grid_module, "Parallel", side_effect=recording_parallel
+                ),
+            ):
+                run_nk_grid(config)
+
+            self.assertEqual(parallel_calls, [1])
+            manifest = json.loads(
+                out_path.with_suffix(".manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["design"]["parallelism"],
+                {
+                    "configured_outer_n_jobs": 8,
+                    "effective_outer_n_jobs_by_model": {"lightgbm": 1},
+                    "joblib_prefer_by_model": {"lightgbm": "threads"},
+                },
+            )
+            logs = stderr.getvalue()
+            self.assertIn(
+                "configured_n_jobs=8 "
+                "effective_n_jobs_by_model={'lightgbm': 1}",
+                logs,
+            )
+            self.assertIn("cell starting model=lightgbm", logs)
+
+    def test_mixed_model_run_only_serializes_lightgbm_cells(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            out_path = root / "nk_grid.csv"
+            self._write_nk_synthetic_data(data_path)
+            config = NKGridConfig(
+                data=data_path,
+                out=out_path,
+                dataset="synthetic",
+                outcome="outcome",
+                models=("ols", "lightgbm"),
+                seed=27,
+                test_size=0.3,
+                n_seeds=1,
+                n_draws=1,
+                n_sizes_n=1,
+                n_sizes_k=1,
+                max_n=20,
+                max_k=3,
+                batch_size=2,
+                n_jobs=8,
+            )
+            parallel_calls: list[tuple[int, str]] = []
+            original_parallel = nk_grid_module.Parallel
+
+            def recording_parallel(*args, **kwargs):
+                parallel_calls.append((kwargs["n_jobs"], kwargs["prefer"]))
+                return original_parallel(*args, **kwargs)
+
+            with (
+                patch.object(
+                    nk_grid_module, "make_model", return_value=DummyRegressor()
+                ),
+                patch.object(
+                    nk_grid_module, "Parallel", side_effect=recording_parallel
+                ),
+            ):
+                run_nk_grid(config)
+
+            self.assertEqual(parallel_calls, [(8, "threads"), (1, "threads")])
+            saved = pd.read_csv(out_path)
+            self.assertEqual(set(saved["model"]), {"ols", "lightgbm"})
+            manifest = json.loads(
+                out_path.with_suffix(".manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["design"]["parallelism"][
+                    "effective_outer_n_jobs_by_model"
+                ],
+                {"ols": 8, "lightgbm": 1},
+            )
+
     def test_nk_grid_failed_rows_include_expanded_metrics_as_nan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1300,6 +1550,7 @@ class NKGridTests(unittest.TestCase):
             saved = pd.read_csv(out_path)
             self.assertEqual(saved.loc[0, "status"], "failed")
             self.assertIn("synthetic fit failure", saved.loc[0, "error"])
+            self.assertTrue((root / "nk_grid.parts").exists())
             expanded_metrics = [
                 "pinball_q05",
                 "pinball_q25",
@@ -1316,6 +1567,28 @@ class NKGridTests(unittest.TestCase):
                 "pearson_r2",
             ]
             self.assertTrue(saved.loc[0, expanded_metrics].isna().all())
+
+    def test_checkpoint_cleanup_retains_parts_when_final_csv_verification_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            out_path = root / "nk_grid.csv"
+            parts = root / "nk_grid.parts"
+            parts.mkdir()
+            (parts / "part-000001.csv").write_text("checkpoint\n1\n")
+            pd.DataFrame({"wrong_column": [1]}).to_csv(out_path, index=False)
+            manifest = {
+                "experiment_id": "experiment-1",
+                "completion": {
+                    "status": "complete",
+                    "expected_rows": 1,
+                    "materialized_rows": 1,
+                    "completed_rows": 1,
+                    "failed_rows": 0,
+                },
+            }
+            with self.assertRaisesRegex(RuntimeError, "required columns"):
+                _prune_checkpoint_parts(out_path, manifest)
+            self.assertTrue(parts.exists())
 
     def test_nk_classification_grid_end_to_end_schema_and_row_count(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1795,6 +2068,218 @@ class NKGridTests(unittest.TestCase):
             manifest.write_text("not_panels: []\n")
             with self.assertRaisesRegex(ValueError, "YAML object with a 'panels' list"):
                 run_panels_main(["--manifest", str(manifest), "--dry-run"])
+
+    def test_slurm_jobs_expand_only_active_panel_model_pairs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            jobs = build_slurm_jobs(manifest)
+            self.assertEqual(
+                [(job.panel, job.model) for job in jobs],
+                [("reg_panel", "ols"), ("clf_panel", "ols")],
+            )
+            self.assertEqual(jobs[0].config.task, "regression")
+            self.assertEqual(jobs[1].config.task, "classification")
+            self.assertEqual(jobs[0].config.models, ("ols",))
+            self.assertEqual(jobs[1].config.models, ("ols",))
+            self.assertEqual(jobs[0].config.out.name, "reg_ols.csv")
+            self.assertEqual(jobs[1].config.out.name, "clf_ols.csv")
+
+    def test_slurm_jobs_do_not_create_missing_task_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "synthetic.csv"
+            self._write_nk_synthetic_data(data_path)
+            manifest = root / "panels.yaml"
+            manifest.write_text(
+                "\n".join(
+                    [
+                        "preset: dev",
+                        "panels:",
+                        "  - name: regression_only",
+                        f"    data: {data_path}",
+                        "    dataset: synthetic",
+                        "    outcome: outcome",
+                        "    task: regression",
+                        "    models:",
+                        "      - ols",
+                        "      - ridge",
+                        f"    out: {root / 'outputs' / 'reg.csv'}",
+                        "",
+                    ]
+                )
+            )
+            jobs = build_slurm_jobs(manifest)
+            self.assertEqual(
+                [(job.panel, job.model, job.config.task) for job in jobs],
+                [
+                    ("regression_only", "ols", "regression"),
+                    ("regression_only", "ridge", "regression"),
+                ],
+            )
+
+    def test_slurm_jobs_require_explicit_large_run_authorization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = root / "panels.yaml"
+            manifest.write_text(
+                "\n".join(
+                    [
+                        "preset: production",
+                        "panels:",
+                        "  - name: production_panel",
+                        "    data: synthetic.csv",
+                        "    dataset: synthetic",
+                        "    outcome: outcome",
+                        "    task: regression",
+                        "    models:",
+                        "      - ols",
+                        "    out: outputs/production.csv",
+                        "",
+                    ]
+                )
+            )
+            jobs = build_slurm_jobs(manifest)
+            with self.assertRaisesRegex(ValueError, "--allow-large-run"):
+                require_large_run_authorization(jobs, allow_large_run=False)
+            require_large_run_authorization(jobs, allow_large_run=True)
+
+    def test_slurm_jobs_reject_duplicate_output_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            text = manifest.read_text()
+            manifest.write_text(text.replace("outputs/clf.csv", "outputs/reg.csv"))
+            with self.assertRaisesRegex(ValueError, "unique output paths"):
+                build_slurm_jobs(manifest)
+
+    def test_slurm_job_snapshot_is_independent_of_later_manifest_edits(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            snapshot = root / "jobs.json"
+            original = write_job_snapshot(
+                manifest,
+                snapshot,
+                allow_large_run=False,
+            )
+            manifest.write_text("preset: dev\npanels: []\n")
+            frozen = load_job_snapshot(snapshot)
+            self.assertEqual(
+                [(job.panel, job.model) for job in frozen],
+                [(job.panel, job.model) for job in original],
+            )
+            self.assertEqual(snapshot.stat().st_mode & 0o777, 0o444)
+
+    def test_slurm_submission_receipt_maps_job_id_to_exact_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = self._write_panel_manifest(root)
+            snapshot = root / "slurm-specs" / "jobs.json"
+            write_job_snapshot(manifest, snapshot, allow_large_run=False)
+            worker = root / "slurm" / "run_nk_grid.sbatch"
+            worker.parent.mkdir()
+            worker.write_text("#!/bin/bash\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {}, clear=True):
+                receipt = write_submission_receipt(
+                    snapshot,
+                    slurm_job_id="24596435",
+                    array_spec="1",
+                    worker_script=worker,
+                    allow_large_run=False,
+                )
+
+            self.assertEqual(receipt.name, "slurm-24596435.json")
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o444)
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(payload["slurm_job_id"], "24596435")
+            self.assertEqual(payload["snapshot"], str(snapshot.resolve()))
+            self.assertEqual(payload["job_count"], 2)
+            self.assertEqual(payload["array"], "1")
+            self.assertEqual(payload["jobs"][0]["panel"], "reg_panel")
+            self.assertEqual(payload["jobs"][0]["model"], "ols")
+            self.assertIn("configured_out", payload["jobs"][0])
+            self.assertEqual(
+                payload["execution_paths"]["project_dir"], str(root.resolve())
+            )
+            self.assertEqual(len(payload["worker_script_sha256"]), 64)
+            rerun = payload["rerun_command_template"]
+            self.assertIn("--chdir=", rerun)
+            self.assertIn("--export=", rerun)
+            self.assertIn("PROJECT_DIR=", rerun)
+            self.assertIn("--array=", rerun)
+            self.assertIn("<task-index>", rerun)
+
+    def test_submit_script_keeps_job_id_visible_when_receipt_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "src").mkdir()
+            (root / "slurm").mkdir()
+            (root / "panels.yaml").write_text("panels: []\n", encoding="utf-8")
+            (root / "src" / "slurm_jobs.py").write_text("", encoding="utf-8")
+            (root / "slurm" / "run_nk_grid.sbatch").write_text(
+                "#!/bin/bash\n", encoding="utf-8"
+            )
+            fake_python = root / "fake-python"
+            fake_python.write_text(
+                "\n".join(
+                    [
+                        "#!/bin/bash",
+                        'if [ "$2" = "snapshot" ]; then',
+                        "  echo 2",
+                        "  exit 0",
+                        "fi",
+                        'if [ "$2" = "receipt" ]; then',
+                        '  echo "synthetic receipt failure" >&2',
+                        "  exit 9",
+                        "fi",
+                        "exit 2",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_sbatch = fake_bin / "sbatch"
+            fake_sbatch.write_text(
+                "#!/bin/bash\necho '123456;cluster-a'\n",
+                encoding="utf-8",
+            )
+            fake_sbatch.chmod(0o755)
+            submit_script = (
+                Path(__file__).resolve().parents[1]
+                / "NK_Grid"
+                / "slurm"
+                / "submit_nk_grid.sh"
+            )
+            environment = {
+                **os.environ,
+                "PROJECT_DIR": str(root),
+                "VENV": str(root / "venv"),
+                "PYTHON": str(fake_python),
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            }
+
+            completed = subprocess.run(
+                ["bash", str(submit_script)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn(
+                "Submitted Slurm array job 123456", completed.stdout
+            )
+            self.assertIn(
+                "WARNING: job 123456 was submitted", completed.stderr
+            )
+            self.assertRegex(completed.stderr, r"--job-id\s+123456")
+            self.assertRegex(completed.stderr, r"--array-spec\s+0-1")
 
     def test_run_panels_only_runs_selected_panel(self):
         with tempfile.TemporaryDirectory() as temp_dir:

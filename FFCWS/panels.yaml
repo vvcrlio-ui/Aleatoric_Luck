@@ -1,0 +1,122 @@
+model_params: model_params.yaml
+preset: dev
+
+panels:
+  - &ffc_panel
+    name: ffc_median_mode_gpa
+    schema: schema/ffc_median_mode_gpa.json
+    outcome: gpa
+    models: &ffc_models
+      - ols
+      - ridge
+      - lasso
+      - elastic_net
+      - random_forest
+      - xgboost
+      - lightgbm
+      - shallow_neural_network
+      - extra_trees
+      - super_learner
+    out: outputs/nk_grid_ffc_median_mode_gpa.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_mode_grit
+    schema: schema/ffc_median_mode_grit.json
+    outcome: grit
+    out: outputs/nk_grid_ffc_median_mode_grit.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_mode_materialHardship
+    schema: schema/ffc_median_mode_materialHardship.json
+    outcome: materialHardship
+    out: outputs/nk_grid_ffc_median_mode_materialHardship.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_mode_eviction
+    schema: schema/ffc_median_mode_eviction.json
+    outcome: eviction
+    out: outputs/nk_grid_ffc_median_mode_eviction.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_mode_layoff
+    schema: schema/ffc_median_mode_layoff.json
+    outcome: layoff
+    out: outputs/nk_grid_ffc_median_mode_layoff.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_mode_jobTraining
+    schema: schema/ffc_median_mode_jobTraining.json
+    outcome: jobTraining
+    out: outputs/nk_grid_ffc_median_mode_jobTraining.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_missing_indicator_gpa
+    schema: schema/ffc_median_missing_indicator_gpa.json
+    outcome: gpa
+    out: outputs/nk_grid_ffc_median_missing_indicator_gpa.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_missing_indicator_grit
+    schema: schema/ffc_median_missing_indicator_grit.json
+    outcome: grit
+    out: outputs/nk_grid_ffc_median_missing_indicator_grit.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_missing_indicator_materialHardship
+    schema: schema/ffc_median_missing_indicator_materialHardship.json
+    outcome: materialHardship
+    out: outputs/nk_grid_ffc_median_missing_indicator_materialHardship.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_missing_indicator_eviction
+    schema: schema/ffc_median_missing_indicator_eviction.json
+    outcome: eviction
+    out: outputs/nk_grid_ffc_median_missing_indicator_eviction.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_missing_indicator_layoff
+    schema: schema/ffc_median_missing_indicator_layoff.json
+    outcome: layoff
+    out: outputs/nk_grid_ffc_median_missing_indicator_layoff.csv
+
+  - <<: *ffc_panel
+    name: ffc_median_missing_indicator_jobTraining
+    schema: schema/ffc_median_missing_indicator_jobTraining.json
+    outcome: jobTraining
+    out: outputs/nk_grid_ffc_median_missing_indicator_jobTraining.csv
+
+  - <<: *ffc_panel
+    name: ffc_tree_ordinal_gpa
+    schema: schema/ffc_tree_ordinal_gpa.json
+    outcome: gpa
+    out: outputs/nk_grid_ffc_tree_ordinal_gpa.csv
+
+  - <<: *ffc_panel
+    name: ffc_tree_ordinal_grit
+    schema: schema/ffc_tree_ordinal_grit.json
+    outcome: grit
+    out: outputs/nk_grid_ffc_tree_ordinal_grit.csv
+
+  - <<: *ffc_panel
+    name: ffc_tree_ordinal_materialHardship
+    schema: schema/ffc_tree_ordinal_materialHardship.json
+    outcome: materialHardship
+    out: outputs/nk_grid_ffc_tree_ordinal_materialHardship.csv
+
+  - <<: *ffc_panel
+    name: ffc_tree_ordinal_eviction
+    schema: schema/ffc_tree_ordinal_eviction.json
+    outcome: eviction
+    out: outputs/nk_grid_ffc_tree_ordinal_eviction.csv
+
+  - <<: *ffc_panel
+    name: ffc_tree_ordinal_layoff
+    schema: schema/ffc_tree_ordinal_layoff.json
+    outcome: layoff
+    out: outputs/nk_grid_ffc_tree_ordinal_layoff.csv
+
+  - <<: *ffc_panel
+    name: ffc_tree_ordinal_jobTraining
+    schema: schema/ffc_tree_ordinal_jobTraining.json
+    outcome: jobTraining
+    out: outputs/nk_grid_ffc_tree_ordinal_jobTraining.csv

@@ -57,12 +57,15 @@ except ImportError:
 
 from evaluation import r2_against_training_mean
 from experiment import (
+    CHECKPOINT_KEY_COLUMNS,
+    SERIAL_OUTER_MODELS,
     add_metadata,
     build_experiment_metadata,
     file_sha256,
     checkpoint_parts_dir,
     core_environment,
     diagnostics_summary,
+    effective_outer_n_jobs,
     git_state,
     load_checkpoint,
     manifest_path,
@@ -172,7 +175,6 @@ class NKGridConfig:
     preset: str | None = None
     allow_large_run: bool = False
     dry_run: bool = False
-    prune_parts: bool = False
 
 
 @dataclass(frozen=True)
@@ -675,6 +677,19 @@ def _manifest_payload(
             "n_grid": [int(value) for value in n_grid],
             "k_grid": [int(value) for value in k_grid],
             "models": list(config.models),
+            "parallelism": {
+                "configured_outer_n_jobs": int(config.n_jobs),
+                "effective_outer_n_jobs_by_model": {
+                    model_name: int(
+                        effective_outer_n_jobs(model_name, config.n_jobs)
+                    )
+                    for model_name in config.models
+                },
+                "joblib_prefer_by_model": {
+                    model_name: parallel_preference([model_name])
+                    for model_name in config.models
+                },
+            },
         },
         "model_parameters": {
             "source": _relative_path(model_params_path),
@@ -685,6 +700,7 @@ def _manifest_payload(
         "output": {
             "csv": out_path.name,
             "parts_directory": checkpoint_parts_dir(out_path).name,
+            "checkpoint_parts_deleted": False,
         },
         "completion": {
             "expected_rows": int(expected_rows),
@@ -698,25 +714,58 @@ def _manifest_payload(
 
 
 def _prune_checkpoint_parts(out_path: Path, manifest: dict) -> bool:
-    """Drop checkpoint shards, but only for a verified-complete experiment.
+    """Delete shards only after the persisted final artifacts pass QA."""
 
-    Shards are the authoritative source and the CSV is the derived view, so
-    pruning is opt-in and refuses to run unless every declared cell landed
-    without failures. Resume still works afterwards via the CSV fallback.
-    """
-
-    status = manifest["completion"]["status"]
+    completion = manifest["completion"]
+    status = completion["status"]
     if status != "complete":
         log_progress(
-            f"--prune-parts skipped: completion status is {status!r}, "
-            "shards are kept as the authoritative checkpoint"
+            f"checkpoint cleanup skipped: completion status is {status!r}; "
+            "shards are retained for resume"
+        )
+        return False
+    expected = int(completion["expected_rows"])
+    counts_are_complete = (
+        int(completion["materialized_rows"]) == expected
+        and int(completion["completed_rows"]) == expected
+        and int(completion["failed_rows"]) == 0
+    )
+    if not counts_are_complete:
+        log_progress(
+            "checkpoint cleanup skipped: manifest row counts or failure count "
+            "did not pass verification"
         )
         return False
     directory = checkpoint_parts_dir(out_path)
     if not directory.exists():
         return False
+
+    try:
+        verified = pd.read_csv(out_path)
+    except Exception as exc:
+        raise RuntimeError(
+            "Final CSV could not be re-read; checkpoint shards were retained."
+        ) from exc
+    required = {"experiment_id", "status", *CHECKPOINT_KEY_COLUMNS}
+    missing = sorted(required - set(verified.columns))
+    if missing:
+        raise RuntimeError(
+            "Final CSV verification failed because required columns are missing: "
+            f"{missing}. Checkpoint shards were retained."
+        )
+    current = rows_for_experiment(verified, manifest["experiment_id"])
+    duplicated = current.duplicated(CHECKPOINT_KEY_COLUMNS).any()
+    valid_statuses = current["status"].isin(("ok", "skipped")).all()
+    if len(current) != expected or duplicated or not valid_statuses:
+        raise RuntimeError(
+            "Final CSV verification failed: expected row count, unique model-cell "
+            "keys, or row statuses did not match. Checkpoint shards were retained."
+        )
+
     shutil.rmtree(directory)
-    log_progress(f"pruned checkpoint shards after complete run: {directory.name}")
+    log_progress(
+        f"deleted checkpoint shards after verified-complete run: {directory.name}"
+    )
     return True
 
 
@@ -819,13 +868,19 @@ def run_nk_grid(
     max_jobs: int | None = None,
     allow_large_run: bool | None = None,
     dry_run: bool | None = None,
-    prune_parts: bool | None = None,
 ) -> Path | dict[str, int]:
     allow_large_run = config.allow_large_run if allow_large_run is None else allow_large_run
     dry_run = config.dry_run if dry_run is None else dry_run
-    prune_parts = config.prune_parts if prune_parts is None else prune_parts
     if config.task not in {"regression", "classification"}:
         raise ValueError("task must be 'regression' or 'classification'")
+    effective_n_jobs_by_model = {
+        model_name: effective_outer_n_jobs(model_name, config.n_jobs)
+        for model_name in config.models
+    }
+    joblib_prefer_by_model = {
+        model_name: parallel_preference([model_name])
+        for model_name in config.models
+    }
     declared_size = estimate_run_size(config)
     if dry_run:
         print(json.dumps(declared_size, indent=2, sort_keys=True))
@@ -1039,7 +1094,10 @@ def run_nk_grid(
     )
     log_progress(
         f"jobs total={len(jobs)} completed={len(completed)} "
-        f"pending={len(pending)} batch_size={config.batch_size} n_jobs={config.n_jobs}"
+        f"pending={len(pending)} batch_size={config.batch_size} "
+        f"configured_n_jobs={config.n_jobs} "
+        f"effective_n_jobs_by_model={effective_n_jobs_by_model} "
+        f"joblib_prefer_by_model={joblib_prefer_by_model}"
     )
 
     def run_one(
@@ -1144,6 +1202,12 @@ def run_nk_grid(
                         },
                         metadata,
                     )
+            if model_name in {"lightgbm", "super_learner"}:
+                log_progress(
+                    "cell starting "
+                    f"model={model_name} seed={seed} draw={draw} "
+                    f"N={n_samples} K={k_features}"
+                )
             model = make_model(
                 model_name,
                 seed=_model_seed(seed, draw, n_samples, k_features),
@@ -1209,11 +1273,64 @@ def run_nk_grid(
             f"batch {batch_index}/{total_batches} starting "
             f"jobs={len(batch)} first={batch[0]}"
         )
-        batch_rows = Parallel(
-                n_jobs=config.n_jobs,
+        indexed_batch = list(enumerate(batch))
+        execution_groups = (
+            (
+                "parallel_threads",
+                [
+                    (position, job)
+                    for position, job in indexed_batch
+                    if job[0] not in SERIAL_OUTER_MODELS and job[0] != "bart"
+                ],
+                config.n_jobs,
+                "threads",
+            ),
+            (
+                "bart_processes",
+                [
+                    (position, job)
+                    for position, job in indexed_batch
+                    if job[0] == "bart"
+                ],
+                config.n_jobs,
+                "processes",
+            ),
+            (
+                "serial_native",
+                [
+                    (position, job)
+                    for position, job in indexed_batch
+                    if job[0] in SERIAL_OUTER_MODELS
+                ],
+                1,
+                "threads",
+            ),
+        )
+        ordered_rows: list[dict | None] = [None] * len(batch)
+        for (
+            group_name,
+            indexed_jobs,
+            group_n_jobs,
+            group_preference,
+        ) in execution_groups:
+            if not indexed_jobs:
+                continue
+            group_models = {job[0] for _, job in indexed_jobs}
+            log_progress(
+                f"batch {batch_index}/{total_batches} group={group_name} "
+                f"models={sorted(group_models)} jobs={len(indexed_jobs)} "
+                f"n_jobs={group_n_jobs} joblib_prefer={group_preference}"
+            )
+            group_rows = Parallel(
+                n_jobs=group_n_jobs,
                 batch_size=1,
-                prefer=parallel_preference(config.models),
-            )(delayed(run_one)(*job) for job in batch)
+                prefer=group_preference,
+            )(delayed(run_one)(*job) for _, job in indexed_jobs)
+            for (position, _), row in zip(indexed_jobs, group_rows):
+                ordered_rows[position] = row
+        if any(row is None for row in ordered_rows):
+            raise RuntimeError("Internal error: one or more batch jobs were not run")
+        batch_rows = [row for row in ordered_rows if row is not None]
         part = write_checkpoint_part(batch_rows, out_path)
         new_rows = batch_rows
         ok_count = sum(row.get("status") == "ok" for row in new_rows)
@@ -1250,8 +1367,10 @@ def run_nk_grid(
     )
     _preserve_prior_timings(final_manifest, prior_manifest)
     write_json_atomic(current_manifest_path, final_manifest)
-    if prune_parts:
-        _prune_checkpoint_parts(out_path, final_manifest)
+    persisted_manifest = json.loads(current_manifest_path.read_text(encoding="utf-8"))
+    if _prune_checkpoint_parts(out_path, persisted_manifest):
+        persisted_manifest["output"]["checkpoint_parts_deleted"] = True
+        write_json_atomic(current_manifest_path, persisted_manifest)
     return out_path
 
 
@@ -1285,15 +1404,6 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--allow-large-run", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
-        "--prune-parts",
-        action="store_true",
-        help=(
-            "Delete checkpoint shards after a verified-complete merge. Shards are "
-            "the authoritative checkpoint and hold per-cell timings that the final "
-            "CSV omits; resume still works from the CSV once they are gone."
-        ),
-    )
-    parser.add_argument(
         "--predictor-prefix",
         nargs="+",
         default=["Aset", "Bset"],
@@ -1306,7 +1416,7 @@ def parse_args() -> NKGridConfig:
     parser.add_argument(
         "--n-jobs",
         type=int,
-        default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
+        default=int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
     )
     args = parser.parse_args()
     if args.outcome is None:
@@ -1349,7 +1459,6 @@ def parse_args() -> NKGridConfig:
         predictor_prefix=tuple(args.predictor_prefix),
         allow_large_run=args.allow_large_run,
         dry_run=args.dry_run,
-        prune_parts=args.prune_parts,
     )
 
 
