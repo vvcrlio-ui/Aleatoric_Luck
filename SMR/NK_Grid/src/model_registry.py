@@ -58,7 +58,7 @@ LEGACY_MODEL_NAMES = (
 SUPPORTED_MODEL_NAMES = MODEL_NAMES + LEGACY_MODEL_NAMES
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL_PARAMS_PATH = ROOT.parent / "NK_Grid" / "model_params.yaml"
+DEFAULT_MODEL_PARAMS_PATH = ROOT / "model_params.yaml"
 
 MODEL_PARAM_KEYS = {
     "regression": {

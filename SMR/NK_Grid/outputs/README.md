@@ -1,51 +1,74 @@
-# NK Grid output files
+# NK Grid Output Files
 
-Each run uses one filename stem and produces three related artifacts:
+This directory stores NK Grid results, run configurations, and checkpoint files used to resume interrupted runs.
 
-- `NAME.csv`: the materialized result table used for analysis and figures.
-- `NAME.manifest.json`: the minimal provenance, configuration, completion, and QA record.
-- `NAME.parts/part-*.csv`: immutable checkpoint shards used for crash-safe resume.
+## What files does each run create?
 
-The final CSV preserves all established metric columns. Four cell-level diagnostic
-columns are appended because they must remain filterable by model, seed, draw, N,
-and K:
+Each run uses one filename prefix, shown as `NAME` below, and creates the following files:
 
-| Column | Meaning |
+- `NAME.csv`: The final results table used for data analysis and plotting.
+- `NAME.manifest.json`: A record of the data, parameters, code version, completion status, and validation results for the run.
+- `NAME.parts/part-*.csv`: Temporary checkpoint files used to resume an interrupted run.
+
+For example, if the results file is `regression.csv`, the corresponding manifest and checkpoint directory are `regression.manifest.json` and `regression.parts/`.
+
+## Diagnostic fields in the results table
+
+In addition to the analysis metrics, the final CSV contains four fields that flag results that may need attention:
+
+| Field | Description |
 | --- | --- |
-| `K_varying` | Number of selected training features with more than one observed value. |
-| `constant_prediction` | `true` when there are fewer than two exactly distinct finite test predictions. This uses the same exact-uniqueness rule as the correlation metrics; an all-nonfinite prediction vector is also flagged. |
-| `underdetermined` | `true` for regression OLS when `K_varying >= N` in that fitted cell. The row is retained. |
-| `converged` | For fitted iterative estimators, `false` when `n_iter_` reaches `max_iter`; wrapper and SuperLearner components are checked recursively. Closed-form, tree, and boosting estimators without this contract default to `true`. Skipped and failed rows use `false`. |
+| `K_varying` | The number of features that actually vary. For example, if 20 features are selected but 3 have the same value for every sample, this value is 17. |
+| `constant_prediction` | Whether the model gives nearly identical predictions for all test samples. `true` means that the model may not have learned to distinguish between samples. It is also `true` if all predictions are invalid. |
+| `underdetermined` | Used only for OLS regression. `true` means that the number of usable features is at least as large as the number of samples—in other words, there are too many features for the available data, so the result may be unstable. |
+| `converged` | Whether the model finished fitting within the allowed number of iterations. `true` means that it converged normally. `false` means that it did not converge, was skipped, or failed and should be checked. |
 
-Flags never delete rows automatically. Primary summaries should retain every
-successful row. Any filtered sensitivity analysis must state its rule explicitly,
-for example excluding `underdetermined=true` for an OLS robustness curve.
+These fields are warnings only; they do not automatically remove any results. Keep all successful runs in the main analysis. If you exclude any type of result, clearly state what was excluded. For example, you can check whether the OLS conclusions change after excluding rows where `underdetermined=true`.
 
-The manifest records the `algorithm_version`, Git commit and dirty state, relative
-data paths and fingerprints, realized grids, resolved model parameters, core package
-versions, output completeness, and compact diagnostic counts. `model_params.yaml`
-is the reusable instruction file; the manifest is the immutable receipt of the
-values that actually applied to one run.
+## What does the manifest record?
 
-`algorithm_version` is a manually maintained methodological version. Increment it
-when a change affects the statistical meaning of results, including model libraries,
-hyperparameters, CV folds, feature sampling, data splitting, or metric definitions.
-Logging and checkpoint performance changes alone do not require a new version.
+`NAME.manifest.json` explains how a specific run was produced. It records:
 
-Checkpoint shards are authoritative while a run is incomplete. On resume, existing
-shards are scanned and completed cells are skipped. On normal exit, shards are
-deduplicated and atomically merged into the final CSV. Do not edit individual shard
-files.
+- `algorithm_version`: The version of the algorithm and analysis method.
+- The Git commit and whether the code had uncommitted changes when the run started.
+- The relative paths and fingerprints of the input data files.
+- The parameter grid and model settings actually used.
+- The versions of core software packages.
+- Whether the run completed successfully and the counts for each diagnostic category.
 
-Large runs never prompt for interactive input. Above the safety threshold they must
-be explicitly authorized:
+## How do I resume an interrupted run?
 
-```bash
-python src/run_panels.py --allow-large-run
-```
+During a run, the program saves completed results as checkpoints in `NAME.parts/`.
 
-Preview declared panel sizes without fitting models:
+If you restart the same task after an interruption, the program reads these temporary files and skips model and parameter combinations that have already finished. It then continues from where the previous run stopped.
+
+When a run finishes normally, the program performs the following checks:
+
+1. Merges the checkpoint files, removes duplicate rows, and creates the final CSV.
+2. Reads the final CSV again.
+3. Confirms that the manifest status is `complete`.
+4. Confirms that the expected, written, and completed row counts match.
+5. Confirms that there are no failed rows.
+6. Confirms that every model and parameter combination is unique and that every row has a valid status.
+
+The program deletes `NAME.parts/` only after all checks pass.
+
+> Do not edit the files in `NAME.parts/` manually. Doing so may prevent the run from resuming correctly or cause the validation checks to fail.
+
+## Common commands
+
+### Preview the task size
+
+Show the expected number of runs for each panel without fitting any models:
 
 ```bash
 python src/run_panels.py --dry-run
+```
+
+### Allow a large run
+
+If the task exceeds the safety threshold, the program does not prompt for interactive confirmation. You must explicitly allow the run with:
+
+```bash
+python src/run_panels.py --allow-large-run
 ```

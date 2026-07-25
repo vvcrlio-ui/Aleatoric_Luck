@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aleatoric-nk-grid"
+version = "1.0.0"
+description = "Article-agnostic N x K prediction-quality sweep engine"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "joblib==1.5.3",
+  "numpy==2.4.4",
+  "pandas==3.0.2",
+  "pyyaml==6.0.2",
+  "scikit-learn==1.8.0",
+  "scipy==1.17.1",
+]
+
+[project.optional-dependencies]
+models = [
+  "bartpy2==0.0.2",
+  "lightgbm==4.6.0",
+  "xgboost==3.2.0",
+]
+parquet = ["pyarrow==25.0.0"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+aleatoric-nk-grid = "aleatoric_nk_grid.nk_grid:main"
+aleatoric-nk-grid-panels = "aleatoric_nk_grid.run_panels:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

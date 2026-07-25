@@ -1,0 +1,23 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+!data/
+data/*
+!data/.gitkeep
+
+outputs/*
+!outputs/README.md
+
+logs/*
+!logs/.gitkeep
+*.log
+
+# Generated run state, including custom --out locations
+*.manifest.json
+*.parts/
+*.csv.tmp
+*.json.tmp
+.part-*.tmp

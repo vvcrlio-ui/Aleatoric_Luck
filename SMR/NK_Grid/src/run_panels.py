@@ -66,7 +66,7 @@ DEFAULTS: dict[str, Any] = {
     "seed": 12345,
     "test_size": 0.3,
     "batch_size": 20,
-    "n_jobs": int(os.environ.get("SLURM_CPUS_PER_TASK", "1")),
+    "n_jobs": int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
     "group_split_col": None,
     "task": "regression",
     "bart_min_n": 10,

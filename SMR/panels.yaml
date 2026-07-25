@@ -1,0 +1,25 @@
+model_params: model_params.yaml
+preset: dev
+
+panels:
+  - name: smr_hourlywage
+    schema: schema/asample2_withlag.json
+    outcome: Cm_lhourlywage
+    models: &smr_models
+      - ols
+      - ridge
+      - lasso
+      - elastic_net
+      - random_forest
+      - xgboost
+      - lightgbm
+      - shallow_neural_network
+      - extra_trees
+      - super_learner
+    out: outputs/nk_grid_smr_hourlywage.csv
+
+  - name: smr_totalincome
+    schema: schema/asample2_withlag.json
+    outcome: Cm_ltotalincome
+    models: *smr_models
+    out: outputs/nk_grid_smr_totalincome.csv
