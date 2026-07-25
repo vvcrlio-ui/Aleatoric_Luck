@@ -15,6 +15,7 @@ import yaml
 from aleatoric_nk_grid.experiment import build_experiment_metadata
 from aleatoric_nk_grid.ingest import load_schema
 from aleatoric_nk_grid.nk_grid import NKGridConfig, run_nk_grid
+from aleatoric_nk_grid import run_panels
 from aleatoric_nk_grid.run_panels import resolve_panel
 
 from conftest import write_schema_bundle
@@ -172,6 +173,51 @@ def test_panel_rejects_schema_owned_fields_and_external_test_size(tmp_path):
         tmp_path,
     )
     assert resolved.rerun_completed is False
+
+
+def test_panel_allow_large_run_survives_the_cli_default(tmp_path, monkeypatch):
+    """An absent --allow-large-run must not silently veto a panel that set it."""
+
+    schema = write_schema_bundle(
+        tmp_path / "bundle", _frame(), predictors=["X_a", "X_b"]
+    )
+    manifest = tmp_path / "panels.yaml"
+    manifest.write_text(
+        "panels:\n"
+        "  - name: big\n"
+        f"    schema: {schema}\n"
+        "    outcome: y\n"
+        "    preset: production\n"
+        "    allow_large_run: true\n"
+        "    models: [ols]\n"
+        "    out: outputs/big.csv\n",
+        encoding="utf-8",
+    )
+
+    _, config = resolve_panel(
+        {
+            "name": "big",
+            "schema": str(schema),
+            "outcome": "y",
+            "preset": "production",
+            "allow_large_run": True,
+            "models": ["ols"],
+            "out": "outputs/big.csv",
+        },
+        tmp_path,
+    )
+    assert config.allow_large_run is True
+
+    seen: dict[str, object] = {}
+
+    def fake_run(config, **kwargs):
+        seen["allow_large_run"] = kwargs.get("allow_large_run")
+        return config.out
+
+    monkeypatch.setattr(run_panels, "run_nk_grid", fake_run)
+    run_panels.main(["--manifest", str(manifest)])
+    # None lets run_nk_grid fall back to the panel's own authorization.
+    assert seen["allow_large_run"] is None
 
 
 def test_unique_package_import_wins_even_with_legacy_cwd_and_pythonpath():

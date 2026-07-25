@@ -1171,3 +1171,68 @@ fi
     ) in stderr
     assert "Requeueing 321_7 (watchdog fallback before wall timeout)" in stderr
     assert "Watchdog already requested requeue" in stderr
+
+
+def test_panel_declared_large_run_authorization_is_honored(tmp_path):
+    """A panel that authorizes its own oversized grid must not need the CLI flag."""
+
+    oversized = _config(
+        tmp_path,
+        n_seeds=100,
+        n_draws=50,
+        n_sizes_n=20,
+        n_sizes_k=20,
+        allow_large_run=True,
+    )
+    jobs = [SlurmJob(panel="big", model="ols", config=oversized)]
+
+    # An absent CLI flag arrives as None and must defer to the panel.
+    require_large_run_authorization(jobs, allow_large_run=None)
+
+    unauthorized = [
+        SlurmJob(
+            panel="big",
+            model="ols",
+            config=replace(oversized, allow_large_run=False),
+        )
+    ]
+    with pytest.raises(ValueError, match="requires --allow-large-run"):
+        require_large_run_authorization(unauthorized, allow_large_run=None)
+
+
+def test_receipt_separates_cli_and_panel_large_run_authorization(tmp_path):
+    """Auditing must distinguish CLI-level from panel-level authorization."""
+
+    jobs = [
+        SlurmJob(
+            panel="panel-cli",
+            model="ols",
+            config=_config(tmp_path, out=tmp_path / "a.csv"),
+        ),
+        SlurmJob(
+            panel="panel-self",
+            model="ridge",
+            config=_config(
+                tmp_path, out=tmp_path / "b.csv", allow_large_run=True
+            ),
+        ),
+    ]
+    snapshot = tmp_path / "jobs.json"
+    _write_snapshot(snapshot, jobs)
+    receipt_path = write_submission_receipt(
+        snapshot,
+        slurm_job_id="4242",
+        array_spec="0-1",
+        worker_script=ENGINE_DIR / "slurm" / "run_nk_grid.sbatch",
+        allow_large_run=False,
+        receipt_path=tmp_path / "receipt.json",
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    assert receipt["cli_allow_large_run"] is False
+    assert "allow_large_run" not in receipt
+    by_panel = {entry["panel"]: entry for entry in receipt["jobs"]}
+    assert by_panel["panel-cli"]["panel_allow_large_run"] is False
+    assert by_panel["panel-cli"]["effective_allow_large_run"] is False
+    assert by_panel["panel-self"]["panel_allow_large_run"] is True
+    assert by_panel["panel-self"]["effective_allow_large_run"] is True

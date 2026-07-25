@@ -159,7 +159,7 @@ def write_job_snapshot(
     manifest_path: Path,
     snapshot_path: Path,
     *,
-    allow_large_run: bool,
+    allow_large_run: bool | None,
     rerun_completed: bool = False,
 ) -> list[SlurmJob]:
     """Freeze a resolved array mapping for workers that may start much later."""
@@ -459,7 +459,10 @@ def write_submission_receipt(
             "open_mode": "append",
             "signal": f"B:USR1@{SLURM_ADVANCE_SIGNAL_SECONDS}",
         },
-        "allow_large_run": bool(allow_large_run),
+        # Large-run authorization has two independent sources. Record the CLI
+        # level under an unambiguous name so a panel-authorized task is not
+        # audited as "unauthorized"; the effective value is per job below.
+        "cli_allow_large_run": bool(allow_large_run),
         "execution_policy": {
             "rerun_completed": bool(rerun_completed),
             "max_restarts": int(max_restarts),
@@ -481,6 +484,10 @@ def write_submission_receipt(
                 "panel": job.panel,
                 "model": job.model,
                 "configured_out": str(Path(job.config.out).resolve()),
+                "panel_allow_large_run": bool(job.config.allow_large_run),
+                "effective_allow_large_run": bool(
+                    allow_large_run or job.config.allow_large_run
+                ),
                 "rerun_command": rerun_command(str(index)),
             }
             for index in selected_indices
@@ -503,14 +510,18 @@ def job_summary(job: SlurmJob, index: int) -> dict:
 
 
 def require_large_run_authorization(
-    jobs: list[SlurmJob], *, allow_large_run: bool
+    jobs: list[SlurmJob], *, allow_large_run: bool | None
 ) -> None:
+    """Reject oversized tasks that neither the CLI nor their panel authorized."""
+
     oversized = []
     for job in jobs:
+        if allow_large_run or job.config.allow_large_run:
+            continue
         cells = estimate_run_size(job.config)["top_level_model_cells"]
         if cells > LARGE_RUN_THRESHOLD:
             oversized.append((job.panel, job.model, cells))
-    if oversized and not allow_large_run:
+    if oversized:
         examples = ", ".join(
             f"{panel}/{model}={cells:,}" for panel, model, cells in oversized[:3]
         )
@@ -535,7 +546,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--array-spec", default=None)
     parser.add_argument("--worker-script", default=None)
     parser.add_argument("--index", type=int, default=None)
-    parser.add_argument("--allow-large-run", action="store_true")
+    # ``default=None`` keeps an absent flag from overriding a panel that already
+    # declares ``allow_large_run``; passing the flag still authorizes every task.
+    parser.add_argument("--allow-large-run", action="store_true", default=None)
     parser.add_argument("--rerun-completed", action="store_true")
     parser.add_argument("--cpus-per-task", type=int, default=8)
     parser.add_argument("--memory", default="48G")
@@ -573,7 +586,9 @@ def main(argv: list[str] | None = None) -> None:
             slurm_job_id=args.job_id,
             array_spec=args.array_spec,
             worker_script=Path(args.worker_script),
-            allow_large_run=args.allow_large_run,
+            # The receipt records the CLI-level authorization handed to workers;
+            # panel-level authorization travels inside the frozen snapshot.
+            allow_large_run=bool(args.allow_large_run),
             rerun_completed=args.rerun_completed,
             cpus_per_task=args.cpus_per_task,
             memory=args.memory,

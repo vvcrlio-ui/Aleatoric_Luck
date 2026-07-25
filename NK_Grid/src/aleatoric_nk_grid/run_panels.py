@@ -214,7 +214,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--only", nargs="+", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-jobs", type=int, default=None)
-    parser.add_argument("--allow-large-run", action="store_true")
+    # ``default=None`` keeps an absent flag from overriding a panel that already
+    # declares ``allow_large_run``; passing the flag still authorizes every panel.
+    parser.add_argument("--allow-large-run", action="store_true", default=None)
     args = parser.parse_args(argv)
     panels = resolved_panels(
         args.manifest, only=set(args.only) if args.only else None
