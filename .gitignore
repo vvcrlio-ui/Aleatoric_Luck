@@ -21,7 +21,7 @@ build/
 *.egg-info/
 .pytest_cache/
 
-# R (vendored ffc_replication-master)
+# R
 .Rhistory
 .Rapp.history
 .RData
@@ -29,22 +29,18 @@ build/
 # Data / experiments
 **/data/
 datasets/
-**/outputs
-outputs/
+**/outputs/
 results/
 !SMR/NK_Grid/outputs/
 SMR/NK_Grid/outputs/*
 !SMR/NK_Grid/outputs/README.md
-!FFC/ffc_replication-master/results/
 runs/
 plans/
 
 # Local implementation/review notes
-FFC_V1/PLAN.md
 SMR/NK_Grid/CODE_REVIEW_REPORT_*.md
 NK_Grid/CODE_REVIEW_REPORT_*.md
 SMR/NK_Grid/KNOWN_ISSUES.md
-/docs/
 
 # Env / secrets
 .env
@@ -56,7 +52,6 @@ env/
 **/logs/*
 !SMR/NK_Grid/logs/.gitkeep
 !SMR/Zheng_Cheng_Replication/logs/.gitkeep
-!FFC/NK_Grid/logs/.gitkeep
 *.log
 *.out
 *.err
