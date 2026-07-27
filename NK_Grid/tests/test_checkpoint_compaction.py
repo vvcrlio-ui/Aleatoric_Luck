@@ -11,6 +11,8 @@ from aleatoric_nk_grid.experiment import (
     compact_checkpoint_parts,
     load_checkpoint,
     load_checkpoint_index,
+    merge_checkpoint_parts,
+    verify_materialized_checkpoint,
     write_checkpoint_part,
 )
 
@@ -132,3 +134,97 @@ def test_default_writer_compacts_each_fifty_loose_shards(tmp_path):
     assert len(parts) == 2
     assert all("-compact-" in part.name for part in parts)
     assert load_checkpoint_index(out)["draw"].tolist() == list(range(100))
+
+
+def test_sqlite_materialization_streams_deduplication_sort_and_summary(tmp_path):
+    out = tmp_path / "result.csv"
+    first_ok = {
+        **_row(0),
+        "constant_prediction": True,
+        "underdetermined": False,
+        "converged": True,
+        "_fit_seconds": 1.0,
+        "_best_rounds": 4,
+    }
+    write_checkpoint_part([first_ok, _row(1, status="failed")], out)
+    write_checkpoint_part(
+        [
+            {**first_ok, "status": "failed", "rmse": 99.0},
+            {
+                **_row(1),
+                "constant_prediction": False,
+                "underdetermined": True,
+                "converged": False,
+                "_fit_seconds": 3.0,
+                "_best_rounds": 8,
+            },
+        ],
+        out,
+    )
+
+    with (
+        patch(
+            "aleatoric_nk_grid.experiment.load_checkpoint",
+            side_effect=AssertionError("materialization must not load a full frame"),
+        ),
+        patch(
+            "aleatoric_nk_grid.experiment.pd.concat",
+            side_effect=AssertionError("materialization must not concatenate frames"),
+        ),
+    ):
+        materialized = merge_checkpoint_parts(
+            out,
+            experiment_id="experiment",
+            drop_output_columns=["_fit_seconds", "_best_rounds"],
+        )
+
+    result = pd.read_csv(out)
+    assert result["draw"].tolist() == [0, 1]
+    assert result["rmse"].tolist() == [0.0, 1.0]
+    assert "_fit_seconds" not in result
+    assert "_best_rounds" not in result
+    summary = materialized.summary
+    assert summary.materialized_rows == 2
+    assert summary.completed_rows == 2
+    assert summary.failed_rows == 0
+    assert summary.diagnostics["constant_prediction_rows"] == 1
+    assert summary.diagnostics["underdetermined_rows"] == 1
+    assert summary.diagnostics["nonconverged_rows"] == 1
+    model = summary.diagnostics["by_model"]["ols"]
+    assert model["fit_seconds_total"] == 4.0
+    assert model["fit_seconds_median"] == 2.0
+    assert model["best_rounds"] == {"min": 4, "median": 6.0, "max": 8}
+    verify_materialized_checkpoint(
+        out,
+        experiment_id="experiment",
+        expected_rows=2,
+    )
+    assert not list(tmp_path.glob("*.sqlite"))
+
+
+def test_sqlite_materialization_large_smoke_has_no_full_frame_concat(tmp_path):
+    out = tmp_path / "large.csv"
+    total_rows = 20_000
+    shard_rows = 1_000
+    for start in range(0, total_rows, shard_rows):
+        write_checkpoint_part(
+            [_row(cell) for cell in range(start, start + shard_rows)],
+            out,
+        )
+
+    with patch(
+        "aleatoric_nk_grid.experiment.pd.concat",
+        side_effect=AssertionError("final materialization must remain out of core"),
+    ):
+        materialized = merge_checkpoint_parts(
+            out,
+            experiment_id="experiment",
+        )
+
+    assert materialized.summary.materialized_rows == total_rows
+    projected = pd.read_csv(
+        out,
+        usecols=["draw", "status"],
+    )
+    assert projected["draw"].tolist() == list(range(total_rows))
+    assert projected["status"].eq("ok").all()

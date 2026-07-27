@@ -7,6 +7,7 @@ import yaml
 
 from aleatoric_nk_grid.model_registry import (
     BartPyRegressor,
+    load_algorithm_version,
     load_model_params,
     make_model,
     resolved_model_params,
@@ -52,6 +53,20 @@ def test_locked_cv_regression_parameters_load_with_rmse():
     )
     assert selected["xgboost"]["eval_metric"] == "rmse"
     assert selected["lightgbm"]["metric"] == "rmse"
+
+
+def test_elastic_net_search_keeps_range_with_reduced_alpha_count():
+    assert load_algorithm_version(MODEL_PARAMS) == "nk-grid-v5-adapter-3"
+    selected = load_model_params(
+        MODEL_PARAMS,
+        task="regression",
+        models=("elastic_net",),
+    )["elastic_net"]
+    assert selected["alpha_log10_min"] == -4
+    assert selected["alpha_log10_max"] == 1
+    assert selected["n_alphas"] == 20
+    assert selected["l1_ratio"] == [0.1, 0.5, 0.9]
+    assert selected["max_cv_folds"] == 5
 
 
 def test_bart_environment_override_is_resolved_at_model_construction(

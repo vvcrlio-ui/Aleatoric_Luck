@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -53,6 +53,7 @@ from .evaluation import r2_against_training_mean
 from .experiment import (
     CHECKPOINT_COMPACTION_LOOSE_PARTS,
     CHECKPOINT_KEY_COLUMNS,
+    CheckpointSummary,
     SERIAL_OUTER_MODELS,
     add_metadata,
     build_experiment_metadata,
@@ -63,7 +64,7 @@ from .experiment import (
     diagnostics_summary,
     effective_outer_n_jobs,
     git_state,
-    load_checkpoint,
+    load_checkpoint,  # compatibility alias; production resume uses projected index
     load_checkpoint_index,
     manifest_path,
     merge_checkpoint_parts,
@@ -71,8 +72,10 @@ from .experiment import (
     output_run_lock,
     parallel_preference,
     rows_for_experiment,
+    seed_checkpoint_parts_from_csv,
     retire_checkpoint_parts,
     utc_now,
+    verify_materialized_checkpoint,
     write_checkpoint_part,
     write_json_atomic,
 )
@@ -86,6 +89,7 @@ from .model_registry import (
     make_model,
     resolved_model_params,
 )
+from .native_process import IsolatedProcessRunner
 from .preprocessing import (
     SourceGroup,
     count_unobserved_sources,
@@ -167,6 +171,8 @@ class NKGridConfig:
     bart_min_k: int = 2
     failed_abs_threshold: int = 50
     failed_ratio_threshold: float = 0.05
+    native_process_max_attempts: int = 2
+    native_process_timeout_seconds: float = 21_600.0
     preset: str | None = None
     allow_large_run: bool = False
     dry_run: bool = False
@@ -693,7 +699,7 @@ def _select_output_path(
     return _timestamped_out_path(directory, stem, preset, suffix)
 
 
-def estimate_run_size(config: NKGridConfig) -> dict[str, int]:
+def estimate_run_size(config: NKGridConfig) -> dict[str, int | str]:
     """Return a conservative pre-data estimate for panel dry-runs."""
 
     _validate_config(config)
@@ -735,6 +741,11 @@ def estimate_run_size(config: NKGridConfig) -> dict[str, int]:
         "estimated_checkpoint_parts": stable_checkpoint_parts,
         "estimated_peak_checkpoint_parts": peak_checkpoint_parts,
         "checkpoint_compaction_loose_parts": CHECKPOINT_COMPACTION_LOOSE_PARTS,
+        "max_uncheckpointed_cells": min(
+            int(config.batch_size),
+            int(top_level),
+        ),
+        "materialization_backend": "sqlite_streaming",
     }
 
 
@@ -767,6 +778,10 @@ def _validate_config(config: NKGridConfig) -> None:
         raise ValueError("failed_abs_threshold must be non-negative")
     if not 0.0 <= config.failed_ratio_threshold <= 1.0:
         raise ValueError("failed_ratio_threshold must be in [0, 1]")
+    if config.native_process_max_attempts < 1:
+        raise ValueError("native_process_max_attempts must be at least 1")
+    if config.native_process_timeout_seconds <= 0:
+        raise ValueError("native_process_timeout_seconds must be greater than zero")
 
 
 def _relative_path(path: Path) -> str:
@@ -792,7 +807,8 @@ def _manifest_payload(
     n_grid: np.ndarray,
     k_grid: np.ndarray,
     expected_rows: int,
-    results: pd.DataFrame,
+    results: pd.DataFrame | None,
+    result_summary: CheckpointSummary | None = None,
     started_at: str,
     dataset: str,
     task: str,
@@ -800,11 +816,27 @@ def _manifest_payload(
     schema_semantic_hash: str,
     feature_manifest_path: Path | None,
 ) -> dict:
-    current_results = rows_for_experiment(results, metadata["experiment_id"])
-    statuses = current_results.get("status", pd.Series(dtype=str))
-    completed = int(statuses.isin(("ok", "skipped")).sum())
-    failed = int(statuses.eq("failed").sum())
-    if len(current_results) != expected_rows:
+    if result_summary is not None:
+        if result_summary.experiment_id != metadata["experiment_id"]:
+            raise ValueError("Checkpoint summary does not match the current experiment")
+        materialized_rows = int(result_summary.materialized_rows)
+        ok_count = int(result_summary.ok_rows)
+        skipped_count = int(result_summary.skipped_rows)
+        failed = int(result_summary.failed_rows)
+        completed = int(result_summary.completed_rows)
+        diagnostics = result_summary.diagnostics
+    else:
+        if results is None:
+            raise ValueError("results or result_summary is required")
+        current_results = rows_for_experiment(results, metadata["experiment_id"])
+        statuses = current_results.get("status", pd.Series(dtype=str))
+        materialized_rows = int(len(current_results))
+        ok_count = int(statuses.eq("ok").sum())
+        skipped_count = int(statuses.eq("skipped").sum())
+        failed = int(statuses.eq("failed").sum())
+        completed = ok_count + skipped_count
+        diagnostics = diagnostics_summary(current_results)
+    if materialized_rows != expected_rows:
         completion_status = "incomplete"
     elif failed:
         completion_status = "complete_with_failures"
@@ -861,6 +893,22 @@ def _manifest_payload(
                     model_name: parallel_preference([model_name])
                     for model_name in config.models
                 },
+                "native_process_isolated_models": sorted(
+                    set(config.models) & set(SERIAL_OUTER_MODELS)
+                ),
+                "native_process_max_attempts": int(
+                    config.native_process_max_attempts
+                ),
+                "native_process_timeout_seconds": float(
+                    config.native_process_timeout_seconds
+                ),
+            },
+            "checkpointing": {
+                "batch_size": int(config.batch_size),
+                "loose_parts_per_compaction": int(
+                    CHECKPOINT_COMPACTION_LOOSE_PARTS
+                ),
+                "materialization_backend": "sqlite_streaming",
             },
         },
         "model_parameters": {
@@ -876,7 +924,7 @@ def _manifest_payload(
         },
         "completion": {
             "expected_rows": int(expected_rows),
-            "materialized_rows": int(len(current_results)),
+            "materialized_rows": materialized_rows,
             "completed_rows": completed,
             "failed_rows": failed,
             "status": completion_status,
@@ -885,16 +933,16 @@ def _manifest_payload(
             "failed_abs_threshold": int(config.failed_abs_threshold),
             "failed_ratio_threshold": float(config.failed_ratio_threshold),
             "failed_count": failed,
-            "ok_count": int(statuses.eq("ok").sum()),
-            "skipped_count": int(statuses.eq("skipped").sum()),
-            "denominator": int(statuses.isin(("ok", "failed")).sum()),
+            "ok_count": ok_count,
+            "skipped_count": skipped_count,
+            "denominator": ok_count + failed,
             "failed_ratio": (
-                float(failed / statuses.isin(("ok", "failed")).sum())
-                if statuses.isin(("ok", "failed")).sum()
+                float(failed / (ok_count + failed))
+                if ok_count + failed
                 else None
             ),
         },
-        "diagnostics": diagnostics_summary(current_results),
+        "diagnostics": diagnostics,
     }
 
 
@@ -926,26 +974,16 @@ def _prune_checkpoint_parts(out_path: Path, manifest: dict) -> bool:
         return False
 
     try:
-        verified = pd.read_csv(out_path)
+        verify_materialized_checkpoint(
+            out_path,
+            experiment_id=manifest["experiment_id"],
+            expected_rows=expected,
+        )
     except Exception as exc:
         raise RuntimeError(
-            "Final CSV could not be re-read; checkpoint shards were retained."
+            "Final CSV streaming verification failed; checkpoint shards were "
+            "retained."
         ) from exc
-    required = {"experiment_id", "status", *CHECKPOINT_KEY_COLUMNS}
-    missing = sorted(required - set(verified.columns))
-    if missing:
-        raise RuntimeError(
-            "Final CSV verification failed because required columns are missing: "
-            f"{missing}. Checkpoint shards were retained."
-        )
-    current = rows_for_experiment(verified, manifest["experiment_id"])
-    duplicated = current.duplicated(CHECKPOINT_KEY_COLUMNS).any()
-    valid_statuses = current["status"].isin(("ok", "skipped")).all()
-    if len(current) != expected or duplicated or not valid_statuses:
-        raise RuntimeError(
-            "Final CSV verification failed: expected row count, unique model-cell "
-            "keys, or row statuses did not match. Checkpoint shards were retained."
-        )
 
     retired = retire_checkpoint_parts(out_path)
     if retired is None:
@@ -1110,6 +1148,40 @@ def _positive_class_probability(model, X) -> np.ndarray:
     return positive
 
 
+def _fit_predict_model_cell(
+    *,
+    model_name: str,
+    model_seed: int,
+    task: str,
+    params: dict,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+) -> dict[str, Any]:
+    """Fit and predict one cell; safe to execute in an isolated subprocess."""
+
+    model = make_model(
+        model_name,
+        seed=model_seed,
+        n_jobs=1,
+        task=task,
+        params=params,
+    )
+    fit_started = time.perf_counter()
+    model.fit(X_train, y_train)
+    predictions = (
+        _positive_class_probability(model, X_test)
+        if task == "classification"
+        else np.asarray(model.predict(X_test))
+    )
+    return {
+        "predictions": predictions,
+        "fit_seconds": time.perf_counter() - fit_started,
+        "best_rounds": _model_best_rounds(model),
+        "converged": _model_converged(model),
+    }
+
+
 def run_nk_grid(
     config: NKGridConfig,
     *,
@@ -1118,7 +1190,7 @@ def run_nk_grid(
     dry_run: bool | None = None,
     stop_after_batch: Callable[[], bool] | None = None,
     defer_materialization_on_stop: bool = False,
-) -> Path | dict[str, int]:
+) -> Path | dict[str, int | str]:
     """Run one output under an advisory cross-process writer lease."""
 
     effective_dry_run = config.dry_run if dry_run is None else dry_run
@@ -1150,7 +1222,7 @@ def _run_nk_grid_locked(
     dry_run: bool | None = None,
     stop_after_batch: Callable[[], bool] | None = None,
     defer_materialization_on_stop: bool = False,
-) -> Path | dict[str, int]:
+) -> Path | dict[str, int | str]:
     allow_large_run = config.allow_large_run if allow_large_run is None else allow_large_run
     dry_run = config.dry_run if dry_run is None else dry_run
     if max_jobs is not None and max_jobs < 0:
@@ -1246,6 +1318,11 @@ def _run_nk_grid_locked(
         "group_column": None,
         "bart_min_n": config.bart_min_n,
         "bart_min_k": config.bart_min_k,
+        "native_process_isolated_models": sorted(
+            set(config.models) & set(SERIAL_OUTER_MODELS)
+        ),
+        "native_process_max_attempts": config.native_process_max_attempts,
+        "native_process_timeout_seconds": config.native_process_timeout_seconds,
         "split_mode": split_mode,
         "model_params": resolved_selected_model_params,
         "imputation": dict(schema.imputation),
@@ -1307,9 +1384,10 @@ def _run_nk_grid_locked(
         for n_samples in n_grid
         for model_name in config.models
     ]
-    if len(jobs) > LARGE_RUN_THRESHOLD and not allow_large_run:
+    expected_rows = len(jobs)
+    if expected_rows > LARGE_RUN_THRESHOLD and not allow_large_run:
         raise ValueError(
-            f"Large run requires --allow-large-run: {len(jobs):,} top-level model "
+            f"Large run requires --allow-large-run: {expected_rows:,} top-level model "
             f"cells exceeds the {LARGE_RUN_THRESHOLD:,} safety threshold."
         )
     state = git_state(ROOT)
@@ -1336,7 +1414,7 @@ def _run_nk_grid_locked(
         and _verified_complete_artifacts(
             out_path,
             metadata["experiment_id"],
-            len(jobs),
+            expected_rows,
         )
     ):
         if not _checkpoint_index_exactly_matches_jobs(
@@ -1367,17 +1445,28 @@ def _run_nk_grid_locked(
                 model_name: parallel_preference([model_name])
                 for model_name in config.models
             },
+            "native_process_isolated_models": sorted(
+                set(config.models) & set(SERIAL_OUTER_MODELS)
+            ),
+            "native_process_max_attempts": int(
+                config.native_process_max_attempts
+            ),
+            "native_process_timeout_seconds": float(
+                config.native_process_timeout_seconds
+            ),
         }
         write_json_atomic(completed_manifest_path, completed_manifest)
         log_progress(f"already complete; no-op reuse of verified output: {out_path}")
         return out_path
-    existing = load_checkpoint(out_path)
+    # Resume planning needs only identity, cell keys and status. Avoid loading
+    # every metric column for a multi-million-row checkpoint.
+    existing = existing_index
     completed = _completed_jobs_for_experiment(existing, metadata["experiment_id"])
     pending = [job for job in jobs if job not in completed]
     if max_jobs is not None:
         pending = pending[: int(max_jobs)]
     if pending and not existing.empty and not checkpoint_parts(out_path):
-        write_checkpoint_part(existing.to_dict("records"), out_path)
+        seed_checkpoint_parts_from_csv(out_path)
     started_at = utc_now()
     current_manifest_path = manifest_path(out_path)
     prior_manifest = _read_prior_manifest(
@@ -1399,7 +1488,7 @@ def _run_nk_grid_locked(
         splits=splits,
         n_grid=n_grid,
         k_grid=k_grid,
-        expected_rows=len(jobs),
+        expected_rows=expected_rows,
         results=existing,
         started_at=started_at,
         dataset=dataset,
@@ -1413,12 +1502,17 @@ def _run_nk_grid_locked(
         _preserve_prior_timings(initial_manifest, prior_manifest),
     )
     log_progress(
-        f"jobs total={len(jobs)} completed={len(completed)} "
+        f"jobs total={expected_rows} completed={len(completed)} "
         f"pending={len(pending)} batch_size={config.batch_size} "
         f"configured_n_jobs={config.n_jobs} "
         f"effective_n_jobs_by_model={effective_n_jobs_by_model} "
         f"joblib_prefer_by_model={joblib_prefer_by_model}"
     )
+    # The pending list is now authoritative. Release the full design list,
+    # projected index and completed-key set before model fitting so a resumed
+    # production task does not retain several duplicate multi-million-cell
+    # structures for the lifetime of the run.
+    del existing_index, indexed_completed, existing, completed, jobs
 
     @lru_cache(maxsize=8)
     def cached_draw_orders(seed: int, draw: int) -> DrawOrders:
@@ -1433,6 +1527,11 @@ def _run_nk_grid_locked(
                 draw=draw,
             )
         )
+
+    native_process_runner = IsolatedProcessRunner(
+        max_attempts=config.native_process_max_attempts,
+        timeout_seconds=config.native_process_timeout_seconds,
+    )
 
     def run_one(
         model_name: str,
@@ -1595,22 +1694,41 @@ def _run_nk_grid_locked(
                     f"model={model_name} seed={seed} draw={draw} "
                     f"N={n_samples} K={k_features}"
                 )
-            model = make_model(
-                model_name,
-                seed=_model_seed(seed, draw, n_samples, k_features),
-                n_jobs=1,
-                task=task,
-                params=selected_model_params[model_name],
-            )
-            fit_started = time.perf_counter()
-            model.fit(X_sub, y_sub)
-            if task == "classification":
-                predictions = _positive_class_probability(model, X_test)
+            fit_arguments = {
+                "model_name": model_name,
+                "model_seed": _model_seed(
+                    seed, draw, n_samples, k_features
+                ),
+                "task": task,
+                "params": selected_model_params[model_name],
+                "X_train": X_sub,
+                "y_train": y_sub,
+                "X_test": X_test,
+            }
+            if model_name in SERIAL_OUTER_MODELS:
+                fit_result = native_process_runner.run(
+                    _fit_predict_model_cell,
+                    **fit_arguments,
+                    on_native_crash=lambda attempt, exc: log_progress(
+                        "native subprocess crashed while running isolated cell "
+                        f"attempt={attempt}/{config.native_process_max_attempts} "
+                        f"model={model_name} seed={seed} draw={draw} "
+                        f"N={n_samples} K={k_features} error={exc}"
+                    ),
+                    on_native_timeout=lambda attempt, exc: log_progress(
+                        "native subprocess timed out while running isolated cell "
+                        f"attempt={attempt}/{config.native_process_max_attempts} "
+                        f"timeout_seconds={config.native_process_timeout_seconds:g} "
+                        f"model={model_name} seed={seed} draw={draw} "
+                        f"N={n_samples} K={k_features} error={exc}"
+                    ),
+                )
             else:
-                predictions = model.predict(X_test)
-            diagnostics["_fit_seconds"] = time.perf_counter() - fit_started
-            diagnostics["_best_rounds"] = _model_best_rounds(model)
-            diagnostics["converged"] = _model_converged(model)
+                fit_result = _fit_predict_model_cell(**fit_arguments)
+            predictions = np.asarray(fit_result["predictions"])
+            diagnostics["_fit_seconds"] = fit_result["fit_seconds"]
+            diagnostics["_best_rounds"] = fit_result["best_rounds"]
+            diagnostics["converged"] = fit_result["converged"]
             diagnostics["constant_prediction"] = _constant_prediction(predictions)
             if task == "classification":
                 scores = predictions
@@ -1767,6 +1885,7 @@ def _run_nk_grid_locked(
                 "graceful stop arrived after the final pending batch; "
                 "the run will finalize without requeue"
             )
+    native_process_runner.close()
     if not pending:
         log_progress("no pending jobs; checkpoint is already complete")
     if (
@@ -1786,11 +1905,15 @@ def _run_nk_grid_locked(
         # Slurm's advance-signal watchdog should wait only for the current
         # atomic checkpoint, not a full multi-million-row CSV rewrite.
         results = load_checkpoint_index(out_path)
+        result_summary = None
     else:
-        results = merge_checkpoint_parts(
+        materialization = merge_checkpoint_parts(
             out_path,
+            experiment_id=metadata["experiment_id"],
             drop_output_columns=["_fit_seconds", "_best_rounds"],
         )
+        results = None
+        result_summary = materialization.summary
     final_manifest = _manifest_payload(
         config=config,
         metadata=metadata,
@@ -1805,8 +1928,9 @@ def _run_nk_grid_locked(
         splits=splits,
         n_grid=n_grid,
         k_grid=k_grid,
-        expected_rows=len(jobs),
+        expected_rows=expected_rows,
         results=results,
+        result_summary=result_summary,
         started_at=started_at,
         dataset=dataset,
         task=task,
@@ -1876,6 +2000,13 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--bart-min-k", type=int, default=2)
     parser.add_argument("--failed-abs-threshold", type=int, default=50)
     parser.add_argument("--failed-ratio-threshold", type=float, default=0.05)
+    parser.add_argument("--native-process-max-attempts", type=int, default=2)
+    parser.add_argument(
+        "--native-process-timeout-seconds",
+        type=float,
+        default=21_600.0,
+        help="Kill and retry an isolated native-model cell after this deadline.",
+    )
     parser.add_argument("--model-params", default=str(DEFAULT_MODEL_PARAMS_PATH))
     parser.add_argument("--allow-large-run", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -1915,6 +2046,8 @@ def parse_args() -> NKGridConfig:
         bart_min_k=args.bart_min_k,
         failed_abs_threshold=args.failed_abs_threshold,
         failed_ratio_threshold=args.failed_ratio_threshold,
+        native_process_max_attempts=args.native_process_max_attempts,
+        native_process_timeout_seconds=args.native_process_timeout_seconds,
         allow_large_run=args.allow_large_run,
         dry_run=args.dry_run,
         rerun_completed=args.rerun_completed,

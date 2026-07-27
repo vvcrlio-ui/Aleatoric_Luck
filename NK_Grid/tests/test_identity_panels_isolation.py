@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +24,6 @@ from conftest import write_schema_bundle
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_SRC = REPO_ROOT / "NK_Grid" / "src"
-LEGACY_SRC = REPO_ROOT / "SMR" / "NK_Grid" / "src"
 MODEL_PARAMS = REPO_ROOT / "NK_Grid" / "model_params.yaml"
 
 
@@ -91,6 +91,28 @@ def test_imputation_semantic_change_changes_identity(tmp_path):
     assert (
         pd.read_csv(first_out).loc[0, "experiment_id"]
         != pd.read_csv(second_out).loc[0, "experiment_id"]
+    )
+
+
+def test_native_timeout_change_changes_identity(tmp_path):
+    schema = write_schema_bundle(
+        tmp_path / "bundle", _frame(), predictors=["X_a", "X_b"]
+    )
+    first_config = replace(
+        _config(schema, tmp_path / "first.csv"),
+        native_process_timeout_seconds=60.0,
+    )
+    second_config = replace(
+        _config(schema, tmp_path / "second.csv"),
+        native_process_timeout_seconds=120.0,
+    )
+
+    first = run_nk_grid(first_config)
+    second = run_nk_grid(second_config)
+
+    assert (
+        pd.read_csv(first).loc[0, "experiment_id"]
+        != pd.read_csv(second).loc[0, "experiment_id"]
     )
 
 
@@ -220,22 +242,19 @@ def test_panel_allow_large_run_survives_the_cli_default(tmp_path, monkeypatch):
     assert seen["allow_large_run"] is None
 
 
-def test_unique_package_import_wins_even_with_legacy_cwd_and_pythonpath():
+def test_unique_package_import_works_from_unrelated_cwd(tmp_path):
     environment = dict(os.environ)
-    environment["PYTHONPATH"] = os.pathsep.join(
-        [str(LEGACY_SRC), str(PACKAGE_SRC)]
-    )
+    environment["PYTHONPATH"] = str(PACKAGE_SRC)
     completed = subprocess.run(
         [
             sys.executable,
             "-c",
             "import aleatoric_nk_grid; print(aleatoric_nk_grid.__file__)",
         ],
-        cwd=LEGACY_SRC,
+        cwd=tmp_path,
         env=environment,
         check=True,
         capture_output=True,
         text=True,
     )
     assert str(PACKAGE_SRC) in completed.stdout
-    assert str(LEGACY_SRC) not in completed.stdout

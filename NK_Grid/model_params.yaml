@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v5-adapter-2
+algorithm_version: nk-grid-v5-adapter-3
 
 regression:
   ols:
@@ -18,7 +18,7 @@ regression:
   elastic_net:
     alpha_log10_min: -4
     alpha_log10_max: 1
-    n_alphas: 50
+    n_alphas: 20
     l1_ratio:
       - 0.1
       - 0.5

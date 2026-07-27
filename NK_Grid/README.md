@@ -92,8 +92,9 @@ work.
   sending the order arrays with every loky task would trade permutation work
   for repeated serialization.
 - Resume candidate scans read only `experiment_id`, the five cell-key columns
-  and optional `status`. Full metric columns are still read for final
-  materialization and QA. A completed run is fast-reused only when this
+  and optional `status`. Resume planning never loads the metric columns, and it
+  releases the projected index, completed-key set and full design list after
+  deriving the pending list. A completed run is fast-reused only when this
   projected index exactly matches the current design: no duplicate, failed,
   missing or out-of-design cells. If a manifest claims completion but that
   index is not exact, the run fails integrity checking instead of silently
@@ -119,7 +120,15 @@ work.
   2,000 physical part files (brief publication peak: about 2,050). Raising the
   batch size globally to 1,000 would reach a similar file count while making
   slow serial/BART tasks lose up to 1,000 cells on a forced requeue, so it is
-  not the production default.
+  not the production default. `timing_full` also uses 20; compaction, rather
+  than a large recovery boundary, controls file count.
+- Final materialization uses a temporary SQLite database as an on-disk reducer.
+  Shards are validated and inserted in 2,000-row chunks, successful rows retain
+  priority over failed retries, and the sorted CSV is emitted in 10,000-row
+  chunks. Manifest diagnostics are aggregated in SQLite and final QA streams
+  the sorted CSV, so neither finalization nor verification constructs the full
+  metric table in RAM. The output filesystem must have temporary headroom for
+  the SQLite database and atomically written CSV.
 - On a Slurm checkpoint-boundary stop, the worker writes a lightweight
   resumable manifest from the projected checkpoint index and defers the full
   CSV merge to the next invocation. This keeps the 240-second watchdog from
@@ -133,14 +142,20 @@ work.
   interruption during cleanup therefore cannot make a partial shard set
   override the already-verified final CSV.
 - Standard models continue to use threads and Joblib task batching remains
-  explicit at one cell. Local profiling found process execution slower and
-  substantially more memory intensive for the shared wide DataFrames. BART
+  explicit at one cell. LightGBM and Super Learner fits run one at a time in a
+  reusable spawn-based subprocess. A native abort or segmentation fault kills
+  only that child. A cell exceeding `native_process_timeout_seconds` (six hours
+  by default) is forcibly terminated as well. The parent recreates the worker,
+  retries the cell once by default, and persists a normal failed row if both
+  attempts crash or time out. The timeout and attempt count are recorded in
+  experiment identity and the manifest. BART
   closure/memory redesign remains follow-up work; the checked-in SMR and FFCWS
   panels do not currently select BART.
 - Production planning still materializes the job list and a completed-key set,
   so allow hundreds of MiB of scheduler-side memory in addition to the data and
-  fitted models. Use `--dry-run` to inspect the cell, checkpoint-write, stable
-  part and peak part estimates before submission.
+  fitted models. Those duplicate planning structures are released before
+  fitting. Use `--dry-run` to inspect the cell, checkpoint-write, stable part,
+  peak part and maximum-uncheckpointed-cell estimates before submission.
 
 The authoritative adapter contract is
-[`../docs/upstream-adapter-spec.md`](../docs/upstream-adapter-spec.md).
+[`../Adapter/ADAPTER.md`](../Adapter/ADAPTER.md).

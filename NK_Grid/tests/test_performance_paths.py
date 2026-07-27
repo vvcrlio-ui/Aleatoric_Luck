@@ -41,6 +41,12 @@ class _MeanRegressor:
         return np.full(len(X), self.mean_, dtype=float)
 
 
+def _run_isolated_inline(_runner, function, /, *args, **kwargs):
+    kwargs.pop("on_native_crash", None)
+    kwargs.pop("on_native_timeout", None)
+    return function(*args, **kwargs)
+
+
 def _frame(rows: int = 40) -> pd.DataFrame:
     values = np.arange(rows, dtype=float)
     return pd.DataFrame(
@@ -112,6 +118,11 @@ def test_thread_and_serial_groups_reuse_one_order_per_seed_draw(tmp_path):
         patch(
             "aleatoric_nk_grid.nk_grid.make_model",
             side_effect=lambda *args, **kwargs: _MeanRegressor(),
+        ),
+        patch(
+            "aleatoric_nk_grid.nk_grid.IsolatedProcessRunner.run",
+            autospec=True,
+            side_effect=_run_isolated_inline,
         ),
     ):
         run_nk_grid(config)
@@ -373,6 +384,16 @@ def test_first_checkpoint_durably_publishes_each_new_directory_level(tmp_path):
 
 def test_production_checkpoint_estimate_keeps_small_batches_but_compacts_parts():
     assert PRESETS["production"]["batch_size"] == 20
+    assert PRESETS["timing_full"] == {
+        "n_seeds": 1,
+        "n_draws": 1,
+        "n_sizes_n": 20,
+        "n_sizes_k": 20,
+        "min_n": 10,
+        "max_n": 0,
+        "max_k": 0,
+        "batch_size": 20,
+    }
     config = NKGridConfig(
         schema=Path("schema.json"),
         out=Path("result.csv"),
@@ -400,3 +421,5 @@ def test_production_checkpoint_estimate_keeps_small_batches_but_compacts_parts()
     assert estimate["checkpoint_compaction_loose_parts"] == 50
     assert estimate["estimated_checkpoint_parts"] == 2_000
     assert estimate["estimated_peak_checkpoint_parts"] == 2_050
+    assert estimate["max_uncheckpointed_cells"] == 20
+    assert estimate["materialization_backend"] == "sqlite_streaming"

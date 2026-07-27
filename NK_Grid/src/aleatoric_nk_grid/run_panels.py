@@ -18,10 +18,10 @@ from .nk_grid import NKGridConfig, estimate_run_size, run_nk_grid
 ROOT = Path(__file__).resolve().parents[2]
 PRESETS: dict[str, dict[str, int]] = {
     "dev": {
-        "n_seeds": 5,
-        "n_draws": 5,
-        "n_sizes_n": 8,
-        "n_sizes_k": 8,
+        "n_seeds": 3,
+        "n_draws": 3,
+        "n_sizes_n": 3,
+        "n_sizes_k": 3,
         "min_n": 10,
         "max_n": 100,
         "max_k": 100,
@@ -35,15 +35,15 @@ PRESETS: dict[str, dict[str, int]] = {
         "max_n": 100,
         "max_k": 100,
     },
-    "pilot_full": {
-        "n_seeds": 10,
-        "n_draws": 5,
-        "n_sizes_n": 12,
-        "n_sizes_k": 12,
+    "timing_full": {
+        "n_seeds": 1,
+        "n_draws": 1,
+        "n_sizes_n": 20,
+        "n_sizes_k": 20,
         "min_n": 10,
         "max_n": 0,
         "max_k": 0,
-        "batch_size": 500,
+        "batch_size": 20,
     },
     "production": {
         "n_seeds": 100,
@@ -71,6 +71,8 @@ DEFAULTS: dict[str, Any] = {
     "model_params": DEFAULT_MODEL_PARAMS_PATH,
     "failed_abs_threshold": 50,
     "failed_ratio_threshold": 0.05,
+    "native_process_max_attempts": 2,
+    "native_process_timeout_seconds": 21_600,
     "allow_large_run": False,
     "dry_run": False,
     "rerun_completed": True,
@@ -100,6 +102,8 @@ PANEL_FIELDS = frozenset(
         "bart_min_k",
         "failed_abs_threshold",
         "failed_ratio_threshold",
+        "native_process_max_attempts",
+        "native_process_timeout_seconds",
         "outcome",
         "out",
     }
