@@ -31,16 +31,11 @@ build/
 datasets/
 **/outputs/
 results/
-!SMR/NK_Grid/outputs/
-SMR/NK_Grid/outputs/*
-!SMR/NK_Grid/outputs/README.md
 runs/
 plans/
 
 # Local implementation/review notes
-SMR/NK_Grid/CODE_REVIEW_REPORT_*.md
 NK_Grid/CODE_REVIEW_REPORT_*.md
-SMR/NK_Grid/KNOWN_ISSUES.md
 
 # Env / secrets
 .env
@@ -50,8 +45,6 @@ env/
 
 # Logs
 **/logs/*
-!SMR/NK_Grid/logs/.gitkeep
-!SMR/Zheng_Cheng_Replication/logs/.gitkeep
 *.log
 *.out
 *.err

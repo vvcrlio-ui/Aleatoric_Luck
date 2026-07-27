@@ -6,7 +6,7 @@
   "feature_manifest_version": 1,
   "feature_universe": {
     "definition_file": "ffc_tree_ordinal.feature_universe.json",
-    "definition_sha256": "0b924b9a1782600d5b83c3a26dc3c2f040e495d67446fb7136dc1b5c052d1c5a",
+    "definition_sha256": "b7740ee79855e59a2b9ba52ef04ffa61a58d7fb16895f60234b2f3f217df2bcb",
     "mode": "train_pool_screened"
   },
   "group_column": null,

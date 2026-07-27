@@ -1,53 +1,37 @@
-# SMR: NK Grid and Zheng-Cheng Replication
+# SMR adapter
 
-> This is the `SMR/` subtree of the [`Aleatoric_Luck`](../README.md) repository.
-> See the repository root README for how this relates to `FFC/` and the other
-> predictability papers.
+This is the article-owned `SMR/` subtree of the
+[`Aleatoric_Luck`](../README.md) repository.
 
-This directory contains two self-contained Python subprojects:
+It contains the [`adapter/`](adapter/README.md), `schema/`, `panels.yaml`, and
+`model_params.yaml` integration for the shared root
+[`NK_Grid/`](../NK_Grid/README.md) engine.
 
-- [`NK_Grid/`](NK_Grid/README.md): joint sample-size (N) by feature-count (K)
-  sweeps for regression and classification prediction metrics, applied to the
-  SMR (hourly wage / total income) panels.
-- [`Zheng_Cheng_Replication/`](Zheng_Cheng_Replication/README.md): the
-  Zheng and Cheng replication workflow plus the early predictive extensions
-  for overall, sample-size, feature-set, domain-wise, and SHAP analyses.
-
-The expanded model space is shared by both subprojects: OLS, Ridge, Lasso,
-Elastic Net, Random Forest, XGBoost, LightGBM, a one-hidden-layer neural
-network, Extra Trees, and a stacked Super Learner. BART remains available as
-a legacy replication model but is not part of the expanded ten-model space.
-
-Each subproject has its own `src/`, `slurm/`, `data` directory, logs marker, and
-requirements file. The shared support modules are intentionally copied into
-both directories so either subproject can run independently.
+The expanded model space includes OLS, Ridge, Lasso, Elastic Net, Random
+Forest, XGBoost, LightGBM, a one-hidden-layer neural network, Extra Trees, and
+a stacked Super Learner. BART remains available in the shared engine but is not
+part of the expanded ten-model SMR panel.
 
 ## Layout (within `SMR/`)
 
 ```text
 SMR/
-├── NK_Grid/
-│   ├── src/
-│   ├── slurm/
-│   ├── panels.yaml
-│   ├── requirements.txt
-│   └── README.md
-├── Zheng_Cheng_Replication/
-│   ├── src/
-│   ├── slurm/
-│   ├── colab_run.ipynb
-│   ├── requirements.txt
-│   ├── requirements-notebook.txt
-│   └── README.md
-├── tests/
-│   ├── test_nk_grid.py
-│   └── test_zheng_cheng_replication.py
+├── adapter/
+│   ├── contracts/asample2_withlag.json
+│   ├── prepare.py
+│   └── tests/
+├── schema/
+├── data/
+│   ├── private/        raw adapter input; ignored by Git
+│   └── ard/            generated adapter output; ignored by Git
+├── panels.yaml
+├── model_params.yaml
 ├── requirements.txt
 └── README.md
 ```
 
-NLSY data are not committed (`**/data/` is gitignored repo-wide). Each
-subproject expects its own local `data/` directory populated separately.
+NLSY data and generated outputs are not committed (`**/data/` and
+`**/outputs/` are ignored repository-wide).
 
 ## Quick start
 
@@ -62,29 +46,18 @@ python -m pip install -r requirements.txt
 Run the NK grid:
 
 ```bash
-cd NK_Grid
-python src/nk_grid.py --help
-python src/run_panels.py --dry-run
-```
-
-Run the replication workflow:
-
-```bash
-cd Zheng_Cheng_Replication
-python src/overall_prediction.py --help
-python src/overall_prediction.py --models ols ridge lasso xgboost extra_trees super_learner
+python adapter/prepare.py
+aleatoric-nk-grid-panels --manifest panels.yaml --dry-run
 ```
 
 ## Tests
 
-From `SMR/`:
+Run engine and adapter tests from the repository root:
 
 ```bash
-python -m pytest -q
-python -m compileall NK_Grid/src Zheng_Cheng_Replication/src tests
+python -m pytest -q NK_Grid/tests SMR/adapter/tests
+python -m compileall NK_Grid/src SMR/adapter
 ```
 
-## Reference
-
-Zheng, H., & Cheng, S. (2025). Social Rigidity Across and Within Generations:
-A Predictive Approach. *Sociological Methods & Research, 54*(4), 1683-1725.
+Historical outputs produced by the removed article-local engine fork are kept
+locally under `outputs/legacy_nk_grid/`; current panels write to `outputs/`.

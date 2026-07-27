@@ -1,6 +1,9 @@
 # Generated FFCWS schemas
 
-Run `adapter/data_processor/scripts/build_ffc_strategies.py` with the supplied
-configuration. It writes one authoritative schema per strategy/outcome and one
-shared canonical feature-universe definition per strategy here. The generated
-schemas contain hashes but no raw IDs or absolute input paths.
+Run `python FFCWS/adapter/prepare.py` from the repository root. The adapter
+writes one authoritative schema per strategy/outcome and one shared canonical
+feature-universe definition per strategy into this directory.
+
+All schemas use the provider's official external test split and
+`train_pool_screened` feature universes. The generated schema and universe files
+are versioned; raw and derived tables remain ignored.

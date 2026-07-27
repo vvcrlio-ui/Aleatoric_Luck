@@ -1,2 +1,1 @@
--r NK_Grid/requirements.txt
--r Zheng_Cheng_Replication/requirements.txt
+-e ../NK_Grid[models,test]
