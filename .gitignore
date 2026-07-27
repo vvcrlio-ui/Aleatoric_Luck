@@ -30,7 +30,9 @@ build/
 **/data/*
 !**/data/.gitkeep
 datasets/
-**/outputs/
+**/outputs/*
+!**/outputs/.gitkeep
+!**/outputs/README.md
 results/
 runs/
 plans/
