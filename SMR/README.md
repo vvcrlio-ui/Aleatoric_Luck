@@ -17,8 +17,8 @@ part of the expanded ten-model SMR panel.
 ```text
 SMR/
 ├── adapter/
-│   ├── contracts/asample2_withlag.json
-│   ├── prepare.py
+│   ├── config/asample2_withlag.json
+│   ├── adapter.py
 │   └── tests/
 ├── schema/
 ├── data/
@@ -46,7 +46,7 @@ python -m pip install -r requirements.txt
 Run the NK grid:
 
 ```bash
-python adapter/prepare.py
+python adapter/adapter.py
 aleatoric-nk-grid-panels --manifest panels.yaml --dry-run
 ```
 

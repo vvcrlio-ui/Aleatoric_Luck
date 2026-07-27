@@ -6,8 +6,8 @@ This is the article-owned FFCWS integration for the shared root
 ```text
 FFCWS/
 ├── adapter/
-│   ├── contracts/ffc.yaml
-│   ├── prepare.py
+│   ├── config/ffc.yaml
+│   ├── adapter.py
 │   ├── src/
 │   └── tests/
 ├── schema/
@@ -28,7 +28,7 @@ From this directory:
 
 ```bash
 python -m pip install -r requirements.txt
-python adapter/prepare.py
+python adapter/adapter.py
 aleatoric-nk-grid-panels --manifest panels.yaml --dry-run
 ```
 

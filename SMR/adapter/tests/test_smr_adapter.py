@@ -10,7 +10,7 @@ import pytest
 
 from aleatoric_nk_grid.ingest import load_input
 from aleatoric_nk_grid.validate_input import validate_input
-from SMR.adapter.prepare import prepare_smr
+from SMR.adapter.adapter import build_adapter
 
 
 def _hash(path: Path) -> str:
@@ -59,7 +59,7 @@ def test_adapter_emits_typed_validated_deterministic_bundle(tmp_path):
     contract = _write_contract(tmp_path / "contract.json")
     article = tmp_path / "article"
 
-    first = prepare_smr(source, article_root=article, contract_path=contract)
+    first = build_adapter(source, article_root=article, contract_path=contract)
     bundle = article / "data" / "ard" / "synthetic_smr"
     tracked = [
         first.schema_path,
@@ -69,7 +69,7 @@ def test_adapter_emits_typed_validated_deterministic_bundle(tmp_path):
         bundle / "provenance.json",
     ]
     first_hashes = [_hash(path) for path in tracked]
-    second = prepare_smr(source, article_root=article, contract_path=contract)
+    second = build_adapter(source, article_root=article, contract_path=contract)
     assert first_hashes == [_hash(path) for path in tracked]
     assert second.predictor_count == 3
     assert second.source_count == 2
@@ -102,12 +102,12 @@ def test_row_perturbation_does_not_change_fixed_universe(tmp_path):
     first.to_csv(first_source, index=False)
     second.to_csv(second_source, index=False)
 
-    first_result = prepare_smr(
+    first_result = build_adapter(
         first_source,
         article_root=tmp_path / "first_article",
         contract_path=contract,
     )
-    second_result = prepare_smr(
+    second_result = build_adapter(
         second_source,
         article_root=tmp_path / "second_article",
         contract_path=contract,
@@ -128,7 +128,7 @@ def test_adapter_rejects_header_drift(tmp_path):
     frame.to_csv(source, index=False)
     contract = _write_contract(tmp_path / "contract.json")
     with pytest.raises(ValueError, match="undeclared Aset/Bset"):
-        prepare_smr(
+        build_adapter(
             source,
             article_root=tmp_path / "article",
             contract_path=contract,

@@ -19,7 +19,7 @@ if __name__ == "__main__":
     if "--config" not in arguments:
         arguments = [
             "--config",
-            str(ADAPTER_ROOT / "contracts" / "ffc.yaml"),
+            str(ADAPTER_ROOT / "config" / "ffc.yaml"),
             *arguments,
         ]
     pipeline_main(arguments)

@@ -45,8 +45,8 @@ FFCWS/data/private/test.csv
 Generate and validate the engine inputs:
 
 ```bash
-python SMR/adapter/prepare.py
-python FFCWS/adapter/prepare.py
+python SMR/adapter/adapter.py
+python FFCWS/adapter/adapter.py
 ```
 
 The generated ARD tables are written below `SMR/data/ard/` and

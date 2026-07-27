@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--out",
         type=Path,
-        default=article_root / "adapter" / "contracts" / "asample2_withlag.json",
+        default=article_root / "adapter" / "config" / "asample2_withlag.json",
     )
     args = parser.parse_args(argv)
     contract = build_contract(args.source)

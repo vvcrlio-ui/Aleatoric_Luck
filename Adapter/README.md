@@ -35,7 +35,7 @@ missingness, read [`ADAPTER.md`](ADAPTER.md).
 
 ## Complete Script
 
-Save the following code as `prepare.py` in the same directory as `raw.csv`. It
+Save the following code as `adapter.py` in the same directory as `raw.csv`. It
 produces the ARD, feature universe, and schema in that order, then validates them
 immediately.
 
@@ -108,7 +108,7 @@ print(f"OK: {len(resolved)} predictors, all treated as independent continuous va
 ## Run
 
 ```bash
-python prepare.py
+python adapter.py
 ```
 
 On success, it prints:

@@ -248,7 +248,7 @@ def _manifest_from_contract(
     return pd.DataFrame(rows, columns=MANIFEST_COLUMNS)
 
 
-def prepare_smr(
+def build_adapter(
     source: Path,
     *,
     article_root: Path,
@@ -380,7 +380,7 @@ def main(argv: list[str] | None = None) -> None:
     contract = (
         args.contract
         if args.contract is not None
-        else article_root / "adapter" / "contracts" / DEFAULT_CONTRACT
+        else article_root / "adapter" / "config" / DEFAULT_CONTRACT
     )
     contract_document = _load_contract(contract)
     source = (
@@ -391,7 +391,7 @@ def main(argv: list[str] | None = None) -> None:
         / "private"
         / f"{contract_document['dataset']}.csv"
     )
-    result = prepare_smr(
+    result = build_adapter(
         source,
         article_root=article_root,
         contract_path=contract,

@@ -8,8 +8,8 @@ This directory implements the article-owned side of the contract in
 ```text
 SMR/
 ├── adapter/
-│   ├── contracts/asample2_withlag.json  fixed, tracked feature contract
-│   ├── prepare.py                       raw analysis matrix -> engine artifacts
+│   ├── config/asample2_withlag.json     fixed feature configuration
+│   ├── adapter.py                       raw analysis matrix -> engine artifacts
 │   ├── build_contract.py                explicit contract-authoring utility
 │   └── tests/
 ├── schema/                              tracked schema + canonical universe
@@ -21,7 +21,7 @@ SMR/
         └── provenance.json
 ```
 
-`prepare.py` uses the fixed contract rather than learning feature names,
+`adapter.py` uses the fixed contract rather than learning feature names,
 vocabularies, or screening rules from row values. It writes artifacts in the
 required order, uses the shared engine's `canonical_feature_universe()`, and
 runs `validate_input()` for both outcomes before reporting success.
@@ -53,21 +53,21 @@ analysis, the integration must stop rather than silently changing the schema.
 From the repository root:
 
 ```bash
-python SMR/adapter/prepare.py
+python SMR/adapter/adapter.py
 ```
 
 The default input is `SMR/data/private/asample2_withlag.csv`. Validation
 parameters can be aligned with a planned run:
 
 ```bash
-python SMR/adapter/prepare.py \
+python SMR/adapter/adapter.py \
   --validation-model ols ridge lasso elastic_net random_forest \
   --min-n 10 \
   --test-size 0.3 \
   --seed 12345
 ```
 
-`build_contract.py` is an authoring utility, not part of routine preparation.
+`build_contract.py` is an authoring utility, not part of routine adapter builds.
 Run it only after deliberately changing the source header or the fixed one-hot
 source declarations, then review and commit the resulting contract:
 

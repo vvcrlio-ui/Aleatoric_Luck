@@ -27,7 +27,8 @@ build/
 .RData
 
 # Data / experiments
-**/data/
+**/data/*
+!**/data/.gitkeep
 datasets/
 **/outputs/
 results/
@@ -36,6 +37,8 @@ plans/
 
 # Local implementation/review notes
 NK_Grid/CODE_REVIEW_REPORT_*.md
+NK_Grid/ADAPTER_TO_NK_GRID_WORKFLOW_HARDENING_PROPOSAL_*.md
+NK_Grid/RISK_REMEDIATION_REVIEW_*.md
 
 # Env / secrets
 .env

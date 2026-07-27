@@ -8,8 +8,8 @@ This directory implements the article-owned side of
 ```text
 FFCWS/
 ├── adapter/
-│   ├── contracts/ffc.yaml       tracked preprocessing contract
-│   ├── prepare.py               single adapter entry point
+│   ├── config/ffc.yaml          tracked preprocessing configuration
+│   ├── adapter.py               single adapter entry point
 │   ├── src/ffcws_data_processor/
 │   │   ├── common/
 │   │   └── strategies/
@@ -24,7 +24,7 @@ FFCWS/
     └── ard/<dataset>/           engine tables, manifest and provenance
 ```
 
-`prepare.py` preserves the provider's official train/test split. Feature
+`adapter.py` preserves the provider's official train/test split. Feature
 eligibility, categorical vocabularies and prevalence screening are learned only
 from background rows whose IDs occur in the official training pool, so the
 feature-universe mode is `train_pool_screened`. The adapter writes each
@@ -59,7 +59,7 @@ expand the training vocabulary. One-hot columns from a raw categorical variable
 are sampled atomically.
 
 The schemas set `exchangeable=true` under the research assumption recorded in
-`contracts/ffc.yaml`: eligible background-variable sources are treated as
+`config/ffc.yaml`: eligible background-variable sources are treated as
 exchangeable units in the N×K feature-availability estimand. The missing-
 indicator strategy additionally treats each explicitly declared missingness
 indicator as a sampling source. If these assumptions are unsuitable for a
@@ -70,20 +70,20 @@ planned analysis, stop rather than changing the flag merely to pass validation.
 From the repository root, build and validate all three strategies:
 
 ```bash
-python FFCWS/adapter/prepare.py
+python FFCWS/adapter/adapter.py
 ```
 
 Build only selected strategies:
 
 ```bash
-python FFCWS/adapter/prepare.py \
+python FFCWS/adapter/adapter.py \
   --strategy median_mode median_missing_indicator tree_ordinal
 ```
 
 Validation parameters can be aligned with a planned run:
 
 ```bash
-python FFCWS/adapter/prepare.py \
+python FFCWS/adapter/adapter.py \
   --validation-model ols ridge lasso elastic_net random_forest \
   --min-n 10 \
   --seed 12345

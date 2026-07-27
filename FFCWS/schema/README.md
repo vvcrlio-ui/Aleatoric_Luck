@@ -1,6 +1,6 @@
 # Generated FFCWS schemas
 
-Run `python FFCWS/adapter/prepare.py` from the repository root. The adapter
+Run `python FFCWS/adapter/adapter.py` from the repository root. The adapter
 writes one authoritative schema per strategy/outcome and one shared canonical
 feature-universe definition per strategy into this directory.
 
