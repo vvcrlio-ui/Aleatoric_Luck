@@ -1,17 +1,19 @@
-# Adapter Quick Start
+# Data-preparation quick start
 
-An adapter is a preprocessing program that you write for each dataset: it takes
-raw data as input and produces files that the engine can read.
+An adapter is an application-specific program that converts source data into a
+validated analysis-ready dataset and its machine-readable specifications. This
+short example applies only to a single-table regression dataset containing
+continuous predictor variables.
 
-Three questions to answer before you begin:
+Before using the example, answer three substantive questions:
 
 1. Are all variables used for prediction (predictors) truly continuous?  
    If `1/2/3` merely represent three education levels, the answer is “no.”
-2. Does each raw variable correspond to exactly one predictor column?  
+2. Does each predictor variable correspond to exactly one model input column?
    For example, if one education variable is expanded into multiple columns by
    one-hot encoding, the answer is “no.”
-3. Does the dataset consist of a single table rather than predefined training
-   and test sets?
+3. Does the dataset consist of a single table with an internally generated
+   training and test split?
 
 **If any answer is “no,” read [`ADAPTER.md`](ADAPTER.md).**
 
@@ -23,7 +25,7 @@ Run the following command from the repository root:
 python -m pip install -e NK_Grid
 ```
 
-`raw.csv` must satisfy the following assumptions:
+`raw.csv` must satisfy all of the following assumptions:
 
 1. It contains a regression outcome column named `y`.
 2. Predictor columns begin with `X_` and contain only continuous numeric values.
@@ -33,11 +35,11 @@ python -m pip install -e NK_Grid
 If the raw data uses custom sentinel values such as `-9` or `999` to represent
 missingness, read [`ADAPTER.md`](ADAPTER.md).
 
-## Complete Script
+## Complete example
 
 Save the following code as `adapter.py` in the same directory as `raw.csv`. It
-produces the ARD, feature universe, and schema in that order, then validates them
-immediately.
+produces the analysis-ready data table, predictor-universe definition, and
+schema in that order, then validates them immediately.
 
 ```python
 import hashlib, json
@@ -50,20 +52,18 @@ from aleatoric_nk_grid.validate_input import canonical_feature_universe, validat
 OUTCOME = "y"
 PREFIX = "X_"
 
-# 1. raw -> ARD: project columns only. Keep missing values as NaN; do not impute—
-# the engine handles them within each training subsample
+# 1. Source data -> analysis-ready data. Keep missing values as NaN; imputation
+# parameters are estimated separately within each selected training sample.
 raw = pd.read_csv("raw.csv")
 predictors = [c for c in raw.columns if c.startswith(PREFIX)]
 raw[[OUTCOME, *predictors]].to_csv("data.csv", index=False)
 
-# 2. feature universe: use the engine function; a handwritten version may drift
-# from the validation logic
+# 2. Predictor universe: use the shared function to match validation logic.
 groups = source_groups(predictors, None, {})
 Path("universe.json").write_text(canonical_json(
     canonical_feature_universe(predictors, groups, None)))
 
-# 3. schema: the engine's sole semantic entry point; paths are resolved relative
-# to the directory containing schema.json
+# 3. Schema: paths are resolved relative to the directory containing schema.json.
 schema = {
     "schema_version": 1,
     "feature_manifest_version": None,     # All-continuous data needs no manifest
@@ -77,8 +77,8 @@ schema = {
     "predictor_columns": None,            # Set exactly one of this and predictor_prefix
     "predictor_prefix": [PREFIX],
     "feature_manifest": None,
-    "exchangeable": True,                 # Assumes raw variables are exchangeable
-                                            # sampling units; requires research justification
+    "exchangeable": True,                 # Assumes the declared predictor variables can be
+                                            # sampled on equal terms; justify this assumption
     "feature_universe": {
         "mode": "fixed_a_priori",         # Fixed in advance, with no row-level screening
         "definition_file": "universe.json",
@@ -98,7 +98,7 @@ schema = {
 }
 Path("schema.json").write_text(json.dumps(schema, indent=2))
 
-# 4. Validation: these parameters serve validation only and do not affect adapter artifacts
+# 4. Validation: these settings leave the generated files unchanged.
 loaded = load_input(Path("schema.json"), OUTCOME)
 _, resolved = validate_input(loaded, OUTCOME, models=["ols"],
                              min_n=10, test_size=0.3, seed=1)
@@ -118,12 +118,12 @@ OK: <your predictor count> predictors, all treated as independent continuous var
 ```
 
 The current directory should now contain `data.csv`, `universe.json`, and
-`schema.json`. If their format or content does not meet the engine's input
-requirements, validation will raise an error at this step.
+`schema.json`. Validation raises an error when their structure or
+interpretation falls outside the common analysis requirements.
 
 ## When You Must Read the Full Guide
 
-If your data contains ordinal features, one-hot features, a raw variable expanded
-into multiple predictor columns, or external training and test sets, do not extend
-this template. Read the “Internal / External,” “Feature Universe,” and “Feature
+Data containing ordinal variables, one-hot representations, predictor variables
+expanded into multiple model input columns, or predefined training and test
+samples require the “Internal / External,” “Feature Universe,” and “Feature
 Manifest” sections of [`ADAPTER.md`](ADAPTER.md).

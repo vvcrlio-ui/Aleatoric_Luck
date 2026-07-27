@@ -1,9 +1,17 @@
-# Generated FFCWS schemas
+# FFCWS analysis specifications
 
-Run `python FFCWS/adapter/adapter.py` from the repository root. The adapter
-writes one authoritative schema per strategy/outcome and one shared canonical
-feature-universe definition per strategy into this directory.
+Run `python FFCWS/adapter/adapter.py` from the repository root to regenerate
+this directory.
 
-All schemas use the provider's official external test split and
-`train_pool_screened` feature universes. The generated schema and universe files
-are versioned; raw and derived tables remain ignored.
+For each predictor representation, the adapter generates:
+
+- one canonical definition of the predictor variables eligible for the
+  \(K\)-dimension; and
+- one machine-readable analysis schema for each of the six outcomes.
+
+The schemas record the predefined training and test samples, variable
+representations, missing-value treatment, and links to the generated
+analysis-ready tables. Schemas and predictor-universe definitions are
+versioned because they determine how those untracked tables are interpreted.
+The source data and generated data tables remain excluded from version
+control.

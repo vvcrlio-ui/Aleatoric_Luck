@@ -1,54 +1,68 @@
-# SMR adapter
+# SMR data preparation
 
-This directory implements the article-owned side of the contract in
-[`../../Adapter/ADAPTER.md`](../../Adapter/ADAPTER.md).
+## Role in the research design
 
-## Standard layout
+The SMR adapter converts the provider-supplied analysis matrix into the
+versioned inputs required for the \(N\)-by-\(K\) analysis. It preserves the
+substantive distinction between a predictor variable and the numeric columns
+used to represent that variable in a statistical model.
+
+The source matrix contains:
+
+| Quantity | Count |
+|---|---:|
+| Model input columns | 4,252 |
+| Predictor variables counted in \(K\) | 497 |
+| Categorical variables represented by grouped indicator columns | 29 |
+
+The 3,784 indicator columns belonging to those 29 categorical variables are
+kept in atomic groups. When a categorical variable is selected, all of its
+indicator columns are supplied to the model together.
+
+## Data transformations
+
+The source is already a numeric, analysis-ready matrix. The adapter therefore:
+
+- retains the supplied numeric representation of continuous and scalar
+  variables;
+- records which indicator columns belong to the same categorical variable;
+- records the two outcome columns and the eligible predictor variables; and
+- validates the resulting data and analysis specifications.
+
+The source matrix is free of non-finite values and the negative sentinel codes
+commonly used to denote missingness. It enters the analysis with its supplied
+values, rows, and predictor set unchanged. Any imputation parameters required
+during analysis are estimated within the selected training sample.
+
+The \(K\)-dimension treats the 497 declared predictor variables as eligible
+units of prior information. This is a research-design assumption: it gives
+each declared predictor variable an opportunity to enter the random
+predictor-availability experiment, while preventing the arbitrary selection of
+individual indicator columns from the same categorical variable.
+
+## Inputs and generated files
 
 ```text
 SMR/
 ├── adapter/
-│   ├── config/asample2_withlag.json     fixed feature configuration
-│   ├── adapter.py                       raw analysis matrix -> engine artifacts
-│   ├── build_contract.py                explicit contract-authoring utility
+│   ├── config/asample2_withlag.json     reviewed variable specification
+│   ├── adapter.py                       data-preparation entry point
+│   ├── build_contract.py                specification-authoring utility
 │   └── tests/
-├── schema/                              tracked schema + canonical universe
-└── data/                                ignored by Git
-    ├── private/asample2_withlag.csv
-    └── ard/asample2_withlag/
+├── schema/                              generated, versioned analysis specifications
+└── data/
+    ├── private/asample2_withlag.csv     source data; excluded from Git
+    └── ard/asample2_withlag/            generated data; excluded from Git
         ├── data.csv
         ├── feature_manifest.csv
         └── provenance.json
 ```
 
-`adapter.py` uses the fixed contract rather than learning feature names,
-vocabularies, or screening rules from row values. It writes artifacts in the
-required order, uses the shared engine's `canonical_feature_universe()`, and
-runs `validate_input()` for both outcomes before reporting success.
+The schema and predictor-universe files are versioned because they define how
+the generated data are interpreted. Git excludes the source and generated data
+tables.
 
-## Source semantics
-
-The source is the provider-supplied, numeric analysis matrix used by the SMR
-replication. It contains no `NaN`, `±inf`, or `-1` through `-9` sentinel values.
-The adapter therefore has no missing-code substitutions and performs no
-fitting, imputation, standardization, splitting, row deletion, or feature
-screening.
-
-Scalar columns retain the paper's supplied numeric representation. The 3,784
-dummy columns are declared as 29 atomic `onehot_group` sources. The resulting
-feature universe contains 4,252 predictor columns but 497 K-sampling sources.
-This source-level K definition is the one required by `ADAPTER.md`; results
-from the removed legacy engine, which sampled dummy columns independently, are
-not directly comparable on the K dimension.
-
-The schema sets `exchangeable=true` under this research assumption: the N×K
-estimand samples from the paper's predeclared Aset/Bset predictor sources, and
-these sources are treated as exchangeable units for the feature-availability
-experiment. Dummy columns from one raw categorical variable remain atomic and
-are sampled together. If that assumption is not appropriate for a later
-analysis, the integration must stop rather than silently changing the schema.
-
-## Run
+## Reproduction
 
 From the repository root:
 
@@ -56,8 +70,7 @@ From the repository root:
 python SMR/adapter/adapter.py
 ```
 
-The default input is `SMR/data/private/asample2_withlag.csv`. Validation
-parameters can be aligned with a planned run:
+To use validation settings that match a planned analysis:
 
 ```bash
 python SMR/adapter/adapter.py \
@@ -67,10 +80,13 @@ python SMR/adapter/adapter.py \
   --seed 12345
 ```
 
-`build_contract.py` is an authoring utility, not part of routine adapter builds.
-Run it only after deliberately changing the source header or the fixed one-hot
-source declarations, then review and commit the resulting contract:
+`build_contract.py` is used only when the reviewed source header or grouped
+categorical-variable declarations change. Its output must be reviewed before
+it replaces the existing specification:
 
 ```bash
 python SMR/adapter/build_contract.py
 ```
+
+The generated files follow the common
+[adapter specification](../../Adapter/ADAPTER.md).
