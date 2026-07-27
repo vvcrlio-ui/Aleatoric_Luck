@@ -169,9 +169,13 @@ def _atomic_text_writer(target: Path) -> Iterator[Any]:
 
 @contextmanager
 def output_run_lock(out_path: Path) -> Iterator[Path]:
-    """Fail fast when another process is already writing this output."""
+    """Fail fast when another process is already writing this output.
 
-    lock_path = out_path.with_suffix(out_path.suffix + ".run.lock")
+    Keep persistent lock inodes in a hidden directory so output folders remain
+    uncluttered without introducing the race caused by deleting flock files.
+    """
+
+    lock_path = out_path.parent / ".locks" / f"{out_path.name}.run.lock"
     _mkdir_durable(lock_path.parent)
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
     acquired = False

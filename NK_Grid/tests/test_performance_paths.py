@@ -336,7 +336,9 @@ def test_checkpoint_index_normalizes_mixed_legacy_and_status_shards(tmp_path):
 def test_output_writer_lease_rejects_duplicate_process_owner(tmp_path):
     out = tmp_path / "result.csv"
 
-    with output_run_lock(out):
+    with output_run_lock(out) as lock_path:
+        assert lock_path == tmp_path / ".locks" / "result.csv.run.lock"
+        assert lock_path.is_file()
         with pytest.raises(RuntimeError, match="already holds the output lease"):
             with output_run_lock(out):
                 pass
