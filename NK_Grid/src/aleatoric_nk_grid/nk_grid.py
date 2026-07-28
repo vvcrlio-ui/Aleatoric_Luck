@@ -65,7 +65,6 @@ from .experiment import (
     checkpoint_parts_dir,
     core_environment,
     diagnostics_summary,
-    effective_outer_n_jobs,
     git_state,
     load_checkpoint,  # compatibility alias; production resume uses projected index
     load_checkpoint_index,
@@ -73,7 +72,6 @@ from .experiment import (
     merge_checkpoint_parts,
     model_run_settings,
     output_run_lock,
-    parallel_preference,
     rows_for_experiment,
     seed_checkpoint_parts_from_csv,
     retire_checkpoint_parts,
@@ -827,6 +825,41 @@ def _relative_path(path: Path) -> str:
         return str(path)
 
 
+def _parallelism_payload(config: NKGridConfig) -> dict[str, Any]:
+    """Describe the scheduler policy actually used by cell windows."""
+
+    selected = set(config.models)
+    non_bart = selected - {"bart"}
+    native = non_bart & set(SERIAL_OUTER_MODELS)
+    return {
+        "configured_outer_n_jobs": int(config.n_jobs),
+        "window_policy": {
+            "parallel_unit": "cell_group",
+            "non_bart": {
+                "selected": bool(non_bart),
+                "prefer": "threads",
+                "contains_native": bool(native),
+                "n_jobs_rule": {
+                    "all_models_native": 1,
+                    "otherwise": int(config.n_jobs),
+                },
+                "native_calls_serialized": bool(native),
+            },
+            "bart": {
+                "selected": "bart" in selected,
+                "scheduled_separately": True,
+                "prefer": "processes",
+                "n_jobs": int(config.n_jobs),
+            },
+        },
+        "native_process_isolated_models": sorted(native),
+        "native_process_max_attempts": int(config.native_process_max_attempts),
+        "native_process_timeout_seconds": float(
+            config.native_process_timeout_seconds
+        ),
+    }
+
+
 def _manifest_payload(
     *,
     config: NKGridConfig,
@@ -917,28 +950,7 @@ def _manifest_payload(
             "n_grid": [int(value) for value in n_grid],
             "k_grid": [int(value) for value in k_grid],
             "models": list(config.models),
-            "parallelism": {
-                "configured_outer_n_jobs": int(config.n_jobs),
-                "effective_outer_n_jobs_by_model": {
-                    model_name: int(
-                        effective_outer_n_jobs(model_name, config.n_jobs)
-                    )
-                    for model_name in config.models
-                },
-                "joblib_prefer_by_model": {
-                    model_name: parallel_preference([model_name])
-                    for model_name in config.models
-                },
-                "native_process_isolated_models": sorted(
-                    set(config.models) & set(SERIAL_OUTER_MODELS)
-                ),
-                "native_process_max_attempts": int(
-                    config.native_process_max_attempts
-                ),
-                "native_process_timeout_seconds": float(
-                    config.native_process_timeout_seconds
-                ),
-            },
+            "parallelism": _parallelism_payload(config),
             "checkpointing": {
                 "batch_size": int(config.batch_size),
                 "loose_parts_per_compaction": int(
@@ -1272,14 +1284,6 @@ def _run_nk_grid_locked(
     if max_jobs is not None and max_jobs < 0:
         raise ValueError("max_jobs must be non-negative")
     declared_size = estimate_run_size(config)
-    effective_n_jobs_by_model = {
-        model_name: effective_outer_n_jobs(model_name, config.n_jobs)
-        for model_name in config.models
-    }
-    joblib_prefer_by_model = {
-        model_name: parallel_preference([model_name])
-        for model_name in config.models
-    }
     if dry_run:
         print(json.dumps(declared_size, indent=2, sort_keys=True))
         return declared_size
@@ -1477,28 +1481,9 @@ def _run_nk_grid_locked(
             completed_manifest_path.read_text(encoding="utf-8")
         )
         completed_manifest["updated_at"] = utc_now()
-        completed_manifest["design"]["parallelism"] = {
-            "configured_outer_n_jobs": int(config.n_jobs),
-            "effective_outer_n_jobs_by_model": {
-                model_name: int(
-                    effective_outer_n_jobs(model_name, config.n_jobs)
-                )
-                for model_name in config.models
-            },
-            "joblib_prefer_by_model": {
-                model_name: parallel_preference([model_name])
-                for model_name in config.models
-            },
-            "native_process_isolated_models": sorted(
-                set(config.models) & set(SERIAL_OUTER_MODELS)
-            ),
-            "native_process_max_attempts": int(
-                config.native_process_max_attempts
-            ),
-            "native_process_timeout_seconds": float(
-                config.native_process_timeout_seconds
-            ),
-        }
+        completed_manifest["design"]["parallelism"] = _parallelism_payload(
+            config
+        )
         write_json_atomic(completed_manifest_path, completed_manifest)
         log_progress(f"already complete; no-op reuse of verified output: {out_path}")
         return out_path
@@ -1548,9 +1533,7 @@ def _run_nk_grid_locked(
     log_progress(
         f"jobs total={expected_rows} completed={len(completed)} "
         f"pending={len(pending)} batch_size={config.batch_size} "
-        f"configured_n_jobs={config.n_jobs} "
-        f"effective_n_jobs_by_model={effective_n_jobs_by_model} "
-        f"joblib_prefer_by_model={joblib_prefer_by_model}"
+        f"window_policy={_parallelism_payload(config)['window_policy']}"
     )
     # The pending list is now authoritative. Release the full design list,
     # projected index and completed-key set before model fitting so a resumed
@@ -1933,55 +1916,86 @@ def _run_nk_grid_locked(
     checkpoint_buffer: list[dict] = []
     checkpoint_batch_index = 0
     for execution_window in execution_windows:
-        window_models = {
-            job[0]
-            for _, cell_jobs in execution_window
-            for job in cell_jobs
-        }
-        contains_native = bool(window_models & set(SERIAL_OUTER_MODELS))
-        group_preference = (
-            "threads"
-            if contains_native
-            else parallel_preference(window_models)
-        )
-        group_n_jobs = (
-            1
-            if window_models and window_models <= set(SERIAL_OUTER_MODELS)
-            else config.n_jobs
-        )
-        log_progress(
-            f"cell window starting groups={len(execution_window)} "
-            f"models={sorted(window_models)} n_jobs={group_n_jobs} "
-            f"joblib_prefer={group_preference}"
-        )
-        grouped_rows = Parallel(
-            n_jobs=group_n_jobs,
-            batch_size=1,
-            prefer=group_preference,
-        )(
-            delayed(run_cell_group)(
-                seed,
-                draw,
-                n_samples,
-                k_features,
-                tuple(job[0] for job in cell_jobs),
-                # Keep BART's process-local order construction to avoid
-                # repeatedly serializing the shared order arrays.
-                orders=(
-                    None
-                    if group_preference == "processes"
-                    else cached_draw_orders(seed, draw)
-                ),
+        rows_by_cell: dict[
+            tuple[int, int, int, int], dict[str, dict]
+        ] = {}
+        for subwindow_name, selects_bart, group_preference in (
+            ("non_bart", False, "threads"),
+            ("bart", True, "processes"),
+        ):
+            subwindow = [
+                (
+                    cell_key,
+                    [
+                        job
+                        for job in cell_jobs
+                        if (job[0] == "bart") is selects_bart
+                    ],
+                )
+                for cell_key, cell_jobs in execution_window
+            ]
+            subwindow = [
+                (cell_key, cell_jobs)
+                for cell_key, cell_jobs in subwindow
+                if cell_jobs
+            ]
+            if not subwindow:
+                continue
+            subwindow_models = {
+                job[0] for _, cell_jobs in subwindow for job in cell_jobs
+            }
+            group_n_jobs = (
+                1
+                if (
+                    not selects_bart
+                    and subwindow_models <= set(SERIAL_OUTER_MODELS)
+                )
+                else config.n_jobs
             )
-            for (
-                seed,
-                draw,
-                n_samples,
-                k_features,
-            ), cell_jobs in execution_window
-        )
+            log_progress(
+                f"cell subwindow={subwindow_name} groups={len(subwindow)} "
+                f"models={sorted(subwindow_models)} n_jobs={group_n_jobs} "
+                f"joblib_prefer={group_preference}"
+            )
+            grouped_rows = Parallel(
+                n_jobs=group_n_jobs,
+                batch_size=1,
+                prefer=group_preference,
+            )(
+                delayed(run_cell_group)(
+                    seed,
+                    draw,
+                    n_samples,
+                    k_features,
+                    tuple(job[0] for job in cell_jobs),
+                    # BART constructs orders inside its isolated process;
+                    # thread workers share the frozen parent cache.
+                    orders=(
+                        None
+                        if selects_bart
+                        else cached_draw_orders(seed, draw)
+                    ),
+                )
+                for (
+                    seed,
+                    draw,
+                    n_samples,
+                    k_features,
+                ), cell_jobs in subwindow
+            )
+            for (cell_key, cell_jobs), cell_rows in zip(
+                subwindow, grouped_rows
+            ):
+                rows_by_cell.setdefault(cell_key, {}).update(
+                    {
+                        job[0]: row
+                        for job, row in zip(cell_jobs, cell_rows)
+                    }
+                )
         checkpoint_buffer.extend(
-            row for cell_rows in grouped_rows for row in cell_rows
+            rows_by_cell[cell_key][job[0]]
+            for cell_key, cell_jobs in execution_window
+            for job in cell_jobs
         )
         while len(checkpoint_buffer) >= config.batch_size:
             checkpoint_batch_index += 1

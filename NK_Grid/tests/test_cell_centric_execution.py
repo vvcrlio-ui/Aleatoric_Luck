@@ -37,6 +37,17 @@ class _MeanRegressor:
         return np.full(len(X), self.mean_, dtype=float)
 
 
+class _InlineParallel:
+    def __init__(self, **_kwargs):
+        pass
+
+    def __call__(self, tasks):
+        return [
+            function(*args, **kwargs)
+            for function, args, kwargs in tasks
+        ]
+
+
 def _run_isolated_inline(_runner, function, /, *args, **kwargs):
     kwargs.pop("on_native_crash", None)
     kwargs.pop("on_native_timeout", None)
@@ -304,6 +315,128 @@ def test_cell_groups_are_deterministic_with_concurrent_outer_jobs(tmp_path):
         _metric_rows(second.out),
         check_exact=True,
     )
+
+
+def test_mixed_bart_panel_schedules_bart_in_separate_process_subwindow(
+    tmp_path,
+):
+    frame = _frame()
+    predictors = [column for column in frame if column.startswith("X_")]
+    schema = write_schema_bundle(
+        tmp_path / "input", frame, predictors=predictors
+    )
+    parallel_calls = []
+
+    class TrackingParallel:
+        def __init__(self, **kwargs):
+            self.settings = kwargs
+
+        def __call__(self, tasks):
+            observed_models = []
+            rows = []
+            for function, args, kwargs in tasks:
+                observed_models.append(tuple(args[4]))
+                rows.append(function(*args, **kwargs))
+            parallel_calls.append(
+                {
+                    "prefer": self.settings["prefer"],
+                    "n_jobs": self.settings["n_jobs"],
+                    "models": observed_models,
+                }
+            )
+            return rows
+
+    with (
+        patch("aleatoric_nk_grid.nk_grid.Parallel", TrackingParallel),
+        patch(
+            "aleatoric_nk_grid.nk_grid.make_model",
+            side_effect=lambda *args, **kwargs: _MeanRegressor(),
+        ),
+        patch(
+            "aleatoric_nk_grid.nk_grid.IsolatedProcessRunner.run",
+            autospec=True,
+            side_effect=_run_isolated_inline,
+        ),
+    ):
+        run_nk_grid(
+            _config(
+                schema,
+                tmp_path / "mixed-bart.csv",
+                models=("bart", "lightgbm", "ols"),
+                n_jobs=3,
+            )
+        )
+
+    assert parallel_calls == [
+        {
+            "prefer": "threads",
+            "n_jobs": 3,
+            "models": [("lightgbm", "ols")],
+        },
+        {
+            "prefer": "processes",
+            "n_jobs": 3,
+            "models": [("bart",)],
+        },
+    ]
+    assert pd.read_csv(tmp_path / "mixed-bart.csv")["status"].eq("ok").all()
+
+
+def test_manifest_records_actual_window_policy_without_legacy_model_policy(
+    tmp_path,
+):
+    frame = _frame()
+    predictors = [column for column in frame if column.startswith("X_")]
+    schema = write_schema_bundle(
+        tmp_path / "input", frame, predictors=predictors
+    )
+    out = tmp_path / "window-policy.csv"
+    with (
+        patch("aleatoric_nk_grid.nk_grid.Parallel", _InlineParallel),
+        patch(
+            "aleatoric_nk_grid.nk_grid.make_model",
+            side_effect=lambda *args, **kwargs: _MeanRegressor(),
+        ),
+        patch(
+            "aleatoric_nk_grid.nk_grid.IsolatedProcessRunner.run",
+            autospec=True,
+            side_effect=_run_isolated_inline,
+        ),
+    ):
+        run_nk_grid(
+            _config(
+                schema,
+                out,
+                models=("ols", "lightgbm", "bart"),
+                n_jobs=3,
+            )
+        )
+
+    parallelism = json.loads(
+        out.with_suffix(".manifest.json").read_text(encoding="utf-8")
+    )["design"]["parallelism"]
+    assert "effective_outer_n_jobs_by_model" not in parallelism
+    assert "joblib_prefer_by_model" not in parallelism
+    assert parallelism["configured_outer_n_jobs"] == 3
+    assert parallelism["window_policy"] == {
+        "parallel_unit": "cell_group",
+        "non_bart": {
+            "selected": True,
+            "prefer": "threads",
+            "contains_native": True,
+            "n_jobs_rule": {
+                "all_models_native": 1,
+                "otherwise": 3,
+            },
+            "native_calls_serialized": True,
+        },
+        "bart": {
+            "selected": True,
+            "scheduled_separately": True,
+            "prefer": "processes",
+            "n_jobs": 3,
+        },
+    }
 
 
 def test_preprocess_telemetry_counts_only_mode_misses_and_matches_manifest(
