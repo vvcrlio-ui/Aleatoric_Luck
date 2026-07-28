@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -61,7 +61,6 @@ from .experiment import (
     add_metadata,
     build_experiment_metadata,
     checkpoint_parts,
-    file_sha256,
     checkpoint_parts_dir,
     core_environment,
     diagnostics_summary,
@@ -197,6 +196,15 @@ class NKGridConfig:
     allow_large_run: bool = False
     dry_run: bool = False
     rerun_completed: bool = True
+    # Direct construction is used by the test/dev API. Production manifests
+    # always override these explicit values.
+    experiment_id: str = "nkgrid-test-v1"
+    data_version: str = "test-data-v1"
+    model_spec_version: str = "nkgrid-test-models-v1"
+    resume_group: str | None = None
+    repeat_plan: tuple[tuple[int, int], ...] | None = None
+    n_grid: tuple[int, ...] | None = None
+    k_grid: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -211,6 +219,45 @@ class SplitData:
 class DrawOrders:
     row_index: np.ndarray
     feature_names: np.ndarray
+
+
+def resolve_repeat_pairs(config: NKGridConfig) -> tuple[tuple[int, int], ...]:
+    """Resolve legacy counts or explicit absolute pairs into one representation."""
+
+    if config.repeat_plan is not None:
+        if config.n_seeds != 1 or config.n_draws != 1:
+            raise ValueError("repeat_plan cannot be combined with n_seeds or n_draws")
+        pairs = tuple((seed, draw) for seed, draw in config.repeat_plan)
+    else:
+        pairs = tuple(
+            (config.seed + offset, draw)
+            for offset in range(config.n_seeds)
+            for draw in range(config.n_draws)
+        )
+    group_repeat_pairs_by_seed(pairs)
+    return tuple(sorted(pairs))
+
+
+def group_repeat_pairs_by_seed(
+    repeat_pairs: Sequence[tuple[int, int]],
+) -> dict[int, tuple[int, ...]]:
+    """Validate and group absolute repeat pairs without silently deduplicating."""
+
+    grouped: dict[int, list[int]] = {}
+    seen: set[tuple[int, int]] = set()
+    for pair in repeat_pairs:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError("repeat_plan entries must be (seed, draw) pairs")
+        seed, draw = pair
+        if isinstance(seed, bool) or isinstance(draw, bool) or not isinstance(seed, int) or not isinstance(draw, int) or seed < 0 or draw < 0:
+            raise ValueError("repeat_plan seed and draw must be non-negative integers")
+        if (seed, draw) in seen:
+            raise ValueError(f"repeat_plan contains duplicate pair ({seed}, {draw})")
+        seen.add((seed, draw))
+        grouped.setdefault(seed, []).append(draw)
+    if not grouped:
+        raise ValueError("repeat_plan must not be empty")
+    return {seed: tuple(sorted(draws)) for seed, draws in sorted(grouped.items())}
 
 
 def log2_size_grid(
@@ -737,10 +784,9 @@ def estimate_run_size(config: NKGridConfig) -> dict[str, int | str]:
     _validate_config(config)
     top_level = (
         len(config.models)
-        * config.n_seeds
-        * config.n_draws
-        * config.n_sizes_n
-        * config.n_sizes_k
+        * len(resolve_repeat_pairs(config))
+        * len(config.n_grid or tuple(range(config.n_sizes_n)))
+        * len(config.k_grid or tuple(range(config.n_sizes_k)))
     )
     super_cells = (
         top_level // len(config.models)
@@ -811,6 +857,11 @@ def _validate_config(config: NKGridConfig) -> None:
         raise ValueError("native_process_max_attempts must be at least 1")
     if config.native_process_timeout_seconds <= 0:
         raise ValueError("native_process_timeout_seconds must be greater than zero")
+    for field in ("experiment_id", "data_version", "model_spec_version"):
+        value = getattr(config, field)
+        if not isinstance(value, str) or not value or len(value) > 80 or not value.isascii() or not all(char.isalnum() or char in "._-" for char in value):
+            raise ValueError(f"{field} must contain 1-80 ASCII letters, digits, dots, underscores or hyphens")
+    group_repeat_pairs_by_seed(resolve_repeat_pairs(config))
 
 
 def _relative_path(path: Path) -> str:
@@ -825,7 +876,11 @@ def _parallelism_payload(config: NKGridConfig) -> dict[str, Any]:
 
     selected = set(config.models)
     native = selected & set(SERIAL_OUTER_MODELS)
+    super_learner = selected == {"super_learner"}
     return {
+        "outer_cell_n_jobs": 1 if super_learner or selected == {"lightgbm"} else int(config.n_jobs),
+        "model_internal_n_jobs": int(config.n_jobs) if super_learner else 1,
+        "base_estimator_n_jobs": 1,
         "configured_outer_n_jobs": int(config.n_jobs),
         "window_policy": {
             "parallel_unit": "cell_group",
@@ -857,6 +912,7 @@ def _manifest_payload(
     frame: pd.DataFrame,
     predictors: Sequence[str],
     split_seeds: list[int],
+    execution_pairs: Sequence[tuple[int, int]],
     splits: dict[int, SplitData],
     n_grid: np.ndarray,
     k_grid: np.ndarray,
@@ -867,8 +923,7 @@ def _manifest_payload(
     dataset: str,
     task: str,
     schema_path: Path,
-    schema_semantic_hash: str,
-    feature_manifest_path: Path | None,
+    semantic_contract: Mapping[str, Any],
 ) -> dict:
     if result_summary is not None:
         if result_summary.experiment_id != metadata["experiment_id"]:
@@ -905,22 +960,15 @@ def _manifest_payload(
         "task": task,
         "outcome": config.outcome,
         "dataset": dataset,
-        "experiment_identity_version": metadata["experiment_identity_version"],
+        "identity": metadata["identity"],
+        "semantic_contract": semantic_contract,
         "schema": {
             "path": _relative_path(schema_path),
-            "semantic_sha256": schema_semantic_hash,
-            "feature_manifest_sha256": (
-                file_sha256(feature_manifest_path)
-                if feature_manifest_path is not None
-                else None
-            ),
         },
         "git": git_state(ROOT),
         "data": {
             "input_path": _relative_path(data_path),
-            "input_sha256": metadata["data_sha256"],
             "test_path": _relative_path(test_path) if test_path is not None else None,
-            "test_sha256": metadata.get("test_data_sha256") or None,
             "rows": int(len(frame)),
             "features": int(len(predictors)),
             "train_rows": int(len(next(iter(splits.values())).X_train)),
@@ -931,7 +979,9 @@ def _manifest_payload(
             "test_size": float(config.test_size),
             "split_mode": metadata["split_mode"],
             "split_seeds": split_seeds,
-            "n_draws": int(config.n_draws),
+            "repeat_plan": [
+                {"seed": seed, "draw": draw} for seed, draw in resolve_repeat_pairs(config)
+            ],
             "n_grid": [int(value) for value in n_grid],
             "k_grid": [int(value) for value in k_grid],
             "models": list(config.models),
@@ -944,9 +994,14 @@ def _manifest_payload(
                 "materialization_backend": "sqlite_streaming",
             },
         },
+        "execution": {
+            "mode": "seed-shard" if len(split_seeds) == 1 and len(execution_pairs) < len(resolve_repeat_pairs(config)) else "monolithic",
+            "seed": split_seeds[0] if len(split_seeds) == 1 else None,
+            "draws": [draw for _, draw in execution_pairs] if len(split_seeds) == 1 else None,
+            "expected_rows": int(expected_rows),
+        },
         "model_parameters": {
             "source": _relative_path(model_params_path),
-            "sha256": file_sha256(model_params_path),
             "resolved": resolved_model_params(selected_model_params),
         },
         "environment": core_environment(),
@@ -1049,6 +1104,33 @@ def _read_prior_manifest(path: Path, experiment_id: str) -> dict | None:
     if not isinstance(prior, dict):
         return None
     return prior if prior.get("experiment_id") == experiment_id else None
+
+
+def _first_contract_difference(previous: Any, current: Any, path: str = "semantic_contract") -> str | None:
+    if isinstance(previous, Mapping) and isinstance(current, Mapping):
+        for key in sorted(set(previous) | set(current)):
+            if key not in previous or key not in current:
+                return f"{path}.{key}: checkpoint={previous.get(key)!r} current={current.get(key)!r}"
+            difference = _first_contract_difference(previous[key], current[key], f"{path}.{key}")
+            if difference:
+                return difference
+        return None
+    if previous != current:
+        return f"{path}: checkpoint={previous!r} current={current!r}"
+    return None
+
+
+def _require_resumable_manifest(prior: dict, metadata: Mapping[str, Any]) -> None:
+    identity = prior.get("identity")
+    expected = metadata["identity"]
+    if not isinstance(identity, Mapping) or identity.get("mode") != "explicit-v1":
+        raise ValueError("Existing manifest is not explicit-v1 and cannot be resumed")
+    for field in ("experiment_id", "data_version", "model_spec_version"):
+        if identity.get(field) != expected[field]:
+            raise ValueError(f"identity.{field}: checkpoint={identity.get(field)!r} current={expected[field]!r}")
+    difference = _first_contract_difference(prior.get("semantic_contract"), metadata["semantic_contract"])
+    if difference:
+        raise ValueError(difference)
 
 
 def _verified_complete_artifacts(
@@ -1197,13 +1279,14 @@ def _fit_predict_model_cell(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
+    model_n_jobs: int = 1,
 ) -> dict[str, Any]:
     """Fit and predict one cell; safe to execute in an isolated subprocess."""
 
     model = make_model(
         model_name,
         seed=model_seed,
-        n_jobs=1,
+        n_jobs=model_n_jobs,
         task=task,
         params=params,
     )
@@ -1226,6 +1309,8 @@ def _fit_predict_model_cell(
 def run_nk_grid(
     config: NKGridConfig,
     *,
+    execution_pairs: tuple[tuple[int, int], ...] | None = None,
+    defer_failure_policy: bool = False,
     max_jobs: int | None = None,
     allow_large_run: bool | None = None,
     dry_run: bool | None = None,
@@ -1243,6 +1328,8 @@ def run_nk_grid(
             dry_run=True,
             stop_after_batch=stop_after_batch,
             defer_materialization_on_stop=defer_materialization_on_stop,
+            execution_pairs=execution_pairs,
+            defer_failure_policy=defer_failure_policy,
         )
     with output_run_lock(Path(config.out)):
         return _run_nk_grid_locked(
@@ -1252,6 +1339,8 @@ def run_nk_grid(
             dry_run=False,
             stop_after_batch=stop_after_batch,
             defer_materialization_on_stop=defer_materialization_on_stop,
+            execution_pairs=execution_pairs,
+            defer_failure_policy=defer_failure_policy,
         )
 
 
@@ -1263,6 +1352,8 @@ def _run_nk_grid_locked(
     dry_run: bool | None = None,
     stop_after_batch: Callable[[], bool] | None = None,
     defer_materialization_on_stop: bool = False,
+    execution_pairs: tuple[tuple[int, int], ...] | None = None,
+    defer_failure_policy: bool = False,
 ) -> Path | dict[str, int | str]:
     allow_large_run = config.allow_large_run if allow_large_run is None else allow_large_run
     dry_run = config.dry_run if dry_run is None else dry_run
@@ -1338,48 +1429,45 @@ def _run_nk_grid_locked(
             f"usable_test_rows={len(fixed_split.X_test)}"
         )
 
-    metadata_extra = {
+    semantic_contract = {
+        "kind": "nk_grid" if task == "regression" else "nk_grid_classification",
+        "algorithm_version": algorithm_version,
         "dataset": dataset,
-        "n_seeds": config.n_seeds,
-        "n_draws": config.n_draws,
-        "n_sizes_n": config.n_sizes_n,
-        "n_sizes_k": config.n_sizes_k,
-        "min_n": config.min_n,
-        "max_n": config.max_n,
-        "max_k": config.max_k,
-        "predictors": predictors,
-        "group_column": None,
-        "native_process_isolated_models": sorted(
-            set(config.models) & set(SERIAL_OUTER_MODELS)
-        ),
-        "native_process_max_attempts": config.native_process_max_attempts,
-        "native_process_timeout_seconds": config.native_process_timeout_seconds,
+        "outcome": config.outcome,
+        "task": task,
         "split_mode": split_mode,
-        "model_params": resolved_selected_model_params,
+        "split_seed": config.seed,
+        "test_size": config.test_size if split_mode == "internal_random" else None,
+        "predictors": predictors,
+        "model": list(config.models),
+        "resolved_model_params": resolved_selected_model_params,
         "imputation": dict(schema.imputation),
-        "feature_manifest_sha256": (
-            file_sha256(schema.feature_manifest)
-            if schema.feature_manifest is not None
-            else None
-        ),
-        "schema_semantic_sha256": schema.semantic_hash,
-        **model_run_settings(config.models),
+        "feature_universe": dict(schema.semantic_contract.get("feature_universe", {})),
+        "environment_overrides": model_run_settings(config.models),
     }
-    if task == "classification":
-        metadata_extra["task"] = task
     metadata = build_experiment_metadata(
         kind="nk_grid" if task == "regression" else "nk_grid_classification",
-        data_path=data_path,
+        experiment_id=config.experiment_id,
+        data_version=config.data_version,
+        model_spec_version=config.model_spec_version,
         outcome=config.outcome,
         test_size=config.test_size,
         split_seed=config.seed,
         algorithm_version=algorithm_version,
-        extra=metadata_extra,
+        semantic_contract=semantic_contract,
         split_mode=split_mode,
-        test_data_path=test_path,
     )
 
-    split_seeds = [config.seed + offset for offset in range(config.n_seeds)]
+    repeat_pairs = resolve_repeat_pairs(config)
+    if execution_pairs is None:
+        execution_pairs = repeat_pairs
+    else:
+        execution_pairs = tuple((int(seed), int(draw)) for seed, draw in execution_pairs)
+        if not execution_pairs or not set(execution_pairs).issubset(set(repeat_pairs)):
+            raise ValueError("execution_pairs must be a non-empty subset of repeat_plan")
+        if len({seed for seed, _ in execution_pairs}) != 1:
+            raise ValueError("seed-shard execution_pairs must contain exactly one seed")
+    split_seeds = sorted({seed for seed, _ in execution_pairs})
     if fixed_split is None:
         splits = {
             seed: split_frame(
@@ -1394,23 +1482,22 @@ def _run_nk_grid_locked(
         }
     else:
         splits = {seed: fixed_split for seed in split_seeds}
-    n_grid = log2_size_grid(
+    n_grid = np.asarray(config.n_grid, dtype=int) if config.n_grid else log2_size_grid(
         len(next(iter(splits.values())).X_train),
         config.n_sizes_n,
         config.max_n,
         min_size=config.min_n,
     )
-    k_grid = log2_size_grid(len(feature_units), config.n_sizes_k, config.max_k)
+    k_grid = np.asarray(config.k_grid, dtype=int) if config.k_grid else log2_size_grid(len(feature_units), config.n_sizes_k, config.max_k)
     log_progress(
         "grid "
         f"N={n_grid.tolist()} K={k_grid.tolist()} "
-        f"seeds={split_seeds} draws={config.n_draws} models={list(config.models)}"
+        f"seeds={split_seeds} repeat_pairs={list(execution_pairs)} models={list(config.models)}"
     )
 
     jobs = [
         (model_name, seed, draw, int(n_samples), int(k_features))
-        for seed in split_seeds
-        for draw in range(config.n_draws)
+        for seed, draw in execution_pairs
         for k_features in k_grid
         for n_samples in n_grid
         for model_name in config.models
@@ -1485,6 +1572,7 @@ def _run_nk_grid_locked(
         current_manifest_path, metadata["experiment_id"]
     )
     if prior_manifest is not None:
+        _require_resumable_manifest(prior_manifest, metadata)
         started_at = prior_manifest.get("created_at", started_at)
     initial_manifest = _manifest_payload(
         config=config,
@@ -1497,6 +1585,7 @@ def _run_nk_grid_locked(
         frame=frame,
         predictors=predictors,
         split_seeds=split_seeds,
+        execution_pairs=execution_pairs,
         splits=splits,
         n_grid=n_grid,
         k_grid=k_grid,
@@ -1506,8 +1595,7 @@ def _run_nk_grid_locked(
         dataset=dataset,
         task=task,
         schema_path=schema.path,
-        schema_semantic_hash=schema.semantic_hash,
-        feature_manifest_path=schema.feature_manifest,
+        semantic_contract=semantic_contract,
     )
     write_json_atomic(
         current_manifest_path,
@@ -1784,6 +1872,7 @@ def _run_nk_grid_locked(
                     "model_seed": _model_seed(
                         seed, draw, n_samples, k_features
                     ),
+                    "model_n_jobs": config.n_jobs if model_name == "super_learner" else 1,
                     "task": task,
                     "params": selected_model_params[model_name],
                     "X_train": X_fit,
@@ -1894,11 +1983,7 @@ def _run_nk_grid_locked(
             window_models = {
                 job[0] for _, cell_jobs in execution_window for job in cell_jobs
             }
-            group_n_jobs = (
-                1
-                if window_models <= set(SERIAL_OUTER_MODELS)
-                else config.n_jobs
-            )
+            group_n_jobs = 1 if "super_learner" in window_models or window_models <= {"lightgbm"} else config.n_jobs
             log_progress(
                 f"cell window groups={len(execution_window)} "
                 f"models={sorted(window_models)} n_jobs={group_n_jobs} "
@@ -2063,6 +2148,7 @@ def _run_nk_grid_locked(
         frame=frame,
         predictors=predictors,
         split_seeds=split_seeds,
+        execution_pairs=execution_pairs,
         splits=splits,
         n_grid=n_grid,
         k_grid=k_grid,
@@ -2073,8 +2159,7 @@ def _run_nk_grid_locked(
         dataset=dataset,
         task=task,
         schema_path=schema.path,
-        schema_semantic_hash=schema.semantic_hash,
-        feature_manifest_path=schema.feature_manifest,
+        semantic_contract=semantic_contract,
     )
     _preserve_prior_timings(final_manifest, prior_manifest)
     if materialization_deferred:
@@ -2099,9 +2184,9 @@ def _run_nk_grid_locked(
             "resumable": True,
         }
     else:
-        violation = _failure_policy_violation(final_manifest)
-        final_manifest["failure_policy"]["passed"] = violation is None
-        final_manifest["failure_policy"]["violation"] = violation
+        violation = None if defer_failure_policy else _failure_policy_violation(final_manifest)
+        final_manifest["failure_policy"]["passed"] = None if defer_failure_policy else violation is None
+        final_manifest["failure_policy"]["violation"] = None if defer_failure_policy else violation
     write_json_atomic(current_manifest_path, final_manifest)
     persisted_manifest = json.loads(current_manifest_path.read_text(encoding="utf-8"))
     if violation is None and _prune_checkpoint_parts(out_path, persisted_manifest):

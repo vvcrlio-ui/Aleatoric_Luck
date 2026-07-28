@@ -10,8 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-from .experiment import file_sha256
-from .ingest import InputSchema, LoadedInput, canonical_json, semantic_sha256
+from .ingest import InputSchema, LoadedInput, canonical_json
 from .preprocessing import SourceGroup, source_groups, validate_onehot_states
 
 
@@ -116,12 +115,6 @@ def _validate_feature_universe(
     if not definition_path.exists():
         raise FileNotFoundError(
             f"Feature-universe definition not found: {definition_path}"
-        )
-    declared_file_hash = str(loaded.schema.feature_universe["definition_sha256"])
-    actual_file_hash = file_sha256(definition_path)
-    if actual_file_hash != declared_file_hash:
-        raise ValueError(
-            "feature_universe definition_sha256 does not match definition_file"
         )
     try:
         declared = json.loads(definition_path.read_text(encoding="utf-8"))
@@ -312,9 +305,6 @@ def _validate_provenance(schema: InputSchema) -> None:
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError("provenance.json is invalid JSON") from exc
-    declared = provenance.get("schema_sha256")
-    if declared is not None and declared != file_sha256(schema.path):
-        raise ValueError("provenance schema_sha256 does not match authoritative schema")
 
 
 def validate_input(
@@ -392,6 +382,5 @@ def validate_input(
 __all__ = [
     "REGRESSION_CV_MIN_N",
     "canonical_feature_universe",
-    "semantic_sha256",
     "validate_input",
 ]

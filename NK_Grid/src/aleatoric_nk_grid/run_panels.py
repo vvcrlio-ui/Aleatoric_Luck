@@ -74,6 +74,9 @@ DEFAULTS: dict[str, Any] = {
     "allow_large_run": False,
     "dry_run": False,
     "rerun_completed": True,
+    "experiment_id": "nkgrid-dev-v1",
+    "data_version": "dev-data-v1",
+    "model_spec_version": "nkgrid-models-v1",
 }
 PANEL_FIELDS = frozenset(
     {
@@ -102,6 +105,13 @@ PANEL_FIELDS = frozenset(
         "native_process_timeout_seconds",
         "outcome",
         "out",
+        "experiment_id",
+        "data_version",
+        "model_spec_version",
+        "resume_group",
+        "repeat_plan",
+        "n_grid",
+        "k_grid",
     }
 )
 CONFIG_FIELDS = set(NKGridConfig.__dataclass_fields__)
@@ -166,6 +176,24 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
     values["models"] = tuple(str(model) for model in values["models"])
     values["outcome"] = outcome
     values["preset"] = preset_name
+    if "repeat_plan" in panel:
+        if "n_seeds" in panel or "n_draws" in panel:
+            raise ValueError(f"Panel {name} cannot combine repeat_plan with n_seeds/n_draws")
+        pairs: list[tuple[int, int]] = []
+        plan = panel["repeat_plan"]
+        if not isinstance(plan, list):
+            raise ValueError(f"Panel {name} repeat_plan must be a list")
+        for block in plan:
+            if not isinstance(block, dict) or set(block) != {"seeds", "draws"}:
+                raise ValueError(f"Panel {name} repeat_plan blocks require seeds and draws")
+            pairs.extend((seed, draw) for seed in block["seeds"] for draw in block["draws"])
+        values["repeat_plan"] = tuple(pairs)
+        values["n_seeds"] = values["n_draws"] = 1
+    for grid_name in ("n_grid", "k_grid"):
+        if grid_name in values and values[grid_name] is not None:
+            if not isinstance(values[grid_name], list) or not values[grid_name]:
+                raise ValueError(f"Panel {name} {grid_name} must be a non-empty list")
+            values[grid_name] = tuple(int(value) for value in values[grid_name])
     extra = sorted(set(values) - CONFIG_FIELDS)
     if extra:
         raise ValueError(f"Panel {name} did not resolve cleanly: {extra}")
@@ -176,12 +204,20 @@ def resolved_panels(
     manifest_path: Path, only: set[str] | None = None
 ) -> list[tuple[str, NKGridConfig]]:
     manifest = load_manifest(manifest_path)
-    allowed_root = {"panels", "model_params", "preset"}
+    allowed_root = {
+        "panels", "model_params", "preset", "experiment_id", "data_version",
+        "model_spec_version", "resume_group", "repeat_plan", "n_grid", "k_grid",
+    }
     root_unknown = sorted(set(manifest) - allowed_root)
     if root_unknown:
         raise ValueError(f"Unknown panel-manifest root keys: {root_unknown}")
     shared = {
-        key: manifest[key] for key in ("model_params", "preset") if key in manifest
+        key: manifest[key]
+        for key in (
+            "model_params", "preset", "experiment_id", "data_version",
+            "model_spec_version", "resume_group", "repeat_plan", "n_grid", "k_grid",
+        )
+        if key in manifest
     }
     panels = [
         resolve_panel({**shared, **panel}, Path(manifest_path).parent)

@@ -1,5 +1,8 @@
 model_params: model_params.yaml
 preset: dev
+experiment_id: smr-aleatoric-v1
+data_version: smr-ard-v1
+model_spec_version: nkgrid-models-v1
 
 panels:
   - name: smr_hourlywage

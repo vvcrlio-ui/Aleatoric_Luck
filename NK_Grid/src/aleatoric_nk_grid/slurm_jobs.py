@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shlex
@@ -14,13 +13,15 @@ from typing import Any, Mapping
 from .experiment import (
     MODEL_ENV_KEYS,
     SERIAL_OUTER_MODELS,
-    file_sha256,
     manifest_path as result_manifest_path,
     utc_now,
     write_json_atomic,
 )
 from .helpers_logging import log_progress
-from .nk_grid import LARGE_RUN_THRESHOLD, NKGridConfig, estimate_run_size, run_nk_grid
+from .nk_grid import (
+    LARGE_RUN_THRESHOLD, NKGridConfig, estimate_run_size, run_nk_grid,
+    group_repeat_pairs_by_seed, resolve_repeat_pairs,
+)
 from .run_panels import ROOT, config_to_json, resolved_panels
 
 
@@ -28,10 +29,12 @@ from .run_panels import ROOT, config_to_json, resolved_panels
 class SlurmJob:
     panel: str
     model: str
+    seed: int
+    draws: tuple[int, ...]
     config: NKGridConfig
 
 
-RESOURCE_CLASSES = ("parallel", "serial")
+RESOURCE_CLASSES = ("parallel", "serial", "super_learner")
 OPTIONAL_SLURM_ENV_KEYS = (
     "ALEATORIC_NK_GRID_SOURCE_FALLBACK",
     "PYTHON_MODULE",
@@ -46,7 +49,9 @@ MAX_REQUEUE_WATCHDOG_SECONDS = (
 
 
 def resource_class_for_model(model: str) -> str:
-    if model in SERIAL_OUTER_MODELS:
+    if model == "super_learner":
+        return "super_learner"
+    if model == "lightgbm":
         return "serial"
     return "parallel"
 
@@ -86,8 +91,8 @@ def resource_class_partition(
     return partition
 
 
-def _model_output_path(path: Path, model: str) -> Path:
-    return path.with_name(f"{path.stem}_{model}{path.suffix}")
+def _model_output_path(path: Path, panel: str, model: str, seed: int) -> Path:
+    return path.parent / ".seed-shards" / panel / model / f"seed-{seed}{path.suffix}"
 
 
 def build_slurm_jobs(manifest_path: Path) -> list[SlurmJob]:
@@ -96,17 +101,11 @@ def build_slurm_jobs(manifest_path: Path) -> list[SlurmJob]:
     jobs: list[SlurmJob] = []
     for panel_name, config in resolved_panels(manifest_path):
         for model_name in config.models:
-            jobs.append(
-                SlurmJob(
-                    panel=panel_name,
-                    model=model_name,
-                    config=replace(
-                        config,
-                        models=(model_name,),
-                        out=_model_output_path(Path(config.out), model_name),
-                    ),
-                )
-            )
+            for seed, draws in group_repeat_pairs_by_seed(resolve_repeat_pairs(config)).items():
+                jobs.append(SlurmJob(panel_name, model_name, seed, draws, replace(
+                    config, models=(model_name,),
+                    out=_model_output_path(Path(config.out), panel_name, model_name, seed),
+                )))
     if not jobs:
         raise ValueError(f"No active panel/model jobs found in {manifest_path}")
     _require_unique_output_paths(jobs)
@@ -138,6 +137,11 @@ def _config_from_json(payload: dict[str, Any]) -> NKGridConfig:
         if values.get(key) is not None:
             values[key] = Path(values[key])
     values["models"] = tuple(values["models"])
+    if values.get("repeat_plan") is not None:
+        values["repeat_plan"] = tuple(tuple(pair) for pair in values["repeat_plan"])
+    for field in ("n_grid", "k_grid"):
+        if values.get(field) is not None:
+            values[field] = tuple(values[field])
     return NKGridConfig(**values)
 
 
@@ -177,6 +181,8 @@ def write_job_snapshot(
             {
                 "panel": job.panel,
                 "model": job.model,
+                "seed": job.seed,
+                "draws": list(job.draws),
                 "config": config_to_json(job.config),
             }
             for job in jobs
@@ -193,10 +199,8 @@ def write_job_snapshot(
     return jobs
 
 
-def _read_job_snapshot(
-    snapshot_path: Path,
-) -> tuple[dict[str, Any], list[SlurmJob], str]:
-    """Read, validate and hash one frozen snapshot with a single file read."""
+def _read_job_snapshot(snapshot_path: Path) -> tuple[dict[str, Any], list[SlurmJob]]:
+    """Read and validate one frozen snapshot with a single file read."""
 
     raw = snapshot_path.read_bytes()
     payload = json.loads(raw)
@@ -206,6 +210,8 @@ def _read_job_snapshot(
         SlurmJob(
             panel=str(item["panel"]),
             model=str(item["model"]),
+            seed=int(item["seed"]),
+            draws=tuple(int(draw) for draw in item["draws"]),
             config=_config_from_json(item["config"]),
         )
         for item in payload["jobs"]
@@ -213,13 +219,13 @@ def _read_job_snapshot(
     if not jobs:
         raise ValueError(f"No jobs found in Slurm job snapshot: {snapshot_path}")
     _require_unique_output_paths(jobs)
-    return payload, jobs, hashlib.sha256(raw).hexdigest()
+    return payload, jobs
 
 
 def load_job_snapshot(snapshot_path: Path) -> list[SlurmJob]:
     """Load the read-only array mapping produced at submission time."""
 
-    _, jobs, _ = _read_job_snapshot(snapshot_path)
+    _, jobs = _read_job_snapshot(snapshot_path)
     return jobs
 
 
@@ -363,7 +369,7 @@ def write_submission_receipt(
     environment_controls = {
         key: os.environ.get(key) for key in OPTIONAL_SLURM_ENV_KEYS
     }
-    snapshot_payload, jobs, snapshot_sha256 = _read_job_snapshot(snapshot_path)
+    snapshot_payload, jobs = _read_job_snapshot(snapshot_path)
     selected_indices = _expand_array_indices(array_spec, len(jobs))
     if resource_class is not None:
         if resource_class not in RESOURCE_CLASSES:
@@ -440,10 +446,8 @@ def write_submission_receipt(
         "job_count": len(selected_indices),
         "snapshot_job_count": len(jobs),
         "snapshot": str(snapshot_path),
-        "snapshot_sha256": snapshot_sha256,
         "source_manifest": snapshot_payload.get("source_manifest"),
         "worker_script": str(worker_script),
-        "worker_script_sha256": file_sha256(worker_script),
         "execution_paths": {
             "engine_dir": str(engine_dir),
             "venv": str(venv),
@@ -502,6 +506,8 @@ def job_summary(job: SlurmJob, index: int) -> dict:
         "index": index,
         "panel": job.panel,
         "model": job.model,
+        "seed": job.seed,
+        "draws": list(job.draws),
         "config": config_to_json(job.config),
         "estimate": estimate_run_size(job.config),
     }
@@ -664,6 +670,8 @@ def main(argv: list[str] | None = None) -> None:
             (lambda: stop_file.exists()) if stop_file is not None else None
         ),
         defer_materialization_on_stop=stop_file is not None,
+        execution_pairs=tuple((job.seed, draw) for draw in job.draws),
+        defer_failure_policy=True,
     )
     if (
         stop_file is not None

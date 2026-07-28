@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import importlib.metadata
 import json
 import math
@@ -46,7 +45,6 @@ CHECKPOINT_RESUME_COLUMNS = [
 CHECKPOINT_COMPACTION_LOOSE_PARTS = 50
 CHECKPOINT_SQLITE_INSERT_ROWS = 2_000
 MANIFEST_SCHEMA_VERSION = "1"
-EXPERIMENT_IDENTITY_VERSION = 3
 COMPLETED_CHECKPOINT_STATUSES = frozenset({"ok", "skipped"})
 SERIAL_OUTER_MODELS = frozenset({"lightgbm", "super_learner"})
 
@@ -76,14 +74,6 @@ class CheckpointMaterialization:
     columns: tuple[str, ...]
     summary: CheckpointSummary
     backend: str = "sqlite_streaming"
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -195,45 +185,31 @@ def output_run_lock(out_path: Path) -> Iterator[Path]:
 def build_experiment_metadata(
     *,
     kind: str,
-    data_path: Path,
+    experiment_id: str,
+    data_version: str,
+    model_spec_version: str,
     outcome: str,
     test_size: float,
     split_seed: int,
     algorithm_version: str = "legacy",
-    extra: dict[str, Any] | None = None,
+    semantic_contract: dict[str, Any],
     split_mode: str = "internal_random",
-    test_data_path: Path | None = None,
-    experiment_identity_version: int = EXPERIMENT_IDENTITY_VERSION,
 ) -> dict[str, Any]:
-    """Return stable metadata that distinguishes result-producing inputs."""
+    """Return researcher-declared identity and directly comparable semantics."""
 
-    settings = {
-        "experiment_identity_version": int(experiment_identity_version),
-        "kind": kind,
-        "algorithm_version": algorithm_version,
-        "data_sha256": file_sha256(data_path),
-        "test_data_sha256": (
-            file_sha256(test_data_path) if test_data_path is not None else ""
-        ),
-        "outcome": outcome,
-        "split_mode": split_mode,
-        "split_seed": int(split_seed),
-        "extra": extra or {},
-    }
-    if split_mode == "internal_random":
-        settings["test_size"] = float(test_size)
-    elif split_mode != "external_test":
+    if split_mode not in {"internal_random", "external_test"}:
         raise ValueError(f"Unknown split_mode: {split_mode!r}")
-    encoded = json.dumps(settings, sort_keys=True, separators=(",", ":"))
-    experiment_id = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
     return {
         "experiment_id": experiment_id,
-        "experiment_identity_version": int(experiment_identity_version),
+        "identity": {
+            "mode": "explicit-v1",
+            "experiment_id": experiment_id,
+            "data_version": data_version,
+            "model_spec_version": model_spec_version,
+        },
+        "semantic_contract": semantic_contract,
         "experiment_kind": kind,
         "algorithm_version": algorithm_version,
-        "data_sha256": settings["data_sha256"],
-        "test_data_sha256": settings["test_data_sha256"],
-        "data_path": str(data_path.resolve()),
         "outcome": outcome,
         "test_size": float(test_size) if split_mode == "internal_random" else None,
         "split_mode": split_mode,

@@ -27,12 +27,10 @@ if _PACKAGE_DIR.name != "aleatoric_nk_grid" or not (
         f"{_PACKAGE_PATH}"
     )
 
-from .experiment import EXPERIMENT_IDENTITY_VERSION
 from .ingest import InputSchema, LoadedInput, load_input, load_schema
 from .nk_grid import NKGridConfig, run_nk_grid
 
 __all__ = [
-    "EXPERIMENT_IDENTITY_VERSION",
     "InputSchema",
     "LoadedInput",
     "NKGridConfig",

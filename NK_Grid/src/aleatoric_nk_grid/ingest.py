@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,10 +56,6 @@ def canonical_json(value: Any) -> str:
     )
 
 
-def semantic_sha256(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
-
-
 def _resolve_path(value: str | None, directory: Path) -> Path | None:
     if value is None:
         return None
@@ -102,7 +97,7 @@ class InputSchema:
     max_train_outcome_missing_ratio: float
     max_test_outcome_missing_ratio: float
     continuous_priors: Mapping[str, float]
-    semantic_hash: str
+    semantic_contract: Mapping[str, Any]
     raw: Mapping[str, Any]
 
 
@@ -201,14 +196,10 @@ def load_schema(path: Path) -> InputSchema:
     if not isinstance(document["table"], str) or not document["table"]:
         raise ValueError("schema.table must be a non-empty relative or absolute path")
     universe = document["feature_universe"]
-    if not isinstance(universe, dict) or set(universe) != {
-        "mode",
-        "definition_file",
-        "definition_sha256",
-    }:
+    if not isinstance(universe, dict) or not {"mode", "definition_file"}.issubset(universe):
         raise ValueError(
             "schema.feature_universe must contain exactly mode, definition_file, "
-            "and definition_sha256"
+            "and definition_file"
         )
     if universe["mode"] not in {"fixed_a_priori", "train_pool_screened"}:
         raise ValueError("Unknown feature_universe.mode")
@@ -218,9 +209,9 @@ def load_schema(path: Path) -> InputSchema:
         )
     if not all(
         isinstance(universe[key], str) and universe[key]
-        for key in ("definition_file", "definition_sha256")
+        for key in ("definition_file",)
     ):
-        raise ValueError("feature_universe definition_file/hash must be non-empty strings")
+        raise ValueError("feature_universe definition_file must be a non-empty string")
     imputation = document["imputation"]
     if not isinstance(imputation, dict):
         raise ValueError("schema.imputation must be an object")
@@ -322,7 +313,7 @@ def load_schema(path: Path) -> InputSchema:
             "max_test_outcome_missing_ratio"
         ],
         continuous_priors=normalized_priors,
-        semantic_hash=semantic_sha256(raw_semantics),
+        semantic_contract=raw_semantics,
         raw=raw_semantics,
     )
 
