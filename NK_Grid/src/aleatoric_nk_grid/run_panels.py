@@ -66,8 +66,6 @@ DEFAULTS: dict[str, Any] = {
     # Panel resolution must not depend on the submit host's environment.
     # Slurm workers replace this scheduler-only value from their allocation.
     "n_jobs": 4,
-    "bart_min_n": 10,
-    "bart_min_k": 2,
     "model_params": DEFAULT_MODEL_PARAMS_PATH,
     "failed_abs_threshold": 50,
     "failed_ratio_threshold": 0.05,
@@ -98,8 +96,6 @@ PANEL_FIELDS = frozenset(
         "allow_large_run",
         "dry_run",
         "rerun_completed",
-        "bart_min_n",
-        "bart_min_k",
         "failed_abs_threshold",
         "failed_ratio_threshold",
         "native_process_max_attempts",

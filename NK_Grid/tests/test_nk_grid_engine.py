@@ -232,11 +232,6 @@ def test_invalid_run_controls_fail_before_dry_run_arithmetic(overrides, match):
     "model,overrides,error",
     [
         (
-            "bart",
-            {"min_n": 10, "max_n": 10, "bart_min_n": 100},
-            "below BART minimum N/K floor",
-        ),
-        (
             "ridge",
             {"min_n": 1, "max_n": 1},
             "below minimum N for ridge's internal CV",
@@ -265,7 +260,11 @@ def test_floor_skips_do_not_run_full_preprocessing(
     assert row["K_unobserved"] == 0
 
 
-def test_all_unobserved_skip_keeps_priority_over_bart_floor(tmp_path):
+def test_all_unobserved_skip_happens_before_any_preprocessing(tmp_path):
+    # The BART N/K floor used to sit right behind this branch, so this test also
+    # asserted a precedence between the two. With BART gone the only remaining
+    # floor is the CV one, which cannot co-trigger at this N, so precedence is
+    # no longer observable; the early-skip behaviour itself still is.
     frame = _regression_frame(30)[["y", "X_a"]]
     split = split_frame(frame, ["X_a"], "y", test_size=0.3, seed=123)
     order = draw_orders(
@@ -276,14 +275,13 @@ def test_all_unobserved_skip_keeps_priority_over_bart_floor(tmp_path):
     schema = write_schema_bundle(
         tmp_path / "input", frame, predictors=["X_a"]
     )
-    out = tmp_path / "bart.csv"
+    out = tmp_path / "unobserved.csv"
     config = _config(
         schema,
         out,
-        models=("bart",),
+        models=("ols",),
         min_n=10,
         max_n=10,
-        bart_min_n=100,
     )
     with patch(
         "aleatoric_nk_grid.nk_grid.preprocess_cell",

@@ -189,8 +189,6 @@ class NKGridConfig:
     n_jobs: int
     min_n: int = 10
     model_params: Path = DEFAULT_MODEL_PARAMS_PATH
-    bart_min_n: int = 10
-    bart_min_k: int = 2
     failed_abs_threshold: int = 50
     failed_ratio_threshold: float = 0.05
     native_process_max_attempts: int = 2
@@ -796,9 +794,6 @@ def _validate_config(config: NKGridConfig) -> None:
     ):
         if int(getattr(config, field)) < 1:
             raise ValueError(f"{field} must be at least 1")
-    for field in ("bart_min_n", "bart_min_k"):
-        if int(getattr(config, field)) < 0:
-            raise ValueError(f"{field} must be non-negative")
     if config.n_jobs == 0:
         raise ValueError("n_jobs must not be zero")
     if not config.models:
@@ -829,28 +824,18 @@ def _parallelism_payload(config: NKGridConfig) -> dict[str, Any]:
     """Describe the scheduler policy actually used by cell windows."""
 
     selected = set(config.models)
-    non_bart = selected - {"bart"}
-    native = non_bart & set(SERIAL_OUTER_MODELS)
+    native = selected & set(SERIAL_OUTER_MODELS)
     return {
         "configured_outer_n_jobs": int(config.n_jobs),
         "window_policy": {
             "parallel_unit": "cell_group",
-            "non_bart": {
-                "selected": bool(non_bart),
-                "prefer": "threads",
-                "contains_native": bool(native),
-                "n_jobs_rule": {
-                    "all_models_native": 1,
-                    "otherwise": int(config.n_jobs),
-                },
-                "native_calls_serialized": bool(native),
+            "prefer": "threads",
+            "contains_native": bool(native),
+            "n_jobs_rule": {
+                "all_models_native": 1,
+                "otherwise": int(config.n_jobs),
             },
-            "bart": {
-                "selected": "bart" in selected,
-                "scheduled_separately": True,
-                "prefer": "processes",
-                "n_jobs": int(config.n_jobs),
-            },
+            "native_calls_serialized": bool(native),
         },
         "native_process_isolated_models": sorted(native),
         "native_process_max_attempts": int(config.native_process_max_attempts),
@@ -1364,8 +1349,6 @@ def _run_nk_grid_locked(
         "max_k": config.max_k,
         "predictors": predictors,
         "group_column": None,
-        "bart_min_n": config.bart_min_n,
-        "bart_min_k": config.bart_min_k,
         "native_process_isolated_models": sorted(
             set(config.models) & set(SERIAL_OUTER_MODELS)
         ),
@@ -1701,18 +1684,6 @@ def _run_nk_grid_locked(
                     error="all_selected_sources_unobserved",
                 )
             if (
-                model_name == "bart"
-                and (
-                    n_samples < config.bart_min_n
-                    or k_features < config.bart_min_k
-                )
-            ):
-                return result_row(
-                    empty_metrics,
-                    status="skipped",
-                    error="below BART minimum N/K floor",
-                )
-            if (
                 task == "regression"
                 and model_name in REGRESSION_CV_MIN_N
                 and n_samples < REGRESSION_CV_MIN_N[model_name]
@@ -1919,48 +1890,24 @@ def _run_nk_grid_locked(
         rows_by_cell: dict[
             tuple[int, int, int, int], dict[str, dict]
         ] = {}
-        for subwindow_name, selects_bart, group_preference in (
-            ("non_bart", False, "threads"),
-            ("bart", True, "processes"),
-        ):
-            subwindow = [
-                (
-                    cell_key,
-                    [
-                        job
-                        for job in cell_jobs
-                        if (job[0] == "bart") is selects_bart
-                    ],
-                )
-                for cell_key, cell_jobs in execution_window
-            ]
-            subwindow = [
-                (cell_key, cell_jobs)
-                for cell_key, cell_jobs in subwindow
-                if cell_jobs
-            ]
-            if not subwindow:
-                continue
-            subwindow_models = {
-                job[0] for _, cell_jobs in subwindow for job in cell_jobs
+        if execution_window:
+            window_models = {
+                job[0] for _, cell_jobs in execution_window for job in cell_jobs
             }
             group_n_jobs = (
                 1
-                if (
-                    not selects_bart
-                    and subwindow_models <= set(SERIAL_OUTER_MODELS)
-                )
+                if window_models <= set(SERIAL_OUTER_MODELS)
                 else config.n_jobs
             )
             log_progress(
-                f"cell subwindow={subwindow_name} groups={len(subwindow)} "
-                f"models={sorted(subwindow_models)} n_jobs={group_n_jobs} "
-                f"joblib_prefer={group_preference}"
+                f"cell window groups={len(execution_window)} "
+                f"models={sorted(window_models)} n_jobs={group_n_jobs} "
+                f"joblib_prefer=threads"
             )
             grouped_rows = Parallel(
                 n_jobs=group_n_jobs,
                 batch_size=1,
-                prefer=group_preference,
+                prefer="threads",
             )(
                 delayed(run_cell_group)(
                     seed,
@@ -1968,23 +1915,18 @@ def _run_nk_grid_locked(
                     n_samples,
                     k_features,
                     tuple(job[0] for job in cell_jobs),
-                    # BART constructs orders inside its isolated process;
-                    # thread workers share the frozen parent cache.
-                    orders=(
-                        None
-                        if selects_bart
-                        else cached_draw_orders(seed, draw)
-                    ),
+                    # Thread workers share the frozen parent cache.
+                    orders=cached_draw_orders(seed, draw),
                 )
                 for (
                     seed,
                     draw,
                     n_samples,
                     k_features,
-                ), cell_jobs in subwindow
+                ), cell_jobs in execution_window
             )
             for (cell_key, cell_jobs), cell_rows in zip(
-                subwindow, grouped_rows
+                execution_window, grouped_rows
             ):
                 rows_by_cell.setdefault(cell_key, {}).update(
                     {
@@ -2192,8 +2134,6 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--max-n", type=int, default=100, help="Use <=0 for full train set.")
     parser.add_argument("--max-k", type=int, default=100, help="Use <=0 for all features.")
     parser.add_argument("--batch-size", type=int, default=20)
-    parser.add_argument("--bart-min-n", type=int, default=10)
-    parser.add_argument("--bart-min-k", type=int, default=2)
     parser.add_argument("--failed-abs-threshold", type=int, default=50)
     parser.add_argument("--failed-ratio-threshold", type=float, default=0.05)
     parser.add_argument("--native-process-max-attempts", type=int, default=2)
@@ -2238,8 +2178,6 @@ def parse_args() -> NKGridConfig:
         batch_size=args.batch_size,
         n_jobs=args.n_jobs,
         model_params=Path(args.model_params),
-        bart_min_n=args.bart_min_n,
-        bart_min_k=args.bart_min_k,
         failed_abs_threshold=args.failed_abs_threshold,
         failed_ratio_threshold=args.failed_ratio_threshold,
         native_process_max_attempts=args.native_process_max_attempts,

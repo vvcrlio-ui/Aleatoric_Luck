@@ -13,11 +13,8 @@ RERUN_COMPLETED=0
 MAX_CONCURRENT_PER_CLASS=""
 CPUS_PER_TASK=8
 SERIAL_CPUS_PER_TASK=1
-BART_CPUS_PER_TASK=""
 MEMORY="48G"
-BART_MEMORY=""
 TIME_LIMIT="4-00:00:00"
-BART_TIME_LIMIT=""
 MAX_RESTARTS=5
 REQUEUE_WATCHDOG_SECONDS=240
 ONLY_RESOURCE_CLASS=""
@@ -27,15 +24,12 @@ usage() {
   echo "  --snapshot PATH            reuse a frozen snapshot (requires --resource-class)"
   echo "  --allow-large-run          authorize production-sized tasks"
   echo "  --rerun-completed          intentionally recompute completed tasks"
-  echo "  --resource-class CLASS     submit only parallel, serial or bart (recovery)"
+  echo "  --resource-class CLASS     submit only parallel or serial (recovery)"
   echo "  --max-concurrent-per-class N  cap running tasks in each resource-class array"
   echo "  --cpus-per-task N          CPUs for parallel tasks (default: 8)"
   echo "  --serial-cpus-per-task N   CPUs for serial tasks (default: 1)"
-  echo "  --bart-cpus-per-task N     CPUs for BART tasks (default: parallel value)"
   echo "  --mem VALUE                memory for parallel/serial tasks (default: 48G)"
-  echo "  --bart-mem VALUE           memory for BART tasks (default: --mem)"
   echo "  --time VALUE               time for parallel/serial tasks (default: 4-00:00:00)"
-  echo "  --bart-time VALUE          time for BART tasks (default: --time)"
   echo "  --max-restarts N           checkpoint requeues allowed (default: 5)"
   echo "  --requeue-watchdog-seconds N  force requeue after waiting N seconds (default: 240)"
   echo "  --dry-run                  print resolved jobs without submitting"
@@ -55,11 +49,8 @@ while [ "$#" -gt 0 ]; do
       ;;
     --cpus-per-task) CPUS_PER_TASK="${2:?--cpus-per-task requires a value}"; shift 2 ;;
     --serial-cpus-per-task) SERIAL_CPUS_PER_TASK="${2:?--serial-cpus-per-task requires a value}"; shift 2 ;;
-    --bart-cpus-per-task) BART_CPUS_PER_TASK="${2:?--bart-cpus-per-task requires a value}"; shift 2 ;;
     --mem) MEMORY="${2:?--mem requires a value}"; shift 2 ;;
-    --bart-mem) BART_MEMORY="${2:?--bart-mem requires a value}"; shift 2 ;;
     --time) TIME_LIMIT="${2:?--time requires a value}"; shift 2 ;;
-    --bart-time) BART_TIME_LIMIT="${2:?--bart-time requires a value}"; shift 2 ;;
     --max-restarts) MAX_RESTARTS="${2:?--max-restarts requires a value}"; shift 2 ;;
     --requeue-watchdog-seconds) REQUEUE_WATCHDOG_SECONDS="${2:?--requeue-watchdog-seconds requires a value}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -77,8 +68,8 @@ if [ -z "$MANIFEST" ] && [ -z "$SNAPSHOT_INPUT" ]; then
   exit 2
 fi
 case "$ONLY_RESOURCE_CLASS" in
-  ""|parallel|serial|bart) ;;
-  *) echo "--resource-class must be parallel, serial or bart" >&2; exit 2 ;;
+  ""|parallel|serial) ;;
+  *) echo "--resource-class must be parallel or serial" >&2; exit 2 ;;
 esac
 if [ -n "$SNAPSHOT_INPUT" ] && [ -z "$ONLY_RESOURCE_CLASS" ]; then
   echo "--snapshot recovery requires --resource-class to avoid duplicate arrays" >&2
@@ -102,16 +93,8 @@ esac
 case "$SERIAL_CPUS_PER_TASK" in
   ''|*[!0-9]*|0) echo "--serial-cpus-per-task must be a positive integer" >&2; exit 2 ;;
 esac
-BART_CPUS_PER_TASK="${BART_CPUS_PER_TASK:-$CPUS_PER_TASK}"
-BART_MEMORY="${BART_MEMORY:-$MEMORY}"
-BART_TIME_LIMIT="${BART_TIME_LIMIT:-$TIME_LIMIT}"
-case "$BART_CPUS_PER_TASK" in
-  ''|*[!0-9]*|0) echo "--bart-cpus-per-task must be a positive integer" >&2; exit 2 ;;
-esac
 [ -n "$MEMORY" ] || { echo "--mem must not be empty" >&2; exit 2; }
-[ -n "$BART_MEMORY" ] || { echo "--bart-mem must not be empty" >&2; exit 2; }
 [ -n "$TIME_LIMIT" ] || { echo "--time must not be empty" >&2; exit 2; }
-[ -n "$BART_TIME_LIMIT" ] || { echo "--bart-time must not be empty" >&2; exit 2; }
 case "$MAX_RESTARTS" in
   ''|*[!0-9]*) echo "--max-restarts must be a non-negative integer" >&2; exit 2 ;;
 esac
@@ -169,7 +152,7 @@ case "$SNAPSHOT_JOB_COUNT" in
   ''|*[!0-9]*|0) echo "Snapshot returned an invalid job count: $SNAPSHOT_JOB_COUNT" >&2; exit 1 ;;
 esac
 
-RESOURCE_CLASSES=(parallel serial bart)
+RESOURCE_CLASSES=(parallel serial)
 CLASS_INDICES_BY_POSITION=()
 CLASS_JOB_COUNTS_BY_POSITION=()
 PLANNED_JOB_COUNT=0
@@ -214,11 +197,6 @@ for CLASS_POSITION in "${!RESOURCE_CLASSES[@]}"; do
   case "$RESOURCE_CLASS" in
     serial)
       CLASS_CPUS="$SERIAL_CPUS_PER_TASK"
-      ;;
-    bart)
-      CLASS_CPUS="$BART_CPUS_PER_TASK"
-      CLASS_MEMORY="$BART_MEMORY"
-      CLASS_TIME_LIMIT="$BART_TIME_LIMIT"
       ;;
   esac
 

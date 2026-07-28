@@ -6,7 +6,6 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
-from joblib.externals.cloudpickle import dumps as cloudpickle_dumps
 
 import aleatoric_nk_grid.experiment as experiment_module
 from aleatoric_nk_grid.experiment import (
@@ -132,57 +131,6 @@ def test_thread_and_serial_groups_reuse_one_order_per_seed_draw(tmp_path):
     result = pd.read_csv(config.out)
     assert len(result) == 16
     assert result["status"].eq("ok").all()
-
-
-def test_bart_process_task_remains_pickleable_without_cached_order_ipc(tmp_path):
-    schema = write_schema_bundle(
-        tmp_path / "input",
-        _frame(),
-        predictors=["X_a", "X_b"],
-    )
-    config = NKGridConfig(
-        schema=schema,
-        out=tmp_path / "bart.csv",
-        outcome="y",
-        models=("bart",),
-        seed=123,
-        test_size=0.3,
-        n_seeds=1,
-        n_draws=1,
-        n_sizes_n=1,
-        n_sizes_k=1,
-        min_n=10,
-        max_n=0,
-        max_k=0,
-        batch_size=1,
-        n_jobs=2,
-        model_params=MODEL_PARAMS,
-    )
-    observed_orders = []
-
-    class PicklingParallel:
-        def __init__(self, **kwargs):
-            assert kwargs["prefer"] == "processes"
-
-        def __call__(self, tasks):
-            rows = []
-            for function, args, kwargs in tasks:
-                cloudpickle_dumps(function)
-                observed_orders.append(kwargs["orders"])
-                rows.append(function(*args, **kwargs))
-            return rows
-
-    with (
-        patch("aleatoric_nk_grid.nk_grid.Parallel", PicklingParallel),
-        patch(
-            "aleatoric_nk_grid.nk_grid.make_model",
-            side_effect=lambda *args, **kwargs: _MeanRegressor(),
-        ),
-    ):
-        run_nk_grid(config)
-
-    assert observed_orders == [None]
-    assert pd.read_csv(config.out).loc[0, "status"] == "ok"
 
 
 def test_checkpoint_index_projects_metrics_and_preserves_success_priority(

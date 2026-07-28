@@ -197,8 +197,9 @@ def test_resource_classes_are_mutually_exclusive_and_exhaust_all_models(
     assert {
         jobs[index].model for index in grouped["serial"]
     } == {"lightgbm", "super_learner"}
-    assert {jobs[index].model for index in grouped["bart"]} == {"bart"}
     assert grouped["parallel"]
+    # Two classes exhaust the space now that BART's own class is gone.
+    assert RESOURCE_CLASSES == ("parallel", "serial")
 
 
 def test_resource_class_indices_rejects_unknown_class(tmp_path):
@@ -413,7 +414,7 @@ def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy
 ):
     for key in slurm_jobs.OPTIONAL_SLURM_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("BART_N_TREES", "17")
+    monkeypatch.setenv("RF_N_ESTIMATORS", "17")
     monkeypatch.setenv("ENGINE_DIR", str(tmp_path / "engine"))
     monkeypatch.setenv("VENV", str(tmp_path / "venv"))
     monkeypatch.setenv("PYTHON", str(tmp_path / "venv" / "bin" / "python"))
@@ -438,7 +439,7 @@ def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy
     assert set(submission_environment) == set(
         slurm_jobs.OPTIONAL_SLURM_ENV_KEYS
     )
-    assert submission_environment["BART_N_TREES"] == "17"
+    assert submission_environment["RF_N_ESTIMATORS"] == "17"
     assert submission_environment["XGB_MAX_ROUNDS"] is None
     assert payload["execution_policy"]["advance_signal_seconds"] == 300
     assert payload["execution_policy"]["requeue_watchdog_seconds"] == 0
@@ -450,7 +451,7 @@ def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy
         arguments = shlex.split(command)
         sbatch_position = arguments.index("sbatch")
         frozen_environment = arguments[:sbatch_position]
-        assert "BART_N_TREES=17" in frozen_environment
+        assert "RF_N_ESTIMATORS=17" in frozen_environment
         assert any(
             frozen_environment[index : index + 2]
             == ["-u", "XGB_MAX_ROUNDS"]
@@ -466,7 +467,9 @@ def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy
     ("resource_class", "array_spec", "match"),
     [
         ("serial", "0", "do not belong"),
-        ("bart", "0", "do not belong"),
+        # The retired BART class must now be rejected as unknown, not silently
+        # accepted as an empty array.
+        ("bart", "0", "Unknown Slurm resource class"),
         ("gpu", "0", "Unknown Slurm resource class"),
     ],
 )
@@ -479,7 +482,7 @@ def test_receipt_rejects_unknown_or_mismatched_resource_class(
     snapshot = tmp_path / "jobs.json"
     _write_snapshot(
         snapshot,
-        _jobs_for_models(tmp_path, ("ols", "lightgbm", "bart")),
+        _jobs_for_models(tmp_path, ("ols", "lightgbm", "super_learner")),
     )
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
     worker.parent.mkdir(parents=True)
@@ -500,7 +503,7 @@ def test_receipt_rejects_array_indices_outside_snapshot(tmp_path):
     snapshot = tmp_path / "jobs.json"
     _write_snapshot(
         snapshot,
-        _jobs_for_models(tmp_path, ("ols", "lightgbm", "bart")),
+        _jobs_for_models(tmp_path, ("ols", "lightgbm", "super_learner")),
     )
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
     worker.parent.mkdir(parents=True)
@@ -546,7 +549,7 @@ def test_receipt_accepts_only_indices_from_declared_resource_class(tmp_path):
         snapshot,
         _jobs_for_models(
             tmp_path,
-            ("ols", "lightgbm", "bart", "ridge", "super_learner"),
+            ("ols", "lightgbm", "extra_trees", "ridge", "super_learner"),
         ),
     )
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
@@ -628,14 +631,13 @@ if [ "$1" = "-c" ]; then
   exit 0
 fi
 if [ "$3" = "snapshot" ]; then
-  echo 6
+  echo 4
   exit 0
 fi
 if [ "$3" = "indices" ]; then
   case "$*" in
     *"--resource-class parallel"*) echo "0,3" ;;
     *"--resource-class serial"*) echo "1,4" ;;
-    *"--resource-class bart"*) echo "2,5" ;;
     *) exit 8 ;;
   esac
   exit 0
@@ -692,16 +694,10 @@ echo "$((98764 + COUNT));cluster-a"
             "2",
             "--cpus-per-task",
             "6",
-            "--bart-cpus-per-task",
-            "4",
             "--mem",
             "32G",
-            "--bart-mem",
-            "96G",
             "--time",
             "2-00:00:00",
-            "--bart-time",
-            "3-00:00:00",
             "--max-restarts",
             "3",
             "--requeue-watchdog-seconds",
@@ -723,23 +719,19 @@ echo "$((98764 + COUNT));cluster-a"
         "Submitted Slurm serial array 98766 with 2 tasks (array=1,4%2)"
         in completed.stdout
     )
-    assert (
-        "Submitted Slurm bart array 98767 with 2 tasks (array=2,5%2)"
-        in completed.stdout
-    )
     if receipt_fails:
         assert "Receipt:" not in completed.stdout
-        for job_id in ("98765", "98766", "98767"):
+        for job_id in ("98765", "98766"):
             assert f"job {job_id} was submitted" in completed.stderr
-        assert completed.stderr.count("synthetic-receipt-failure") == 3
+        assert completed.stderr.count("synthetic-receipt-failure") == 2
     else:
-        assert completed.stdout.count("Receipt: /synthetic/receipt.json") == 3
+        assert completed.stdout.count("Receipt: /synthetic/receipt.json") == 2
     assert (engine / "logs").is_dir()
     sbatch_lines = sbatch_log.read_text(encoding="utf-8").splitlines()
     call_starts = [
         index for index, line in enumerate(sbatch_lines) if line.startswith("CALL ")
     ]
-    assert len(call_starts) == 3
+    assert len(call_starts) == 2
     sbatch_calls = []
     for position, start in enumerate(call_starts):
         end = (
@@ -752,7 +744,6 @@ echo "$((98764 + COUNT));cluster-a"
     expected_resources = [
         ("--cpus-per-task=6", "--mem=32G", "--time=2-00:00:00", "--array=0,3%2"),
         ("--cpus-per-task=1", "--mem=32G", "--time=2-00:00:00", "--array=1,4%2"),
-        ("--cpus-per-task=4", "--mem=96G", "--time=3-00:00:00", "--array=2,5%2"),
     ]
     snapshot_paths = set()
     for sbatch_args, resource_args in zip(sbatch_calls, expected_resources):
@@ -777,7 +768,6 @@ echo "$((98764 + COUNT));cluster-a"
     for resource_class, indices, cpus, memory, time_limit in (
         ("parallel", "0,3%2", "6", "32G", "2-00:00:00"),
         ("serial", "1,4%2", "1", "32G", "2-00:00:00"),
-        ("bart", "2,5%2", "4", "96G", "3-00:00:00"),
     ):
         assert any(
             " indices " in f" {call} "
@@ -849,18 +839,17 @@ if [ "$3" = "snapshot" ]; then
     fi
     PREVIOUS="$ARGUMENT"
   done
-  echo 3
+  echo 2
   exit 0
 fi
 if [ "$3" = "count" ]; then
-  echo 3
+  echo 2
   exit 0
 fi
 if [ "$3" = "indices" ]; then
   case "$*" in
     *"--resource-class parallel"*) echo "0" ;;
     *"--resource-class serial"*) echo "1" ;;
-    *"--resource-class bart"*) echo "2" ;;
     *) exit 8 ;;
   esac
   exit 0
@@ -918,7 +907,6 @@ echo '41001;cluster-a'
     )
     assert "Receipt: /synthetic/parallel-receipt.json" in completed.stdout
     assert "Submitted Slurm serial" not in completed.stdout
-    assert "Submitted Slurm bart" not in completed.stdout
     assert "Failed to submit Slurm serial array." in completed.stderr
     assert "Already submitted: parallel=41001" in completed.stderr
     assert "Do not rerun the whole submission command." in completed.stderr
@@ -953,7 +941,6 @@ echo '41001;cluster-a'
     assert recovery.returncode == 0, recovery.stderr
     assert "Submitted Slurm serial array 41001 with 1 tasks (array=1)" in recovery.stdout
     assert "Submitted Slurm parallel" not in recovery.stdout
-    assert "Submitted Slurm bart" not in recovery.stdout
     assert sbatch_counter.read_text(encoding="utf-8").strip() == "3"
     recovery_receipts = [
         call

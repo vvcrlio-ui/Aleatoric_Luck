@@ -317,9 +317,10 @@ def test_cell_groups_are_deterministic_with_concurrent_outer_jobs(tmp_path):
     )
 
 
-def test_mixed_bart_panel_schedules_bart_in_separate_process_subwindow(
-    tmp_path,
-):
+def test_mixed_panel_runs_in_one_threads_window(tmp_path):
+    # BART was the only model that needed prefer="processes". With it removed,
+    # a mixed native/non-native panel must collapse into a single threads
+    # window rather than being split across scheduling subwindows.
     frame = _frame()
     predictors = [column for column in frame if column.startswith("X_")]
     schema = write_schema_bundle(
@@ -361,8 +362,8 @@ def test_mixed_bart_panel_schedules_bart_in_separate_process_subwindow(
         run_nk_grid(
             _config(
                 schema,
-                tmp_path / "mixed-bart.csv",
-                models=("bart", "lightgbm", "ols"),
+                tmp_path / "mixed.csv",
+                models=("lightgbm", "ols"),
                 n_jobs=3,
             )
         )
@@ -373,13 +374,8 @@ def test_mixed_bart_panel_schedules_bart_in_separate_process_subwindow(
             "n_jobs": 3,
             "models": [("lightgbm", "ols")],
         },
-        {
-            "prefer": "processes",
-            "n_jobs": 3,
-            "models": [("bart",)],
-        },
     ]
-    assert pd.read_csv(tmp_path / "mixed-bart.csv")["status"].eq("ok").all()
+    assert pd.read_csv(tmp_path / "mixed.csv")["status"].eq("ok").all()
 
 
 def test_manifest_records_actual_window_policy_without_legacy_model_policy(
@@ -407,7 +403,7 @@ def test_manifest_records_actual_window_policy_without_legacy_model_policy(
             _config(
                 schema,
                 out,
-                models=("ols", "lightgbm", "bart"),
+                models=("ols", "lightgbm"),
                 n_jobs=3,
             )
         )
@@ -417,25 +413,17 @@ def test_manifest_records_actual_window_policy_without_legacy_model_policy(
     )["design"]["parallelism"]
     assert "effective_outer_n_jobs_by_model" not in parallelism
     assert "joblib_prefer_by_model" not in parallelism
+    assert "bart" not in json.dumps(parallelism)
     assert parallelism["configured_outer_n_jobs"] == 3
     assert parallelism["window_policy"] == {
         "parallel_unit": "cell_group",
-        "non_bart": {
-            "selected": True,
-            "prefer": "threads",
-            "contains_native": True,
-            "n_jobs_rule": {
-                "all_models_native": 1,
-                "otherwise": 3,
-            },
-            "native_calls_serialized": True,
+        "prefer": "threads",
+        "contains_native": True,
+        "n_jobs_rule": {
+            "all_models_native": 1,
+            "otherwise": 3,
         },
-        "bart": {
-            "selected": True,
-            "scheduled_separately": True,
-            "prefer": "processes",
-            "n_jobs": 3,
-        },
+        "native_calls_serialized": True,
     }
 
 

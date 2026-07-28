@@ -31,7 +31,7 @@ class SlurmJob:
     config: NKGridConfig
 
 
-RESOURCE_CLASSES = ("parallel", "serial", "bart")
+RESOURCE_CLASSES = ("parallel", "serial")
 OPTIONAL_SLURM_ENV_KEYS = (
     "ALEATORIC_NK_GRID_SOURCE_FALLBACK",
     "PYTHON_MODULE",
@@ -46,8 +46,6 @@ MAX_REQUEUE_WATCHDOG_SECONDS = (
 
 
 def resource_class_for_model(model: str) -> str:
-    if model == "bart":
-        return "bart"
     if model in SERIAL_OUTER_MODELS:
         return "serial"
     return "parallel"

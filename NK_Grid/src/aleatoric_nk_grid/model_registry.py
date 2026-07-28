@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import threading
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -32,13 +31,6 @@ from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-# BartPy imports matplotlib even for non-plotting fits; give cluster workers a
-# writable cache before that optional backend is imported.
-MATPLOTLIB_CACHE = Path(os.environ.get("TMPDIR", "/tmp")) / "aleatoric-matplotlib"
-MATPLOTLIB_CACHE.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CACHE))
-
-
 MODEL_NAMES = (
     "ols",
     "ridge",
@@ -52,12 +44,21 @@ MODEL_NAMES = (
     "super_learner",
 )
 
-# BART belongs to the original replication rather than the expanded model
-# space. Keep it constructible so existing runs and checkpoints remain usable.
-LEGACY_MODEL_NAMES = (
-    "bart",
-)
-SUPPORTED_MODEL_NAMES = MODEL_NAMES + LEGACY_MODEL_NAMES
+# Models that were deliberately retired from the model space. Naming one is a
+# hard error rather than a silent drop, so a stale panel fails loudly instead of
+# quietly producing results for one model fewer than it asked for.
+REMOVED_MODEL_NAMES = {
+    "bart": "BART was removed from the model space; see plans/remove-bart.md",
+}
+SUPPORTED_MODEL_NAMES = MODEL_NAMES
+
+
+def reject_removed_model(name: str) -> None:
+    """Raise a self-explaining error for a model that no longer exists."""
+
+    reason = REMOVED_MODEL_NAMES.get(name)
+    if reason is not None:
+        raise ValueError(reason)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_PARAMS_PATH = ROOT / "model_params.yaml"
@@ -100,7 +101,6 @@ MODEL_PARAM_KEYS = {
             "min_data_in_leaf", "verbosity", "max_rounds", "cv_folds",
             "early_stopping_rounds",
         },
-        "bart": {"n_trees", "n_samples", "n_burn", "thin", "n_chains"},
     },
     "classification": {
         "ols": {"C", "l1_ratio", "solver", "max_iter"},
@@ -129,11 +129,8 @@ MODEL_PARAM_KEYS = {
             "objective", "learning_rate", "num_leaves", "min_data_in_leaf",
             "n_estimators", "verbosity",
         },
-        "bart": set(),
     },
 }
-
-_BART_RANDOM_LOCK = threading.Lock()
 
 
 def _validated_params(
@@ -143,6 +140,7 @@ def _validated_params(
 ) -> dict[str, Any]:
     allowed = MODEL_PARAM_KEYS.get(task, {}).get(model_name)
     if allowed is None:
+        reject_removed_model(model_name)
         raise ValueError(
             f"Unknown {task} model '{model_name}'. Choose from: "
             f"{', '.join(SUPPORTED_MODEL_NAMES)}"
@@ -195,6 +193,10 @@ def load_model_params(
         )
 
     normalized_models = [str(model).lower() for model in models]
+    # Reject retired models before the generic "missing from YAML" path, so a
+    # stale panel is told why the model is gone instead of that it is absent.
+    for model_name in normalized_models:
+        reject_removed_model(model_name)
     missing = sorted(set(normalized_models) - set(task_params))
     if missing:
         raise ValueError(
@@ -266,16 +268,6 @@ def _apply_environment_overrides(
             result["max_features"] = os.environ["RF_MAX_FEATURES"]
         if "RF_MIN_SAMPLES_LEAF" in os.environ:
             result["min_samples_leaf"] = int(os.environ["RF_MIN_SAMPLES_LEAF"])
-    if model_name == "bart":
-        bart_env = {
-            "BART_N_TREES": ("n_trees", int),
-            "BART_N_SAMPLES": ("n_samples", int),
-            "BART_N_BURN": ("n_burn", int),
-            "BART_THIN": ("thin", float),
-        }
-        for key, (parameter_name, converter) in bart_env.items():
-            if key in os.environ:
-                result[parameter_name] = converter(os.environ[key])
     return result
 
 
@@ -526,85 +518,6 @@ class AdaptiveElasticNetCV(BaseEstimator, RegressorMixin):
 
     def predict(self, X):
         return self.model_.predict(X)
-
-
-class BartPyRegressor(BaseEstimator, RegressorMixin):
-    """Small sklearn-compatible wrapper around a BartPy implementation."""
-
-    def __init__(
-        self,
-        n_trees: int = 200,
-        n_samples: int = 1000,
-        n_burn: int = 100,
-        thin: float = 1.0,
-        n_chains: int = 1,
-        n_jobs: int = 1,
-        random_state: int | None = None,
-    ):
-        self.n_trees = n_trees
-        self.n_samples = n_samples
-        self.n_burn = n_burn
-        self.thin = thin
-        self.n_chains = n_chains
-        self.n_jobs = n_jobs
-        self.random_state = random_state
-
-    def fit(self, X, y):
-        try:
-            from bartpy.sklearnmodel import SklearnModel
-        except ImportError as exc:
-            try:
-                from bartpy2.sklearnmodel import SklearnModel
-            except ImportError:
-                raise ImportError(
-                    "BART requires bartpy2 or a compatible bartpy package."
-                ) from exc
-
-        self.feature_names_ = list(getattr(X, "columns", [])) or [
-            f"x{i}" for i in range(np.asarray(X).shape[1])
-        ]
-        self.imputer_ = SimpleImputer(strategy="median")
-        X_imputed = self.imputer_.fit_transform(X)
-        X_frame = pd.DataFrame(X_imputed, columns=self.feature_names_)
-        kwargs = {
-            "n_trees": self.n_trees,
-            "n_samples": self.n_samples,
-            "n_burn": self.n_burn,
-            "thin": self.thin,
-        }
-        try:
-            self.model_ = SklearnModel(
-                **kwargs, n_chains=self.n_chains, n_jobs=self.n_jobs
-            )
-        except TypeError:
-            self.model_ = SklearnModel(**kwargs)
-        # BartPy uses NumPy's process-global RNG. Protect and restore it for
-        # direct threaded use; experiment scripts additionally use processes.
-        with _BART_RANDOM_LOCK:
-            previous_state = np.random.get_state()
-            try:
-                if self.random_state is not None:
-                    np.random.seed(self.random_state)
-                self.model_.fit(X_frame, np.asarray(y))
-            finally:
-                np.random.set_state(previous_state)
-        return self
-
-    def predict(self, X):
-        X_imputed = self.imputer_.transform(X)
-        X_frame = pd.DataFrame(X_imputed, columns=self.feature_names_)
-        return np.asarray(self.model_.predict(X_frame))
-
-
-class BartPyClassifier(BaseEstimator):
-    """Placeholder for BART classification until a supported backend is available."""
-
-    def __init__(self, random_state: int | None = None, n_jobs: int = 1):
-        self.random_state = random_state
-        self.n_jobs = n_jobs
-
-    def fit(self, X, y):
-        raise NotImplementedError("BART classification is not supported by this backend.")
 
 
 class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
@@ -945,12 +858,7 @@ def _make_classification_model(
             n_jobs=n_jobs,
             **params,
         )
-    if name == "bart":
-        return BartPyClassifier(
-            random_state=seed,
-            n_jobs=n_jobs,
-            **params,
-        )
+    reject_removed_model(name)
     raise ValueError(
         f"Unknown model '{model_name}'. Choose from: "
         f"{', '.join(SUPPORTED_MODEL_NAMES)}"
@@ -1060,12 +968,7 @@ def make_model(
             n_jobs=n_jobs,
             **resolved_params,
         )
-    if name == "bart":
-        return BartPyRegressor(
-            random_state=seed,
-            n_jobs=n_jobs,
-            **resolved_params,
-        )
+    reject_removed_model(name)
     raise ValueError(
         f"Unknown model '{model_name}'. Choose from: "
         f"{', '.join(SUPPORTED_MODEL_NAMES)}"

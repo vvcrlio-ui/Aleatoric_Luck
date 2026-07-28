@@ -25,10 +25,6 @@ import pandas as pd
 
 
 MODEL_ENV_KEYS = (
-    "BART_N_BURN",
-    "BART_N_SAMPLES",
-    "BART_N_TREES",
-    "BART_THIN",
     "LGBM_MAX_ROUNDS",
     "RF_MAX_FEATURES",
     "RF_MIN_SAMPLES_LEAF",
@@ -1321,12 +1317,6 @@ def diagnostics_summary(frame: pd.DataFrame) -> dict[str, Any]:
             by_model[str(model)] = summary
     result["by_model"] = by_model
     return result
-
-
-def parallel_preference(models: Iterable[str]) -> str:
-    """Isolate BART's process-global RNG when jobs run concurrently."""
-
-    return "processes" if "bart" in set(models) else "threads"
 
 
 def effective_outer_n_jobs(model_name: str, configured_n_jobs: int) -> int:
