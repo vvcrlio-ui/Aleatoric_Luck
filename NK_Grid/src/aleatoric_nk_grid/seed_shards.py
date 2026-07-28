@@ -39,6 +39,7 @@ def finalize_seed_shards(master_snapshot: Path, *, panel: str, model: str) -> Pa
     if not jobs:
         raise ValueError(f"No seed jobs for {panel}/{model}")
     config = _config_from_json(jobs[0]["config"])
+    final_out = Path(jobs[0]["final_out"])
     expected = group_repeat_pairs_by_seed(resolve_repeat_pairs(config))
     by_seed = {int(item["seed"]): item for item in jobs}
     missing = sorted(set(expected) - set(by_seed))
@@ -75,7 +76,7 @@ def finalize_seed_shards(master_snapshot: Path, *, panel: str, model: str) -> Pa
         manifests.append((manifest, out))
     if issues:
         raise ValueError("Seed shard validation failed: " + "; ".join(issues[:20]) + f" (total={len(issues)})")
-    target = Path(config.out)
+    target = final_out
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(prefix="nk-grid-seed-", suffix=".sqlite", delete=False) as handle:
         database = Path(handle.name)

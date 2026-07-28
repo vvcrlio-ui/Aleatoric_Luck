@@ -278,7 +278,7 @@ def test_external_id_contract_checks_rows_dropped_for_missing_outcome(
         _validated(schema_path)
 
 
-def test_feature_universe_hash_and_semantics_are_both_checked(tmp_path):
+def test_feature_universe_semantics_are_checked_without_hash(tmp_path):
     schema_path = write_schema_bundle(
         tmp_path, _frame(), predictors=["X_a", "X_b"]
     )
@@ -286,7 +286,7 @@ def test_feature_universe_hash_and_semantics_are_both_checked(tmp_path):
     document = json.loads(definition_path.read_text())
     document["predictors"].reverse()
     definition_path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ValueError, match="definition_sha256"):
+    with pytest.raises(ValueError, match="Resolved feature universe"):
         _validated(schema_path)
 
     schema = json.loads(schema_path.read_text())
@@ -375,15 +375,14 @@ def test_external_train_row_floor_is_validated_before_sampling(tmp_path):
         _validated(schema_path, min_n=10)
 
 
-def test_provenance_schema_hash_is_cross_checked(tmp_path):
+def test_provenance_schema_hash_is_ignored(tmp_path):
     schema_path = write_schema_bundle(
         tmp_path, _frame(), predictors=["X_a", "X_b"]
     )
     (tmp_path / "provenance.json").write_text(
         json.dumps({"schema_sha256": "incorrect"}), encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="provenance schema_sha256"):
-        _validated(schema_path)
+    _validated(schema_path)
 
 
 def test_external_ordinal_category_must_be_covered_by_train(tmp_path):

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
+import signal
 import traceback
 from multiprocessing.connection import Connection, wait
 from typing import Any, Callable
@@ -23,6 +25,9 @@ class NativeProcessRemoteError(RuntimeError):
 def _worker_loop(connection: Connection) -> None:
     """Execute sequential requests until the parent closes the worker."""
 
+    # Loky/joblib descendants inherit this group, so timeout/crash cleanup can
+    # terminate the complete model tree rather than leaking grandchildren.
+    os.setsid()
     try:
         while True:
             try:
@@ -132,10 +137,16 @@ class IsolatedProcessRunner:
         if process is None:
             return
         if force and process.is_alive():
-            process.terminate()
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         process.join(timeout=self.shutdown_grace_seconds)
         if process.is_alive():
-            process.kill()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.join(timeout=self.shutdown_grace_seconds)
         process.close()
 

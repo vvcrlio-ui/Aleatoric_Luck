@@ -17,6 +17,7 @@ PYTHON="${PYTHON:-$VENV/bin/python}"
 SNAPSHOT="${1:?Pass a frozen Slurm job snapshot}"
 ALLOW_LARGE_RUN="${2:-0}"
 RERUN_COMPLETED="${3:-0}"
+CHUNK_MAP="${4:-}"
 MAX_SLURM_RESTARTS="${MAX_SLURM_RESTARTS:-5}"
 REQUEUE_WATCHDOG_SECONDS="${REQUEUE_WATCHDOG_SECONDS:-240}"
 : "${SLURM_ARRAY_TASK_ID:?Submit this worker as a Slurm array job}"
@@ -153,6 +154,7 @@ trap cleanup_stop_request EXIT
 trap request_requeue USR1
 
 ARGS=(run --snapshot "$SNAPSHOT" --index "$SLURM_ARRAY_TASK_ID")
+[ -z "$CHUNK_MAP" ] || ARGS+=(--chunk-map "$CHUNK_MAP")
 [ "$ALLOW_LARGE_RUN" = "0" ] || ARGS+=(--allow-large-run)
 [ "$RERUN_COMPLETED" = "0" ] || ARGS+=(--rerun-completed)
 "$PYTHON" -m aleatoric_nk_grid.slurm_jobs "${ARGS[@]}" &

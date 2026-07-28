@@ -48,3 +48,10 @@
 1. 审查 `semantic_contract` 边界，确保 runtime/design 字段没有进入合同。
 2. 审查 `seed_shards.py` 的最终输出路径与 failure-policy 汇总规则。
 3. 审查现有测试迁移策略：不应恢复已删除的 hash 身份字段。
+
+## 第 1 轮修改
+
+- 已将 identity、ingest 与 engine 的过时 SHA/identity-version 测试改为 explicit-v1 合同语义；局部回归 `test_identity_panels_isolation.py` 为 9 passed。
+- `native_process.py` 的 worker 建立独立 session，超时/崩溃时对整个 process group 发送 SIGTERM 后 SIGKILL。
+- 增加不可变 chunk-map 读写和 worker 的本地 array index 映射入口；提交脚本尚未完成 MaxArraySize 探测及按 map 提交的调用层。
+- 全量 pytest 继续运行到 72 passed 后发现并修正 `test_nk_grid_engine.py` 的旧 identity-version 断言；尚未获得全量最终结果。

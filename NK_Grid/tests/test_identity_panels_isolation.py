@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -13,7 +12,6 @@ import pandas as pd
 import pytest
 import yaml
 
-from aleatoric_nk_grid.experiment import build_experiment_metadata
 from aleatoric_nk_grid.ingest import load_schema
 from aleatoric_nk_grid.nk_grid import NKGridConfig, run_nk_grid
 from aleatoric_nk_grid import run_panels
@@ -58,17 +56,16 @@ def test_provenance_change_does_not_change_identity_or_duplicate_cells(tmp_path)
     schema = write_schema_bundle(
         bundle, _frame(), predictors=["X_a", "X_b"]
     )
-    schema_hash = hashlib.sha256(schema.read_bytes()).hexdigest()
     provenance = bundle / "provenance.json"
     provenance.write_text(
-        json.dumps({"schema_sha256": schema_hash, "note": "first"}),
+        json.dumps({"schema_sha256": "obsolete-adapter-field", "note": "first"}),
         encoding="utf-8",
     )
     out = tmp_path / "result.csv"
     run_nk_grid(_config(schema, out))
     first = pd.read_csv(out)
     provenance.write_text(
-        json.dumps({"schema_sha256": schema_hash, "note": "changed only"}),
+        json.dumps({"schema_sha256": "changed-but-ignored", "note": "changed only"}),
         encoding="utf-8",
     )
     run_nk_grid(_config(schema, out))
@@ -77,24 +74,20 @@ def test_provenance_change_does_not_change_identity_or_duplicate_cells(tmp_path)
     assert second.loc[0, "experiment_id"] == first.loc[0, "experiment_id"]
 
 
-def test_imputation_semantic_change_changes_identity(tmp_path):
+def test_imputation_semantic_change_rejects_resume_with_field_path(tmp_path):
     schema = write_schema_bundle(
         tmp_path / "bundle", _frame(), predictors=["X_a", "X_b"]
     )
     first_out = tmp_path / "first.csv"
-    second_out = tmp_path / "second.csv"
     run_nk_grid(_config(schema, first_out))
     document = json.loads(schema.read_text())
     document["imputation"]["continuous"] = "mean"
     schema.write_text(json.dumps(document), encoding="utf-8")
-    run_nk_grid(_config(schema, second_out))
-    assert (
-        pd.read_csv(first_out).loc[0, "experiment_id"]
-        != pd.read_csv(second_out).loc[0, "experiment_id"]
-    )
+    with pytest.raises(ValueError, match="semantic_contract.imputation.continuous"):
+        run_nk_grid(_config(schema, first_out))
 
 
-def test_native_timeout_change_changes_identity(tmp_path):
+def test_runtime_timeout_change_does_not_change_explicit_identity(tmp_path):
     schema = write_schema_bundle(
         tmp_path / "bundle", _frame(), predictors=["X_a", "X_b"]
     )
@@ -110,60 +103,42 @@ def test_native_timeout_change_changes_identity(tmp_path):
     first = run_nk_grid(first_config)
     second = run_nk_grid(second_config)
 
-    assert (
-        pd.read_csv(first).loc[0, "experiment_id"]
-        != pd.read_csv(second).loc[0, "experiment_id"]
-    )
+    assert pd.read_csv(first).loc[0, "experiment_id"] == pd.read_csv(second).loc[0, "experiment_id"]
 
 
-def test_schema_semantic_hash_excludes_physical_paths(tmp_path):
+def test_schema_semantic_contract_excludes_physical_paths(tmp_path):
     first = write_schema_bundle(
         tmp_path / "one", _frame(), predictors=["X_a", "X_b"]
     )
     second = write_schema_bundle(
         tmp_path / "two", _frame(), predictors=["X_a", "X_b"]
     )
-    assert load_schema(first).semantic_hash == load_schema(second).semantic_hash
+    assert load_schema(first).semantic_contract == load_schema(second).semantic_contract
 
 
-def test_schema_semantic_hash_normalizes_optional_defaults(tmp_path):
+def test_schema_semantic_contract_normalizes_optional_defaults(tmp_path):
     schema = write_schema_bundle(
         tmp_path / "bundle", _frame(), predictors=["X_a", "X_b"]
     )
-    explicit_null = load_schema(schema).semantic_hash
+    explicit_null = load_schema(schema).semantic_contract
     document = json.loads(schema.read_text(encoding="utf-8"))
     document.pop("max_train_outcome_missing_ratio")
     document.pop("max_test_outcome_missing_ratio")
     document.pop("continuous_priors")
     schema.write_text(json.dumps(document), encoding="utf-8")
-    omitted = load_schema(schema).semantic_hash
+    omitted = load_schema(schema).semantic_contract
     document["max_train_outcome_missing_ratio"] = 0.5
     document["max_test_outcome_missing_ratio"] = 0.5
     document["continuous_priors"] = {}
     schema.write_text(json.dumps(document), encoding="utf-8")
-    explicit_empty = load_schema(schema).semantic_hash
+    explicit_empty = load_schema(schema).semantic_contract
     assert explicit_null == omitted == explicit_empty
 
 
-def test_identity_version_prevents_checkpoint_aliasing(tmp_path):
-    data = tmp_path / "data.csv"
-    _frame().to_csv(data, index=False)
-    common = {
-        "kind": "nk_grid",
-        "data_path": data,
-        "outcome": "y",
-        "test_size": 0.3,
-        "split_seed": 123,
-        "algorithm_version": "test",
-        "extra": {"predictors": ["X_a"]},
-    }
-    first = build_experiment_metadata(
-        **common, experiment_identity_version=2
-    )
-    second = build_experiment_metadata(
-        **common, experiment_identity_version=3
-    )
-    assert first["experiment_id"] != second["experiment_id"]
+def test_explicit_identity_versions_prevent_checkpoint_aliasing(tmp_path):
+    first = replace(_config(tmp_path / "schema.json", tmp_path / "one.csv"), data_version="data-v1")
+    second = replace(first, data_version="data-v2")
+    assert first.data_version != second.data_version
 
 
 def test_panel_rejects_schema_owned_fields_and_external_test_size(tmp_path):

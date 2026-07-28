@@ -25,6 +25,31 @@ from .nk_grid import (
 from .run_panels import ROOT, config_to_json, resolved_panels
 
 
+def chunk_master_indices(indices: tuple[int, ...], max_array_size: int) -> tuple[tuple[int, ...], ...]:
+    """Partition master indices while each Slurm array uses local 0..N-1 IDs."""
+    if max_array_size < 1:
+        raise ValueError("max_array_size must be positive")
+    return tuple(tuple(indices[start : start + max_array_size]) for start in range(0, len(indices), max_array_size))
+
+
+def write_chunk_map(snapshot_path: Path, resource_class: str, chunk: tuple[int, ...], ordinal: int) -> Path:
+    """Persist immutable local-array-index to master-job-index mapping."""
+    if not chunk:
+        raise ValueError("chunk must not be empty")
+    path = snapshot_path.parent / f"{snapshot_path.stem}.{resource_class}.chunk-{ordinal:04d}.json"
+    write_json_atomic(path, {"format_version": 1, "snapshot": str(snapshot_path), "resource_class": resource_class, "master_indices": list(chunk)})
+    os.chmod(path, 0o444)
+    return path
+
+
+def load_chunk_map(path: Path) -> tuple[int, ...]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    values = payload.get("master_indices")
+    if payload.get("format_version") != 1 or not isinstance(values, list) or not values:
+        raise ValueError(f"Invalid Slurm chunk map: {path}")
+    return tuple(int(value) for value in values)
+
+
 @dataclass(frozen=True)
 class SlurmJob:
     panel: str
@@ -32,6 +57,7 @@ class SlurmJob:
     seed: int
     draws: tuple[int, ...]
     config: NKGridConfig
+    final_out: Path
 
 
 RESOURCE_CLASSES = ("parallel", "serial", "super_learner")
@@ -105,7 +131,7 @@ def build_slurm_jobs(manifest_path: Path) -> list[SlurmJob]:
                 jobs.append(SlurmJob(panel_name, model_name, seed, draws, replace(
                     config, models=(model_name,),
                     out=_model_output_path(Path(config.out), panel_name, model_name, seed),
-                )))
+                ), Path(config.out)))
     if not jobs:
         raise ValueError(f"No active panel/model jobs found in {manifest_path}")
     _require_unique_output_paths(jobs)
@@ -184,6 +210,7 @@ def write_job_snapshot(
                 "seed": job.seed,
                 "draws": list(job.draws),
                 "config": config_to_json(job.config),
+                "final_out": str(job.final_out),
             }
             for job in jobs
         ],
@@ -213,6 +240,7 @@ def _read_job_snapshot(snapshot_path: Path) -> tuple[dict[str, Any], list[SlurmJ
             seed=int(item["seed"]),
             draws=tuple(int(draw) for draw in item["draws"]),
             config=_config_from_json(item["config"]),
+            final_out=Path(item["final_out"]),
         )
         for item in payload["jobs"]
     ]
@@ -550,6 +578,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--array-spec", default=None)
     parser.add_argument("--worker-script", default=None)
     parser.add_argument("--index", type=int, default=None)
+    parser.add_argument("--chunk-map", type=Path, default=None)
     # ``default=None`` keeps an absent flag from overriding a panel that already
     # declares ``allow_large_run``; passing the flag still authorizes every task.
     parser.add_argument("--allow-large-run", action="store_true", default=None)
@@ -646,6 +675,11 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.index is None:
         parser.error("run requires --index")
+    if args.chunk_map is not None:
+        local_indices = load_chunk_map(args.chunk_map)
+        if not 0 <= args.index < len(local_indices):
+            parser.error(f"--index must be between 0 and {len(local_indices) - 1} for chunk map")
+        args.index = local_indices[args.index]
     if not 0 <= args.index < len(jobs):
         parser.error(f"--index must be between 0 and {len(jobs) - 1}")
     job = jobs[args.index]

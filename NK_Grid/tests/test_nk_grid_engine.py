@@ -83,11 +83,12 @@ def test_engine_smoke_records_identity_and_k_diagnostics(tmp_path):
     assert result.loc[0, "K"] == 2
     assert result.loc[0, "K_expanded"] == 2
     assert result.loc[0, "K_unobserved"] == 0
-    assert result.loc[0, "experiment_identity_version"] == 3
+    assert result.loc[0, "experiment_id"] == "nkgrid-test-v1"
     manifest = json.loads(out.with_suffix(".manifest.json").read_text())
     assert manifest["failure_policy"]["passed"] is True
     assert manifest["failure_policy"]["denominator"] == 1
-    assert manifest["schema"]["semantic_sha256"]
+    assert manifest["identity"]["mode"] == "explicit-v1"
+    assert manifest["semantic_contract"]["kind"] == "nk_grid"
     assert not checkpoint_parts_dir(out).exists()
 
 
