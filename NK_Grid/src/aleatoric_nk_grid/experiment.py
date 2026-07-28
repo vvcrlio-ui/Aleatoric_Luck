@@ -928,6 +928,30 @@ def _sqlite_diagnostics_summary(
             )
             model_summary["fit_seconds_total"] = total if count else 0.0
             model_summary["fit_seconds_median"] = median
+        if "_preprocess_seconds" in columns:
+            count, total, _, _, _ = _numeric_column_summary(
+                connection,
+                column="_preprocess_seconds",
+                experiment_id=experiment_id,
+                model=model,
+            )
+            model_summary["preprocess_seconds_total"] = total if count else 0.0
+        if "_cell_wall_seconds" in columns:
+            count, total, _, _, _ = _numeric_column_summary(
+                connection,
+                column="_cell_wall_seconds",
+                experiment_id=experiment_id,
+                model=model,
+            )
+            model_summary["cell_wall_seconds_total"] = total if count else 0.0
+        if "_peak_rss_bytes" in columns:
+            count, _, _, _, maximum = _numeric_column_summary(
+                connection,
+                column="_peak_rss_bytes",
+                experiment_id=experiment_id,
+                model=model,
+            )
+            model_summary["peak_rss_bytes_max"] = int(maximum) if count else 0
         if "_best_rounds" in columns:
             count, _, median, minimum, maximum = _numeric_column_summary(
                 connection,
@@ -1268,6 +1292,21 @@ def diagnostics_summary(frame: pd.DataFrame) -> dict[str, Any]:
                 timings = pd.to_numeric(all_group["_fit_seconds"], errors="coerce").dropna()
                 summary["fit_seconds_total"] = float(timings.sum())
                 summary["fit_seconds_median"] = float(timings.median()) if len(timings) else None
+            if "_preprocess_seconds" in all_group:
+                preprocess = pd.to_numeric(
+                    all_group["_preprocess_seconds"], errors="coerce"
+                ).dropna()
+                summary["preprocess_seconds_total"] = float(preprocess.sum())
+            if "_cell_wall_seconds" in all_group:
+                wall = pd.to_numeric(
+                    all_group["_cell_wall_seconds"], errors="coerce"
+                ).dropna()
+                summary["cell_wall_seconds_total"] = float(wall.sum())
+            if "_peak_rss_bytes" in all_group:
+                rss = pd.to_numeric(
+                    all_group["_peak_rss_bytes"], errors="coerce"
+                ).dropna()
+                summary["peak_rss_bytes_max"] = int(rss.max()) if len(rss) else 0
             if "_best_rounds" in all_group:
                 rounds = pd.to_numeric(all_group["_best_rounds"], errors="coerce").dropna()
                 summary["best_rounds"] = (

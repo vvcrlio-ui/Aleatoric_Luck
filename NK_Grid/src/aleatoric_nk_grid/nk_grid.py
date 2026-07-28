@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
 import shutil
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -103,6 +106,27 @@ LARGE_RUN_THRESHOLD = 250_000
 # Super Learner fits each of its 4 base learners once per CV fold plus one final
 # refit on the full subsample: 4 x (cv + 1) with cv=5.
 SUPER_LEARNER_FITS_PER_CELL = 24
+
+
+_NATIVE_RUNNER_LOCK = threading.Lock()
+
+
+def _run_native_model_cell_locked(
+    runner: IsolatedProcessRunner,
+    *,
+    fit_arguments: dict[str, Any],
+    on_native_crash: Callable[[int, BaseException], None],
+    on_native_timeout: Callable[[int, BaseException], None],
+) -> dict[str, Any]:
+    """Serialize access to the one reusable native-model subprocess."""
+
+    with _NATIVE_RUNNER_LOCK:
+        return runner.run(
+            _fit_predict_model_cell,
+            **fit_arguments,
+            on_native_crash=on_native_crash,
+            on_native_timeout=on_native_timeout,
+        )
 
 
 METRIC_COLUMNS = (
@@ -475,7 +499,19 @@ def _empty_diagnostics() -> dict[str, float | bool]:
         "converged": False,
         "_fit_seconds": np.nan,
         "_best_rounds": np.nan,
+        "_preprocess_seconds": 0.0,
+        "_preprocess_computed": False,
+        "_slice_seconds": 0.0,
+        "_cell_wall_seconds": 0.0,
+        "_peak_rss_bytes": 0,
     }
+
+
+def _process_peak_rss_bytes() -> int:
+    """Return this process's peak resident set size in bytes."""
+
+    peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return peak if sys.platform == "darwin" else peak * 1024
 
 
 def _constant_prediction(values: Sequence[float]) -> bool:
@@ -1043,9 +1079,9 @@ def _verified_complete_artifacts(
 def _preserve_prior_timings(payload: dict, prior: dict | None) -> dict:
     """Carry per-model timings forward when shards can no longer supply them.
 
-    ``_fit_seconds``/``_best_rounds`` live only in checkpoint shards, so once the
-    shards are pruned a later merge cannot recompute them. Keep whatever the
-    previous manifest recorded instead of dropping the fields.
+    Timing diagnostics live only in checkpoint shards, so once the shards are
+    pruned a later merge cannot recompute them. Keep whatever the previous
+    manifest recorded instead of dropping the fields.
     """
 
     if prior is None:
@@ -1060,7 +1096,14 @@ def _preserve_prior_timings(payload: dict, prior: dict | None) -> dict:
         prior_summary = prior_models.get(model, {})
         if not isinstance(prior_summary, dict):
             continue
-        for key in ("fit_seconds_total", "fit_seconds_median", "best_rounds"):
+        for key in (
+            "fit_seconds_total",
+            "fit_seconds_median",
+            "preprocess_seconds_total",
+            "cell_wall_seconds_total",
+            "peak_rss_bytes_max",
+            "best_rounds",
+        ):
             if key not in summary and key in prior_summary:
                 summary[key] = prior_summary[key]
     return payload
@@ -1179,6 +1222,7 @@ def _fit_predict_model_cell(
         "fit_seconds": time.perf_counter() - fit_started,
         "best_rounds": _model_best_rounds(model),
         "converged": _model_converged(model),
+        "peak_rss_bytes": _process_peak_rss_bytes(),
     }
 
 
@@ -1533,15 +1577,15 @@ def _run_nk_grid_locked(
         timeout_seconds=config.native_process_timeout_seconds,
     )
 
-    def run_one(
-        model_name: str,
+    def run_cell_group(
         seed: int,
         draw: int,
         n_samples: int,
         k_features: int,
+        models: Sequence[str],
         *,
         orders: DrawOrders | None = None,
-    ) -> dict:
+    ) -> list[dict]:
         split = splits[seed]
         if orders is None:
             orders = draw_orders(
@@ -1553,41 +1597,125 @@ def _run_nk_grid_locked(
             feature for unit in selected_units for feature in feature_groups[unit]
         ]
         selected_groups = [groups_by_name[unit] for unit in selected_units]
-        row = _base_row(
-            dataset=dataset,
-            outcome=config.outcome,
-            model_name=model_name,
-            seed=seed,
-            draw=draw,
-            n_samples=n_samples,
-            k_features=k_features,
-            n_train_total=len(split.X_train),
-            n_test_total=len(split.X_test),
-            n_features_total=len(feature_units),
-            k_expanded=len(selected_cols),
-            n_expanded_features_total=len(predictors),
-        )
-        diagnostics = _empty_diagnostics()
+        slice_started = time.perf_counter()
         try:
-            X_sub = split.X_train.loc[selected_rows, selected_cols]
+            X_sub_raw = split.X_train.loc[selected_rows, selected_cols]
             y_sub = split.y_train.loc[selected_rows]
-            unobserved = count_unobserved_sources(X_sub, selected_groups)
+            X_test_raw = split.X_test.loc[:, selected_cols]
+        except Exception as exc:
+            slice_seconds = time.perf_counter() - slice_started
+            failed_rows = []
+            for position, model_name in enumerate(models):
+                row = _base_row(
+                    dataset=dataset,
+                    outcome=config.outcome,
+                    model_name=model_name,
+                    seed=seed,
+                    draw=draw,
+                    n_samples=n_samples,
+                    k_features=k_features,
+                    n_train_total=len(split.X_train),
+                    n_test_total=len(split.X_test),
+                    n_features_total=len(feature_units),
+                    k_expanded=len(selected_cols),
+                    n_expanded_features_total=len(predictors),
+                )
+                diagnostics = _empty_diagnostics()
+                diagnostics["_slice_seconds"] = (
+                    slice_seconds if position == 0 else 0.0
+                )
+                diagnostics["_peak_rss_bytes"] = _process_peak_rss_bytes()
+                failed_rows.append(
+                    add_metadata(
+                        {
+                            **row,
+                            **(
+                                _empty_metrics()
+                                if task == "regression"
+                                else _empty_classification_metrics()
+                            ),
+                            **diagnostics,
+                            **(
+                                {"task": task}
+                                if task == "classification"
+                                else {}
+                            ),
+                            "status": "failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                        metadata,
+                    )
+                )
+            return failed_rows
+
+        slice_seconds = time.perf_counter() - slice_started
+        unobserved = count_unobserved_sources(X_sub_raw, selected_groups)
+        prepared: dict[str, Any] = {}
+        preparation_errors: dict[str, Exception] = {}
+
+        def run_model(model_name: str, position: int) -> dict:
+            model_started = time.perf_counter()
+            row = _base_row(
+                dataset=dataset,
+                outcome=config.outcome,
+                model_name=model_name,
+                seed=seed,
+                draw=draw,
+                n_samples=n_samples,
+                k_features=k_features,
+                n_train_total=len(split.X_train),
+                n_test_total=len(split.X_test),
+                n_features_total=len(feature_units),
+                k_expanded=len(selected_cols),
+                n_expanded_features_total=len(predictors),
+            )
             row["K_unobserved"] = unobserved
-            if unobserved == k_features:
+            diagnostics = _empty_diagnostics()
+            diagnostics["_slice_seconds"] = (
+                slice_seconds if position == 0 else 0.0
+            )
+
+            def result_row(
+                metrics: dict[str, Any],
+                *,
+                status: str,
+                error: str,
+                peak_rss_bytes: int | None = None,
+            ) -> dict:
+                diagnostics["_cell_wall_seconds"] = (
+                    time.perf_counter() - model_started
+                )
+                diagnostics["_peak_rss_bytes"] = (
+                    _process_peak_rss_bytes()
+                    if peak_rss_bytes is None
+                    else int(peak_rss_bytes)
+                )
                 return add_metadata(
                     {
                         **row,
-                        **(
-                            _empty_metrics()
-                            if task == "regression"
-                            else _empty_classification_metrics()
-                        ),
+                        **metrics,
                         **diagnostics,
-                        **({"task": task} if task == "classification" else {}),
-                        "status": "skipped",
-                        "error": "all_selected_sources_unobserved",
+                        **(
+                            {"task": task}
+                            if task == "classification"
+                            else {}
+                        ),
+                        "status": status,
+                        "error": error,
                     },
                     metadata,
+                )
+
+            empty_metrics = (
+                _empty_metrics()
+                if task == "regression"
+                else _empty_classification_metrics()
+            )
+            if unobserved == k_features:
+                return result_row(
+                    empty_metrics,
+                    status="skipped",
+                    error="all_selected_sources_unobserved",
                 )
             if (
                 model_name == "bart"
@@ -1596,20 +1724,10 @@ def _run_nk_grid_locked(
                     or k_features < config.bart_min_k
                 )
             ):
-                return add_metadata(
-                    {
-                        **row,
-                        **(
-                            _empty_metrics()
-                            if task == "regression"
-                            else _empty_classification_metrics()
-                        ),
-                        **diagnostics,
-                        **({"task": task} if task == "classification" else {}),
-                        "status": "skipped",
-                        "error": "below BART minimum N/K floor",
-                    },
-                    metadata,
+                return result_row(
+                    empty_metrics,
+                    status="skipped",
+                    error="below BART minimum N/K floor",
                 )
             if (
                 task == "regression"
@@ -1617,262 +1735,318 @@ def _run_nk_grid_locked(
                 and n_samples < REGRESSION_CV_MIN_N[model_name]
             ):
                 min_required = REGRESSION_CV_MIN_N[model_name]
-                return add_metadata(
-                    {
-                        **row,
-                        **_empty_metrics(),
-                        **diagnostics,
-                        "status": "skipped",
-                        "error": (
-                            f"below minimum N for {model_name}'s internal CV "
-                            f"(requires N>={min_required})"
-                        ),
-                    },
-                    metadata,
+                return result_row(
+                    empty_metrics,
+                    status="skipped",
+                    error=(
+                        f"below minimum N for {model_name}'s internal CV "
+                        f"(requires N>={min_required})"
+                    ),
                 )
-            X_test = split.X_test.loc[:, selected_cols]
-            prepared = preprocess_cell(
-                X_sub,
-                X_test,
-                selected_groups,
-                schema.imputation,
-                model_name=model_name,
-            )
-            if prepared.K_unobserved != unobserved:
-                raise RuntimeError(
-                    "preprocessing changed the precomputed K_unobserved count"
+            try:
+                mode = (
+                    "passthrough"
+                    if schema.imputation["model_overrides"].get(model_name)
+                    == "passthrough"
+                    else "imputed"
                 )
-            X_sub = prepared.X_train
-            X_test = prepared.X_test
-            k_varying = int(
-                sum(
-                    X_sub.loc[:, list(group.features)]
-                    .nunique(dropna=True)
-                    .gt(1)
-                    .any()
-                    for group in selected_groups
+                if mode in preparation_errors:
+                    raise preparation_errors[mode]
+                if mode not in prepared:
+                    preprocess_started = time.perf_counter()
+                    diagnostics["_preprocess_computed"] = True
+                    try:
+                        prepared_cell = preprocess_cell(
+                            X_sub_raw,
+                            X_test_raw,
+                            selected_groups,
+                            schema.imputation,
+                            model_name=model_name,
+                        )
+                    except Exception as exc:
+                        preparation_errors[mode] = exc
+                        raise
+                    finally:
+                        diagnostics["_preprocess_seconds"] = (
+                            time.perf_counter() - preprocess_started
+                        )
+                    if prepared_cell.K_unobserved != unobserved:
+                        mismatch = RuntimeError(
+                            "preprocessing changed the precomputed "
+                            "K_unobserved count"
+                        )
+                        preparation_errors[mode] = mismatch
+                        raise mismatch
+                    prepared[mode] = prepared_cell
+                prepared_cell = prepared[mode]
+                X_prepared = prepared_cell.X_train
+                X_test_prepared = prepared_cell.X_test
+                k_varying = int(
+                    sum(
+                        X_prepared.loc[:, list(group.features)]
+                        .nunique(dropna=True)
+                        .gt(1)
+                        .any()
+                        for group in selected_groups
+                    )
                 )
-            )
-            diagnostics["K_varying"] = k_varying
-            diagnostics["underdetermined"] = bool(
-                task == "regression"
-                and model_name == "ols"
-                and _ols_is_underdetermined(X_sub)
-            )
-            if task == "classification" and len(np.unique(y_sub)) < 2:
-                return add_metadata(
-                    {
-                        **row,
-                        **_empty_classification_metrics(),
-                        **diagnostics,
-                        "task": task,
-                        "status": "skipped",
-                        "error": "single-class training sample for classification",
-                    },
-                    metadata,
+                diagnostics["K_varying"] = k_varying
+                diagnostics["underdetermined"] = bool(
+                    task == "regression"
+                    and model_name == "ols"
+                    and _ols_is_underdetermined(X_prepared)
                 )
-            if task == "classification" and model_name == "super_learner":
-                min_class_count = int(y_sub.value_counts().min())
-                if min_class_count < 2:
-                    return add_metadata(
-                        {
-                            **row,
-                            **_empty_classification_metrics(),
-                            **diagnostics,
-                            "task": task,
-                            "status": "skipped",
-                            "error": (
+                if task == "classification" and len(np.unique(y_sub)) < 2:
+                    return result_row(
+                        empty_metrics,
+                        status="skipped",
+                        error="single-class training sample for classification",
+                    )
+                if task == "classification" and model_name == "super_learner":
+                    min_class_count = int(y_sub.value_counts().min())
+                    if min_class_count < 2:
+                        return result_row(
+                            empty_metrics,
+                            status="skipped",
+                            error=(
                                 "below minimum per-class count for "
                                 "super_learner CV"
                             ),
-                        },
-                        metadata,
+                        )
+                if model_name in {"lightgbm", "super_learner"}:
+                    log_progress(
+                        "cell starting "
+                        f"model={model_name} seed={seed} draw={draw} "
+                        f"N={n_samples} K={k_features}"
                     )
-            if model_name in {"lightgbm", "super_learner"}:
-                log_progress(
-                    "cell starting "
-                    f"model={model_name} seed={seed} draw={draw} "
-                    f"N={n_samples} K={k_features}"
-                )
-            fit_arguments = {
-                "model_name": model_name,
-                "model_seed": _model_seed(
-                    seed, draw, n_samples, k_features
-                ),
-                "task": task,
-                "params": selected_model_params[model_name],
-                "X_train": X_sub,
-                "y_train": y_sub,
-                "X_test": X_test,
-            }
-            if model_name in SERIAL_OUTER_MODELS:
-                fit_result = native_process_runner.run(
-                    _fit_predict_model_cell,
-                    **fit_arguments,
-                    on_native_crash=lambda attempt, exc: log_progress(
-                        "native subprocess crashed while running isolated cell "
-                        f"attempt={attempt}/{config.native_process_max_attempts} "
-                        f"model={model_name} seed={seed} draw={draw} "
-                        f"N={n_samples} K={k_features} error={exc}"
+                if model_name in SERIAL_OUTER_MODELS:
+                    X_fit = X_prepared
+                    X_test_fit = X_test_prepared
+                else:
+                    X_fit = X_prepared.copy(deep=True)
+                    X_test_fit = X_test_prepared.copy(deep=True)
+                fit_arguments = {
+                    "model_name": model_name,
+                    "model_seed": _model_seed(
+                        seed, draw, n_samples, k_features
                     ),
-                    on_native_timeout=lambda attempt, exc: log_progress(
-                        "native subprocess timed out while running isolated cell "
-                        f"attempt={attempt}/{config.native_process_max_attempts} "
-                        f"timeout_seconds={config.native_process_timeout_seconds:g} "
-                        f"model={model_name} seed={seed} draw={draw} "
-                        f"N={n_samples} K={k_features} error={exc}"
-                    ),
+                    "task": task,
+                    "params": selected_model_params[model_name],
+                    "X_train": X_fit,
+                    "y_train": y_sub,
+                    "X_test": X_test_fit,
+                }
+                if model_name in SERIAL_OUTER_MODELS:
+                    fit_result = _run_native_model_cell_locked(
+                        native_process_runner,
+                        fit_arguments=fit_arguments,
+                        on_native_crash=lambda attempt, exc: log_progress(
+                            "native subprocess crashed while running "
+                            "isolated cell "
+                            f"attempt={attempt}/"
+                            f"{config.native_process_max_attempts} "
+                            f"model={model_name} seed={seed} draw={draw} "
+                            f"N={n_samples} K={k_features} error={exc}"
+                        ),
+                        on_native_timeout=lambda attempt, exc: log_progress(
+                            "native subprocess timed out while running "
+                            "isolated cell "
+                            f"attempt={attempt}/"
+                            f"{config.native_process_max_attempts} "
+                            f"timeout_seconds="
+                            f"{config.native_process_timeout_seconds:g} "
+                            f"model={model_name} seed={seed} draw={draw} "
+                            f"N={n_samples} K={k_features} error={exc}"
+                        ),
+                    )
+                else:
+                    fit_result = _fit_predict_model_cell(**fit_arguments)
+                del fit_arguments, X_fit, X_test_fit
+                predictions = np.asarray(fit_result["predictions"])
+                diagnostics["_fit_seconds"] = fit_result["fit_seconds"]
+                diagnostics["_best_rounds"] = fit_result["best_rounds"]
+                diagnostics["converged"] = fit_result["converged"]
+                diagnostics["constant_prediction"] = _constant_prediction(
+                    predictions
                 )
-            else:
-                fit_result = _fit_predict_model_cell(**fit_arguments)
-            predictions = np.asarray(fit_result["predictions"])
-            diagnostics["_fit_seconds"] = fit_result["fit_seconds"]
-            diagnostics["_best_rounds"] = fit_result["best_rounds"]
-            diagnostics["converged"] = fit_result["converged"]
-            diagnostics["constant_prediction"] = _constant_prediction(predictions)
-            if task == "classification":
-                scores = predictions
-                return add_metadata(
-                    {
-                        **row,
-                        "task": task,
-                        **compute_classification_metrics(split.y_test, scores, y_sub),
-                        **diagnostics,
-                        "status": "ok",
-                        "error": "",
-                    },
-                    metadata,
+                if task == "classification":
+                    metrics = compute_classification_metrics(
+                        split.y_test, predictions, y_sub
+                    )
+                else:
+                    metrics = compute_regression_metrics(
+                        split.y_test, predictions, y_sub
+                    )
+                return result_row(
+                    metrics,
+                    status="ok",
+                    error="",
+                    peak_rss_bytes=fit_result["peak_rss_bytes"],
                 )
-            preds = predictions
-            return add_metadata(
-                {
-                    **row,
-                    **compute_regression_metrics(split.y_test, preds, y_sub),
-                    **diagnostics,
-                    "status": "ok",
-                    "error": "",
-                },
-                metadata,
-            )
-        except Exception as exc:
-            return add_metadata(
-                {
-                    **row,
-                    **(
-                        _empty_metrics()
-                        if task == "regression"
-                        else _empty_classification_metrics()
-                    ),
-                    **diagnostics,
-                    **({"task": task} if task == "classification" else {}),
-                    "status": "failed",
-                    "error": f"{type(exc).__name__}: {exc}",
-                },
-                metadata,
-            )
+            except Exception as exc:
+                return result_row(
+                    empty_metrics,
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
 
-    total_batches = int(np.ceil(len(pending) / config.batch_size)) if pending else 0
+        try:
+            return [
+                run_model(model_name, position)
+                for position, model_name in enumerate(models)
+            ]
+        finally:
+            prepared.clear()
+            preparation_errors.clear()
+            del X_sub_raw, y_sub, X_test_raw
+
+    pending_cell_groups: dict[
+        tuple[int, int, int, int], list[tuple[str, int, int, int, int]]
+    ] = {}
+    for job in pending:
+        pending_cell_groups.setdefault(job[1:], []).append(job)
+    execution_windows: list[
+        list[
+            tuple[
+                tuple[int, int, int, int],
+                list[tuple[str, int, int, int, int]],
+            ]
+        ]
+    ] = []
+    accumulating_window = []
+    accumulating_rows = 0
+    for cell_group in pending_cell_groups.items():
+        accumulating_window.append(cell_group)
+        accumulating_rows += len(cell_group[1])
+        if accumulating_rows >= config.batch_size:
+            execution_windows.append(accumulating_window)
+            accumulating_window = []
+            accumulating_rows = 0
+    if accumulating_window:
+        execution_windows.append(accumulating_window)
+    total_batches = (
+        int(np.ceil(len(pending) / config.batch_size)) if pending else 0
+    )
     graceful_stop = False
     stop_before_materialization = False
-    for batch_index, start in enumerate(
-        range(0, len(pending), config.batch_size),
-        start=1,
-    ):
-        batch = pending[start : start + config.batch_size]
+    processed_rows = 0
+    checkpoint_buffer: list[dict] = []
+    checkpoint_batch_index = 0
+    for execution_window in execution_windows:
+        window_models = {
+            job[0]
+            for _, cell_jobs in execution_window
+            for job in cell_jobs
+        }
+        contains_native = bool(window_models & set(SERIAL_OUTER_MODELS))
+        group_preference = (
+            "threads"
+            if contains_native
+            else parallel_preference(window_models)
+        )
+        group_n_jobs = (
+            1
+            if window_models and window_models <= set(SERIAL_OUTER_MODELS)
+            else config.n_jobs
+        )
         log_progress(
-            f"batch {batch_index}/{total_batches} starting "
-            f"jobs={len(batch)} first={batch[0]}"
+            f"cell window starting groups={len(execution_window)} "
+            f"models={sorted(window_models)} n_jobs={group_n_jobs} "
+            f"joblib_prefer={group_preference}"
         )
-        indexed_batch = list(enumerate(batch))
-        execution_groups = (
-            (
-                "parallel_threads",
-                [
-                    (position, job)
-                    for position, job in indexed_batch
-                    if job[0] not in SERIAL_OUTER_MODELS and job[0] != "bart"
-                ],
-                config.n_jobs,
-                "threads",
-            ),
-            (
-                "bart_processes",
-                [
-                    (position, job)
-                    for position, job in indexed_batch
-                    if job[0] == "bart"
-                ],
-                config.n_jobs,
-                "processes",
-            ),
-            (
-                "serial_native",
-                [
-                    (position, job)
-                    for position, job in indexed_batch
-                    if job[0] in SERIAL_OUTER_MODELS
-                ],
-                1,
-                "threads",
-            ),
+        grouped_rows = Parallel(
+            n_jobs=group_n_jobs,
+            batch_size=1,
+            prefer=group_preference,
+        )(
+            delayed(run_cell_group)(
+                seed,
+                draw,
+                n_samples,
+                k_features,
+                tuple(job[0] for job in cell_jobs),
+                # Keep BART's process-local order construction to avoid
+                # repeatedly serializing the shared order arrays.
+                orders=(
+                    None
+                    if group_preference == "processes"
+                    else cached_draw_orders(seed, draw)
+                ),
+            )
+            for (
+                seed,
+                draw,
+                n_samples,
+                k_features,
+            ), cell_jobs in execution_window
         )
-        ordered_rows: list[dict | None] = [None] * len(batch)
-        for (
-            group_name,
-            indexed_jobs,
-            group_n_jobs,
-            group_preference,
-        ) in execution_groups:
-            if not indexed_jobs:
-                continue
-            group_models = {job[0] for _, job in indexed_jobs}
+        checkpoint_buffer.extend(
+            row for cell_rows in grouped_rows for row in cell_rows
+        )
+        while len(checkpoint_buffer) >= config.batch_size:
+            checkpoint_batch_index += 1
+            batch_rows = checkpoint_buffer[: config.batch_size]
+            del checkpoint_buffer[: config.batch_size]
             log_progress(
-                f"batch {batch_index}/{total_batches} group={group_name} "
-                f"models={sorted(group_models)} jobs={len(indexed_jobs)} "
-                f"n_jobs={group_n_jobs} joblib_prefer={group_preference}"
+                f"batch {checkpoint_batch_index}/{total_batches} starting "
+                f"jobs={len(batch_rows)}"
             )
-            group_rows = Parallel(
-                n_jobs=group_n_jobs,
-                batch_size=1,
-                prefer=group_preference,
-            )(
-                delayed(run_one)(
-                    *job,
-                    # Passing the shared arrays to loky for every BART cell can
-                    # cost more IPC than the permutation saves. Keep BART's
-                    # process-local behavior pending a dedicated benchmark.
-                    orders=(
-                        None
-                        if group_name == "bart_processes"
-                        else cached_draw_orders(job[1], job[2])
-                    ),
+            part = write_checkpoint_part(batch_rows, out_path)
+            ok_count = sum(row.get("status") == "ok" for row in batch_rows)
+            failed_count = sum(
+                row.get("status") == "failed" for row in batch_rows
+            )
+            skipped_count = sum(
+                row.get("status") == "skipped" for row in batch_rows
+            )
+            log_progress(
+                f"batch {checkpoint_batch_index}/{total_batches} wrote "
+                f"checkpoint new_rows={len(batch_rows)} ok={ok_count} "
+                f"failed={failed_count} skipped={skipped_count} "
+                f"part={part.name if part else 'none'} out={out_path}"
+            )
+            processed_rows += len(batch_rows)
+            if stop_after_batch is not None and stop_after_batch():
+                if processed_rows < len(pending):
+                    graceful_stop = True
+                    log_progress(
+                        "graceful stop requested; latest batch is checkpointed "
+                        "and remaining cells will resume on the next invocation"
+                    )
+                    break
+                if defer_materialization_on_stop:
+                    graceful_stop = True
+                    stop_before_materialization = True
+                    log_progress(
+                        "graceful stop arrived after the final cell checkpoint; "
+                        "full CSV materialization is deferred to the next invocation"
+                    )
+                    break
+                log_progress(
+                    "graceful stop arrived after the final pending batch; "
+                    "the run will finalize without requeue"
                 )
-                for _, job in indexed_jobs
-            )
-            for (position, _), row in zip(indexed_jobs, group_rows):
-                ordered_rows[position] = row
-        if any(row is None for row in ordered_rows):
-            raise RuntimeError("Internal error: one or more batch jobs were not run")
-        batch_rows = [row for row in ordered_rows if row is not None]
-        part = write_checkpoint_part(batch_rows, out_path)
-        new_rows = batch_rows
-        ok_count = sum(row.get("status") == "ok" for row in new_rows)
-        failed_count = sum(row.get("status") == "failed" for row in new_rows)
-        skipped_count = sum(row.get("status") == "skipped" for row in new_rows)
+        if graceful_stop:
+            break
+    if checkpoint_buffer and not graceful_stop:
+        checkpoint_batch_index += 1
+        batch_rows = checkpoint_buffer
         log_progress(
-            f"batch {batch_index}/{total_batches} wrote checkpoint "
-            f"new_rows={len(new_rows)} ok={ok_count} failed={failed_count} "
+            f"batch {checkpoint_batch_index}/{total_batches} starting "
+            f"jobs={len(batch_rows)}"
+        )
+        part = write_checkpoint_part(batch_rows, out_path)
+        ok_count = sum(row.get("status") == "ok" for row in batch_rows)
+        failed_count = sum(row.get("status") == "failed" for row in batch_rows)
+        skipped_count = sum(row.get("status") == "skipped" for row in batch_rows)
+        log_progress(
+            f"batch {checkpoint_batch_index}/{total_batches} wrote checkpoint "
+            f"new_rows={len(batch_rows)} ok={ok_count} failed={failed_count} "
             f"skipped={skipped_count} "
             f"part={part.name if part else 'none'} out={out_path}"
         )
+        processed_rows += len(batch_rows)
         if stop_after_batch is not None and stop_after_batch():
-            if start + len(batch) < len(pending):
-                graceful_stop = True
-                log_progress(
-                    "graceful stop requested; latest batch is checkpointed and "
-                    "remaining cells will resume on the next invocation"
-                )
-                break
             if defer_materialization_on_stop:
                 graceful_stop = True
                 stop_before_materialization = True
@@ -1880,11 +2054,11 @@ def _run_nk_grid_locked(
                     "graceful stop arrived after the final cell checkpoint; "
                     "full CSV materialization is deferred to the next invocation"
                 )
-                break
-            log_progress(
-                "graceful stop arrived after the final pending batch; "
-                "the run will finalize without requeue"
-            )
+            else:
+                log_progress(
+                    "graceful stop arrived after the final pending batch; "
+                    "the run will finalize without requeue"
+                )
     native_process_runner.close()
     if not pending:
         log_progress("no pending jobs; checkpoint is already complete")
@@ -1910,7 +2084,15 @@ def _run_nk_grid_locked(
         materialization = merge_checkpoint_parts(
             out_path,
             experiment_id=metadata["experiment_id"],
-            drop_output_columns=["_fit_seconds", "_best_rounds"],
+            drop_output_columns=[
+                "_fit_seconds",
+                "_best_rounds",
+                "_preprocess_seconds",
+                "_preprocess_computed",
+                "_slice_seconds",
+                "_cell_wall_seconds",
+                "_peak_rss_bytes",
+            ],
         )
         results = None
         result_summary = materialization.summary
