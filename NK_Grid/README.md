@@ -142,7 +142,6 @@ bash NK_Grid/slurm/submit_nk_grid.sh \
   --max-concurrent-per-class 4 \
   --cpus-per-task 8 \
   --serial-cpus-per-task 1 \
-  --super-learner-cpus-per-task 4 \
   --mem 48G \
   --time 4-00:00:00
 ```

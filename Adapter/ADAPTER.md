@@ -72,8 +72,7 @@ can handle them within each training subsample.
 ## 3. Artifacts, Directories, and Paths
 
 **The schema is the sole semantic entry point:** it references the ARD, feature
-universe, and feature manifest by path. `provenance.json` is optional audit
-metadata and is not read by the engine.
+universe, and feature manifest by path. The one exception is `provenance.json`, which the engine discovers by location rather than by reference.
 
 | Artifact | When required |
 |---|---|
@@ -112,9 +111,12 @@ in `YourArticle/schema/`, use the following values:
 
 ### Provenance
 
-`provenance.json` is optional audit metadata. The engine does not read it and no
-longer validates `schema_sha256` or any other digest from it. Do not record raw
-IDs or absolute paths.
+`provenance.json` is optional audit metadata. Its location is fixed by the
+engine: it must sit in the same directory as the **training table** referenced by
+`table`, and its filename cannot change. If the file is present the engine reads
+it and rejects the run when it is not valid JSON; it no longer validates
+`schema_sha256` or any other digest from it. Do not record raw IDs or absolute
+paths.
 
 ## 4. ARD Requirements
 
