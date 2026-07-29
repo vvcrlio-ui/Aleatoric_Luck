@@ -924,6 +924,7 @@ def _manifest_payload(
     task: str,
     schema_path: Path,
     semantic_contract: Mapping[str, Any],
+    seed_shard_execution: bool = False,
 ) -> dict:
     if result_summary is not None:
         if result_summary.experiment_id != metadata["experiment_id"]:
@@ -995,7 +996,7 @@ def _manifest_payload(
             },
         },
         "execution": {
-            "mode": "seed-shard" if len(split_seeds) == 1 and len(execution_pairs) < len(resolve_repeat_pairs(config)) else "monolithic",
+            "mode": "seed-shard" if seed_shard_execution else "monolithic",
             "seed": split_seeds[0] if len(split_seeds) == 1 else None,
             "draws": [draw for _, draw in execution_pairs] if len(split_seeds) == 1 else None,
             "expected_rows": int(expected_rows),
@@ -1316,6 +1317,7 @@ def run_nk_grid(
     dry_run: bool | None = None,
     stop_after_batch: Callable[[], bool] | None = None,
     defer_materialization_on_stop: bool = False,
+    exact_output_path: bool = False,
 ) -> Path | dict[str, int | str]:
     """Run one output under an advisory cross-process writer lease."""
 
@@ -1328,6 +1330,7 @@ def run_nk_grid(
             dry_run=True,
             stop_after_batch=stop_after_batch,
             defer_materialization_on_stop=defer_materialization_on_stop,
+            exact_output_path=exact_output_path,
             execution_pairs=execution_pairs,
             defer_failure_policy=defer_failure_policy,
         )
@@ -1339,6 +1342,7 @@ def run_nk_grid(
             dry_run=False,
             stop_after_batch=stop_after_batch,
             defer_materialization_on_stop=defer_materialization_on_stop,
+            exact_output_path=exact_output_path,
             execution_pairs=execution_pairs,
             defer_failure_policy=defer_failure_policy,
         )
@@ -1352,6 +1356,7 @@ def _run_nk_grid_locked(
     dry_run: bool | None = None,
     stop_after_batch: Callable[[], bool] | None = None,
     defer_materialization_on_stop: bool = False,
+    exact_output_path: bool = False,
     execution_pairs: tuple[tuple[int, int], ...] | None = None,
     defer_failure_policy: bool = False,
 ) -> Path | dict[str, int | str]:
@@ -1459,6 +1464,7 @@ def _run_nk_grid_locked(
     )
 
     repeat_pairs = resolve_repeat_pairs(config)
+    shard_execution_requested = execution_pairs is not None
     if execution_pairs is None:
         execution_pairs = repeat_pairs
     else:
@@ -1467,6 +1473,11 @@ def _run_nk_grid_locked(
             raise ValueError("execution_pairs must be a non-empty subset of repeat_plan")
         if len({seed for seed, _ in execution_pairs}) != 1:
             raise ValueError("seed-shard execution_pairs must contain exactly one seed")
+    if exact_output_path:
+        if not shard_execution_requested or len({seed for seed, _ in execution_pairs}) != 1:
+            raise ValueError(
+                "exact_output_path is reserved for explicit single-seed shard execution"
+            )
     split_seeds = sorted({seed for seed, _ in execution_pairs})
     if fixed_split is None:
         splits = {
@@ -1514,12 +1525,16 @@ def _run_nk_grid_locked(
             "Production runs require a clean Git worktree; commit or stash changes first."
         )
 
-    out_path = _select_output_path(
-        Path(config.out),
-        preset=config.preset,
-        experiment_id=metadata["experiment_id"],
-        jobs=jobs,
-        rerun_completed=config.rerun_completed,
+    out_path = (
+        Path(config.out)
+        if exact_output_path
+        else _select_output_path(
+            Path(config.out),
+            preset=config.preset,
+            experiment_id=metadata["experiment_id"],
+            jobs=jobs,
+            rerun_completed=config.rerun_completed,
+        )
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     existing_index = load_checkpoint_index(out_path)
@@ -1596,6 +1611,7 @@ def _run_nk_grid_locked(
         task=task,
         schema_path=schema.path,
         semantic_contract=semantic_contract,
+        seed_shard_execution=exact_output_path,
     )
     write_json_atomic(
         current_manifest_path,
@@ -2160,6 +2176,7 @@ def _run_nk_grid_locked(
         task=task,
         schema_path=schema.path,
         semantic_contract=semantic_contract,
+        seed_shard_execution=exact_output_path,
     )
     _preserve_prior_timings(final_manifest, prior_manifest)
     if materialization_deferred:

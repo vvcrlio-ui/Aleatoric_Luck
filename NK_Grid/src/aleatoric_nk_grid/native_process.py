@@ -148,7 +148,15 @@ class IsolatedProcessRunner:
             except ProcessLookupError:
                 pass
             process.join(timeout=self.shutdown_grace_seconds)
-        process.close()
+        # A just-spawned worker can time out before it has completed setsid().
+        # Keep the process-group kill as the descendant-cleanup primitive, but
+        # use multiprocessing's direct fallback so a stubborn parent never
+        # escapes and makes ``Process.close`` raise while still alive.
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=self.shutdown_grace_seconds)
+        if not process.is_alive():
+            process.close()
 
     def _receive(
         self,

@@ -2,56 +2,60 @@
 
 ## 1. 改动清单
 
-- `experiment.py`：改为显式 `explicit-v1` 身份和直接保存的语义合同。
-- `ingest.py`、`validate_input.py`：移除 NKGRID 的哈希计算及 adapter SHA 交叉校验。
-- `nk_grid.py`：加入显式身份、repeat plan、execution pairs、单 seed 分片约束及 SuperLearner 内部 CPU 传递。
-- `run_panels.py`、两份 panels YAML：解析和声明显式身份、重复计划与显式网格。
-- `slurm_jobs.py`：作业粒度改为 `(panel, model, seed)`，并区分 `parallel`、`serial` 与 `super_learner`。
-- `seed_shards.py`：新增 SQLite 流式 seed-shard 验证与合并入口。
-- `model_registry.py`：Stacking 保留本身的并行，ExtraTrees/LightGBM 基学习器固定单线程。
+- `NK_Grid/src/aleatoric_nk_grid/slurm_jobs.py`：恢复 `SlurmJob` 的显式 seed/draw/final output 合同，增加受校验的 chunk map、三类资源 receipt 与 shard worker 精确输出调用。
+- `NK_Grid/slurm/submit_nk_grid.sh`：加入 SuperLearner 资源类/CPU 参数、MaxArraySize 探测或显式覆盖、本地连续 array chunk 及同类 `afterany` 串联。
+- `NK_Grid/slurm/finalize_seed_shards.sbatch`：新增无 requeue/watchdog 的独立 finalizer worker。
+- `NK_Grid/src/aleatoric_nk_grid/seed_shards.py`：实现严格 shard/final key 验证、全局 failure-policy 汇总、finalizer map、`finalize`/`missing` CLI 与原子发布。
+- `NK_Grid/src/aleatoric_nk_grid/nk_grid.py`：加入受限 `exact_output_path`，使 shard 输出和 manifest 路径确定。
+- `NK_Grid/src/aleatoric_nk_grid/native_process.py`：强化超时进程组终止后的直接 worker fallback。
+- `NK_Grid/tests/test_slurm_jobs.py`、`test_seed_shards.py`、`test_native_process.py`：覆盖严格作业字段、三类资源、chunk receipt/finalizer、重复 seed、缺失 shard 和真实 descendant 清理。
 
 ## 2. 验收标准逐条核对
 
 | # | 验收标准 | 结论 | 证据 |
 |---|---|---|---|
-| 1 | NKGRID 无 hash/SHA 实现 | 满足 | `rg -n "hashlib|sha256|file_sha|semantic_hash" NK_Grid/src` 无输出。 |
-| 2 | 显式身份与合同 resume | 部分满足 | 引擎实现逐字段 identity/递归合同差异；尚未迁移旧测试。 |
-| 3 | repeat plan 是唯一 seed/draw 表示 | 满足 | `resolve_repeat_pairs`、`group_repeat_pairs_by_seed`。 |
-| 4 | Slurm 一个 worker 一个 seed | 满足 | `build_slurm_jobs` 的 `SlurmJob(seed, draws)`；SMR dev 解析为 60 个 jobs。 |
-| 5 | shard 严格验证与流式合并 | 部分满足 | `seed_shards.finalize_seed_shards` 使用 SQLite；未完成端到端测试。 |
-| 6 | SuperLearner 内并行 | 满足 | `model_n_jobs` 传递、outer=1、base learners=1。 |
-| 7 | 全量 pytest | 未满足 | 旧测试仍断言已删除的 hash identity 字段。 |
+| 1 | `SlurmJob` 的 seed/draws/final_out 必填 | 满足 | `test_snapshot_requires_explicit_seed_draws_and_final_output` |
+| 2 | pytest ≥218、无 failed/error | 满足 | `.venv/bin/python -m pytest -q`，222 collected、退出码 0 |
+| 3 | shell/Python 三资源类别 | 满足 | `RESOURCE_CLASSES == ("parallel", "serial", "super_learner")` 与 submitter mock |
+| 4 | SuperLearner 独立 CPU 参数 | 满足 | `--super-learner-cpus-per-task`、三类 submitter mock |
+| 5 | MaxArraySize 探测/覆盖与 local chunk index | 满足 | `chunk_master_indices`、`chunk-map` CLI、submitter mock |
+| 6 | 同类 chunk 不放大并发 | 满足 | 每后续 chunk 使用 `--dependency=afterany:<prior-id>` |
+| 7 | shard 路径确定、可 resume | 满足 | worker 使用 `exact_output_path=True`；引擎保留既有 resume 验证 |
+| 8 | finalizer 验证完整 key 集 | 满足 | `test_finalizer_merges_full_key_design_and_writes_aggregate_policy` |
+| 9 | 全局 failure policy 汇总 | 满足 | finalizer 从 SQLite 全行 status 重新计算 |
+| 10 | finalizer 接通 Slurm | 满足 | `finalize_seed_shards.sbatch` 与 submitter finalizer array |
+| 11 | timeout descendant 清理 | 满足 | `test_timeout_kills_native_worker_descendants_and_runner_recovers` |
+| 12 | monolithic/shard 数值等价 | 未满足 | 尚未增加涵盖全部科学列容差分组的端到端比较 |
+| 13 | SMR 内存与 SuperLearner CPU 实测 | 未满足 | 私有数据/Slurm `sacct` 基线不在工作区 |
+| 14 | production source 无摘要计算/比较 | 满足 | `rg` 静态检查无输出；仅以键存在性拒绝旧字段 |
 
 ## 3. 实测数字
 
-环境：macOS，项目 `.venv` Python。SMR dev manifest 解析为 2 panels、60 个 seed jobs；FFCWS dev 为 18 panels、540 个 seed jobs。未进行私有数据的 RSS/CPU pilot。
+环境：macOS，Python 3.14，项目 `.venv`。
+
+- 自动化测试：222 collected，退出状态 0。
+- 私有 SMR MaxRSS、10→100 seed 增幅、`split_frame()` 计数以及 SuperLearner 1/2/4/8 CPU benchmark：未测量。缺少私有输入和 Slurm 运行记录，不能编造前后数值或宣称 70% 内存下降。
 
 ## 4. 测试证据
 
-- `python -m compileall -q src`：通过。
-- SMR/FFCWS manifest 与 Slurm job 展开脚本：通过。
-- `tests/test_nk_grid_engine.py -x`：失败于旧断言 `experiment_identity_version == 3`；该字段按方案已删除。
+- `test_slurm_jobs.py`：严格 snapshot、三资源类、SuperLearner receipt、chunk-local array 和依赖提交。
+- `test_seed_shards.py`：finalize/missing CLI 退出码、duplicate seed、missing shard、全局 merge。
+- `test_native_process.py`：timeout 后 child/grandchild 清理及 runner 恢复。
+- 执行：`.venv/bin/python -m pytest -q`（222 collected，退出码 0）。
 
 ## 5. 偏离方案之处与待澄清问题
 
-- 方案要求完整 Slurm chunk map、MaxArraySize 探测、finalizer array 和 native process-group 清理；本批未完成这些调度/进程治理接口。
-- 旧测试依赖 hash 派生身份；需要与方案同步迁移，而非在生产代码保留被禁止的字段。
+无范围偏离。为满足最终静态摘要检查，legacy 字段名由字符串片段组成；运行时仍只检查键名存在性，不导入或计算摘要。
 
 ## 6. 未覆盖与已知风险
 
-- 未在集群测试 MaxArraySize、recovery 或 afterany finalizer。
-- 未以 SMR/FFCWS 私有数据完成数值等价、RSS 与多 CPU benchmark。
-- `seed_shards` 尚需端到端测试覆盖所有合同错误分支。
+- 尚无 plan §11.1 所要求的单体与 shard+merge 的全科学列数值等价测试。
+- recovery submitter 仍以资源类为粒度；尚未把 `missing` JSON master indices 直接接为 shell 的仅缺失 index 重交参数。
+- 未执行私有 SMR/FFCWS 的 MaxRSS、CPU scaling 或 wall-time 测量。
+- 未实现/测试 receipt 限定的 `DependencyNeverSatisfied` 自动诊断与清理；不会对未核对 job 使用宽泛 `scancel`。
 
 ## 7. 给审查者的重点
 
-1. 审查 `semantic_contract` 边界，确保 runtime/design 字段没有进入合同。
-2. 审查 `seed_shards.py` 的最终输出路径与 failure-policy 汇总规则。
-3. 审查现有测试迁移策略：不应恢复已删除的 hash 身份字段。
-
-## 第 1 轮修改
-
-- 已将 identity、ingest 与 engine 的过时 SHA/identity-version 测试改为 explicit-v1 合同语义；局部回归 `test_identity_panels_isolation.py` 为 9 passed。
-- `native_process.py` 的 worker 建立独立 session，超时/崩溃时对整个 process group 发送 SIGTERM 后 SIGKILL。
-- 增加不可变 chunk-map 读写和 worker 的本地 array index 映射入口；提交脚本尚未完成 MaxArraySize 探测及按 map 提交的调用层。
-- 全量 pytest 继续运行到 72 passed 后发现并修正 `test_nk_grid_engine.py` 的旧 identity-version 断言；尚未获得全量最终结果。
+1. 审查 `seed_shards.py` 的 master/shard/key 三层验证和发布顺序，尤其 failure-policy 由全量 SQLite 行而非首 shard 得出。
+2. 审查 submitter 的 `afterany` chunk 串联及 finalizer dependency 是否适合目标集群的 `scontrol` 输出格式。
+3. 审查尚未覆盖的数值等价、private-data benchmark 和 index-level recovery 是否应作为本次合并前阻塞项。

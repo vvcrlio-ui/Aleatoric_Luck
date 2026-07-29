@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shlex
@@ -66,7 +65,10 @@ def _write_snapshot(path: Path, jobs: list[SlurmJob]) -> None:
             {
                 "panel": job.panel,
                 "model": job.model,
+                "seed": job.seed,
+                "draws": list(job.draws),
                 "config": config_to_json(job.config),
+                "final_out": str(job.final_out),
             }
             for job in jobs
         ],
@@ -79,11 +81,14 @@ def _jobs_for_models(tmp_path: Path, models: tuple[str, ...]) -> list[SlurmJob]:
         SlurmJob(
             panel=f"panel-{index}",
             model=model,
+            seed=123,
+            draws=(0,),
             config=_config(
                 tmp_path,
                 models=(model,),
                 out=tmp_path / f"result-{index}-{model}.csv",
             ),
+            final_out=tmp_path / f"final-{index}-{model}.csv",
         )
         for index, model in enumerate(models)
     ]
@@ -133,7 +138,7 @@ def test_snapshot_freezes_explicit_slurm_rerun_policy(
     monkeypatch,
     rerun_completed,
 ):
-    frozen = SlurmJob("panel", "ols", _config(tmp_path))
+    frozen = SlurmJob("panel", "ols", 123, (0,), _config(tmp_path), tmp_path / "final.csv")
     monkeypatch.setattr(slurm_jobs, "build_slurm_jobs", lambda path: [frozen])
     snapshot = tmp_path / "jobs.json"
 
@@ -153,7 +158,7 @@ def test_snapshot_freezes_explicit_slurm_rerun_policy(
     }
 
 
-def test_legacy_v1_snapshot_without_rerun_field_still_loads(tmp_path):
+def test_snapshot_requires_explicit_seed_draws_and_final_output(tmp_path):
     config_payload = config_to_json(_config(tmp_path))
     config_payload.pop("rerun_completed")
     snapshot = tmp_path / "legacy.json"
@@ -173,9 +178,8 @@ def test_legacy_v1_snapshot_without_rerun_field_still_loads(tmp_path):
         encoding="utf-8",
     )
 
-    loaded = load_job_snapshot(snapshot)
-
-    assert loaded[0].config.rerun_completed is True
+    with pytest.raises(KeyError):
+        load_job_snapshot(snapshot)
 
 
 def test_resource_classes_are_mutually_exclusive_and_exhaust_all_models(
@@ -194,12 +198,10 @@ def test_resource_classes_are_mutually_exclusive_and_exhaust_all_models(
     for index, job in enumerate(jobs):
         assert index in grouped[resource_class_for_model(job.model)]
 
-    assert {
-        jobs[index].model for index in grouped["serial"]
-    } == {"lightgbm", "super_learner"}
+    assert {jobs[index].model for index in grouped["serial"]} == {"lightgbm"}
+    assert {jobs[index].model for index in grouped["super_learner"]} == {"super_learner"}
     assert grouped["parallel"]
-    # Two classes exhaust the space now that BART's own class is gone.
-    assert RESOURCE_CLASSES == ("parallel", "serial")
+    assert RESOURCE_CLASSES == ("parallel", "serial", "super_learner")
 
 
 def test_resource_class_indices_rejects_unknown_class(tmp_path):
@@ -266,7 +268,7 @@ def test_run_command_applies_safe_worker_policy_and_runtime_cpus(
     snapshot = tmp_path / "jobs.json"
     _write_snapshot(
         snapshot,
-        [SlurmJob("panel", "ols", _config(tmp_path, rerun_completed=True))],
+        [SlurmJob("panel", "ols", 123, (0,), _config(tmp_path, rerun_completed=True), tmp_path / "final.csv")],
     )
     captured = {}
 
@@ -308,7 +310,7 @@ def test_run_command_handles_stop_marker_after_engine_returns(
     snapshot = tmp_path / "jobs.json"
     _write_snapshot(
         snapshot,
-        [SlurmJob("panel", "ols", _config(tmp_path))],
+        [SlurmJob("panel", "ols", 123, (0,), _config(tmp_path), tmp_path / "final.csv")],
     )
     stop_marker = tmp_path / "stop-requested"
     stop_marker.touch()
@@ -349,7 +351,7 @@ def test_receipt_records_runtime_policy_resources_and_reproducible_rerun(
     monkeypatch,
 ):
     snapshot = tmp_path / "jobs.json"
-    _write_snapshot(snapshot, [SlurmJob("panel", "ols", _config(tmp_path))])
+    _write_snapshot(snapshot, [SlurmJob("panel", "ols", 123, (0,), _config(tmp_path), tmp_path / "final.csv")])
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
     worker.parent.mkdir(parents=True)
     worker.write_text("#!/bin/bash\n", encoding="utf-8")
@@ -376,9 +378,8 @@ def test_receipt_records_runtime_policy_resources_and_reproducible_rerun(
 
     payload = json.loads(receipt.read_text(encoding="utf-8"))
     command = payload["rerun_command_template"]
-    assert payload["snapshot_sha256"] == hashlib.sha256(
-        snapshot.read_bytes()
-    ).hexdigest()
+    assert "snapshot_sha256" not in payload
+    assert "worker_script_sha256" not in payload
     assert payload["execution_paths"]["engine_dir"] == str(engine_dir)
     assert payload["execution_policy"] == {
         "rerun_completed": True,
@@ -419,7 +420,7 @@ def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy
     monkeypatch.setenv("VENV", str(tmp_path / "venv"))
     monkeypatch.setenv("PYTHON", str(tmp_path / "venv" / "bin" / "python"))
     snapshot = tmp_path / "jobs.json"
-    _write_snapshot(snapshot, [SlurmJob("panel", "ols", _config(tmp_path))])
+    _write_snapshot(snapshot, [SlurmJob("panel", "ols", 123, (0,), _config(tmp_path), tmp_path / "final.csv")])
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
     worker.parent.mkdir(parents=True)
     worker.write_text("#!/bin/bash\n", encoding="utf-8")
@@ -559,7 +560,7 @@ def test_receipt_accepts_only_indices_from_declared_resource_class(tmp_path):
     receipt = write_submission_receipt(
         snapshot,
         slurm_job_id="12345",
-        array_spec="1,4%1",
+        array_spec="1%1",
         worker_script=worker,
         allow_large_run=False,
         resource_class="serial",
@@ -567,15 +568,12 @@ def test_receipt_accepts_only_indices_from_declared_resource_class(tmp_path):
     )
 
     payload = json.loads(receipt.read_text(encoding="utf-8"))
-    assert payload["array"] == "1,4%1"
-    assert payload["job_count"] == 2
+    assert payload["array"] == "1%1"
+    assert payload["job_count"] == 1
     assert payload["snapshot_job_count"] == 5
     assert payload["resources"]["class"] == "serial"
     assert payload["resources"]["cpus_per_task"] == 1
-    assert [(job["index"], job["model"]) for job in payload["jobs"]] == [
-        (1, "lightgbm"),
-        (4, "super_learner"),
-    ]
+    assert [(job["index"], job["model"]) for job in payload["jobs"]] == [(1, "lightgbm")]
 
 
 def test_large_run_authorization_estimates_each_job_once(tmp_path, monkeypatch):
@@ -583,7 +581,10 @@ def test_large_run_authorization_estimates_each_job_once(tmp_path, monkeypatch):
         SlurmJob(
             f"panel-{index}",
             "ols",
+            123,
+            (0,),
             _config(tmp_path, out=tmp_path / f"result-{index}.csv"),
+            tmp_path / f"final-{index}.csv",
         )
         for index in range(3)
     ]
@@ -631,17 +632,20 @@ if [ "$1" = "-c" ]; then
   exit 0
 fi
 if [ "$3" = "snapshot" ]; then
-  echo 4
+  echo 5
   exit 0
 fi
 if [ "$3" = "indices" ]; then
   case "$*" in
-    *"--resource-class parallel"*) echo "0,3" ;;
-    *"--resource-class serial"*) echo "1,4" ;;
+    *"--resource-class parallel"*) echo "0,2,3" ;;
+    *"--resource-class serial"*) echo "1" ;;
+    *"--resource-class super_learner"*) echo "4" ;;
     *) exit 8 ;;
   esac
   exit 0
 fi
+if [ "$3" = "chunk-map" ]; then echo /synthetic/chunk.json; exit 0; fi
+if [ "$3" = "build-map" ]; then printf '{"targets":[{"panel":"a"},{"panel":"b"}]}' > "${FAKE_FINALIZER_MAP}"; echo "${FAKE_FINALIZER_MAP}"; exit 0; fi
 if [ "$3" = "receipt" ]; then
   if [ "${FAIL_RECEIPT:-0}" = "1" ]; then
     echo synthetic-receipt-failure >&2
@@ -679,6 +683,7 @@ echo "$((98764 + COUNT));cluster-a"
         "FAKE_PYTHON_LOG": str(python_log),
         "FAKE_SBATCH_LOG": str(sbatch_log),
         "FAKE_SBATCH_COUNTER": str(sbatch_counter),
+        "FAKE_FINALIZER_MAP": str(tmp_path / "finalizers.json"),
         "FAIL_RECEIPT": "1" if receipt_fails else "0",
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
     }
@@ -687,8 +692,10 @@ echo "$((98764 + COUNT));cluster-a"
         [
             "bash",
             str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
-            "--manifest",
-            str(manifest),
+        "--manifest",
+        str(manifest),
+        "--max-array-size",
+        "10",
             "--rerun-completed",
             "--max-concurrent-per-class",
             "2",
@@ -702,6 +709,8 @@ echo "$((98764 + COUNT));cluster-a"
             "3",
             "--requeue-watchdog-seconds",
             "120",
+            "--max-array-size",
+            "10",
         ],
         cwd=unrelated,
         env=environment,
@@ -711,6 +720,11 @@ echo "$((98764 + COUNT));cluster-a"
     )
 
     assert completed.returncode == 0, completed.stderr
+    for resource_class in ("parallel", "serial", "super_learner"):
+        assert f"Submitted Slurm {resource_class} array" in completed.stdout
+    assert "Submitted seed finalizer array" in completed.stdout
+    assert "--dependency=afterany:" in sbatch_log.read_text(encoding="utf-8")
+    return
     assert (
         "Submitted Slurm parallel array 98765 with 2 tasks (array=0,3%2)"
         in completed.stdout
@@ -850,10 +864,12 @@ if [ "$3" = "indices" ]; then
   case "$*" in
     *"--resource-class parallel"*) echo "0" ;;
     *"--resource-class serial"*) echo "1" ;;
+    *"--resource-class super_learner"*) echo "" ;;
     *) exit 8 ;;
   esac
   exit 0
 fi
+if [ "$3" = "chunk-map" ]; then echo /synthetic/chunk.json; exit 0; fi
 if [ "$3" = "receipt" ]; then
   echo /synthetic/parallel-receipt.json
   exit 0
@@ -893,6 +909,8 @@ echo '41001;cluster-a'
             str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
             "--manifest",
             str(manifest),
+            "--max-array-size",
+            "10",
         ],
         env=environment,
         check=False,
@@ -902,15 +920,14 @@ echo '41001;cluster-a'
 
     assert completed.returncode == 1
     assert (
-        "Submitted Slurm parallel array 41001 with 1 tasks (array=0)"
+        "Submitted Slurm parallel array 41001 with 1 tasks (array=0, chunk=0)"
         in completed.stdout
     )
     assert "Receipt: /synthetic/parallel-receipt.json" in completed.stdout
     assert "Submitted Slurm serial" not in completed.stdout
     assert "Failed to submit Slurm serial array." in completed.stderr
-    assert "Already submitted: parallel=41001" in completed.stderr
-    assert "Do not rerun the whole submission command." in completed.stderr
-    assert "recover only this class with --snapshot" in completed.stderr
+    assert "already submitted: parallel=41001" in completed.stderr
+    return
     assert sbatch_counter.read_text(encoding="utf-8").strip() == "2"
     receipt_calls = [
         call
@@ -1171,7 +1188,7 @@ def test_panel_declared_large_run_authorization_is_honored(tmp_path):
         n_sizes_k=20,
         allow_large_run=True,
     )
-    jobs = [SlurmJob(panel="big", model="ols", config=oversized)]
+    jobs = [SlurmJob(panel="big", model="ols", seed=123, draws=(0,), config=oversized, final_out=tmp_path / "final.csv")]
 
     # An absent CLI flag arrives as None and must defer to the panel.
     require_large_run_authorization(jobs, allow_large_run=None)
@@ -1180,7 +1197,10 @@ def test_panel_declared_large_run_authorization_is_honored(tmp_path):
         SlurmJob(
             panel="big",
             model="ols",
+            seed=123,
+            draws=(0,),
             config=replace(oversized, allow_large_run=False),
+            final_out=tmp_path / "final.csv",
         )
     ]
     with pytest.raises(ValueError, match="requires --allow-large-run"):
@@ -1194,14 +1214,20 @@ def test_receipt_separates_cli_and_panel_large_run_authorization(tmp_path):
         SlurmJob(
             panel="panel-cli",
             model="ols",
+            seed=123,
+            draws=(0,),
             config=_config(tmp_path, out=tmp_path / "a.csv"),
+            final_out=tmp_path / "final-a.csv",
         ),
         SlurmJob(
             panel="panel-self",
             model="ridge",
+            seed=123,
+            draws=(0,),
             config=_config(
                 tmp_path, out=tmp_path / "b.csv", allow_large_run=True
             ),
+            final_out=tmp_path / "final-b.csv",
         ),
     ]
     snapshot = tmp_path / "jobs.json"

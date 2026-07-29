@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -35,6 +37,14 @@ def _raise_value_error() -> None:
 
 def _raise_system_exit() -> None:
     raise SystemExit("child requested exit")
+
+
+def _start_blocking_grandchild(pid_file: str) -> None:
+    grandchild = subprocess.Popen(
+        [sys.executable, "-c", "import os,sys,time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)", pid_file]
+    )
+    while grandchild.poll() is None:
+        time.sleep(0.05)
 
 
 def test_native_process_crash_is_retried_and_does_not_kill_parent():
@@ -80,6 +90,40 @@ def test_native_process_timeout_kills_worker_and_parent_can_continue():
     assert attempts == [1]
     assert recovered_child_pid != first_child_pid
     assert recovered_child_pid != parent_pid
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are unavailable")
+def test_timeout_kills_native_worker_descendants_and_runner_recovers(tmp_path):
+    pid_file = tmp_path / "grandchild.pid"
+    with IsolatedProcessRunner(max_attempts=1, timeout_seconds=1.0, shutdown_grace_seconds=0.2) as runner:
+        try:
+            with pytest.raises(NativeProcessTimedOut):
+                runner.run(_start_blocking_grandchild, str(pid_file))
+        except (NotImplementedError, PermissionError) as exc:
+            pytest.skip(f"processes unavailable in this sandbox: {exc}")
+        deadline = time.monotonic() + 3.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pid_file.exists()
+        grandchild_pid = int(pid_file.read_text(encoding="utf-8"))
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                break
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(grandchild_pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if state.startswith("Z"):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("timeout leaked a native worker grandchild")
+        runner.timeout_seconds = 5.0
+        assert runner.run(os.getpid) != os.getpid()
 
 
 def test_python_exception_crosses_boundary_without_destroying_worker():

@@ -13,6 +13,8 @@ RERUN_COMPLETED=0
 MAX_CONCURRENT_PER_CLASS=""
 CPUS_PER_TASK=8
 SERIAL_CPUS_PER_TASK=1
+SUPER_LEARNER_CPUS_PER_TASK=1
+MAX_ARRAY_SIZE=""
 MEMORY="48G"
 TIME_LIMIT="4-00:00:00"
 MAX_RESTARTS=5
@@ -24,10 +26,12 @@ usage() {
   echo "  --snapshot PATH            reuse a frozen snapshot (requires --resource-class)"
   echo "  --allow-large-run          authorize production-sized tasks"
   echo "  --rerun-completed          intentionally recompute completed tasks"
-  echo "  --resource-class CLASS     submit only parallel or serial (recovery)"
+  echo "  --resource-class CLASS     submit only parallel, serial, or super_learner (recovery)"
   echo "  --max-concurrent-per-class N  cap running tasks in each resource-class array"
   echo "  --cpus-per-task N          CPUs for parallel tasks (default: 8)"
   echo "  --serial-cpus-per-task N   CPUs for serial tasks (default: 1)"
+  echo "  --super-learner-cpus-per-task N  CPUs for SuperLearner tasks (default: 1)"
+  echo "  --max-array-size N         Slurm MaxArraySize override (otherwise auto-detect)"
   echo "  --mem VALUE                memory for parallel/serial tasks (default: 48G)"
   echo "  --time VALUE               time for parallel/serial tasks (default: 4-00:00:00)"
   echo "  --max-restarts N           checkpoint requeues allowed (default: 5)"
@@ -49,6 +53,8 @@ while [ "$#" -gt 0 ]; do
       ;;
     --cpus-per-task) CPUS_PER_TASK="${2:?--cpus-per-task requires a value}"; shift 2 ;;
     --serial-cpus-per-task) SERIAL_CPUS_PER_TASK="${2:?--serial-cpus-per-task requires a value}"; shift 2 ;;
+    --super-learner-cpus-per-task) SUPER_LEARNER_CPUS_PER_TASK="${2:?--super-learner-cpus-per-task requires a value}"; shift 2 ;;
+    --max-array-size) MAX_ARRAY_SIZE="${2:?--max-array-size requires a value}"; shift 2 ;;
     --mem) MEMORY="${2:?--mem requires a value}"; shift 2 ;;
     --time) TIME_LIMIT="${2:?--time requires a value}"; shift 2 ;;
     --max-restarts) MAX_RESTARTS="${2:?--max-restarts requires a value}"; shift 2 ;;
@@ -68,8 +74,8 @@ if [ -z "$MANIFEST" ] && [ -z "$SNAPSHOT_INPUT" ]; then
   exit 2
 fi
 case "$ONLY_RESOURCE_CLASS" in
-  ""|parallel|serial) ;;
-  *) echo "--resource-class must be parallel or serial" >&2; exit 2 ;;
+  ""|parallel|serial|super_learner) ;;
+  *) echo "--resource-class must be parallel, serial, or super_learner" >&2; exit 2 ;;
 esac
 if [ -n "$SNAPSHOT_INPUT" ] && [ -z "$ONLY_RESOURCE_CLASS" ]; then
   echo "--snapshot recovery requires --resource-class to avoid duplicate arrays" >&2
@@ -93,6 +99,14 @@ esac
 case "$SERIAL_CPUS_PER_TASK" in
   ''|*[!0-9]*|0) echo "--serial-cpus-per-task must be a positive integer" >&2; exit 2 ;;
 esac
+case "$SUPER_LEARNER_CPUS_PER_TASK" in
+  ''|*[!0-9]*|0) echo "--super-learner-cpus-per-task must be a positive integer" >&2; exit 2 ;;
+esac
+if [ -n "$MAX_ARRAY_SIZE" ]; then
+  case "$MAX_ARRAY_SIZE" in
+    ''|*[!0-9]*|0) echo "--max-array-size must be a positive integer" >&2; exit 2 ;;
+  esac
+fi
 [ -n "$MEMORY" ] || { echo "--mem must not be empty" >&2; exit 2; }
 [ -n "$TIME_LIMIT" ] || { echo "--time must not be empty" >&2; exit 2; }
 case "$MAX_RESTARTS" in
@@ -152,7 +166,15 @@ case "$SNAPSHOT_JOB_COUNT" in
   ''|*[!0-9]*|0) echo "Snapshot returned an invalid job count: $SNAPSHOT_JOB_COUNT" >&2; exit 1 ;;
 esac
 
-RESOURCE_CLASSES=(parallel serial)
+if [ -z "$MAX_ARRAY_SIZE" ]; then
+  MAX_ARRAY_CONFIG=$(scontrol show config 2>/dev/null || true)
+  MAX_ARRAY_SIZE=$(printf '%s\n' "$MAX_ARRAY_CONFIG" | sed -n 's/^[[:space:]]*MaxArraySize[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+fi
+case "$MAX_ARRAY_SIZE" in
+  ''|*[!0-9]*|0) echo "Unable to determine Slurm MaxArraySize; pass --max-array-size explicitly." >&2; exit 1 ;;
+esac
+
+RESOURCE_CLASSES=(parallel serial super_learner)
 CLASS_INDICES_BY_POSITION=()
 CLASS_JOB_COUNTS_BY_POSITION=()
 PLANNED_JOB_COUNT=0
@@ -182,94 +204,61 @@ export ENGINE_DIR VENV PYTHON MAX_SLURM_RESTARTS REQUEUE_WATCHDOG_SECONDS
 EXPORT_SPEC="ALL"
 SUBMITTED_ARRAYS=0
 SUBMITTED_JOBS=()
+LAST_JOB_IDS=()
 for CLASS_POSITION in "${!RESOURCE_CLASSES[@]}"; do
   RESOURCE_CLASS="${RESOURCE_CLASSES[$CLASS_POSITION]}"
-  if [ -n "$ONLY_RESOURCE_CLASS" ] && [ "$RESOURCE_CLASS" != "$ONLY_RESOURCE_CLASS" ]; then
-    continue
-  fi
-  CLASS_INDICES="${CLASS_INDICES_BY_POSITION[$CLASS_POSITION]}"
-  [ -n "$CLASS_INDICES" ] || continue
+  [ -z "$ONLY_RESOURCE_CLASS" ] || [ "$RESOURCE_CLASS" = "$ONLY_RESOURCE_CLASS" ] || continue
   CLASS_JOB_COUNT="${CLASS_JOB_COUNTS_BY_POSITION[$CLASS_POSITION]}"
-
-  CLASS_CPUS="$CPUS_PER_TASK"
-  CLASS_MEMORY="$MEMORY"
-  CLASS_TIME_LIMIT="$TIME_LIMIT"
+  [ "$CLASS_JOB_COUNT" -gt 0 ] || continue
   case "$RESOURCE_CLASS" in
-    serial)
-      CLASS_CPUS="$SERIAL_CPUS_PER_TASK"
-      ;;
+    parallel) CLASS_CPUS="$CPUS_PER_TASK" ;;
+    serial) CLASS_CPUS="$SERIAL_CPUS_PER_TASK" ;;
+    super_learner) CLASS_CPUS="$SUPER_LEARNER_CPUS_PER_TASK" ;;
   esac
-
-  ARRAY_SPEC="$CLASS_INDICES"
-  [ -z "$MAX_CONCURRENT_PER_CLASS" ] || ARRAY_SPEC="${ARRAY_SPEC}%${MAX_CONCURRENT_PER_CLASS}"
-  if ! SBATCH_OUTPUT=$(sbatch --parsable \
-      --requeue \
-      --signal=B:USR1@300 \
-      --open-mode=append \
-      --job-name="al-nk-grid-$RESOURCE_CLASS" \
-      --output="$ENGINE_DIR/logs/%x-%A_%a.out" \
-      --error="$ENGINE_DIR/logs/%x-%A_%a.err" \
-      --chdir="$ENGINE_DIR" \
-      --export="$EXPORT_SPEC" \
-      --cpus-per-task="$CLASS_CPUS" \
-      --mem="$CLASS_MEMORY" \
-      --time="$CLASS_TIME_LIMIT" \
-      --array="$ARRAY_SPEC" \
-      "$ENGINE_DIR/slurm/run_nk_grid.sbatch" \
-      "$SNAPSHOT" "$ALLOW_LARGE_RUN" "$RERUN_COMPLETED"); then
-    echo "Failed to submit Slurm $RESOURCE_CLASS array." >&2
-    echo "Snapshot retained at $SNAPSHOT" >&2
-    if [ "${#SUBMITTED_JOBS[@]}" -gt 0 ]; then
-      echo "Already submitted: ${SUBMITTED_JOBS[*]}" >&2
-      echo "Do not rerun the whole submission command." >&2
+  CLASS_LAST_JOB=""
+  CHUNK_ORDINAL=0
+  CHUNK_START=0
+  while [ "$CHUNK_START" -lt "$CLASS_JOB_COUNT" ]; do
+    CHUNK_SIZE="$MAX_ARRAY_SIZE"
+    [ $((CLASS_JOB_COUNT - CHUNK_START)) -lt "$CHUNK_SIZE" ] && CHUNK_SIZE=$((CLASS_JOB_COUNT - CHUNK_START))
+    CHUNK_MAP=$("$PYTHON" -m aleatoric_nk_grid.slurm_jobs chunk-map --snapshot "$SNAPSHOT" --resource-class "$RESOURCE_CLASS" --max-array-size "$MAX_ARRAY_SIZE" --chunk-ordinal "$CHUNK_ORDINAL")
+    ARRAY_SPEC="0-$((CHUNK_SIZE - 1))"
+    [ "$CHUNK_SIZE" -eq 1 ] && ARRAY_SPEC="0"
+    [ -z "$MAX_CONCURRENT_PER_CLASS" ] || ARRAY_SPEC="${ARRAY_SPEC}%${MAX_CONCURRENT_PER_CLASS}"
+    DEPENDENCY_ARGS=()
+    [ -z "$CLASS_LAST_JOB" ] || DEPENDENCY_ARGS=("--dependency=afterany:$CLASS_LAST_JOB")
+    if ! SBATCH_OUTPUT=$(set +u; sbatch --parsable --requeue --signal=B:USR1@300 --open-mode=append \
+      --job-name="al-nk-grid-$RESOURCE_CLASS" --output="$ENGINE_DIR/logs/%x-%A_%a.out" --error="$ENGINE_DIR/logs/%x-%A_%a.err" \
+      --chdir="$ENGINE_DIR" --export="$EXPORT_SPEC" --cpus-per-task="$CLASS_CPUS" --mem="$MEMORY" --time="$TIME_LIMIT" \
+      --array="$ARRAY_SPEC" "${DEPENDENCY_ARGS[@]}" "$ENGINE_DIR/slurm/run_nk_grid.sbatch" \
+      "$SNAPSHOT" "$ALLOW_LARGE_RUN" "$RERUN_COMPLETED" "$CHUNK_MAP"); then
+      echo "Failed to submit Slurm $RESOURCE_CLASS array." >&2
+      echo "Snapshot retained at $SNAPSHOT; already submitted: ${SUBMITTED_JOBS[*]:-}" >&2
+      exit 1
     fi
-    echo "After checking squeue, recover only this class with --snapshot '$SNAPSHOT' --resource-class '$RESOURCE_CLASS' and the same policy/resource flags." >&2
-    exit 1
-  fi
-  JOB_ID="${SBATCH_OUTPUT%%;*}"
-  [[ "$JOB_ID" =~ ^[0-9]+$ ]] || {
-    echo "Could not parse Slurm job ID: $SBATCH_OUTPUT. A job may already exist; inspect squeue before resubmitting." >&2
-    echo "Snapshot retained at $SNAPSHOT" >&2
-    if [ "${#SUBMITTED_JOBS[@]}" -gt 0 ]; then
-      echo "Previously submitted: ${SUBMITTED_JOBS[*]}" >&2
-    fi
-    exit 1
-  }
-  SUBMITTED_ARRAYS=$((SUBMITTED_ARRAYS + 1))
-  SUBMITTED_JOBS+=("$RESOURCE_CLASS=$JOB_ID")
-  echo "Submitted Slurm $RESOURCE_CLASS array $JOB_ID with $CLASS_JOB_COUNT tasks (array=$ARRAY_SPEC)"
-
-  RECEIPT_ARGS=(
-    receipt
-    --snapshot "$SNAPSHOT"
-    --job-id "$JOB_ID"
-    --array-spec "$ARRAY_SPEC"
-    --worker-script "$ENGINE_DIR/slurm/run_nk_grid.sbatch"
-    --resource-class "$RESOURCE_CLASS"
-    --cpus-per-task "$CLASS_CPUS"
-    --memory "$CLASS_MEMORY"
-    --time-limit "$CLASS_TIME_LIMIT"
-    --max-restarts "$MAX_RESTARTS"
-    --requeue-watchdog-seconds "$REQUEUE_WATCHDOG_SECONDS"
-  )
-  [ "$ALLOW_LARGE_RUN" = "0" ] || RECEIPT_ARGS+=(--allow-large-run)
-  [ "$RERUN_COMPLETED" = "0" ] || RECEIPT_ARGS+=(--rerun-completed)
-  if ! RECEIPT_OUTPUT=$(
-    "$PYTHON" -m aleatoric_nk_grid.slurm_jobs "${RECEIPT_ARGS[@]}" 2>&1
-  ); then
-    echo "WARNING: job $JOB_ID was submitted, but its receipt could not be written." >&2
-    echo "$RECEIPT_OUTPUT" >&2
-    echo "Snapshot retained at $SNAPSHOT" >&2
-    continue
-  fi
-  echo "Receipt: $RECEIPT_OUTPUT"
+    JOB_ID="${SBATCH_OUTPUT%%;*}"
+    [[ "$JOB_ID" =~ ^[0-9]+$ ]] || { echo "Could not parse Slurm job ID: $SBATCH_OUTPUT" >&2; exit 1; }
+    SUBMITTED_ARRAYS=$((SUBMITTED_ARRAYS + 1)); SUBMITTED_JOBS+=("$RESOURCE_CLASS=$JOB_ID")
+    echo "Submitted Slurm $RESOURCE_CLASS array $JOB_ID with $CHUNK_SIZE tasks (array=$ARRAY_SPEC, chunk=$CHUNK_ORDINAL)"
+    RECEIPT_ARGS=(receipt --snapshot "$SNAPSHOT" --job-id "$JOB_ID" --array-spec "$ARRAY_SPEC" --worker-script "$ENGINE_DIR/slurm/run_nk_grid.sbatch" --resource-class "$RESOURCE_CLASS" --cpus-per-task "$CLASS_CPUS" --memory "$MEMORY" --time-limit "$TIME_LIMIT" --max-restarts "$MAX_RESTARTS" --requeue-watchdog-seconds "$REQUEUE_WATCHDOG_SECONDS" --chunk-map-path "$CHUNK_MAP")
+    [ -z "$CLASS_LAST_JOB" ] || RECEIPT_ARGS+=(--dependency-job-id "$CLASS_LAST_JOB")
+    [ "$ALLOW_LARGE_RUN" = "0" ] || RECEIPT_ARGS+=(--allow-large-run)
+    [ "$RERUN_COMPLETED" = "0" ] || RECEIPT_ARGS+=(--rerun-completed)
+    if RECEIPT_OUTPUT=$("$PYTHON" -m aleatoric_nk_grid.slurm_jobs "${RECEIPT_ARGS[@]}" 2>&1); then echo "Receipt: $RECEIPT_OUTPUT"; else echo "WARNING: job $JOB_ID was submitted, but its receipt could not be written: $RECEIPT_OUTPUT" >&2; fi
+    CLASS_LAST_JOB="$JOB_ID"; CHUNK_START=$((CHUNK_START + CHUNK_SIZE)); CHUNK_ORDINAL=$((CHUNK_ORDINAL + 1))
+  done
+  LAST_JOB_IDS+=("$CLASS_LAST_JOB")
 done
 
-if [ "$SUBMITTED_ARRAYS" -eq 0 ]; then
-  if [ -n "$ONLY_RESOURCE_CLASS" ]; then
-    echo "Snapshot contains no $ONLY_RESOURCE_CLASS tasks; nothing was submitted." >&2
-  else
-    echo "Snapshot contains $SNAPSHOT_JOB_COUNT jobs but no recognized resource-class tasks." >&2
+if [ "$SUBMITTED_ARRAYS" -eq 0 ]; then echo "No matching resource-class tasks were submitted." >&2; exit 1; fi
+if [ -z "$ONLY_RESOURCE_CLASS" ]; then
+  FINALIZER_MAP=$("$PYTHON" -m aleatoric_nk_grid.seed_shards build-map --snapshot "$SNAPSHOT")
+  FINALIZER_COUNT=$(grep -c '"panel"' "$FINALIZER_MAP" || true)
+  case "$FINALIZER_COUNT" in ''|*[!0-9]*|0) echo "Finalizer map is empty: $FINALIZER_MAP" >&2; exit 1 ;; esac
+  FINALIZER_ARRAY="0-$((FINALIZER_COUNT - 1))"; [ "$FINALIZER_COUNT" -eq 1 ] && FINALIZER_ARRAY="0"
+  FINALIZER_DEPENDENCY=$(IFS=:; echo "${LAST_JOB_IDS[*]}")
+  if ! FINALIZER_OUTPUT=$(sbatch --parsable --job-name="al-nk-finalize" --output="$ENGINE_DIR/logs/%x-%A_%a.out" --error="$ENGINE_DIR/logs/%x-%A_%a.err" --chdir="$ENGINE_DIR" --export="$EXPORT_SPEC" --array="$FINALIZER_ARRAY" --dependency="afterany:$FINALIZER_DEPENDENCY" "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch" "$SNAPSHOT" "$FINALIZER_MAP"); then
+    echo "Seed arrays submitted but finalizer submission failed." >&2; exit 1
   fi
-  exit 1
+  echo "Submitted seed finalizer array ${FINALIZER_OUTPUT%%;*} with $FINALIZER_COUNT tasks"
 fi
