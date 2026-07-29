@@ -9,12 +9,13 @@ import json
 import math
 import os
 import sqlite3
+import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .experiment import manifest_path, output_run_lock, utc_now, write_json_atomic
+from .experiment import OutputRunLockError, manifest_path, output_run_lock, utc_now, write_json_atomic
 from .nk_grid import group_repeat_pairs_by_seed, resolve_repeat_pairs
 from .slurm_jobs import _config_from_json
 
@@ -1060,13 +1061,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         return 0
     except SeedShardIncompleteError as exc:
-        print(str(exc), file=__import__("sys").stderr)
+        print(str(exc), file=sys.stderr)
         return 3
-    except (OSError, RuntimeError) as exc:
-        print(str(exc), file=__import__("sys").stderr)
-        return 0 if isinstance(exc, RuntimeError) else 4
+    except OutputRunLockError as exc:
+        print(str(exc), file=sys.stderr)
+        return 5
+    except (OSError, sqlite3.Error) as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
     except (SeedShardValidationError, ValueError) as exc:
-        print(str(exc), file=__import__("sys").stderr)
+        print(str(exc), file=sys.stderr)
         return 1
 
 

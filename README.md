@@ -109,7 +109,11 @@ The finalizer/publish command exit codes mean: `0` completed successfully
 invalid design, duplicate/out-of-design key, identity/semantic-contract error,
 or other program failure; `3` means a shard or per-model final is
 missing/incomplete and recovery can recreate it; `4` is an environment I/O
-failure such as no space, permissions, or storage errors.
+failure such as no space, permissions, or storage errors; `5` means another
+process already held the publication lease for that output, so this task
+published nothing. Exit code `5` is usually a duplicate submission for the same
+target and is harmless: confirm the output and its manifest exist, and rerun
+the command if they do not.
 
 ## 3. What to send back when something fails
 

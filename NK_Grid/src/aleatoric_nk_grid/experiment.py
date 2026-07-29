@@ -152,6 +152,7 @@ def _atomic_text_writer(target: Path) -> Iterator[Any]:
         if not published:
             tmp.unlink(missing_ok=True)
 
+class OutputRunLockError(RuntimeError): ...
 
 @contextmanager
 def output_run_lock(out_path: Path) -> Iterator[Path]:
@@ -170,7 +171,7 @@ def output_run_lock(out_path: Path) -> Iterator[Path]:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except BlockingIOError as exc:
-            raise RuntimeError(
+            raise OutputRunLockError(
                 f"Another NK Grid worker already holds the output lease: {lock_path}"
             ) from exc
         yield lock_path

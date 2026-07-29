@@ -3,15 +3,15 @@
 - 日期：2026-07-29
 - 分支：`codex/no-hash-seed-sharding-superlearner`
 - D1–D7 返工基线：`b1d4534`
-- 本轮并发退出码修正基线：`7b59303`
+- 本轮异常分流修正基线：`7a811ed`
 - 正式实施规范：`plans/no-hash-seed-sharding-completion.md`
-- 本轮范围：并发发布 loser 的退出码语义，以及删除两行 `input_artifacts` 死代码
+- 本轮范围：仅增加 output lock 专用异常、收窄 `seed_shards.main()` 分流并同步退出码合同
 
 结论：D1–D7 均已按返工清单完成，生产实现相对 `b1d4534` 为
-`+113/-562`，净减少 449 行；本轮相对 `7b59303` 为 `+2/-4`，净减少 2 行。
+`+122/-566`，净减少 444 行；本轮相对 `7a811ed` 为 `+12/-7`，净增加 5 行。
 production preset 的 20,000,000-row panel publish
 已完成，独立发布进程 MaxRSS 为 837,828,608 bytes；最终全量 pytest 连续三次均为
-`290 passed`。本报告第 5 节列出两项按方案约束明确放弃的保证，等待审查决定是否接受。
+`293 passed`。本报告第 5 节列出两项按方案约束明确放弃的保证，等待审查决定是否接受。
 
 ## 1. 实现结果
 
@@ -38,21 +38,23 @@ production preset 的 20,000,000-row panel publish
   有序值数组。production publish 全程流式处理。
 - 根 `README.md` 改为面向 Slurm 使用者的三节说明：研究问题与方法、安装/数据/两-seed
   smoke/production 提交与三级任务链、故障回传材料和路径；不列内部函数或设计决策。
-- 本轮把 `seed_shards.main()` 现有 `OSError` 捕获分支替换为
-  `(OSError, RuntimeError)` 分流：非阻塞 output lock 的并发 loser 输出一行说明并返回
-  0，存储 `OSError` 仍返回 4；没有改变锁、锁范围、非阻塞行为或发布路径。§9.2
-  退出码表同步增加该行。
-- 删除 finalize/publish manifest 上两行只服务于 `b1d4534` 旧产物的
+- `experiment.py` 定义专用于 `output_run_lock()` 的 `OutputRunLockError`，锁竞争不再抛
+  裸 `RuntimeError`；锁本身、锁范围和非阻塞行为均未改变。
+- `seed_shards.main()` 使用互不重叠的 handler：`OutputRunLockError` 返回新专用非零码
+  5，`OSError`/`sqlite3.Error` 返回 4，既有 incomplete/validation 分别返回 3/1；
+  其他异常不捕获。三处 stderr 写入改用模块顶部 `import sys`。
+- 上一轮删除 finalize/publish manifest 上两行只服务于 `b1d4534` 旧产物的
   `pop("input_artifacts", None)`。
 
 退出码合同保持为：
 
 | 退出码 | 含义 |
 |---:|---|
-| 0 | finalize/publish 成功或并发 loser 无需重复发布；`missing` 成功完成诊断 |
-| 1 | identity/contract/design/key 违约或程序错误 |
+| 0 | finalize/publish 成功；`missing` 成功完成诊断 |
+| 1 | identity/contract/design/key 违约 |
 | 3 | shard 或 per-model final 缺失/不完整，可 recovery |
-| 4 | finalize/publish 的环境、权限或存储 `OSError` |
+| 4 | 环境、权限、存储 `OSError` 或 `sqlite3.Error` |
+| 5 | 另一进程持有发布租约，本次未发布 |
 
 ## 2. 正式验收矩阵
 
@@ -64,10 +66,10 @@ production preset 的 20,000,000-row panel publish
 | D2 无 provenance/marker/backup/residual | 满足 | production source 检索为空；manifest 无 `input_artifacts`；失败测试无 `.previous` |
 | D2 缺 manifest 不完整 | 满足 | per-model CSV 存在但 manifest 缺失时 publish 抛 `SeedShardIncompleteError` 且不发布 panel |
 | H1 并发唯一临时 CSV | 满足 | finalize/publish 两并发线程各取得不同 temp path，清理后无残留 |
-| H1 loser 观察旧 pair | 满足 | loser 获取 lock 失败时精确读到 whole-old pair，winner 后为 whole-new pair |
-| 并发 loser 退出语义 | 满足 | `test_concurrent_finalize_and_publish_loser_exits_zero_without_traceback`：finalize/publish 的 winner 与 loser 均返回 0，stderr 精确一行且无 traceback |
-| 并发最终产物完整 | 满足 | 同一测试精确断言最终模型/seed keys、manifest mode 和 materialized rows；竞态用例连续 10 轮共 20/20 通过 |
-| 删除旧 manifest 死代码 | 满足 | 两个 `pop("input_artifacts", None)` 均已删除；本轮生产实现净减少 2 行 |
+| H1 loser 观察旧 pair | 满足 | loser 精确捕获 `OutputRunLockError` 并读到 whole-old pair，winner 后为 whole-new pair |
+| 并发 loser 退出语义 | 满足 | `test_concurrent_finalize_and_publish_loser_exits_five_without_traceback`：finalize/publish 各精确得到 `[0, 5]`，stderr 只有一行租约说明 |
+| 并发最终产物完整 | 满足 | 同一测试精确断言最终模型/seed keys、manifest mode 和 materialized rows |
+| 删除旧 manifest 死代码 | 满足 | 两个 `pop("input_artifacts", None)` 保持不存在；本轮删除对应的永真测试断言 |
 | D3 单 shard I/O 容忍 | 满足 | 同一次 diagnosis 精确返回 `invalid_targets=[0]` 与 `missing_master_indices=[1]` |
 | D4 精确 feature-universe 键 | 满足 | unknown `definition_sha256` 被精确错误拒绝；真实 SMR manifest 可解析为 60 jobs |
 | D5 definition 内容入 contract | 满足 | 修改 definition 内容前后 contract 不同，且 contract 中内容与 JSON 对象精确相等 |
@@ -76,12 +78,12 @@ production preset 的 20,000,000-row panel publish
 | D7 production publish MaxRSS | 满足 | 10 models、20M rows 完整发布；MaxRSS 837,828,608 bytes |
 | 多模型 panel 完整性 | 满足 | OLS/ridge 全部模型、seed rows 均存在于最终 CSV |
 | failure policy | 满足 | per-model 汇总与 panel `passed` 合取测试 |
-| CLI 退出码 | 满足 | concurrent loser=0、contract=1、incomplete=3、write-path `OSError`=4 |
+| CLI 异常边界 | 满足 | lock=5、`OSError`/`sqlite3.Error`=4、contract=1、incomplete=3；普通 `RuntimeError`/`RecursionError` 均向外传播 |
 | 数值等价 | 满足 | OLS + SuperLearner，2 seeds × 2 draws × 2 N × 2 K，见 §4 |
 | descendant cleanup | 满足 | timeout/crash/grandchild/SIGKILL fallback 与 runner recovery 保持通过 |
 | SuperLearner 性能证据 | 满足 | 1/2 CPU 每档三次取中位数；2 CPU 未达 +15%，按停止规则不测 4/8 |
-| 连续三次全量 pytest | 满足 | 三次均 `290 passed`，见 §3 |
-| 实现净删除 | 满足 | 相对 `7b59303` 为 `+2/-4`，净减少 2 行；相对 `b1d4534` 净减少 449 行 |
+| 连续三次全量 pytest | 满足 | 三次均 `293 passed`，见 §3 |
+| 实现行数上限 | 满足 | 相对 `7a811ed` 的生产实现为 `+12/-7`，净增加 5 行 |
 | 用户工作树保护 | 满足 | 精确暂存清单不含用户 README/旧 reports 删除、requirements、`AGENTS.md`、`docs/` |
 
 ## 3. 自动化测试证据
@@ -90,22 +92,23 @@ production preset 的 20,000,000-row panel publish
 测试或工作树变更。以下是 pytest 的原始结果行：
 
 ```text
-290 passed, 70 warnings in 50.95s
-290 passed, 70 warnings in 49.53s
-290 passed, 70 warnings in 49.87s
+293 passed, 70 warnings in 48.16s
+293 passed, 70 warnings in 50.29s
+293 passed, 70 warnings in 48.59s
 ```
 
-三次命令退出码均为 0，即每轮 `290 passed / 0 failed / 0 errors`。新增测试不是
-字符串宽松包含检查：并发 CLI 测试精确比较 `[0, 0]` 返回码、唯一 stderr 行、临时路径、
-完整模型/seed keys、manifest mode 和 materialized rows；重发测试比较 inode；
+三次命令退出码均为 0，即每轮 `293 passed / 0 failed / 0 errors`。新增测试不是
+字符串宽松包含检查：并发 CLI 测试精确比较排序后的 `[0, 5]` 返回码、唯一 stderr 行、
+临时路径、完整模型/seed keys、manifest mode 和 materialized rows；异常边界测试精确
+断言普通 `RuntimeError`/`RecursionError` 向外传播、专用锁异常为 5、SQLite 异常为 4；
+重发测试比较 inode；
 D3 比较完整 diagnosis 对象；D4/D5 比较精确 contract 对象；D7 运行真实 SQLite
 缺失/完整检查并用 AST 排除指定 resident sets。
 
 本轮冻结前的针对性结果：
 
 ```text
-NK_Grid/tests/test_seed_shards.py: 44 passed, 56 warnings in 7.04s
-并发 finalize/publish 参数化用例连续 10 轮：每轮 2 passed，共 20/20
+NK_Grid/tests/test_seed_shards.py: 47 passed, 56 warnings in 6.98s
 ```
 
 ## 4. 数值等价
@@ -224,6 +227,8 @@ CSV 521,000,028 bytes。输入是完整 20M cardinality 的合成 per-model fina
    检测 schema 文件字节级替换/损坏”的保证；请确认是否接受以 semantic contract
    作为唯一行为合同。
 
+本轮异常分流没有新增偏离方案之处或待澄清问题；专用码选择 5，并已同步本地 §9.2 表格。
+
 ## 6. 静态检查与工作树保护
 
 以下检查通过：
@@ -240,20 +245,21 @@ SMR real manifest resolution: 60 jobs
 `SMR/adapter`、`FFCWS/adapter`：
 
 ```text
-production additions=113 deletions=562 net=-449
-current-round additions=2 deletions=4 net=-2
+production additions=122 deletions=566 net=-444
+current-round additions=12 deletions=7 net=+5
 ```
 
 本轮未修改 `SMR/requirements.txt` 或 `FFCWS/requirements.txt`。提交只精确暂存
-本轮提交只精确暂存 `seed_shards.py`、对应测试与本报告；不包含用户删除的
+`experiment.py`、`seed_shards.py`、对应测试与本报告；不包含用户删除的
 `SMR/README.md`、`FFCWS/README.md`、`reports/cell-centric-execution.md`、
 `reports/remove-bart.md`，也不包含未跟踪 `AGENTS.md`、`docs/`。
 
 ## 7. 未满足项与合并判断
 
 D1–D7、README、production MaxRSS、数值等价、SuperLearner 三次中位数证据和连续三次
-全量 pytest 均满足。本轮并发 loser 的退出码合同已变为 0，且实现相对 `7b59303`
-净减少 2 行；没有新增协调、重试、探测或诊断机制。
+全量 pytest 均满足。本轮并发 loser 的退出码合同已变为专用非零码 5，普通
+`RuntimeError`/`RecursionError` 不再被吞掉，SQLite 异常返回 4；实现相对 `7a811ed`
+净增加 5 行，没有新增协调、重试、探测或诊断机制。
 
 没有把第 5.3 节两项放弃保证伪装为已满足；它们属于方案在禁止额外机制后留下的语义代价，
 需要审查者确认。除这两项待确认问题外，本轮没有已知未满足的 §16 验收项。本报告不代替

@@ -125,6 +125,18 @@ def _rewrite_rows(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def _finalize_arguments(tmp_path: Path) -> list[str]:
+    return [
+        "finalize",
+        "--snapshot",
+        str(tmp_path / "jobs.json"),
+        "--map",
+        str(tmp_path / "map.json"),
+        "--index",
+        "0",
+    ]
+
+
 def _snapshot(
     tmp_path: Path,
     *,
@@ -306,7 +318,7 @@ def test_finalize_and_publish_reruns_replace_equivalent_existing_results(tmp_pat
 
 
 @pytest.mark.parametrize("operation", ["finalize", "publish"])
-def test_concurrent_finalize_and_publish_loser_exits_zero_without_traceback(
+def test_concurrent_finalize_and_publish_loser_exits_five_without_traceback(
     tmp_path, monkeypatch, capsys, operation
 ):
     snapshot = _snapshot(tmp_path, models=("ols", "ridge"))
@@ -373,7 +385,7 @@ def test_concurrent_finalize_and_publish_loser_exits_zero_without_traceback(
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: run(), range(2)))
 
-    assert results == [0, 0]
+    assert sorted(results) == [0, 5]
     assert loser_returned.is_set()
     assert published.is_set()
     assert capsys.readouterr().err.splitlines() == [expected_lock_error]
@@ -423,7 +435,7 @@ def test_concurrent_publication_loser_observes_whole_old_pair(tmp_path):
 
     def loser():
         assert winner_locked.wait(timeout=10)
-        with pytest.raises(RuntimeError) as error:
+        with pytest.raises(seed_shards.OutputRunLockError) as error:
             with seed_shards.output_run_lock(target):
                 pass
         assert str(error.value) == (
@@ -469,27 +481,60 @@ def test_finalizer_republishes_when_shard_content_changes(tmp_path):
     changed_rows = list(csv.DictReader(target.open(encoding="utf-8")))
     assert target.read_bytes() != original
     assert [row["metric"] for row in changed_rows] == ["1.0", "2.0"]
-    assert "input_artifacts" not in _read_json(manifest_path(target))
 
 
-def test_cli_distinguishes_oserror_from_contract_violation(
+def test_cli_does_not_catch_non_lock_runtime_error(
+    tmp_path, monkeypatch, capsys
+):
+    def runtime_failure(*args, **kwargs):
+        raise RuntimeError("unexpected runtime failure")
+
+    monkeypatch.setattr(seed_shards, "_load_map", runtime_failure)
+    with pytest.raises(RuntimeError, match="unexpected runtime failure"):
+        main(_finalize_arguments(tmp_path))
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_does_not_catch_recursion_error(tmp_path, monkeypatch, capsys):
+    def recursion_failure(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(seed_shards, "_load_map", recursion_failure)
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        main(_finalize_arguments(tmp_path))
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_returns_five_for_output_lock_error_without_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    def lock_failure(*args, **kwargs):
+        raise seed_shards.OutputRunLockError("output lease held")
+
+    monkeypatch.setattr(seed_shards, "_load_map", lock_failure)
+    assert main(_finalize_arguments(tmp_path)) == 5
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "output lease held\n"
+
+
+def test_cli_distinguishes_storage_and_contract_errors(
     tmp_path, monkeypatch, capsys
 ):
     def storage_failure(*args, **kwargs):
         raise PermissionError("storage unavailable")
 
     monkeypatch.setattr(seed_shards, "_load_map", storage_failure)
-    arguments = [
-        "finalize",
-        "--snapshot",
-        str(tmp_path / "jobs.json"),
-        "--map",
-        str(tmp_path / "map.json"),
-        "--index",
-        "0",
-    ]
+    arguments = _finalize_arguments(tmp_path)
     assert main(arguments) == 4
     assert capsys.readouterr().err.strip() == "storage unavailable"
+
+    def sqlite_failure(*args, **kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(seed_shards, "_load_map", sqlite_failure)
+    assert main(arguments) == 4
+    assert capsys.readouterr().err.strip() == "database or disk is full"
 
     def contract_failure(*args, **kwargs):
         raise SeedShardValidationError("contract mismatch")
