@@ -196,10 +196,12 @@ def load_schema(path: Path) -> InputSchema:
     if not isinstance(document["table"], str) or not document["table"]:
         raise ValueError("schema.table must be a non-empty relative or absolute path")
     universe = document["feature_universe"]
-    if not isinstance(universe, dict) or not {"mode", "definition_file"}.issubset(universe):
+    if not isinstance(universe, dict) or set(universe) != {
+        "mode",
+        "definition_file",
+    }:
         raise ValueError(
-            "schema.feature_universe must contain exactly mode, definition_file, "
-            "and definition_file"
+            "schema.feature_universe must contain exactly mode and definition_file"
         )
     if universe["mode"] not in {"fixed_a_priori", "train_pool_screened"}:
         raise ValueError("Unknown feature_universe.mode")
@@ -270,6 +272,16 @@ def load_schema(path: Path) -> InputSchema:
     directory = path.parent
     table = _resolve_path(document["table"], directory)
     assert table is not None
+    definition_path = _resolve_path(universe["definition_file"], directory)
+    assert definition_path is not None
+    try:
+        feature_universe_definition = json.loads(
+            definition_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "feature_universe definition_file is invalid JSON"
+        ) from exc
     raw_semantics = {
         key: value
         for key, value in document.items()
@@ -284,9 +296,8 @@ def load_schema(path: Path) -> InputSchema:
     ]
     raw_semantics["continuous_priors"] = normalized_priors
     raw_semantics["feature_universe"] = {
-        key: value
-        for key, value in document["feature_universe"].items()
-        if key != "definition_file"
+        "mode": universe["mode"],
+        "definition": feature_universe_definition,
     }
     return InputSchema(
         path=path,

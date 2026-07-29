@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -73,7 +72,6 @@ def write_schema_bundle(
         + "\n"
     )
     definition_path.write_text(definition_text, encoding="utf-8")
-    definition_hash = hashlib.sha256(definition_path.read_bytes()).hexdigest()
     schema = {
         "schema_version": 1,
         "feature_manifest_version": 1 if manifest is not None else None,
@@ -97,7 +95,6 @@ def write_schema_bundle(
                 else "train_pool_screened"
             ),
             "definition_file": "feature_universe.json",
-            "definition_sha256": definition_hash,
         },
         "group_column": None,
         "imputation": imputation or DEFAULT_IMPUTATION,

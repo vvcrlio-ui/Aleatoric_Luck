@@ -2,107 +2,102 @@
 
 - 日期：2026-07-29
 - 分支：`codex/no-hash-seed-sharding-superlearner`
+- 本轮基线：`b1d4534`
 - 正式实施规范：`plans/no-hash-seed-sharding-completion.md`
+- 本轮范围：§2.2 D1–D7 与根目录 `README.md`
 
-结论：§2.2 的 H1/H2、四项非阻塞修正、严格测试和 SuperLearner 三次中位数
-复测均已完成；最终全量 pytest 连续三轮 `290 passed`。但 production preset 的
-20,000,000-row panel publish 在本机 16 GB 内存与有限 swap/磁盘条件下无法安全跑完，
-没有取得完成态 MaxRSS；此前私有 SMR 10-seed 可复核基线的 MaxRSS 降幅 37.16%
-也仍未达到候选 70% 门槛。因此本分支仍标记为**不可合并**。
+结论：D1–D7 均已按返工清单完成，生产实现相对 `b1d4534` 为
+`+113/-560`，净减少 447 行；production preset 的 20,000,000-row panel publish
+已完成，独立发布进程 MaxRSS 为 837,828,608 bytes；最终全量 pytest 连续三次均为
+`290 passed`。本报告第 5 节列出两项按方案约束明确放弃的保证，等待审查决定是否接受。
 
 ## 1. 实现结果
 
-- `SlurmJob.seed/draws/final_out` 保持必填；seed shards 写确定性精确路径，
-  per-model final 写 `.seed-final/<panel>/<model>.csv`，不会再由同 panel 的模型互相覆盖。
-- 发布为 seed chunks → per-model finalizer → per-panel publish 三级链。finalizer/publish
-  都有独立 map、明确资源、`afterany` dependency、output lock、等价结果 no-op 和退出码合同。
-- finalizer 严格验证 master seed/draw/output、explicit identity、semantic contract、N/K grid、
-  completion、CSV schema、完整 cell key、status 和全量 failure policy；diagnostics 不再错误沿用
-  单个 shard。
-- CSV 与 manifest 都先写临时文件；锁内发布使用 marker 和旧 pair 回滚。失败保留全部 shards，
-  interrupted marker 不会被判断为 complete。
-- finalizer/publish 的待发布 CSV 改为 target 同目录 `mkstemp` 唯一文件；并发调用不再
-  共享固定临时路径，并发 loser 只能观察到完整旧 pair，winner 发布后为完整新 pair。
-- final/panel manifest 记录每个输入 artifact 的路径、`updated_at` 与行数；输入 key
-  不变但内容按新 `updated_at` 替换时拒绝 no-op。`missing` JSON 同时报告当前 snapshot
-  target 上残留的 `.previous` / `.publishing` 文件。
-- CLI 将 contract violation、incomplete input 和 `OSError` 分别映射为退出码 1、3、4。
-- submitter 使用 `parallel/serial/super_learner` 三类互斥完备分区，SuperLearner 有独立 CPU
-  参数；MaxArraySize 可自动探测或显式覆盖；array task 使用 chunk-local 连续 indices，同类
-  chunks 用 `afterany` 串联。
-- recovery 只接受 machine-readable diagnosis 或显式 master indices，并再次过滤已完整
-  shards；`DependencyNeverSatisfied` 诊断和可选清理由本 snapshot 的 receipts 限定 job IDs。
-- finalizer/publish 各自写 snapshot-scoped stage receipt。recovery 在任何 `sbatch`
-  之前用 receipt job IDs 查询 `squeue`；发现 finalizer/publish 非终态即整体拒绝，因此
-  不会提交第二套并存链。两级资源与 worker 分离：finalizer 默认 `16G/1-00:00:00`，
-  publish 默认 `32G/2-00:00:00`，且各有独立 CLI override。
-- native worker 的 timeout/crash 都清理真实 grandchild，SIGTERM grace 后覆盖 SIGKILL fallback，
-  runner 随后可恢复工作。
-- NKGRID production source 未引入摘要计算或摘要值比较；legacy digest 字段仅按键存在性拒绝。
+- D1：删除 `FINALIZATION_STAGES`、finalization stage receipt、active-finalization
+  scheduler query、两个 CLI 子命令，以及 shell 中的 recovery 前置守卫、stage receipt
+  写入和 receipt 失败后的 `scancel`。recovery 恢复为直接提交本轮 seed chunks，
+  随后无条件提交 finalizer array 和 publish array。
+- D2：删除 existing-result no-op、artifact provenance、publish marker、publication
+  residuals、`.previous` 备份/回滚和全部 `input_artifacts` 构造/透传。finalize/publish
+  每次都重新合并、先 rename CSV、再 rename manifest；唯一 `mkstemp` 临时文件和只覆盖
+  发布动作的 output lock 保留。
+- D3：`_shard_state()` 重新捕获 `OSError` 并把单个不可读 shard 归入 `invalid_targets`；
+  诊断继续扫描其余 shards。finalize/publish 自身的 I/O 错误仍返回 4。
+- D4：`feature_universe` 只接受精确键集合 `{mode, definition_file}`，修正重复
+  `definition_file` 的报错文本。SMR/FFCWS adapters 和 19 个已提交 schema 同步删除
+  `definition_sha256`，使真实集群输入符合该精确合同。
+- D5：加载 schema 时读取 feature-universe definition JSON，并把规范化内容直接放入
+  `semantic_contract.feature_universe.definition`；定义内容变化会进入 finalizer 的现有
+  逐字段 contract 比较，不新增摘要。
+- D6：删除 `NKGridConfig.resume_group` 及 panel root/shared/config 三处透传；全仓库无残留读取。
+- D7：删除 finalize/publish 中的 `expected_keys`、`actual_keys`、
+  `all_expected_keys` 和 per-model Python key sets。SQLite `expected`/`rows` 表使用
+  count 与双向 `NOT EXISTS` 检查缺失和越界；两表使用 `WITHOUT ROWID`，payload 只保存
+  有序值数组。production publish 全程流式处理。
+- 根 `README.md` 改为面向 Slurm 使用者的三节说明：研究问题与方法、安装/数据/两-seed
+  smoke/production 提交与三级任务链、故障回传材料和路径；不列内部函数或设计决策。
 
-对应方案 §9.2 的 CLI 退出合同：
+退出码合同保持为：
 
-| 退出码 | 含义 | recovery 含义 |
-|---:|---|---|
-| 0 | 完成或等价 no-op | 不重试 |
-| 1 | identity/contract/design/key 违约 | 不自动重试，人工修正输入 |
-| 3 | shard/per-model final 缺失或未完成 | 可按 diagnosis 重交 |
-| 4 | `OSError` 环境/存储故障 | 不伪装为 contract 违约；修复环境后再重试 |
+| 退出码 | 含义 |
+|---:|---|
+| 0 | finalize/publish 成功；`missing` 成功完成诊断 |
+| 1 | identity/contract/design/key 违约或程序错误 |
+| 3 | shard 或 per-model final 缺失/不完整，可 recovery |
+| 4 | finalize/publish 的环境、权限或存储 `OSError` |
 
 ## 2. 正式验收矩阵
 
 | 验收项 | 结论 | 证据 |
 |---|---|---|
-| R1：多模型 panel 不覆盖 | 满足 | `test_per_model_final_outputs_are_unique_within_one_panel`、`test_multi_model_panel_publication_preserves_every_model` |
-| R2：submitter mock 无裸 `return` 死代码 | 满足 | 三类 CPU、local array、receipt、snapshot、partial submission/recovery 断言均实际执行 |
-| R3：`exact_output_path` 三用例 | 满足 | restriction、deterministic resume、identity mismatch 三项测试 |
-| R4：descendant race 修复 | 满足 | helper 在触发 timeout 前确认 grandchild PID；最终连续三轮全量 pytest 见 §3 |
-| 三资源类与独立 SuperLearner CPU | 满足 | Python partition、shell submitter、独立 receipt |
-| MaxArraySize 与 chunk-local arrays | 满足 | 自动探测成功/失败/显式覆盖、0/1/M/M+1/sparse、local 越界 |
-| chunk dependency/空类/partial submission | 满足 | 同类 `afterany`、空类省略、无 recovery jobs 报错、finalizer 失败阻止 publish |
-| receipt 限定的 dependency diagnosis | 满足 | 只识别/清理当前 snapshot receipt job IDs |
-| H1：唯一临时 CSV 与并发 pair 完整性 | 满足 | finalize/publish 并发各保留两个不同 temp path；loser 精确读取 whole-old pair，winner 后为 whole-new pair |
-| H2：recovery 不产生并存 finalization 链 | 满足 | stage receipt 精确记录 stage/job/dependency/resource；active finalizer+publish 时 recovery 在 `sbatch` 前拒绝且提交计数为 0 |
-| no-op 输入内容来源 | 满足 | final/panel manifest 记录 path/`updated_at`/rows；changed shard + unchanged key set 强制重发 |
-| CLI 环境故障退出码 | 满足 | contract=1、incomplete=3、`OSError`=4，测试精确断言 stderr 与返回值 |
-| 发布残留诊断 | 满足 | `missing.publication_residuals` 精确列出 snapshot target 的 CSV/manifest `.previous` 与 `.publishing` |
-| finalizer/publish 独立资源 | 满足 | worker、finalizer、publish 的 sbatch argv 与两份 stage receipts 均精确断言不同 memory/time |
-| deterministic shard/recovery | 满足 | exact path、resume、missing/incomplete-only recovery、显式 indices 再过滤 |
-| finalizer/publish 严格验证 | 满足 | 42 个 seed-shard 测试覆盖 master、manifest、key、policy、atomic/no-op/concurrency/CLI |
-| multi-model failure policy | 满足 | per-model 阈值判定和 panel `passed` 合取 |
-| monolithic 与 shard+merge 数值等价 | 满足 | 2 seeds × 2 draws × 2 N × 2 K，OLS + SuperLearner，见 §4 |
-| timeout/crash descendant cleanup | 满足 | 8 个 native-process 测试 |
-| SMR 10→100 seeds 单 worker MaxRSS 增幅 ≤10% | 满足 | 1.322→1.367 GiB，+3.385%，`split_frame()` 均为 1 |
-| 可复核旧基线到新 worker MaxRSS 下降 ≥70% | **未满足** | 2.104→1.322 GiB，下降 37.165% |
-| SuperLearner 每档 ≥3 次取中位数 | 满足 | 1/2 CPU 各三次均 8/8 `ok`；2 CPU 中位吞吐下降 11.57%，按停止规则不继续 4/8 |
-| production preset panel publish MaxRSS | **未满足** | 10 models、20M rows 真实运行使 16 GB 主机扩张 swap、系统卷仅余 357 MiB；为避免写满磁盘终止，未取得完成态 MaxRSS |
-| production source 无摘要实现/调用 | 满足 | §6 静态命令无输出 |
+| D1 调度守卫净删除 | 满足 | production source 无 finalization status/stage receipt；submitter mock 精确断言调用中二者均不存在 |
+| D1 recovery 仍提交收尾链 | 满足 | recovery shell 测试断言 seed recovery 后 finalizer 与 publish 均提交 |
+| D2 每次重发 | 满足 | 同输入连续 finalize/publish 的 CSV 和 manifest inode 均变化 |
+| D2 无 provenance/marker/backup/residual | 满足 | production source 检索为空；manifest 无 `input_artifacts`；失败测试无 `.previous` |
+| D2 缺 manifest 不完整 | 满足 | per-model CSV 存在但 manifest 缺失时 publish 抛 `SeedShardIncompleteError` 且不发布 panel |
+| H1 并发唯一临时 CSV | 满足 | finalize/publish 两并发线程各取得不同 temp path，清理后无残留 |
+| H1 loser 观察旧 pair | 满足 | loser 获取 lock 失败时精确读到 whole-old pair，winner 后为 whole-new pair |
+| D3 单 shard I/O 容忍 | 满足 | 同一次 diagnosis 精确返回 `invalid_targets=[0]` 与 `missing_master_indices=[1]` |
+| D4 精确 feature-universe 键 | 满足 | unknown `definition_sha256` 被精确错误拒绝；真实 SMR manifest 可解析为 60 jobs |
+| D5 definition 内容入 contract | 满足 | 修改 definition 内容前后 contract 不同，且 contract 中内容与 JSON 对象精确相等 |
+| D6 删除 `resume_group` | 满足 | production/test/source 全仓库检索无结果 |
+| D7 SQL key 完整性 | 满足 | missing/out-of-design/duplicate 行为测试；AST 断言 finalize/publish 无四类 resident key-set 名称 |
+| D7 production publish MaxRSS | 满足 | 10 models、20M rows 完整发布；MaxRSS 837,828,608 bytes |
+| 多模型 panel 完整性 | 满足 | OLS/ridge 全部模型、seed rows 均存在于最终 CSV |
+| failure policy | 满足 | per-model 汇总与 panel `passed` 合取测试 |
+| CLI 退出码 | 满足 | contract=1、incomplete=3、write-path `OSError`=4 |
+| 数值等价 | 满足 | OLS + SuperLearner，2 seeds × 2 draws × 2 N × 2 K，见 §4 |
+| descendant cleanup | 满足 | timeout/crash/grandchild/SIGKILL fallback 与 runner recovery 保持通过 |
+| SuperLearner 性能证据 | 满足 | 1/2 CPU 每档三次取中位数；2 CPU 未达 +15%，按停止规则不测 4/8 |
+| 连续三次全量 pytest | 满足 | 三次均 `290 passed`，见 §3 |
+| 实现净删除 | 满足 | `+113/-560`，净减少 447 行 |
+| 用户工作树保护 | 满足 | 精确暂存清单不含用户 README/旧 reports 删除、requirements、`AGENTS.md`、`docs/` |
 
 ## 3. 自动化测试证据
 
-最终代码状态连续执行三轮：
+实现和测试冻结后连续执行三次 `.venv/bin/python -m pytest -q`，三轮之间没有代码、
+测试或工作树变更。以下是 pytest 的原始结果行：
 
 ```text
-290 passed, 70 warnings in 48.68s
-exit=0
-290 passed, 70 warnings in 48.70s
-exit=0
-290 passed, 70 warnings in 48.09s
-exit=0
+290 passed, 70 warnings in 49.48s
+290 passed, 70 warnings in 47.34s
+290 passed, 70 warnings in 47.50s
 ```
 
-三轮均为 `290 passed, 0 failed, 0 errors`，测试数量高于 218。每轮前等待 15 秒，
-用于释放前一 pytest 进程和 production publish 压测后的 swap 压力；三轮之间没有代码
-或工作树变更。
+三次命令退出码均为 0，即每轮 `290 passed / 0 failed / 0 errors`。新增测试不是
+字符串宽松包含检查：并发测试比较实际路径和完整 JSON/CSV pair；重发测试比较 inode；
+D3 比较完整 diagnosis 对象；D4/D5 比较精确 contract 对象；D7 运行真实 SQLite
+缺失/完整检查并用 AST 排除指定 resident sets。
 
-Targeted evidence：
+冻结前的针对性结果：
 
 ```text
-NK_Grid/tests/test_slurm_jobs.py: 74 passed
-NK_Grid/tests/test_seed_shards.py: 42 passed
-NK_Grid/tests/test_nk_grid_engine.py + test_native_process.py:
-  included in 160 passed targeted run
-§2.2 directly changed targeted total: 116 passed, 0 failed, 0 errors
+NK_Grid/tests/test_seed_shards.py:
+44 passed, 56 warnings in 6.84s
+
+test_seed_shards.py + test_ingest_validate.py +
+test_identity_panels_isolation.py + test_slurm_jobs.py:
+156 passed, 56 warnings in 16.71s
 ```
 
 ## 4. 数值等价
@@ -113,15 +108,11 @@ NK_Grid/tests/test_nk_grid_engine.py + test_native_process.py:
 2 seeds × 2 draws/seed × 2 N × 2 K = 16 rows/model
 ```
 
-旧式基线为每个 `(panel, model)` 一次多-seed monolithic 运行；新路径为单-seed shards、
-per-model finalize、per-panel publish。按 `(model, seed, draw, N, K)` 排序后：
+monolithic 与单-seed shards → per-model finalize → panel publish 按
+`(model, seed, draw, N, K)` 排序比较。key、status、error、整数、字符串、NaN
+位置、completion 与 failure-policy counts 相同；同为 `n_jobs=1` 时全部科学列逐位相同。
 
-- key、status、error、整数、字符串字段逐位相同。
-- NaN 位置逐列相同。
-- completion 与 failure-policy counts 相同。
-- 同为 `n_jobs=1`，两个模型全部科学列逐位相同。
-
-容差组：
+容差组保持：
 
 ```text
 bounded_dimensionless: rtol=0,     atol=1e-12
@@ -129,93 +120,48 @@ r2_like_unbounded:     rtol=1e-12, atol=1e-12
 scale_dependent:       rtol=1e-10, atol=1e-12
 ```
 
-下表的 representative key 在最大误差并列为 0 时取排序后的第一个 cell；
-`OLS` key 为 `(ols,11,0,20,1)`，`SL` key 为 `(super_learner,11,0,20,1)`。
+所有 30 个科学输出列的 OLS 与 SuperLearner max abs/max rel 均为 0。最大误差并列时，
+代表 key 分别为 `OLS=(ols,11,0,20,1)` 与
+`SL=(super_learner,11,0,20,1)`：
 
-| 科学列 | 组 | OLS max abs | OLS max rel | OLS key | SL max abs | SL max rel | SL key |
-|---|---|---:|---:|---|---:|---:|---|
-| r2_test | r2_like_unbounded | 0 | 0 | OLS | 0 | 0 | SL |
-| skill_score_pct | r2_like_unbounded | 0 | 0 | OLS | 0 | 0 | SL |
-| rmse | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| mae | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| medae | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| max_error | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| nrmse | r2_like_unbounded | 0 | 0 | OLS | 0 | 0 | SL |
-| spearman_rho | bounded_dimensionless | 0 | 0 | OLS | 0 | 0 | SL |
-| pearson_r | bounded_dimensionless | 0 | 0 | OLS | 0 | 0 | SL |
-| kendall_tau | bounded_dimensionless | 0 | 0 | OLS | 0 | 0 | SL |
-| ccc | bounded_dimensionless | 0 | 0 | OLS | 0 | 0 | SL |
-| explained_variance | r2_like_unbounded | 0 | 0 | OLS | 0 | 0 | SL |
-| mean_bias | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| median_bias | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| pinball_q10 | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| pinball_q90 | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| d2_absolute_error | r2_like_unbounded | 0 | 0 | OLS | 0 | 0 | SL |
-| pinball_q05 | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| pinball_q25 | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| pinball_q50 | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| pinball_q75 | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| pinball_q95 | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| ks_statistic | bounded_dimensionless | 0 | 0 | OLS | 0 | 0 | SL |
-| wasserstein_distance | scale_dependent | 0 | 0 | OLS | 0 | 0 | SL |
-| top_decile_hit_rate | bounded_dimensionless | 0 | 0 | OLS | 0 | 0 | SL |
-| bottom_decile_hit_rate | bounded_dimensionless | 0 | 0 | OLS | 0 | 0 | SL |
-| rsr | r2_like_unbounded | 0 | 0 | OLS | 0 | 0 | SL |
-| cv_rmse | r2_like_unbounded | 0 | 0 | OLS | 0 | 0 | SL |
-| mase | r2_like_unbounded | 0 | 0 | OLS | 0 | 0 | SL |
-| pearson_r2 | bounded_dimensionless | 0 | 0 | OLS | 0 | 0 | SL |
+| 科学列 | 组 | OLS max abs/rel | OLS key | SL max abs/rel | SL key |
+|---|---|---:|---|---:|---|
+| r2_test | r2_like_unbounded | 0 / 0 | OLS | 0 / 0 | SL |
+| skill_score_pct | r2_like_unbounded | 0 / 0 | OLS | 0 / 0 | SL |
+| rmse | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| mae | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| medae | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| max_error | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| nrmse | r2_like_unbounded | 0 / 0 | OLS | 0 / 0 | SL |
+| spearman_rho | bounded_dimensionless | 0 / 0 | OLS | 0 / 0 | SL |
+| pearson_r | bounded_dimensionless | 0 / 0 | OLS | 0 / 0 | SL |
+| kendall_tau | bounded_dimensionless | 0 / 0 | OLS | 0 / 0 | SL |
+| ccc | bounded_dimensionless | 0 / 0 | OLS | 0 / 0 | SL |
+| explained_variance | r2_like_unbounded | 0 / 0 | OLS | 0 / 0 | SL |
+| mean_bias | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| median_bias | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| pinball_q10 | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| pinball_q90 | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| d2_absolute_error | r2_like_unbounded | 0 / 0 | OLS | 0 / 0 | SL |
+| pinball_q05 | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| pinball_q25 | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| pinball_q50 | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| pinball_q75 | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| pinball_q95 | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| ks_statistic | bounded_dimensionless | 0 / 0 | OLS | 0 / 0 | SL |
+| wasserstein_distance | scale_dependent | 0 / 0 | OLS | 0 / 0 | SL |
+| top_decile_hit_rate | bounded_dimensionless | 0 / 0 | OLS | 0 / 0 | SL |
+| bottom_decile_hit_rate | bounded_dimensionless | 0 / 0 | OLS | 0 / 0 | SL |
+| rsr | r2_like_unbounded | 0 / 0 | OLS | 0 / 0 | SL |
+| cv_rmse | r2_like_unbounded | 0 / 0 | OLS | 0 / 0 | SL |
+| mase | r2_like_unbounded | 0 / 0 | OLS | 0 / 0 | SL |
+| pearson_r2 | bounded_dimensionless | 0 / 0 | OLS | 0 / 0 | SL |
 
-私有 SMR 的 1 CPU 与有效 2 CPU SuperLearner 结果也逐位相同：8/8 rows 为 `ok`，
-key/status/error 相同，以上 30 个科学列的 max abs/max rel 均为 0。
+## 5. 性能证据与需审查确认的问题
 
-## 5. 私有数据性能验收
+### 5.1 production panel publish
 
-输入为只读的 `SMR/data/ard/asample2_withlag/data.csv`（7,463 rows、4,252 predictors），
-输出全部写入 `/private/tmp`；未修改 SMR/FFCWS 私有数据。
-
-### 5.1 SMR MaxRSS
-
-相同 OLS panel/model，固定 `N=[10]`、`K=[1]`、每 seed 一个 draw/cell：
-
-| 模式 | repeat-plan seeds | 实际 worker seeds | `split_frame()` | MaxRSS | Elapsed |
-|---|---:|---:|---:|---:|---:|
-| retained old multi-seed worker | 10 | 10 | 10 | 2.104 GiB | 3.204 s |
-| new one-seed worker | 10 | 1 | 1 | 1.322 GiB | 2.640 s |
-| new one-seed worker | 100 | 1 | 1 | 1.367 GiB | 3.545 s |
-
-结论：
-
-- 新 worker 的 `split_frame()` 恰好一次。
-- repeat plan 10→100 时单 worker MaxRSS 增长 3.385%，满足 ≤10%，无 OOM。
-- 本次可复核 10-seed retained baseline 到新 worker 下降 37.165%，未达到候选 70%。
-  旧讨论中的 17–41 GB 没有对应 job IDs/`sacct` 证据，未用作计算基线。
-
-### 5.2 SuperLearner CPU
-
-私有 SMR，同一 seed/cells：2 draws × 2 N × 2 K = 8 cells，production model params。
-每档独立运行三次；2 CPU 使用允许 loky 创建 worker process 的执行环境。每次先验证
-8/8 rows 为 `ok`；1/2 CPU 的 key/status、NaN 位置相同，30 个科学列 max abs=0。
-
-| CPUs | repeat | Elapsed | TotalCPU | CPU efficiency | MaxRSS | cells/hour | core-hours/1,000 cells |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1 | 13.579 s | 12.741 s | 93.83% | 1.521 GB | 2,120.96 | 0.4715 |
-| 1 | 2 | 12.428 s | 12.321 s | 99.13% | 1.689 GB | 2,317.27 | 0.4315 |
-| 1 | 3 | 12.298 s | 12.226 s | 99.41% | 1.791 GB | 2,341.87 | 0.4270 |
-| **1 median** | — | **12.428 s** | **12.321 s** | **99.13%** | **1.689 GB** | **2,317.27** | **0.4315** |
-| 2 | 1 | 14.054 s | 18.406 s | 65.48% | 1.791 GB | 2,049.21 | 0.9760 |
-| 2 | 2 | 13.834 s | 18.255 s | 65.98% | 1.794 GB | 2,081.80 | 0.9607 |
-| 2 | 3 | 14.286 s | 18.531 s | 64.86% | 1.792 GB | 2,016.02 | 0.9921 |
-| **2 median** | — | **14.054 s** | **18.406 s** | **65.48%** | **1.792 GB** | **2,049.21** | **0.9760** |
-| 4 | — | 按停止规则不运行 | — | — | — | — | — |
-| 8 | — | 按停止规则不运行 | — | — | — | — | — |
-
-2 CPU 的中位 cells/hour 相对 1 CPU 为 -11.568%，小于 +15% 阈值；按 §11.3 停止规则，
-不继续增加到 4/8 CPU。MaxRSS 未接近 48G 申请内存的 80%。生产默认保持
-`--super-learner-cpus-per-task 1`。
-
-### 5.3 production panel publish MaxRSS
-
-使用真实 `publish_panel()`，SMR 的 10 个模型和 production cardinality：
+真实调用 `publish_panel()`，使用 SMR 的 10 个模型和 production cardinality：
 
 ```text
 100 seeds × 50 draws × 20 N × 20 K × 10 models
@@ -223,64 +169,82 @@ key/status/error 相同，以上 30 个科学列的 max abs/max rel 均为 0。
 = 20,000,000 panel rows
 ```
 
-输入为只含发布合同必需列的合成 per-model final CSV（合计约 525 MiB），以隔离 publish
-阶段；不是缩小规模的 proxy。运行过程中 benchmark 目录增长到约 3.3 GiB，同时 16 GB
-Mac 因 O(cells) key sets 产生内存压力并扩张 swap，系统卷可用空间从约 4.9 GiB 降到
-357 MiB。为避免写满用户系统卷，在完成前终止，并删除唯一的
-`/private/tmp/nk-publish-production-*` benchmark 目录；清理后可用空间恢复到 3.7 GiB。
-
-结论：**未取得完成态 MaxRSS，§2.2 该项未满足。** 不能把终止前目录大小、swap 或
-缩小规模的 RSS 当作 production panel publish MaxRSS。独立 publish 默认暂设
-`32G/2-00:00:00`，但在高内存节点完成同规模实测前不能据此批准生产资源配置。
-
-### 5.4 技术问题与需审查确认的歧义
-
-1. production 20M-row publish 的完成态 MaxRSS 需要高内存且有充足 local scratch 的节点。
-   请确认下一轮是否在集群节点复测，以及允许的最低内存/scratch 额度；本轮没有自行降低
-   production cardinality，也没有把估算值写成实测。
-2. H2 选择“发现 receipt-owned 非终态 finalizer/publish 就拒绝 recovery”。新提交链都有
-   stage receipts；但 `9dc0046` 旧版本已经提交的链没有 stage receipt，代码无法从 snapshot
-   反推出它的 job IDs。请确认是否要对“snapshot 有 worker receipts、但完全没有 stage
-   receipts”的 legacy recovery 一律拒绝；这也会拒绝“worker 部分提交失败、从未交过
-   finalizer”的合法 recovery，因此本轮没有自行改变该语义。
-3. §2.2 要求独立默认值但没有指定额度。本轮取 finalizer `16G/1 day`、publish
-   `32G/2 days` 并允许独立覆盖；publish 完成态 MaxRSS 未取得，以上值仍需集群实测确认。
-4. §2.2 的明确验收要求是 `missing` JSON “列出” `.previous` / `.publishing` 残留，
-   同段前文又使用“诊断与清理”措辞。为避免擅自删除可能用于人工恢复的 old pair，本轮只
-   实现报告、不实现自动清理命令。请确认后续是否需要 receipt/marker-aware 的显式清理子命令。
-
-## 6. 静态与工作树保护
-
-以下命令无输出：
-
-```bash
-rg -n \
-  '(^|[[:space:]])(import hashlib|from hashlib)|hashlib\.|file_sha256|semantic_sha256' \
-  NK_Grid/src
-```
-
-另外通过：
+完整原始结果：
 
 ```text
-bash -n NK_Grid/slurm/submit_nk_grid.sh
-bash -n NK_Grid/slurm/finalize_seed_shards.sbatch
-.venv/bin/python -m compileall -q NK_Grid/src
-git diff --check
+BENCHMARK_JSON={"benchmark": "production_panel_publish", "elapsed_seconds": 208.25895962503273, "max_rss_bytes": 837828608, "models": 10, "panel_rows": 20000000, "preset": "production", "published_csv_bytes": 521000028, "rows_per_model": 2000000, "total_cpu_seconds": 191.794924}
 ```
 
-实现提交只精确暂存 NKGRID 实现、测试和本报告；不包含用户对 SMR/FFCWS README、
-requirements、旧 reports 的删除，也不包含未跟踪 `AGENTS.md`/`docs/`。
+即墙钟 208.259 s、CPU 191.795 s、MaxRSS 837,828,608 bytes（799.02 MiB），最终
+CSV 521,000,028 bytes。输入是完整 20M cardinality 的合成 per-model finals，不是
+缩小规模 proxy。基准成功后删除自身唯一 `/private/tmp/nk-publish-production-*`
+目录，未触碰用户数据。
+
+外层 `/usr/bin/time -l` 在子进程成功、JSON 输出和清理完成后，因为受限环境不允许
+`sysctl kern.clockrate` 自身返回 1；MaxRSS 来自独立 publish 子进程内部的
+`resource.getrusage(RUSAGE_SELF)`，不使用该失败 wrapper 的统计。
+
+### 5.2 既有 SMR/SuperLearner 证据
+
+只读 SMR ARD 的既有实测保持有效：
+
+| 模式 | MaxRSS | Elapsed |
+|---|---:|---:|
+| retained old 10-seed worker | 2.104 GiB | 3.204 s |
+| new one-seed worker（10-seed repeat plan） | 1.322 GiB | 2.640 s |
+| new one-seed worker（100-seed repeat plan） | 1.367 GiB | 3.545 s |
+
+10→100 repeat plan 的单 worker MaxRSS 增长 3.385%；retained baseline 到新 worker
+下降 37.165%。SuperLearner production params、8 cells、每档三次：
+
+| CPUs | runs | median elapsed | median TotalCPU | median cells/hour | median MaxRSS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 3 | 12.428 s | 12.321 s | 2,317.27 | 1.689 GB |
+| 2 | 3 | 14.054 s | 18.406 s | 2,049.21 | 1.792 GB |
+| 4/8 | 未运行 | 2 CPU 中位吞吐比 1 CPU 低 11.568%，按 §11.3 停止 | — | — | — |
+
+### 5.3 问题与明确放弃的保证
+
+1. D2 要求先 rename CSV、再 rename manifest，同时禁止 marker、备份和新检查。若目标
+   原本已有旧 manifest，进程在第一个 rename 后崩溃，会形成“新 CSV + 旧 manifest”；
+   现有 manifest 没有 CSV generation 标识，因此下游无法区分它与 matching pair。
+   本轮按方案没有新增标识或探测，明确放弃“该特定崩溃窗口能被自动识别”的保证；显式
+   重跑 finalize/publish 会重新生成 pair。请审查确认这是否是 D2 可接受的代价。
+2. D5 按原文只把 feature-universe definition 内容纳入 semantic contract。provenance
+   中旧 `schema_sha256` 的一致性检查没有恢复，因为恢复它会违反“不新增摘要机制”，而
+   schema 的行为字段已进入 semantic contract。本轮明确放弃“仅凭 provenance hash
+   检测 schema 文件字节级替换/损坏”的保证；请确认是否接受以 semantic contract
+   作为唯一行为合同。
+
+## 6. 静态检查与工作树保护
+
+以下检查通过：
+
+```text
+.venv/bin/python -m py_compile <全部本轮 Python 实现>
+git diff --check
+production forbidden-name rg: no output
+feature_universe definition_sha256 rg in schemas/adapters: no output
+SMR real manifest resolution: 60 jobs
+```
+
+相对 `b1d4534` 的生产实现统计命令限定为 `NK_Grid/src`、`NK_Grid/slurm`、
+`SMR/adapter`、`FFCWS/adapter`：
+
+```text
+production additions=113 deletions=560 net=-447
+```
+
+本轮未修改 `SMR/requirements.txt` 或 `FFCWS/requirements.txt`。提交只精确暂存
+D1–D7 实现、对应测试、19 个 D4 schema、根 `README.md` 与本报告；不包含用户删除的
+`SMR/README.md`、`FFCWS/README.md`、`reports/cell-centric-execution.md`、
+`reports/remove-bart.md`，也不包含未跟踪 `AGENTS.md`、`docs/`。
 
 ## 7. 未满足项与合并判断
 
-未满足：
+D1–D7、README、production MaxRSS、数值等价、SuperLearner 三次中位数证据和连续三次
+全量 pytest 均满足。实现相对基线显著净删除，未新增兜底、重试、探测或诊断机制。
 
-1. 本次可复核 retained 10-seed 基线的 MaxRSS 降幅为 37.165%，不是 70%。
-2. production preset 的 20,000,000-row panel publish 在本机 16 GB 内存与有限
-   swap/scratch 下无法安全完成，未取得完成态 MaxRSS；详见 §5.3。
-
-SuperLearner 的证据要求已满足：1/2 CPU 每档三次取中位数，2 CPU 吞吐下降后按停止规则
-不继续 4/8，不再把“未跑 4/8”列为未满足。
-
-因此，尽管 §2.2 代码、严格测试、数值等价、连续三轮 pytest 和调度链均完成，本报告
-仍不把分支标记为可合并。
+没有把第 5.3 节两项放弃保证伪装为已满足；它们属于方案在禁止额外机制后留下的语义代价，
+需要审查者确认。除这两项待确认问题外，本轮没有已知未满足的 §16 验收项。本报告不代替
+审查批准；分支提交后停下，等待审查。

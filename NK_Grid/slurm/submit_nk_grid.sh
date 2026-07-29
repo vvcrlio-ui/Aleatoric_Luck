@@ -229,15 +229,6 @@ if [ "$PLANNED_JOB_COUNT" -ne "$SNAPSHOT_JOB_COUNT" ]; then
   exit 1
 fi
 if [ -n "$SNAPSHOT_INPUT" ]; then
-  if FINALIZATION_STATUS=$(
-    "$PYTHON" -m aleatoric_nk_grid.slurm_jobs \
-      finalization-status --snapshot "$SNAPSHOT" 2>&1
-  ); then
-    echo "Finalization status: $FINALIZATION_STATUS"
-  else
-    echo "Recovery refused because this snapshot has an active finalizer/publish job: $FINALIZATION_STATUS" >&2
-    exit 1
-  fi
   DIAGNOSTIC_ARGS=(
     dependency-diagnostics --snapshot "$SNAPSHOT"
   )
@@ -364,29 +355,6 @@ FINALIZER_JOB_ID="${FINALIZER_OUTPUT%%;*}"
   echo "Could not parse finalizer job ID: $FINALIZER_OUTPUT" >&2
   exit 1
 }
-FINALIZER_RECEIPT_ARGS=(
-  finalization-receipt
-  --snapshot "$SNAPSHOT"
-  --stage finalizer
-  --job-id "$FINALIZER_JOB_ID"
-  --array-spec "$FINALIZER_ARRAY"
-  --finalization-map "$FINALIZER_MAP"
-  --worker-script "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch"
-  --dependency-job-ids "${FINALIZER_DEPENDENCY//:/,}"
-  --cpus-per-task 1
-  --memory "$FINALIZER_MEMORY"
-  --time-limit "$FINALIZER_TIME_LIMIT"
-)
-if FINALIZER_RECEIPT_OUTPUT=$(
-  "$PYTHON" -m aleatoric_nk_grid.slurm_jobs \
-    "${FINALIZER_RECEIPT_ARGS[@]}" 2>&1
-); then
-  echo "Finalizer receipt: $FINALIZER_RECEIPT_OUTPUT"
-else
-  scancel "$FINALIZER_JOB_ID" >/dev/null 2>&1 || true
-  echo "Finalizer receipt failed; cancelled newly submitted job $FINALIZER_JOB_ID: $FINALIZER_RECEIPT_OUTPUT" >&2
-  exit 1
-fi
 echo "Submitted seed finalizer array $FINALIZER_JOB_ID with $FINALIZER_COUNT tasks"
 
 PUBLISH_ARRAY="0-$((PUBLISH_COUNT - 1))"
@@ -409,27 +377,4 @@ PUBLISH_JOB_ID="${PUBLISH_OUTPUT%%;*}"
   echo "Could not parse panel publish job ID: $PUBLISH_OUTPUT" >&2
   exit 1
 }
-PUBLISH_RECEIPT_ARGS=(
-  finalization-receipt
-  --snapshot "$SNAPSHOT"
-  --stage publish
-  --job-id "$PUBLISH_JOB_ID"
-  --array-spec "$PUBLISH_ARRAY"
-  --finalization-map "$PUBLISH_MAP"
-  --worker-script "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch"
-  --dependency-job-ids "$FINALIZER_JOB_ID"
-  --cpus-per-task 1
-  --memory "$PUBLISH_MEMORY"
-  --time-limit "$PUBLISH_TIME_LIMIT"
-)
-if PUBLISH_RECEIPT_OUTPUT=$(
-  "$PYTHON" -m aleatoric_nk_grid.slurm_jobs \
-    "${PUBLISH_RECEIPT_ARGS[@]}" 2>&1
-); then
-  echo "Publish receipt: $PUBLISH_RECEIPT_OUTPUT"
-else
-  scancel "$PUBLISH_JOB_ID" >/dev/null 2>&1 || true
-  echo "Publish receipt failed; cancelled newly submitted job $PUBLISH_JOB_ID: $PUBLISH_RECEIPT_OUTPUT" >&2
-  exit 1
-fi
 echo "Submitted panel publish array $PUBLISH_JOB_ID with $PUBLISH_COUNT tasks"

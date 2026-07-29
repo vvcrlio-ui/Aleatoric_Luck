@@ -83,7 +83,6 @@ class SlurmJob:
 
 
 RESOURCE_CLASSES = ("parallel", "serial", "super_learner")
-FINALIZATION_STAGES = ("finalizer", "publish")
 OPTIONAL_SLURM_ENV_KEYS = (
     "ALEATORIC_NK_GRID_SOURCE_FALLBACK",
     "PYTHON_MODULE",
@@ -597,154 +596,6 @@ def write_submission_receipt(
     return receipt_path
 
 
-def write_finalization_receipt(
-    snapshot_path: Path,
-    *,
-    stage: str,
-    slurm_job_id: str,
-    array_spec: str,
-    finalization_map: Path,
-    worker_script: Path,
-    dependency_job_ids: Sequence[str],
-    cpus_per_task: int,
-    memory: str,
-    time_limit: str,
-    receipt_path: Path | None = None,
-) -> Path:
-    """Record a snapshot-owned finalizer or publish array."""
-
-    if stage not in FINALIZATION_STAGES:
-        raise ValueError(f"Unknown finalization stage: {stage!r}")
-    if not slurm_job_id.isdigit():
-        raise ValueError(f"Invalid Slurm job ID: {slurm_job_id!r}")
-    if cpus_per_task < 1:
-        raise ValueError("cpus_per_task must be positive")
-    if not memory.strip():
-        raise ValueError("memory must not be empty")
-    if not time_limit.strip():
-        raise ValueError("time_limit must not be empty")
-    if not dependency_job_ids or any(
-        not job_id.isdigit() for job_id in dependency_job_ids
-    ):
-        raise ValueError("dependency_job_ids must contain Slurm job IDs")
-
-    snapshot_path = snapshot_path.resolve()
-    finalization_map = finalization_map.resolve()
-    worker_script = worker_script.resolve()
-    map_payload = json.loads(finalization_map.read_text(encoding="utf-8"))
-    targets = map_payload.get("targets")
-    if (
-        map_payload.get("format_version") != 1
-        or not isinstance(map_payload.get("snapshot"), str)
-        or Path(map_payload["snapshot"]).resolve() != snapshot_path
-        or not isinstance(targets, list)
-        or not targets
-    ):
-        raise ValueError(
-            "Finalization map does not belong to this snapshot or is empty"
-        )
-    indices = _expand_array_indices(array_spec, len(targets))
-    if indices != tuple(range(len(targets))):
-        raise ValueError(
-            "Finalization receipt array must cover every map target"
-        )
-
-    if receipt_path is None:
-        receipt_path = snapshot_path.parent / f"slurm-{slurm_job_id}.json"
-    else:
-        receipt_path = receipt_path.resolve()
-    if receipt_path.exists():
-        raise FileExistsError(
-            f"Slurm submission receipt already exists: {receipt_path}"
-        )
-    payload = {
-        "format_version": 1,
-        "created_at": utc_now(),
-        "slurm_job_id": slurm_job_id,
-        "snapshot": str(snapshot_path),
-        "stage": stage,
-        "array": array_spec,
-        "job_count": len(targets),
-        "finalization_map": str(finalization_map),
-        "worker_script": str(worker_script),
-        "dependency_job_ids": list(dependency_job_ids),
-        "resources": {
-            "cpus_per_task": int(cpus_per_task),
-            "memory": memory,
-            "time_limit": time_limit,
-        },
-        "recovery_policy": {
-            "strategy": "refuse-active-finalization-chain",
-        },
-    }
-    write_json_atomic(receipt_path, payload)
-    os.chmod(receipt_path, 0o444)
-    return receipt_path
-
-
-def active_finalization_diagnostics(
-    snapshot_path: Path,
-    *,
-    scheduler_output: str | None = None,
-) -> dict[str, Any]:
-    """Return nonterminal finalizer/publish jobs owned by one snapshot."""
-
-    snapshot_path = snapshot_path.resolve()
-    receipt_stages: dict[str, str] = {}
-    for receipt_path in snapshot_path.parent.glob("slurm-*.json"):
-        try:
-            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        job_id = payload.get("slurm_job_id")
-        stage = payload.get("stage")
-        if (
-            payload.get("format_version") == 1
-            and isinstance(payload.get("snapshot"), str)
-            and Path(payload["snapshot"]).resolve() == snapshot_path
-            and isinstance(job_id, str)
-            and job_id.isdigit()
-            and stage in FINALIZATION_STAGES
-        ):
-            receipt_stages[job_id] = str(stage)
-
-    ordered_ids = sorted(receipt_stages, key=int)
-    if scheduler_output is None and ordered_ids:
-        completed = subprocess.run(
-            [
-                "squeue",
-                "--noheader",
-                "--jobs",
-                ",".join(ordered_ids),
-                "--format",
-                "%A|%T",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        scheduler_output = completed.stdout
-    active: dict[str, dict[str, str]] = {}
-    for line in (scheduler_output or "").splitlines():
-        fields = line.strip().split("|", 1)
-        if len(fields) != 2:
-            continue
-        job_id, state = fields
-        if job_id in receipt_stages:
-            active[job_id] = {
-                "job_id": job_id,
-                "stage": receipt_stages[job_id],
-                "state": state,
-            }
-    return {
-        "snapshot": str(snapshot_path),
-        "receipt_job_ids": ordered_ids,
-        "active_jobs": [
-            active[job_id] for job_id in sorted(active, key=int)
-        ],
-    }
-
-
 def dependency_never_satisfied_diagnostics(
     snapshot_path: Path,
     *,
@@ -862,8 +713,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             "list",
             "snapshot",
             "receipt",
-            "finalization-receipt",
-            "finalization-status",
             "run",
         ),
     )
@@ -873,9 +722,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--job-id", default=None)
     parser.add_argument("--array-spec", default=None)
     parser.add_argument("--worker-script", default=None)
-    parser.add_argument("--stage", choices=FINALIZATION_STAGES, default=None)
-    parser.add_argument("--finalization-map", type=Path, default=None)
-    parser.add_argument("--dependency-job-ids", default=None)
     parser.add_argument("--index", type=int, default=None)
     parser.add_argument("--chunk-map", type=Path, default=None)
     # ``default=None`` keeps an absent flag from overriding a panel that already
@@ -942,52 +788,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             receipt_path=Path(args.receipt) if args.receipt else None,
         )
         print(receipt)
-        return
-
-    if args.command == "finalization-receipt":
-        if snapshot_path is None:
-            parser.error("finalization-receipt requires --snapshot")
-        if args.stage is None:
-            parser.error("finalization-receipt requires --stage")
-        if args.job_id is None:
-            parser.error("finalization-receipt requires --job-id")
-        if args.array_spec is None:
-            parser.error("finalization-receipt requires --array-spec")
-        if args.finalization_map is None:
-            parser.error("finalization-receipt requires --finalization-map")
-        if args.worker_script is None:
-            parser.error("finalization-receipt requires --worker-script")
-        if args.dependency_job_ids is None:
-            parser.error(
-                "finalization-receipt requires --dependency-job-ids"
-            )
-        receipt = write_finalization_receipt(
-            snapshot_path,
-            stage=args.stage,
-            slurm_job_id=args.job_id,
-            array_spec=args.array_spec,
-            finalization_map=args.finalization_map,
-            worker_script=Path(args.worker_script),
-            dependency_job_ids=tuple(
-                value
-                for value in args.dependency_job_ids.split(",")
-                if value
-            ),
-            cpus_per_task=args.cpus_per_task,
-            memory=args.memory,
-            time_limit=args.time_limit,
-            receipt_path=Path(args.receipt) if args.receipt else None,
-        )
-        print(receipt)
-        return
-
-    if args.command == "finalization-status":
-        if snapshot_path is None:
-            parser.error("finalization-status requires --snapshot")
-        payload = active_finalization_diagnostics(snapshot_path)
-        print(json.dumps(payload, sort_keys=True))
-        if payload["active_jobs"]:
-            raise SystemExit(3)
         return
 
     if args.command == "dependency-diagnostics":

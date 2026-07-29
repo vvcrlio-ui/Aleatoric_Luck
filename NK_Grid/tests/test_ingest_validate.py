@@ -283,20 +283,29 @@ def test_feature_universe_semantics_are_checked_without_hash(tmp_path):
         tmp_path, _frame(), predictors=["X_a", "X_b"]
     )
     definition_path = tmp_path / "feature_universe.json"
+    original_contract = load_schema(schema_path).semantic_contract
     document = json.loads(definition_path.read_text())
     document["predictors"].reverse()
     definition_path.write_text(json.dumps(document), encoding="utf-8")
+    changed_contract = load_schema(schema_path).semantic_contract
+    assert changed_contract != original_contract
+    assert changed_contract["feature_universe"] == {
+        "mode": "fixed_a_priori",
+        "definition": document,
+    }
     with pytest.raises(ValueError, match="Resolved feature universe"):
         _validated(schema_path)
 
     schema = json.loads(schema_path.read_text())
-    import hashlib
-
-    schema["feature_universe"]["definition_sha256"] = hashlib.sha256(
-        definition_path.read_bytes()
-    ).hexdigest()
+    schema["feature_universe"]["definition_sha256"] = "obsolete"
     schema_path.write_text(json.dumps(schema), encoding="utf-8")
-    with pytest.raises(ValueError, match="canonical definition"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "schema.feature_universe must contain exactly mode and "
+            "definition_file"
+        ),
+    ):
         _validated(schema_path)
 
 
@@ -309,7 +318,6 @@ def test_feature_universe_semantics_are_checked_without_hash(tmp_path):
                 "feature_universe": {
                     "mode": "train_pool_screened",
                     "definition_file": "feature_universe.json",
-                    "definition_sha256": "placeholder",
                 }
             },
             "internal_random requires",

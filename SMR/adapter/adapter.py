@@ -312,7 +312,6 @@ def build_adapter(
         "feature_universe": {
             "mode": "fixed_a_priori",
             "definition_file": definition_path.name,
-            "definition_sha256": _sha256(definition_path),
         },
         "group_column": None,
         "imputation": {

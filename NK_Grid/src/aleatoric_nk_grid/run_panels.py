@@ -108,7 +108,6 @@ PANEL_FIELDS = frozenset(
         "experiment_id",
         "data_version",
         "model_spec_version",
-        "resume_group",
         "repeat_plan",
         "n_grid",
         "k_grid",
@@ -206,7 +205,7 @@ def resolved_panels(
     manifest = load_manifest(manifest_path)
     allowed_root = {
         "panels", "model_params", "preset", "experiment_id", "data_version",
-        "model_spec_version", "resume_group", "repeat_plan", "n_grid", "k_grid",
+        "model_spec_version", "repeat_plan", "n_grid", "k_grid",
     }
     root_unknown = sorted(set(manifest) - allowed_root)
     if root_unknown:
@@ -215,7 +214,7 @@ def resolved_panels(
         key: manifest[key]
         for key in (
             "model_params", "preset", "experiment_id", "data_version",
-            "model_spec_version", "resume_group", "repeat_plan", "n_grid", "k_grid",
+            "model_spec_version", "repeat_plan", "n_grid", "k_grid",
         )
         if key in manifest
     }

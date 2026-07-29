@@ -202,18 +202,62 @@ def _resolved_grids(manifest: Mapping[str, Any], label: str) -> tuple[list[int],
     return n_grid, k_grid
 
 
-def _expected_keys(
+def _create_key_tables(connection: sqlite3.Connection) -> None:
+    columns = '"model", "seed", "draw", "N", "K"'
+    connection.execute(
+        f"CREATE TABLE expected ({columns}, PRIMARY KEY ({columns})) "
+        "WITHOUT ROWID"
+    )
+    connection.execute(
+        f"CREATE TABLE rows ({columns}, payload TEXT NOT NULL, "
+        f"PRIMARY KEY ({columns})) WITHOUT ROWID"
+    )
+
+
+def _insert_expected_keys(
+    connection: sqlite3.Connection,
     config: Any,
     models: Sequence[str],
     grids: tuple[Sequence[int], Sequence[int]],
-) -> set[tuple[str, int, int, int, int]]:
-    return {
-        (model, int(seed), int(draw), int(n_value), int(k_value))
-        for model in models
-        for seed, draw in resolve_repeat_pairs(config)
-        for n_value in grids[0]
-        for k_value in grids[1]
-    }
+) -> None:
+    connection.executemany(
+        "INSERT INTO expected VALUES (?, ?, ?, ?, ?)",
+        (
+            (model, int(seed), int(draw), int(n_value), int(k_value))
+            for model in models
+            for seed, draw in resolve_repeat_pairs(config)
+            for n_value in grids[0]
+            for k_value in grids[1]
+        ),
+    )
+
+
+def _validate_complete_design(
+    connection: sqlite3.Connection, label: str
+) -> int:
+    columns = '"model", "seed", "draw", "N", "K"'
+    join = " AND ".join(
+        f'e.{column}=r.{column}' for column in columns.split(", ")
+    )
+    expected_rows = int(connection.execute("SELECT COUNT(*) FROM expected").fetchone()[0])
+    actual_rows = int(connection.execute("SELECT COUNT(*) FROM rows").fetchone()[0])
+    missing = connection.execute(
+        f"SELECT {columns} FROM expected e WHERE NOT EXISTS "
+        f"(SELECT 1 FROM rows r WHERE {join}) LIMIT 3"
+    ).fetchall()
+    extra = connection.execute(
+        f"SELECT {columns} FROM rows r WHERE NOT EXISTS "
+        f"(SELECT 1 FROM expected e WHERE {join}) LIMIT 3"
+    ).fetchall()
+    if extra:
+        raise SeedShardValidationError(
+            f"{label}: out-of-design cell keys {extra}"
+        )
+    if actual_rows != expected_rows or missing:
+        raise SeedShardValidationError(
+            f"{label}: incomplete cell keys (missing={missing})"
+        )
+    return expected_rows
 
 
 def _validate_identity(identity: Any, label: str) -> Mapping[str, Any]:
@@ -311,116 +355,6 @@ def _row_key(row: Mapping[str, Any]) -> tuple[str, int, int, int, int]:
     )
 
 
-def _read_artifact_keys(
-    path: Path,
-    *,
-    expected_keys: set[tuple[str, int, int, int, int]],
-) -> tuple[set[tuple[str, int, int, int, int]], Counter[str], list[str]]:
-    header = _read_csv_header(path, str(path))
-    keys: set[tuple[str, int, int, int, int]] = set()
-    statuses: Counter[str] = Counter()
-    with path.open(newline="", encoding="utf-8") as source:
-        for row in csv.DictReader(source):
-            key = _row_key(row)
-            status = str(row.get("status"))
-            if status not in VALID_STATUSES:
-                raise SeedShardValidationError(
-                    f"{path}: invalid status {status!r}"
-                )
-            if key not in expected_keys:
-                raise SeedShardValidationError(
-                    f"{path}: out-of-design cell key {key}"
-                )
-            if key in keys:
-                raise SeedShardValidationError(
-                    f"{path}: duplicate cell key {key}"
-                )
-            keys.add(key)
-            statuses[status] += 1
-    return keys, statuses, header
-
-
-def _publish_marker(target: Path) -> Path:
-    return target.with_name(f".{target.name}.publishing")
-
-
-def _artifact_provenance(
-    path: Path,
-    manifest: Mapping[str, Any],
-    *,
-    rows: int,
-    **identity: Any,
-) -> dict[str, Any]:
-    updated_at = manifest.get("updated_at")
-    if not isinstance(updated_at, str) or not updated_at:
-        raise SeedShardValidationError(
-            f"{manifest_path(path)}: updated_at is missing"
-        )
-    return {
-        **identity,
-        "path": str(path.resolve()),
-        "updated_at": updated_at,
-        "rows": int(rows),
-    }
-
-
-def _existing_artifact_equivalent(
-    target: Path,
-    *,
-    expected_keys: set[tuple[str, int, int, int, int]],
-    identity: Mapping[str, Any],
-    contract: Mapping[str, Any],
-    grids: tuple[list[int], list[int]],
-    execution_mode: str,
-    input_artifacts: Sequence[Mapping[str, Any]],
-) -> bool:
-    target_manifest = manifest_path(target)
-    if (
-        _publish_marker(target).exists()
-        or not target.exists()
-        or not target_manifest.exists()
-    ):
-        return False
-    manifest = _load_json(target_manifest, "existing final manifest")
-    current_identity = _validate_identity(
-        manifest.get("identity"), str(target_manifest)
-    )
-    for field in _IDENTITY_FIELDS:
-        if current_identity[field] != identity[field]:
-            raise SeedShardValidationError(
-                f"{target_manifest}: identity.{field} differs"
-            )
-    if difference := _difference(
-        manifest.get("semantic_contract"),
-        contract,
-        "semantic_contract",
-    ):
-        raise SeedShardValidationError(
-            f"{target_manifest}: {difference}"
-        )
-    if _resolved_grids(manifest, str(target_manifest)) != grids:
-        raise SeedShardValidationError(
-            f"{target_manifest}: resolved N/K grid differs"
-        )
-    if manifest.get("input_artifacts") != list(input_artifacts):
-        return False
-    execution = manifest.get("execution")
-    completion = manifest.get("completion")
-    if (
-        not isinstance(execution, Mapping)
-        or execution.get("mode") != execution_mode
-        or not isinstance(completion, Mapping)
-        or completion.get("materialized_rows") != len(expected_keys)
-        or completion.get("status")
-        not in {"complete", "complete_with_failures"}
-    ):
-        return False
-    keys, _, _ = _read_artifact_keys(
-        target, expected_keys=expected_keys
-    )
-    return keys == expected_keys
-
-
 def _status_summary(
     statuses: Counter[str],
     *,
@@ -500,34 +434,8 @@ def _publish_pair(
     temporary_manifest: Path,
     target: Path,
 ) -> None:
-    marker = _publish_marker(target)
-    target_manifest = manifest_path(target)
-    csv_backup = target.with_name(f".{target.name}.previous")
-    manifest_backup = target_manifest.with_name(
-        f".{target_manifest.name}.previous"
-    )
-    csv_backup.unlink(missing_ok=True)
-    manifest_backup.unlink(missing_ok=True)
-    marker.touch(exist_ok=True)
-    try:
-        if target.exists():
-            os.replace(target, csv_backup)
-        if target_manifest.exists():
-            os.replace(target_manifest, manifest_backup)
-        os.replace(temporary_csv, target)
-        os.replace(temporary_manifest, target_manifest)
-    except BaseException:
-        target.unlink(missing_ok=True)
-        target_manifest.unlink(missing_ok=True)
-        if csv_backup.exists():
-            os.replace(csv_backup, target)
-        if manifest_backup.exists():
-            os.replace(manifest_backup, target_manifest)
-        raise
-    finally:
-        csv_backup.unlink(missing_ok=True)
-        manifest_backup.unlink(missing_ok=True)
-        marker.unlink(missing_ok=True)
+    os.replace(temporary_csv, target)
+    os.replace(temporary_manifest, manifest_path(target))
 
 
 def _shard_state(item: Mapping[str, Any], config: Any) -> str:
@@ -550,33 +458,8 @@ def _shard_state(item: Mapping[str, Any], config: Any) -> str:
         return "complete"
     except SeedShardIncompleteError:
         return "incomplete"
-    except (KeyError, TypeError, ValueError):
+    except (OSError, KeyError, TypeError, ValueError):
         return "invalid"
-
-
-def _publication_residuals(snapshot: Mapping[str, Any]) -> list[str]:
-    targets: set[Path] = set()
-    for job in snapshot["jobs"]:
-        if isinstance(job, Mapping) and isinstance(job.get("final_out"), str):
-            targets.add(Path(job["final_out"]).resolve())
-    panel_outputs = snapshot.get("panel_outputs")
-    if isinstance(panel_outputs, Mapping):
-        targets.update(
-            Path(output).resolve()
-            for output in panel_outputs.values()
-            if isinstance(output, str)
-        )
-
-    residuals: set[Path] = set()
-    for target in targets:
-        target_manifest = manifest_path(target)
-        candidates = (
-            _publish_marker(target),
-            target.with_name(f".{target.name}.previous"),
-            target_manifest.with_name(f".{target_manifest.name}.previous"),
-        )
-        residuals.update(path for path in candidates if path.exists())
-    return [str(path) for path in sorted(residuals)]
 
 
 def diagnose_missing(master_snapshot: Path) -> dict[str, list[int]]:
@@ -605,7 +488,6 @@ def diagnose_missing(master_snapshot: Path) -> dict[str, list[int]]:
         "missing_master_indices": missing,
         "incomplete_master_indices": incomplete,
         "invalid_targets": invalid,
-        "publication_residuals": _publication_residuals(snapshot),
     }
 
 
@@ -746,7 +628,6 @@ def finalize_seed_shards(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     manifests: list[tuple[dict[str, Any], Path, int, tuple[int, ...]]] = []
-    input_artifacts: list[dict[str, Any]] = []
     identity: Mapping[str, Any] | None = None
     contract: Mapping[str, Any] | None = None
     grids: tuple[list[int], list[int]] | None = None
@@ -774,17 +655,8 @@ def finalize_seed_shards(
         elif current_header != header:
             raise SeedShardValidationError(f"seed={seed}: CSV header differs")
         manifests.append((manifest, shard, seed, tuple(draws)))
-        input_artifacts.append(
-            _artifact_provenance(
-                shard,
-                manifest,
-                rows=len(draws) * len(grids[0]) * len(grids[1]),
-                seed=seed,
-            )
-        )
 
     assert identity is not None and contract is not None and grids is not None
-    expected_keys = _expected_keys(config, (model,), grids)
 
     descriptor, raw_database = tempfile.mkstemp(
         prefix="nk-grid-seed-", suffix=".sqlite", dir=target.parent
@@ -796,11 +668,8 @@ def finalize_seed_shards(
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(database)
-        connection.execute(
-            'CREATE TABLE rows ("model", "seed", "draw", "N", "K", '
-            'payload TEXT NOT NULL, PRIMARY KEY '
-            '("model", "seed", "draw", "N", "K"))'
-        )
+        _create_key_tables(connection)
+        _insert_expected_keys(connection, config, (model,), grids)
         statuses: Counter[str] = Counter()
         for _, shard, seed, draws in manifests:
             with shard.open(newline="", encoding="utf-8") as source:
@@ -815,7 +684,6 @@ def finalize_seed_shards(
                         key[0] != model
                         or key[1] != seed
                         or key[2] not in draws
-                        or key not in expected_keys
                     ):
                         raise SeedShardValidationError(
                             f"seed={seed}: out-of-design cell key {key}"
@@ -823,30 +691,25 @@ def finalize_seed_shards(
                     try:
                         connection.execute(
                             "INSERT INTO rows VALUES (?, ?, ?, ?, ?, ?)",
-                            (*key, json.dumps(row, sort_keys=True)),
+                            (
+                                *key,
+                                json.dumps(
+                                    [row[column] for column in header or ()],
+                                    separators=(",", ":"),
+                                ),
+                            ),
                         )
                     except sqlite3.IntegrityError as exc:
                         raise SeedShardValidationError(
                             f"Duplicate cell key: {key}"
                         ) from exc
                     statuses[status] += 1
-        actual_keys = {
-            tuple(row)
-            for row in connection.execute(
-                'SELECT "model", "seed", "draw", "N", "K" FROM rows'
-            )
-        }
-        if actual_keys != expected_keys:
-            raise SeedShardValidationError(
-                "Merged cell keys differ "
-                f"(missing={sorted(expected_keys - actual_keys)[:3]}, "
-                f"extra={sorted(actual_keys - expected_keys)[:3]})"
-            )
+        expected_rows = _validate_complete_design(connection, "Merged result")
         with temporary_csv.open(
             "w", newline="", encoding="utf-8"
         ) as destination:
-            writer = csv.DictWriter(destination, fieldnames=header or [])
-            writer.writeheader()
+            writer = csv.writer(destination)
+            writer.writerow(header or [])
             for (payload,) in connection.execute(
                 'SELECT payload FROM rows ORDER BY '
                 '"model", "seed", "draw", "N", "K"'
@@ -864,26 +727,16 @@ def finalize_seed_shards(
         final_manifest["updated_at"] = utc_now()
         final_manifest["execution"] = {
             "mode": "finalized-seed-shards",
-            "expected_rows": len(expected_keys),
+            "expected_rows": expected_rows,
         }
         final_manifest["completion"] = completion
         final_manifest["failure_policy"] = policy
-        final_manifest["input_artifacts"] = input_artifacts
+        final_manifest.pop("input_artifacts", None)
         final_manifest.pop("diagnostics", None)
         temporary_manifest = _write_temporary_manifest(
             target, final_manifest
         )
         with output_run_lock(target):
-            if _existing_artifact_equivalent(
-                target,
-                expected_keys=expected_keys,
-                identity=identity,
-                contract=contract,
-                grids=grids,
-                execution_mode="finalized-seed-shards",
-                input_artifacts=input_artifacts,
-            ):
-                return target
             _publish_pair(temporary_csv, temporary_manifest, target)
         return target
     finally:
@@ -932,15 +785,11 @@ def publish_panel(
     target = _panel_output(snapshot, panel)
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    artifacts: list[
-        tuple[str, Path, dict[str, Any], Any, set[tuple[str, int, int, int, int]]]
-    ] = []
-    input_artifacts: list[dict[str, Any]] = []
+    artifacts: list[tuple[str, Path, dict[str, Any], Any]] = []
     identity: Mapping[str, Any] | None = None
     shared_contract: dict[str, Any] | None = None
     grids: tuple[list[int], list[int]] | None = None
     header: list[str] | None = None
-    all_expected_keys: set[tuple[str, int, int, int, int]] = set()
     for model in expected_models:
         config, model_final, _ = _validate_master_target(
             snapshot, panel, model
@@ -995,53 +844,18 @@ def publish_panel(
             raise SeedShardIncompleteError(
                 f"{panel}/{model}: per-model final is incomplete"
             )
-        model_expected_keys = _expected_keys(
-            config, (model,), current_grids
-        )
-        keys, _, current_header = _read_artifact_keys(
-            model_final, expected_keys=model_expected_keys
-        )
-        if keys != model_expected_keys:
-            raise SeedShardValidationError(
-                f"{panel}/{model}: per-model key set is incomplete"
-            )
+        current_header = _read_csv_header(model_final, f"{panel}/{model}")
         if header is None:
             header = current_header
         elif current_header != header:
             raise SeedShardValidationError(
                 f"{panel}/{model}: CSV header differs"
             )
-        if all_expected_keys & model_expected_keys:
-            raise SeedShardValidationError(
-                f"{panel}/{model}: cross-model cell keys overlap"
-            )
-        all_expected_keys |= model_expected_keys
-        artifacts.append(
-            (model, model_final, manifest, config, model_expected_keys)
-        )
-        input_artifacts.append(
-            _artifact_provenance(
-                model_final,
-                manifest,
-                rows=len(keys),
-                model=model,
-            )
-        )
+        artifacts.append((model, model_final, manifest, config))
 
     assert identity is not None and shared_contract is not None and grids is not None
     panel_contract = copy.deepcopy(shared_contract)
     panel_contract["model"] = expected_models
-    with output_run_lock(target):
-        if _existing_artifact_equivalent(
-            target,
-            expected_keys=all_expected_keys,
-            identity=identity,
-            contract=panel_contract,
-            grids=grids,
-            execution_mode="published-model-finals",
-            input_artifacts=input_artifacts,
-        ):
-            return target
 
     descriptor, raw_database = tempfile.mkstemp(
         prefix="nk-grid-panel-", suffix=".sqlite", dir=target.parent
@@ -1053,14 +867,12 @@ def publish_panel(
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(database)
-        connection.execute(
-            'CREATE TABLE rows ("model", "seed", "draw", "N", "K", '
-            'payload TEXT NOT NULL, PRIMARY KEY '
-            '("model", "seed", "draw", "N", "K"))'
-        )
+        _create_key_tables(connection)
+        for model, _, _, config in artifacts:
+            _insert_expected_keys(connection, config, (model,), grids)
         statuses: Counter[str] = Counter()
         model_policies: dict[str, Any] = {}
-        for model, model_final, model_manifest, _, model_expected in artifacts:
+        for model, model_final, model_manifest, _ in artifacts:
             model_policies[model] = copy.deepcopy(
                 model_manifest.get("failure_policy")
             )
@@ -1068,35 +880,34 @@ def publish_panel(
                 for row in csv.DictReader(source):
                     key = _row_key(row)
                     status = str(row.get("status"))
-                    if status not in VALID_STATUSES or key not in model_expected:
+                    if status not in VALID_STATUSES or key[0] != model:
                         raise SeedShardValidationError(
                             f"{panel}/{model}: invalid row {key}"
                         )
                     try:
                         connection.execute(
                             "INSERT INTO rows VALUES (?, ?, ?, ?, ?, ?)",
-                            (*key, json.dumps(row, sort_keys=True)),
+                            (
+                                *key,
+                                json.dumps(
+                                    [row[column] for column in header or ()],
+                                    separators=(",", ":"),
+                                ),
+                            ),
                         )
                     except sqlite3.IntegrityError as exc:
                         raise SeedShardValidationError(
                             f"Duplicate cross-model cell key: {key}"
                         ) from exc
                     statuses[status] += 1
-        actual_keys = {
-            tuple(row)
-            for row in connection.execute(
-                'SELECT "model", "seed", "draw", "N", "K" FROM rows'
-            )
-        }
-        if actual_keys != all_expected_keys:
-            raise SeedShardValidationError(
-                "Published panel key set is incomplete"
-            )
+        expected_rows = _validate_complete_design(
+            connection, "Published panel"
+        )
         with temporary_csv.open(
             "w", newline="", encoding="utf-8"
         ) as destination:
-            writer = csv.DictWriter(destination, fieldnames=header or [])
-            writer.writeheader()
+            writer = csv.writer(destination)
+            writer.writerow(header or [])
             for (payload,) in connection.execute(
                 'SELECT payload FROM rows ORDER BY '
                 '"model", "seed", "draw", "N", "K"'
@@ -1119,11 +930,11 @@ def publish_panel(
         panel_manifest["design"]["models"] = expected_models
         panel_manifest["execution"] = {
             "mode": "published-model-finals",
-            "expected_rows": len(all_expected_keys),
+            "expected_rows": expected_rows,
         }
         panel_manifest["completion"] = {
-            "expected_rows": len(all_expected_keys),
-            "materialized_rows": len(all_expected_keys),
+            "expected_rows": expected_rows,
+            "materialized_rows": expected_rows,
             "completed_rows": ok + skipped,
             "failed_rows": failed,
             "status": "complete_with_failures" if failed else "complete",
@@ -1135,22 +946,12 @@ def publish_panel(
             "skipped_count": skipped,
             "passed": panel_passed,
         }
-        panel_manifest["input_artifacts"] = input_artifacts
+        panel_manifest.pop("input_artifacts", None)
         panel_manifest.pop("diagnostics", None)
         temporary_manifest = _write_temporary_manifest(
             target, panel_manifest
         )
         with output_run_lock(target):
-            if _existing_artifact_equivalent(
-                target,
-                expected_keys=all_expected_keys,
-                identity=identity,
-                contract=panel_contract,
-                grids=grids,
-                execution_mode="published-model-finals",
-                input_artifacts=input_artifacts,
-            ):
-                return target
             _publish_pair(temporary_csv, temporary_manifest, target)
         return target
     finally:

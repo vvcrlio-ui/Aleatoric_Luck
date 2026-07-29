@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ast
 import csv
+import inspect
 import json
 import os
+import sqlite3
 import threading
 import time
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -247,6 +251,21 @@ def test_publish_cli_returns_three_when_one_model_final_is_missing(tmp_path):
     assert not (tmp_path / "panel.csv").exists()
 
 
+def test_publish_treats_csv_without_manifest_as_incomplete(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    model_final = finalize_seed_shards(
+        snapshot, panel="panel", model="ols"
+    )
+    manifest_path(model_final).unlink()
+
+    with pytest.raises(
+        SeedShardIncompleteError, match="per-model final is missing"
+    ):
+        publish_panel(snapshot, panel="panel", models=("ols",))
+
+    assert not (tmp_path / "panel.csv").exists()
+
+
 def test_publish_rejects_incomplete_cross_model_key_set(tmp_path):
     snapshot = _snapshot(tmp_path, models=("ols", "ridge"))
     for model in ("ols", "ridge"):
@@ -262,25 +281,29 @@ def test_publish_rejects_incomplete_cross_model_key_set(tmp_path):
         publish_panel(snapshot, panel="panel", models=("ols", "ridge"))
 
 
-def test_finalize_and_publish_noop_for_equivalent_existing_results(tmp_path):
+def test_finalize_and_publish_reruns_replace_equivalent_existing_results(tmp_path):
     snapshot = _snapshot(tmp_path, models=("ols", "ridge"))
     model_out = finalize_seed_shards(snapshot, panel="panel", model="ols")
-    model_mtime = model_out.stat().st_mtime_ns
+    model_inode = model_out.stat().st_ino
+    model_manifest_inode = manifest_path(model_out).stat().st_ino
     assert (
         finalize_seed_shards(snapshot, panel="panel", model="ols")
         == model_out
     )
-    assert model_out.stat().st_mtime_ns == model_mtime
+    assert model_out.stat().st_ino != model_inode
+    assert manifest_path(model_out).stat().st_ino != model_manifest_inode
     finalize_seed_shards(snapshot, panel="panel", model="ridge")
     panel_out = publish_panel(
         snapshot, panel="panel", models=("ols", "ridge")
     )
-    panel_mtime = panel_out.stat().st_mtime_ns
+    panel_inode = panel_out.stat().st_ino
+    panel_manifest_inode = manifest_path(panel_out).stat().st_ino
     assert (
         publish_panel(snapshot, panel="panel", models=("ols", "ridge"))
         == panel_out
     )
-    assert panel_out.stat().st_mtime_ns == panel_mtime
+    assert panel_out.stat().st_ino != panel_inode
+    assert manifest_path(panel_out).stat().st_ino != panel_manifest_inode
 
 
 @pytest.mark.parametrize("operation", ["finalize", "publish"])
@@ -397,7 +420,7 @@ def test_concurrent_publication_loser_observes_whole_old_pair(tmp_path):
     assert _read_json(target_manifest) == {"generation": "new"}
 
 
-def test_finalizer_refuses_noop_when_shard_provenance_changes(tmp_path):
+def test_finalizer_republishes_when_shard_content_changes(tmp_path):
     snapshot = _snapshot(tmp_path)
     target = finalize_seed_shards(snapshot, panel="panel", model="ols")
     original = target.read_bytes()
@@ -416,13 +439,7 @@ def test_finalizer_refuses_noop_when_shard_provenance_changes(tmp_path):
     changed_rows = list(csv.DictReader(target.open(encoding="utf-8")))
     assert target.read_bytes() != original
     assert [row["metric"] for row in changed_rows] == ["1.0", "2.0"]
-    provenance = _read_json(manifest_path(target))["input_artifacts"]
-    assert provenance[1] == {
-        "path": str(shard.resolve()),
-        "rows": 1,
-        "seed": 22,
-        "updated_at": "2026-07-29T01:00:22+00:00",
-    }
+    assert "input_artifacts" not in _read_json(manifest_path(target))
 
 
 def test_cli_distinguishes_oserror_from_contract_violation(
@@ -452,26 +469,30 @@ def test_cli_distinguishes_oserror_from_contract_violation(
     assert capsys.readouterr().err.strip() == "contract mismatch"
 
 
-def test_missing_reports_publication_residuals_for_snapshot_targets(tmp_path):
+def test_missing_treats_unreadable_shard_as_invalid_and_continues(
+    tmp_path, monkeypatch
+):
     snapshot = _snapshot(tmp_path)
-    model_target = tmp_path / ".seed-final" / "panel" / "ols.csv"
-    panel_target = tmp_path / "panel.csv"
-    residuals = (
-        model_target.with_name(f".{model_target.name}.publishing"),
-        model_target.with_name(f".{model_target.name}.previous"),
-        manifest_path(panel_target).with_name(
-            f".{manifest_path(panel_target).name}.previous"
-        ),
+    unreadable = manifest_path(
+        tmp_path / ".seed-shards" / "panel" / "ols" / "seed-11.csv"
     )
-    for residual in residuals:
-        residual.parent.mkdir(parents=True, exist_ok=True)
-        residual.touch()
+    missing = tmp_path / ".seed-shards" / "panel" / "ols" / "seed-22.csv"
+    missing.unlink()
+    manifest_path(missing).unlink()
+    real_load = seed_shards._load_json
 
-    diagnosis = diagnose_missing(snapshot)
+    def fail_one(path, label):
+        if path == unreadable:
+            raise OSError("unreadable shard")
+        return real_load(path, label)
 
-    assert diagnosis["publication_residuals"] == [
-        str(path.resolve()) for path in sorted(residuals)
-    ]
+    monkeypatch.setattr(seed_shards, "_load_json", fail_one)
+
+    assert diagnose_missing(snapshot) == {
+        "missing_master_indices": [1],
+        "incomplete_master_indices": [],
+        "invalid_targets": [0],
+    }
 
 
 @pytest.mark.parametrize(
@@ -578,6 +599,37 @@ def test_finalizer_rejects_duplicate_cell_key(tmp_path):
         finalize_seed_shards(snapshot, panel="panel", model="ols")
 
 
+def test_key_completeness_is_checked_by_sql_without_resident_sets():
+    connection = sqlite3.connect(":memory:")
+    seed_shards._create_key_tables(connection)
+    connection.execute(
+        "INSERT INTO expected VALUES (?, ?, ?, ?, ?)",
+        ("ols", 11, 0, 10, 1),
+    )
+    with pytest.raises(SeedShardValidationError, match="incomplete cell keys"):
+        seed_shards._validate_complete_design(connection, "test")
+    connection.execute(
+        "INSERT INTO rows VALUES (?, ?, ?, ?, ?, ?)",
+        ("ols", 11, 0, 10, 1, "{}"),
+    )
+    assert seed_shards._validate_complete_design(connection, "test") == 1
+    connection.close()
+
+    for function in (finalize_seed_shards, publish_panel):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        assert not any(
+            isinstance(node, ast.Name)
+            and node.id
+            in {
+                "expected_keys",
+                "actual_keys",
+                "all_expected_keys",
+                "model_expected_keys",
+            }
+            for node in ast.walk(tree)
+        )
+
+
 def test_failure_policy_is_aggregated_per_model_and_panel(tmp_path):
     snapshot = _snapshot(tmp_path, models=("ols", "ridge"))
     failed_shard = (
@@ -623,13 +675,12 @@ def test_finalizer_removes_single_shard_diagnostics(tmp_path):
     assert "diagnostics" not in _read_json(manifest_path(final))
 
 
-def test_atomic_publication_failure_preserves_previous_pair_and_shards(
+def test_manifest_publication_failure_leaves_csv_and_shards_for_rerun(
     tmp_path, monkeypatch
 ):
     snapshot = _snapshot(tmp_path)
     target = finalize_seed_shards(snapshot, panel="panel", model="ols")
     old_csv = target.read_bytes()
-    old_manifest = manifest_path(target).read_bytes()
     manifest_payload = _read_json(manifest_path(target))
     manifest_payload["execution"]["mode"] = "obsolete"
     _write_json(manifest_path(target), manifest_payload)
@@ -652,8 +703,10 @@ def test_atomic_publication_failure_preserves_previous_pair_and_shards(
 
     assert target.read_bytes() == old_csv
     assert manifest_path(target).read_bytes() == preserved_manifest
-    assert old_manifest != preserved_manifest
-    assert not target.with_name(f".{target.name}.publishing").exists()
+    assert not target.with_name(f".{target.name}.previous").exists()
+    assert not manifest_path(target).with_name(
+        f".{manifest_path(target).name}.previous"
+    ).exists()
     for seed in (11, 22):
         shard = (
             tmp_path / ".seed-shards" / "panel" / "ols" / f"seed-{seed}.csv"
@@ -715,25 +768,29 @@ def test_recovery_indices_include_only_missing_or_incomplete_class_members(
 
 
 @pytest.mark.parametrize("mutation", ["identity", "legacy"])
-def test_existing_incompatible_or_legacy_final_is_not_replaced(
+def test_existing_incompatible_or_legacy_final_is_republished(
     tmp_path, mutation
 ):
     snapshot = _snapshot(tmp_path)
     target = finalize_seed_shards(snapshot, panel="panel", model="ols")
-    previous_csv = target.read_bytes()
+    previous_inode = target.stat().st_ino
     payload = _read_json(manifest_path(target))
     if mutation == "identity":
         payload["identity"]["data_version"] = "other"
     else:
         payload["file_sha256"] = "obsolete"
     _write_json(manifest_path(target), payload)
-    previous_manifest = manifest_path(target).read_bytes()
+    previous_manifest_inode = manifest_path(target).stat().st_ino
 
-    with pytest.raises(SeedShardValidationError):
-        finalize_seed_shards(snapshot, panel="panel", model="ols")
+    assert finalize_seed_shards(
+        snapshot, panel="panel", model="ols"
+    ) == target
 
-    assert target.read_bytes() == previous_csv
-    assert manifest_path(target).read_bytes() == previous_manifest
+    repaired = _read_json(manifest_path(target))
+    assert target.stat().st_ino != previous_inode
+    assert manifest_path(target).stat().st_ino != previous_manifest_inode
+    assert repaired["identity"]["data_version"] == "data-v1"
+    assert "file_sha256" not in repaired
 
 
 @pytest.mark.parametrize("mutation", ["missing_row", "invalid_status"])
@@ -746,7 +803,7 @@ def test_finalizer_rejects_incomplete_rows_and_invalid_status(
     if mutation == "missing_row":
         with shard.open("w", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=list(rows[0])).writeheader()
-        match = "Merged cell keys differ"
+        match = "incomplete cell keys"
     else:
         rows[0]["status"] = "unknown"
         _rewrite_rows(shard, rows)

@@ -201,7 +201,6 @@ class NKGridConfig:
     experiment_id: str = "nkgrid-test-v1"
     data_version: str = "test-data-v1"
     model_spec_version: str = "nkgrid-test-models-v1"
-    resume_group: str | None = None
     repeat_plan: tuple[tuple[int, int], ...] | None = None
     n_grid: tuple[int, ...] | None = None
     k_grid: tuple[int, ...] | None = None
