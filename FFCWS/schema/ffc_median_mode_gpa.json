@@ -6,7 +6,6 @@
   "feature_manifest_version": 1,
   "feature_universe": {
     "definition_file": "ffc_median_mode.feature_universe.json",
-    "definition_sha256": "9a66f07ba1558833d5088ee58e1f7521e3e2fe065bce66824e06c680c6d4ea45",
     "mode": "train_pool_screened"
   },
   "group_column": null,

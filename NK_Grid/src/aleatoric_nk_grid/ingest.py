@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,10 +56,6 @@ def canonical_json(value: Any) -> str:
     )
 
 
-def semantic_sha256(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
-
-
 def _resolve_path(value: str | None, directory: Path) -> Path | None:
     if value is None:
         return None
@@ -102,7 +97,7 @@ class InputSchema:
     max_train_outcome_missing_ratio: float
     max_test_outcome_missing_ratio: float
     continuous_priors: Mapping[str, float]
-    semantic_hash: str
+    semantic_contract: Mapping[str, Any]
     raw: Mapping[str, Any]
 
 
@@ -204,11 +199,9 @@ def load_schema(path: Path) -> InputSchema:
     if not isinstance(universe, dict) or set(universe) != {
         "mode",
         "definition_file",
-        "definition_sha256",
     }:
         raise ValueError(
-            "schema.feature_universe must contain exactly mode, definition_file, "
-            "and definition_sha256"
+            "schema.feature_universe must contain exactly mode and definition_file"
         )
     if universe["mode"] not in {"fixed_a_priori", "train_pool_screened"}:
         raise ValueError("Unknown feature_universe.mode")
@@ -218,9 +211,9 @@ def load_schema(path: Path) -> InputSchema:
         )
     if not all(
         isinstance(universe[key], str) and universe[key]
-        for key in ("definition_file", "definition_sha256")
+        for key in ("definition_file",)
     ):
-        raise ValueError("feature_universe definition_file/hash must be non-empty strings")
+        raise ValueError("feature_universe definition_file must be a non-empty string")
     imputation = document["imputation"]
     if not isinstance(imputation, dict):
         raise ValueError("schema.imputation must be an object")
@@ -279,6 +272,16 @@ def load_schema(path: Path) -> InputSchema:
     directory = path.parent
     table = _resolve_path(document["table"], directory)
     assert table is not None
+    definition_path = _resolve_path(universe["definition_file"], directory)
+    assert definition_path is not None
+    try:
+        feature_universe_definition = json.loads(
+            definition_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "feature_universe definition_file is invalid JSON"
+        ) from exc
     raw_semantics = {
         key: value
         for key, value in document.items()
@@ -293,9 +296,8 @@ def load_schema(path: Path) -> InputSchema:
     ]
     raw_semantics["continuous_priors"] = normalized_priors
     raw_semantics["feature_universe"] = {
-        key: value
-        for key, value in document["feature_universe"].items()
-        if key != "definition_file"
+        "mode": universe["mode"],
+        "definition": feature_universe_definition,
     }
     return InputSchema(
         path=path,
@@ -322,7 +324,7 @@ def load_schema(path: Path) -> InputSchema:
             "max_test_outcome_missing_ratio"
         ],
         continuous_priors=normalized_priors,
-        semantic_hash=semantic_sha256(raw_semantics),
+        semantic_contract=raw_semantics,
         raw=raw_semantics,
     )
 

@@ -18,7 +18,6 @@ dependencies = [
 
 [project.optional-dependencies]
 models = [
-  "bartpy2==0.0.2",
   "lightgbm==4.6.0",
   "xgboost==3.2.0",
 ]

@@ -6,7 +6,8 @@ import pytest
 import yaml
 
 from aleatoric_nk_grid.model_registry import (
-    BartPyRegressor,
+    MODEL_NAMES,
+    REMOVED_MODEL_NAMES,
     load_algorithm_version,
     load_model_params,
     make_model,
@@ -69,23 +70,29 @@ def test_elastic_net_search_keeps_range_with_reduced_alpha_count():
     assert selected["max_cv_folds"] == 5
 
 
-def test_bart_environment_override_is_resolved_at_model_construction(
-    monkeypatch,
-):
-    selected = load_model_params(
-        MODEL_PARAMS, task="regression", models=("bart",)
-    )
+def test_removed_model_is_absent_from_the_model_space():
+    assert "bart" not in MODEL_NAMES
+    assert "bart" in REMOVED_MODEL_NAMES
+    for task in ("regression", "classification"):
+        assert "bart" not in _document()[task]
+
+
+@pytest.mark.parametrize("task", ["regression", "classification"])
+def test_requesting_a_removed_model_fails_with_a_self_explaining_error(task):
+    # A stale panel must fail loudly rather than silently producing results for
+    # one model fewer than it asked for.
+    with pytest.raises(ValueError, match=r"removed from the model space"):
+        load_model_params(MODEL_PARAMS, task=task, models=("bart",))
+    with pytest.raises(ValueError, match=r"plans/remove-bart\.md"):
+        make_model("bart", seed=1, n_jobs=1, task=task, params={})
+
+
+def test_removed_model_environment_overrides_are_gone(monkeypatch):
+    # BART_* used to be resolved at construction time; nothing may read them now.
     monkeypatch.setenv("BART_N_TREES", "17")
-    resolved = resolved_model_params(selected)
-    model = make_model(
-        "bart",
-        seed=1,
-        n_jobs=1,
-        task="regression",
-        params=selected["bart"],
+    selected = load_model_params(
+        MODEL_PARAMS, task="regression", models=("random_forest",)
     )
-    assert resolved["bart"]["n_trees"] == 17
-    assert model.n_trees == 17
-    # Direct construction has static documented defaults and no hidden
-    # import-time environment state.
-    assert BartPyRegressor().n_trees == 200
+    resolved = resolved_model_params(selected)
+    assert "bart" not in resolved
+    assert all("n_trees" not in params for params in resolved.values())

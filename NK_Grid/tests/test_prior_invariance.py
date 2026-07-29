@@ -62,8 +62,6 @@ def _fast_params(model_name: str) -> dict:
             lgbm_n_estimators=5,
             lgbm_min_data_in_leaf=2,
         )
-    elif model_name == "bart":
-        params.update(n_trees=5, n_samples=10, n_burn=5, n_chains=1)
     return params
 
 

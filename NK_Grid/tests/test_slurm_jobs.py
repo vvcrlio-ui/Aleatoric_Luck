@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shlex
@@ -21,10 +20,15 @@ from aleatoric_nk_grid.slurm_jobs import (
     SlurmJob,
     _expand_array_indices,
     apply_worker_overrides,
+    build_slurm_jobs,
+    chunk_master_indices,
+    dependency_never_satisfied_diagnostics,
+    load_chunk_map,
     load_job_snapshot,
     require_large_run_authorization,
     resource_class_for_model,
     resource_class_indices,
+    write_chunk_map,
     write_job_snapshot,
     write_submission_receipt,
 )
@@ -66,7 +70,10 @@ def _write_snapshot(path: Path, jobs: list[SlurmJob]) -> None:
             {
                 "panel": job.panel,
                 "model": job.model,
+                "seed": job.seed,
+                "draws": list(job.draws),
                 "config": config_to_json(job.config),
+                "final_out": str(job.final_out),
             }
             for job in jobs
         ],
@@ -79,11 +86,14 @@ def _jobs_for_models(tmp_path: Path, models: tuple[str, ...]) -> list[SlurmJob]:
         SlurmJob(
             panel=f"panel-{index}",
             model=model,
+            seed=123,
+            draws=(0,),
             config=_config(
                 tmp_path,
                 models=(model,),
                 out=tmp_path / f"result-{index}-{model}.csv",
             ),
+            final_out=tmp_path / f"final-{index}-{model}.csv",
         )
         for index, model in enumerate(models)
     ]
@@ -133,8 +143,13 @@ def test_snapshot_freezes_explicit_slurm_rerun_policy(
     monkeypatch,
     rerun_completed,
 ):
-    frozen = SlurmJob("panel", "ols", _config(tmp_path))
+    frozen = SlurmJob("panel", "ols", 123, (0,), _config(tmp_path), tmp_path / "final.csv")
     monkeypatch.setattr(slurm_jobs, "build_slurm_jobs", lambda path: [frozen])
+    monkeypatch.setattr(
+        slurm_jobs,
+        "resolved_panels",
+        lambda path: [("panel", _config(tmp_path))],
+    )
     snapshot = tmp_path / "jobs.json"
 
     written = write_job_snapshot(
@@ -151,9 +166,12 @@ def test_snapshot_freezes_explicit_slurm_rerun_policy(
     assert payload["execution_policy"] == {
         "rerun_completed": rerun_completed
     }
+    assert payload["panel_outputs"] == {
+        "panel": str(tmp_path / "result.csv")
+    }
 
 
-def test_legacy_v1_snapshot_without_rerun_field_still_loads(tmp_path):
+def test_snapshot_requires_explicit_seed_draws_and_final_output(tmp_path):
     config_payload = config_to_json(_config(tmp_path))
     config_payload.pop("rerun_completed")
     snapshot = tmp_path / "legacy.json"
@@ -173,9 +191,8 @@ def test_legacy_v1_snapshot_without_rerun_field_still_loads(tmp_path):
         encoding="utf-8",
     )
 
-    loaded = load_job_snapshot(snapshot)
-
-    assert loaded[0].config.rerun_completed is True
+    with pytest.raises(KeyError):
+        load_job_snapshot(snapshot)
 
 
 def test_resource_classes_are_mutually_exclusive_and_exhaust_all_models(
@@ -194,11 +211,10 @@ def test_resource_classes_are_mutually_exclusive_and_exhaust_all_models(
     for index, job in enumerate(jobs):
         assert index in grouped[resource_class_for_model(job.model)]
 
-    assert {
-        jobs[index].model for index in grouped["serial"]
-    } == {"lightgbm", "super_learner"}
-    assert {jobs[index].model for index in grouped["bart"]} == {"bart"}
+    assert {jobs[index].model for index in grouped["serial"]} == {"lightgbm"}
+    assert {jobs[index].model for index in grouped["super_learner"]} == {"super_learner"}
     assert grouped["parallel"]
+    assert RESOURCE_CLASSES == ("parallel", "serial", "super_learner")
 
 
 def test_resource_class_indices_rejects_unknown_class(tmp_path):
@@ -207,6 +223,179 @@ def test_resource_class_indices_rejects_unknown_class(tmp_path):
             _jobs_for_models(tmp_path, ("ols",)),
             "gpu",
         )
+
+
+def test_per_model_final_outputs_are_unique_within_one_panel(
+    tmp_path, monkeypatch
+):
+    panel_config = _config(
+        tmp_path,
+        models=("ols", "ridge"),
+        out=tmp_path / "panel.csv",
+    )
+    monkeypatch.setattr(
+        slurm_jobs,
+        "resolved_panels",
+        lambda path: [("panel", panel_config)],
+    )
+
+    jobs = build_slurm_jobs(tmp_path / "panels.yaml")
+
+    final_by_model = {job.model: job.final_out for job in jobs}
+    assert final_by_model == {
+        "ols": tmp_path / ".seed-final" / "panel" / "ols.csv",
+        "ridge": tmp_path / ".seed-final" / "panel" / "ridge.csv",
+    }
+
+
+@pytest.mark.parametrize(
+    ("indices", "maximum", "expected"),
+    [
+        ((), 4, ()),
+        ((7,), 4, ((7,),)),
+        ((0, 1, 2, 3), 4, ((0, 1, 2, 3),)),
+        ((0, 1, 2, 3, 4), 4, ((0, 1, 2, 3), (4,))),
+        ((12, 17, 25, 90, 103), 2, ((12, 17), (25, 90), (103,))),
+    ],
+)
+def test_chunk_master_indices_obeys_max_array_size(
+    indices, maximum, expected
+):
+    assert chunk_master_indices(indices, maximum) == expected
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [],
+        [1, 1],
+        [-1],
+        [True],
+        [1.5],
+        ["1"],
+    ],
+)
+def test_chunk_map_rejects_empty_duplicate_negative_or_noninteger(
+    tmp_path, values
+):
+    chunk_map = tmp_path / "chunk.json"
+    chunk_map.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "snapshot": str((tmp_path / "jobs.json").resolve()),
+                "resource_class": "parallel",
+                "master_indices": values,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Invalid Slurm chunk map"):
+        load_chunk_map(chunk_map)
+
+
+def test_chunk_map_rejects_wrong_snapshot_and_resource_class(tmp_path):
+    snapshot = tmp_path / "jobs.json"
+    chunk_map = write_chunk_map(snapshot, "parallel", (3, 7), 0)
+    with pytest.raises(ValueError, match="different snapshot"):
+        load_chunk_map(
+            chunk_map, snapshot_path=tmp_path / "other.json"
+        )
+    with pytest.raises(ValueError, match="different resource class"):
+        load_chunk_map(
+            chunk_map,
+            snapshot_path=snapshot,
+            resource_class="serial",
+        )
+
+
+def test_worker_rejects_chunk_local_index_out_of_bounds(
+    tmp_path, monkeypatch
+):
+    snapshot = tmp_path / "jobs.json"
+    _write_snapshot(snapshot, _jobs_for_models(tmp_path, ("ols",)))
+    chunk_map = write_chunk_map(snapshot, "parallel", (0,), 0)
+    monkeypatch.setattr(
+        slurm_jobs,
+        "run_nk_grid",
+        lambda *args, **kwargs: pytest.fail("worker must not run"),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        slurm_jobs.main(
+            [
+                "run",
+                "--snapshot",
+                str(snapshot),
+                "--chunk-map",
+                str(chunk_map),
+                "--index",
+                "1",
+            ]
+        )
+    assert error.value.code == 2
+
+
+def test_dependency_never_satisfied_targets_only_current_snapshot_receipts(
+    tmp_path, monkeypatch
+):
+    snapshot = tmp_path / "jobs.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    other_snapshot = tmp_path / "other.json"
+    other_snapshot.write_text("{}", encoding="utf-8")
+    for job_id, owner in (
+        ("101", snapshot),
+        ("102", snapshot),
+        ("999", other_snapshot),
+    ):
+        (tmp_path / f"slurm-{job_id}.json").write_text(
+            json.dumps(
+                {
+                    "format_version": 1,
+                    "snapshot": str(owner.resolve()),
+                    "slurm_job_id": job_id,
+                }
+            ),
+            encoding="utf-8",
+        )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[0] == "squeue":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    "101|DependencyNeverSatisfied|PENDING\n"
+                    "102|Resources|PENDING\n"
+                    "999|DependencyNeverSatisfied|PENDING\n"
+                    "777|DependencyNeverSatisfied|PENDING\n"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(slurm_jobs.subprocess, "run", fake_run)
+    payload = dependency_never_satisfied_diagnostics(
+        snapshot, cleanup=True
+    )
+
+    assert payload == {
+        "snapshot": str(snapshot.resolve()),
+        "receipt_job_ids": ["101", "102"],
+        "dependency_never_satisfied_job_ids": ["101"],
+        "cleaned_job_ids": ["101"],
+    }
+    assert calls[0][0] == [
+        "squeue",
+        "--noheader",
+        "--jobs",
+        "101,102",
+        "--format",
+        "%A|%r|%T",
+    ]
+    assert calls[1][0] == ["scancel", "101"]
 
 
 @pytest.mark.parametrize(
@@ -265,7 +454,7 @@ def test_run_command_applies_safe_worker_policy_and_runtime_cpus(
     snapshot = tmp_path / "jobs.json"
     _write_snapshot(
         snapshot,
-        [SlurmJob("panel", "ols", _config(tmp_path, rerun_completed=True))],
+        [SlurmJob("panel", "ols", 123, (0,), _config(tmp_path, rerun_completed=True), tmp_path / "final.csv")],
     )
     captured = {}
 
@@ -307,7 +496,7 @@ def test_run_command_handles_stop_marker_after_engine_returns(
     snapshot = tmp_path / "jobs.json"
     _write_snapshot(
         snapshot,
-        [SlurmJob("panel", "ols", _config(tmp_path))],
+        [SlurmJob("panel", "ols", 123, (0,), _config(tmp_path), tmp_path / "final.csv")],
     )
     stop_marker = tmp_path / "stop-requested"
     stop_marker.touch()
@@ -348,7 +537,7 @@ def test_receipt_records_runtime_policy_resources_and_reproducible_rerun(
     monkeypatch,
 ):
     snapshot = tmp_path / "jobs.json"
-    _write_snapshot(snapshot, [SlurmJob("panel", "ols", _config(tmp_path))])
+    _write_snapshot(snapshot, [SlurmJob("panel", "ols", 123, (0,), _config(tmp_path), tmp_path / "final.csv")])
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
     worker.parent.mkdir(parents=True)
     worker.write_text("#!/bin/bash\n", encoding="utf-8")
@@ -375,9 +564,8 @@ def test_receipt_records_runtime_policy_resources_and_reproducible_rerun(
 
     payload = json.loads(receipt.read_text(encoding="utf-8"))
     command = payload["rerun_command_template"]
-    assert payload["snapshot_sha256"] == hashlib.sha256(
-        snapshot.read_bytes()
-    ).hexdigest()
+    assert "snapshot_sha256" not in payload
+    assert "worker_script_sha256" not in payload
     assert payload["execution_paths"]["engine_dir"] == str(engine_dir)
     assert payload["execution_policy"] == {
         "rerun_completed": True,
@@ -407,18 +595,45 @@ def test_receipt_records_runtime_policy_resources_and_reproducible_rerun(
     assert "<task-index>" not in payload["jobs"][0]["rerun_command"]
 
 
+def test_chunk_receipt_rerun_uses_local_not_sparse_master_index(tmp_path):
+    snapshot = tmp_path / "jobs.json"
+    _write_snapshot(
+        snapshot, _jobs_for_models(tmp_path, ("ols", "ridge"))
+    )
+    chunk_map = write_chunk_map(snapshot, "parallel", (1,), 0)
+    worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
+    worker.parent.mkdir(parents=True)
+    worker.write_text("#!/bin/bash\n", encoding="utf-8")
+
+    receipt = write_submission_receipt(
+        snapshot,
+        slurm_job_id="12345",
+        array_spec="0",
+        worker_script=worker,
+        allow_large_run=False,
+        resource_class="parallel",
+        chunk_map=chunk_map,
+    )
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+
+    assert payload["chunk"]["master_indices"] == [1]
+    assert payload["jobs"][0]["index"] == 1
+    assert "--array=0" in payload["jobs"][0]["rerun_command"]
+    assert "--array=1" not in payload["jobs"][0]["rerun_command"]
+
+
 def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy(
     tmp_path,
     monkeypatch,
 ):
     for key in slurm_jobs.OPTIONAL_SLURM_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("BART_N_TREES", "17")
+    monkeypatch.setenv("RF_N_ESTIMATORS", "17")
     monkeypatch.setenv("ENGINE_DIR", str(tmp_path / "engine"))
     monkeypatch.setenv("VENV", str(tmp_path / "venv"))
     monkeypatch.setenv("PYTHON", str(tmp_path / "venv" / "bin" / "python"))
     snapshot = tmp_path / "jobs.json"
-    _write_snapshot(snapshot, [SlurmJob("panel", "ols", _config(tmp_path))])
+    _write_snapshot(snapshot, [SlurmJob("panel", "ols", 123, (0,), _config(tmp_path), tmp_path / "final.csv")])
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
     worker.parent.mkdir(parents=True)
     worker.write_text("#!/bin/bash\n", encoding="utf-8")
@@ -438,7 +653,7 @@ def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy
     assert set(submission_environment) == set(
         slurm_jobs.OPTIONAL_SLURM_ENV_KEYS
     )
-    assert submission_environment["BART_N_TREES"] == "17"
+    assert submission_environment["RF_N_ESTIMATORS"] == "17"
     assert submission_environment["XGB_MAX_ROUNDS"] is None
     assert payload["execution_policy"]["advance_signal_seconds"] == 300
     assert payload["execution_policy"]["requeue_watchdog_seconds"] == 0
@@ -450,7 +665,7 @@ def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy
         arguments = shlex.split(command)
         sbatch_position = arguments.index("sbatch")
         frozen_environment = arguments[:sbatch_position]
-        assert "BART_N_TREES=17" in frozen_environment
+        assert "RF_N_ESTIMATORS=17" in frozen_environment
         assert any(
             frozen_environment[index : index + 2]
             == ["-u", "XGB_MAX_ROUNDS"]
@@ -466,7 +681,9 @@ def test_receipt_freezes_present_and_missing_model_environment_and_signal_policy
     ("resource_class", "array_spec", "match"),
     [
         ("serial", "0", "do not belong"),
-        ("bart", "0", "do not belong"),
+        # The retired BART class must now be rejected as unknown, not silently
+        # accepted as an empty array.
+        ("bart", "0", "Unknown Slurm resource class"),
         ("gpu", "0", "Unknown Slurm resource class"),
     ],
 )
@@ -479,7 +696,7 @@ def test_receipt_rejects_unknown_or_mismatched_resource_class(
     snapshot = tmp_path / "jobs.json"
     _write_snapshot(
         snapshot,
-        _jobs_for_models(tmp_path, ("ols", "lightgbm", "bart")),
+        _jobs_for_models(tmp_path, ("ols", "lightgbm", "super_learner")),
     )
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
     worker.parent.mkdir(parents=True)
@@ -500,7 +717,7 @@ def test_receipt_rejects_array_indices_outside_snapshot(tmp_path):
     snapshot = tmp_path / "jobs.json"
     _write_snapshot(
         snapshot,
-        _jobs_for_models(tmp_path, ("ols", "lightgbm", "bart")),
+        _jobs_for_models(tmp_path, ("ols", "lightgbm", "super_learner")),
     )
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
     worker.parent.mkdir(parents=True)
@@ -546,7 +763,7 @@ def test_receipt_accepts_only_indices_from_declared_resource_class(tmp_path):
         snapshot,
         _jobs_for_models(
             tmp_path,
-            ("ols", "lightgbm", "bart", "ridge", "super_learner"),
+            ("ols", "lightgbm", "extra_trees", "ridge", "super_learner"),
         ),
     )
     worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
@@ -556,7 +773,7 @@ def test_receipt_accepts_only_indices_from_declared_resource_class(tmp_path):
     receipt = write_submission_receipt(
         snapshot,
         slurm_job_id="12345",
-        array_spec="1,4%1",
+        array_spec="1%1",
         worker_script=worker,
         allow_large_run=False,
         resource_class="serial",
@@ -564,14 +781,42 @@ def test_receipt_accepts_only_indices_from_declared_resource_class(tmp_path):
     )
 
     payload = json.loads(receipt.read_text(encoding="utf-8"))
-    assert payload["array"] == "1,4%1"
-    assert payload["job_count"] == 2
+    assert payload["array"] == "1%1"
+    assert payload["job_count"] == 1
     assert payload["snapshot_job_count"] == 5
     assert payload["resources"]["class"] == "serial"
     assert payload["resources"]["cpus_per_task"] == 1
+    assert [(job["index"], job["model"]) for job in payload["jobs"]] == [(1, "lightgbm")]
+
+
+def test_super_learner_receipt_records_independent_class_and_cpu(tmp_path):
+    snapshot = tmp_path / "jobs.json"
+    _write_snapshot(
+        snapshot,
+        _jobs_for_models(
+            tmp_path,
+            ("ols", "lightgbm", "extra_trees", "ridge", "super_learner"),
+        ),
+    )
+    worker = tmp_path / "engine" / "slurm" / "run_nk_grid.sbatch"
+    worker.parent.mkdir(parents=True)
+    worker.write_text("#!/bin/bash\n", encoding="utf-8")
+
+    receipt = write_submission_receipt(
+        snapshot,
+        slurm_job_id="12345",
+        array_spec="4%1",
+        worker_script=worker,
+        allow_large_run=False,
+        resource_class="super_learner",
+        cpus_per_task=4,
+    )
+
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["resources"]["class"] == "super_learner"
+    assert payload["resources"]["cpus_per_task"] == 4
     assert [(job["index"], job["model"]) for job in payload["jobs"]] == [
-        (1, "lightgbm"),
-        (4, "super_learner"),
+        (4, "super_learner")
     ]
 
 
@@ -580,7 +825,10 @@ def test_large_run_authorization_estimates_each_job_once(tmp_path, monkeypatch):
         SlurmJob(
             f"panel-{index}",
             "ols",
+            123,
+            (0,),
             _config(tmp_path, out=tmp_path / f"result-{index}.csv"),
+            tmp_path / f"final-{index}.csv",
         )
         for index in range(3)
     ]
@@ -600,6 +848,131 @@ def test_large_run_authorization_estimates_each_job_once(tmp_path, monkeypatch):
 def _write_executable(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    ("explicit_maximum", "scontrol_output", "expected_code"),
+    [
+        (None, "MaxArraySize = 2\n", 0),
+        (None, "ClusterName = synthetic\n", 1),
+        ("2", "must-not-be-read\n", 0),
+    ],
+    ids=("auto-detect", "auto-detect-fails", "explicit-override"),
+)
+def test_submitter_max_array_size_detection_and_override(
+    tmp_path,
+    explicit_maximum,
+    scontrol_output,
+    expected_code,
+):
+    engine = tmp_path / "engine"
+    (engine / "slurm").mkdir(parents=True)
+    (engine / "slurm" / "run_nk_grid.sbatch").write_text(
+        "#!/bin/bash\n", encoding="utf-8"
+    )
+    manifest = tmp_path / "panels.yaml"
+    manifest.write_text("panels: []\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python_log = tmp_path / "python.log"
+    sbatch_log = tmp_path / "sbatch.log"
+    scontrol_log = tmp_path / "scontrol.log"
+    fake_python = tmp_path / "fake-python"
+    _write_executable(
+        fake_python,
+        """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_PYTHON_LOG"
+if [ "$1" = "-c" ]; then exit 0; fi
+if [ "$3" = "snapshot" ]; then echo 3; exit 0; fi
+if [ "$3" = "indices" ]; then
+  case "$*" in
+    *"--resource-class parallel"*) echo "0,1,2" ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "chunk-map" ]; then
+  case "$*" in
+    *"--chunk-ordinal 0"*) echo /synthetic/chunk-0.json ;;
+    *"--chunk-ordinal 1"*) echo /synthetic/chunk-1.json ;;
+    *) exit 8 ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "receipt" ]; then echo /synthetic/receipt.json; exit 0; fi
+if [ "$3" = "build-map" ]; then echo "/synthetic/$*.json"; exit 0; fi
+if [ "$3" = "map-count" ]; then echo 1; exit 0; fi
+exit 9
+""",
+    )
+    _write_executable(
+        fake_bin / "scontrol",
+        """#!/bin/bash
+printf 'called\n' >> "$FAKE_SCONTROL_LOG"
+printf '%s' "$FAKE_SCONTROL_OUTPUT"
+""",
+    )
+    _write_executable(
+        fake_bin / "sbatch",
+        """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_SBATCH_LOG"
+LINES=0
+if [ -f "$FAKE_SBATCH_LOG" ]; then LINES=$(wc -l < "$FAKE_SBATCH_LOG"); fi
+echo "$((50000 + LINES));cluster"
+""",
+    )
+    command = [
+        "bash",
+        str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
+        "--manifest",
+        str(manifest),
+    ]
+    if explicit_maximum is not None:
+        command.extend(["--max-array-size", explicit_maximum])
+    completed = subprocess.run(
+        command,
+        env={
+            **os.environ,
+            "ENGINE_DIR": str(engine),
+            "VENV": str(tmp_path / "venv"),
+            "PYTHON": str(fake_python),
+            "FAKE_PYTHON_LOG": str(python_log),
+            "FAKE_SBATCH_LOG": str(sbatch_log),
+            "FAKE_SCONTROL_LOG": str(scontrol_log),
+            "FAKE_SCONTROL_OUTPUT": scontrol_output,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == expected_code, completed.stderr
+    if expected_code:
+        assert "Unable to determine Slurm MaxArraySize" in completed.stderr
+        assert not sbatch_log.exists()
+        assert scontrol_log.exists()
+    else:
+        python_calls = python_log.read_text(encoding="utf-8")
+        chunk_calls = [
+            call
+            for call in python_calls.splitlines()
+            if " aleatoric_nk_grid.slurm_jobs chunk-map " in f" {call} "
+        ]
+        assert len(chunk_calls) == 2
+        assert "--max-array-size 2 --chunk-ordinal 0" in python_calls
+        assert "--max-array-size 2 --chunk-ordinal 1" in python_calls
+        sbatch_calls = sbatch_log.read_text(encoding="utf-8").splitlines()
+        assert len(sbatch_calls) == 4
+        assert "--array=0-1" in sbatch_calls[0]
+        assert "--array=0" in sbatch_calls[1]
+        assert "--dependency=afterany:50001" in sbatch_calls[1]
+        assert "--dependency=afterany:50002" in sbatch_calls[2]
+        assert "--dependency=afterany:50003" in sbatch_calls[3]
+        if explicit_maximum is None:
+            assert scontrol_log.exists()
+        else:
+            assert not scontrol_log.exists()
 
 
 @pytest.mark.parametrize("receipt_fails", [False, True])
@@ -628,14 +1001,31 @@ if [ "$1" = "-c" ]; then
   exit 0
 fi
 if [ "$3" = "snapshot" ]; then
-  echo 6
+  echo 5
   exit 0
 fi
 if [ "$3" = "indices" ]; then
   case "$*" in
-    *"--resource-class parallel"*) echo "0,3" ;;
-    *"--resource-class serial"*) echo "1,4" ;;
-    *"--resource-class bart"*) echo "2,5" ;;
+    *"--resource-class parallel"*) echo "0,2,3" ;;
+    *"--resource-class serial"*) echo "1" ;;
+    *"--resource-class super_learner"*) echo "4" ;;
+    *) exit 8 ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "chunk-map" ]; then echo "/synthetic/$*.chunk.json"; exit 0; fi
+if [ "$3" = "build-map" ]; then
+  case "$*" in
+    *"--kind finalizer"*) echo "${FAKE_FINALIZER_MAP}" ;;
+    *"--kind publish"*) echo "${FAKE_PUBLISH_MAP}" ;;
+    *) exit 8 ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "map-count" ]; then
+  case "$*" in
+    *"${FAKE_FINALIZER_MAP}"*) echo 2 ;;
+    *"${FAKE_PUBLISH_MAP}"*) echo 1 ;;
     *) exit 8 ;;
   esac
   exit 0
@@ -677,6 +1067,8 @@ echo "$((98764 + COUNT));cluster-a"
         "FAKE_PYTHON_LOG": str(python_log),
         "FAKE_SBATCH_LOG": str(sbatch_log),
         "FAKE_SBATCH_COUNTER": str(sbatch_counter),
+        "FAKE_FINALIZER_MAP": str(tmp_path / "finalizers.json"),
+        "FAKE_PUBLISH_MAP": str(tmp_path / "publish.json"),
         "FAIL_RECEIPT": "1" if receipt_fails else "0",
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
     }
@@ -685,27 +1077,35 @@ echo "$((98764 + COUNT));cluster-a"
         [
             "bash",
             str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
-            "--manifest",
-            str(manifest),
+        "--manifest",
+        str(manifest),
+        "--max-array-size",
+        "10",
             "--rerun-completed",
             "--max-concurrent-per-class",
             "2",
             "--cpus-per-task",
             "6",
-            "--bart-cpus-per-task",
+            "--super-learner-cpus-per-task",
             "4",
             "--mem",
             "32G",
-            "--bart-mem",
-            "96G",
             "--time",
             "2-00:00:00",
-            "--bart-time",
-            "3-00:00:00",
+            "--finalizer-mem",
+            "12G",
+            "--finalizer-time",
+            "08:00:00",
+            "--publish-mem",
+            "24G",
+            "--publish-time",
+            "1-12:00:00",
             "--max-restarts",
             "3",
             "--requeue-watchdog-seconds",
             "120",
+            "--max-array-size",
+            "10",
         ],
         cwd=unrelated,
         env=environment,
@@ -716,17 +1116,22 @@ echo "$((98764 + COUNT));cluster-a"
 
     assert completed.returncode == 0, completed.stderr
     assert (
-        "Submitted Slurm parallel array 98765 with 2 tasks (array=0,3%2)"
+        "Submitted Slurm parallel array 98765 with 3 tasks "
+        "(array=0-2%2, chunk=0)"
         in completed.stdout
     )
     assert (
-        "Submitted Slurm serial array 98766 with 2 tasks (array=1,4%2)"
+        "Submitted Slurm serial array 98766 with 1 tasks "
+        "(array=0%2, chunk=0)"
         in completed.stdout
     )
     assert (
-        "Submitted Slurm bart array 98767 with 2 tasks (array=2,5%2)"
+        "Submitted Slurm super_learner array 98767 with 1 tasks "
+        "(array=0%2, chunk=0)"
         in completed.stdout
     )
+    assert "Submitted seed finalizer array 98768 with 2 tasks" in completed.stdout
+    assert "Submitted panel publish array 98769 with 1 tasks" in completed.stdout
     if receipt_fails:
         assert "Receipt:" not in completed.stdout
         for job_id in ("98765", "98766", "98767"):
@@ -739,7 +1144,7 @@ echo "$((98764 + COUNT));cluster-a"
     call_starts = [
         index for index, line in enumerate(sbatch_lines) if line.startswith("CALL ")
     ]
-    assert len(call_starts) == 3
+    assert len(call_starts) == 5
     sbatch_calls = []
     for position, start in enumerate(call_starts):
         end = (
@@ -750,34 +1155,52 @@ echo "$((98764 + COUNT));cluster-a"
         sbatch_calls.append(sbatch_lines[start + 1 : end])
 
     expected_resources = [
-        ("--cpus-per-task=6", "--mem=32G", "--time=2-00:00:00", "--array=0,3%2"),
-        ("--cpus-per-task=1", "--mem=32G", "--time=2-00:00:00", "--array=1,4%2"),
-        ("--cpus-per-task=4", "--mem=96G", "--time=3-00:00:00", "--array=2,5%2"),
+        ("--cpus-per-task=6", "--array=0-2%2"),
+        ("--cpus-per-task=1", "--array=0%2"),
+        ("--cpus-per-task=4", "--array=0%2"),
     ]
     snapshot_paths = set()
-    for sbatch_args, resource_args in zip(sbatch_calls, expected_resources):
+    for sbatch_args, resource_args in zip(sbatch_calls[:3], expected_resources):
         assert f"--chdir={engine}" in sbatch_args
         assert "--requeue" in sbatch_args
         assert "--signal=B:USR1@300" in sbatch_args
         assert "--open-mode=append" in sbatch_args
         assert "--export=ALL" in sbatch_args
-        for argument in resource_args:
+        for argument in (*resource_args, "--mem=32G", "--time=2-00:00:00"):
             assert argument in sbatch_args
-        assert sbatch_args[-4] == str(worker)
-        assert sbatch_args[-3].startswith(
+        assert sbatch_args[-5] == str(worker)
+        assert sbatch_args[-4].startswith(
             str(engine / "logs" / "slurm-specs" / "jobs-")
         )
-        assert sbatch_args[-3].endswith(".json")
-        snapshot_paths.add(sbatch_args[-3])
-        assert sbatch_args[-2:] == ["0", "1"]
+        assert sbatch_args[-4].endswith(".json")
+        snapshot_paths.add(sbatch_args[-4])
+        assert sbatch_args[-3:-1] == ["0", "1"]
+        assert sbatch_args[-1].endswith(".chunk.json")
     assert len(snapshot_paths) == 1
+    finalizer_call, publish_call = sbatch_calls[3:]
+    for call in (finalizer_call, publish_call):
+        assert "--requeue" not in call
+        assert "--signal=B:USR1@300" not in call
+        assert "--cpus-per-task=1" in call
+        assert "--mem=32G" not in call
+        assert "--time=2-00:00:00" not in call
+    assert "--mem=12G" in finalizer_call
+    assert "--time=08:00:00" in finalizer_call
+    assert "--mem=24G" in publish_call
+    assert "--time=1-12:00:00" in publish_call
+    assert "--dependency=afterany:98765:98766:98767" in finalizer_call
+    assert "--array=0-1" in finalizer_call
+    assert finalizer_call[-1] == "finalize"
+    assert "--dependency=afterany:98768" in publish_call
+    assert "--array=0" in publish_call
+    assert publish_call[-1] == "publish"
 
     python_calls = python_log.read_text(encoding="utf-8").splitlines()
     assert sum(" snapshot " in f" {call} " for call in python_calls) == 1
-    for resource_class, indices, cpus, memory, time_limit in (
-        ("parallel", "0,3%2", "6", "32G", "2-00:00:00"),
-        ("serial", "1,4%2", "1", "32G", "2-00:00:00"),
-        ("bart", "2,5%2", "4", "96G", "3-00:00:00"),
+    for resource_class, array_spec, cpus in (
+        ("parallel", "0-2%2", "6"),
+        ("serial", "0%2", "1"),
+        ("super_learner", "0%2", "4"),
     ):
         assert any(
             " indices " in f" {call} "
@@ -790,13 +1213,19 @@ echo "$((98764 + COUNT));cluster-a"
             if " receipt " in f" {call} "
             and f"--resource-class {resource_class}" in call
         )
-        assert f"--array-spec {indices}" in receipt_call
+        assert f"--array-spec {array_spec}" in receipt_call
         assert f"--cpus-per-task {cpus}" in receipt_call
-        assert f"--memory {memory}" in receipt_call
-        assert f"--time-limit {time_limit}" in receipt_call
+        assert "--memory 32G" in receipt_call
+        assert "--time-limit 2-00:00:00" in receipt_call
+        assert "--chunk-map-path /synthetic/" in receipt_call
         assert "--max-restarts 3" in receipt_call
         assert "--requeue-watchdog-seconds 120" in receipt_call
         assert "--rerun-completed" in receipt_call
+    assert all(
+        "finalization-receipt" not in call
+        and "finalization-status" not in call
+        for call in python_calls
+    )
 
 
 def test_submitter_rejects_legacy_max_concurrent_option():
@@ -849,22 +1278,37 @@ if [ "$3" = "snapshot" ]; then
     fi
     PREVIOUS="$ARGUMENT"
   done
-  echo 3
+  echo 2
   exit 0
 fi
 if [ "$3" = "count" ]; then
-  echo 3
+  echo 2
   exit 0
 fi
 if [ "$3" = "indices" ]; then
   case "$*" in
     *"--resource-class parallel"*) echo "0" ;;
     *"--resource-class serial"*) echo "1" ;;
-    *"--resource-class bart"*) echo "2" ;;
+    *"--resource-class super_learner"*) echo "" ;;
     *) exit 8 ;;
   esac
   exit 0
 fi
+if [ "$3" = "recovery-indices" ]; then echo "1"; exit 0; fi
+if [ "$3" = "dependency-diagnostics" ]; then
+  echo '{"dependency_never_satisfied_job_ids":[]}'
+  exit 0
+fi
+if [ "$3" = "chunk-map" ]; then echo /synthetic/chunk.json; exit 0; fi
+if [ "$3" = "build-map" ]; then
+  case "$*" in
+    *"--kind finalizer"*) echo /synthetic/finalizers.json ;;
+    *"--kind publish"*) echo /synthetic/publish.json ;;
+    *) exit 8 ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "map-count" ]; then echo 1; exit 0; fi
 if [ "$3" = "receipt" ]; then
   echo /synthetic/parallel-receipt.json
   exit 0
@@ -904,6 +1348,8 @@ echo '41001;cluster-a'
             str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
             "--manifest",
             str(manifest),
+            "--max-array-size",
+            "10",
         ],
         env=environment,
         check=False,
@@ -913,16 +1359,13 @@ echo '41001;cluster-a'
 
     assert completed.returncode == 1
     assert (
-        "Submitted Slurm parallel array 41001 with 1 tasks (array=0)"
+        "Submitted Slurm parallel array 41001 with 1 tasks (array=0, chunk=0)"
         in completed.stdout
     )
     assert "Receipt: /synthetic/parallel-receipt.json" in completed.stdout
     assert "Submitted Slurm serial" not in completed.stdout
-    assert "Submitted Slurm bart" not in completed.stdout
     assert "Failed to submit Slurm serial array." in completed.stderr
-    assert "Already submitted: parallel=41001" in completed.stderr
-    assert "Do not rerun the whole submission command." in completed.stderr
-    assert "recover only this class with --snapshot" in completed.stderr
+    assert "already submitted: parallel=41001" in completed.stderr
     assert sbatch_counter.read_text(encoding="utf-8").strip() == "2"
     receipt_calls = [
         call
@@ -943,6 +1386,8 @@ echo '41001;cluster-a'
             str(snapshot_path),
             "--resource-class",
             "serial",
+            "--max-array-size",
+            "10",
         ],
         env=environment,
         check=False,
@@ -951,10 +1396,18 @@ echo '41001;cluster-a'
     )
 
     assert recovery.returncode == 0, recovery.stderr
-    assert "Submitted Slurm serial array 41001 with 1 tasks (array=1)" in recovery.stdout
+    assert (
+        'Dependency diagnostics: '
+        '{"dependency_never_satisfied_job_ids":[]}'
+    ) in recovery.stdout
+    assert (
+        "Submitted Slurm serial array 41001 with 1 tasks "
+        "(array=0, chunk=0)"
+    ) in recovery.stdout
     assert "Submitted Slurm parallel" not in recovery.stdout
-    assert "Submitted Slurm bart" not in recovery.stdout
-    assert sbatch_counter.read_text(encoding="utf-8").strip() == "3"
+    assert "Submitted seed finalizer array 41001" in recovery.stdout
+    assert "Submitted panel publish array 41001" in recovery.stdout
+    assert sbatch_counter.read_text(encoding="utf-8").strip() == "5"
     recovery_receipts = [
         call
         for call in python_log.read_text(encoding="utf-8").splitlines()
@@ -962,6 +1415,154 @@ echo '41001;cluster-a'
     ]
     assert len(recovery_receipts) == 2
     assert "--resource-class serial" in recovery_receipts[-1]
+    assert "--master-indices 1" in "\n".join(
+        python_log.read_text(encoding="utf-8").splitlines()
+    )
+    assert " dependency-diagnostics " in (
+        f" {' '.join(python_log.read_text(encoding='utf-8').splitlines())} "
+    )
+
+
+def test_finalizer_submission_failure_blocks_panel_publish(tmp_path):
+    engine = tmp_path / "engine"
+    (engine / "slurm").mkdir(parents=True)
+    (engine / "slurm" / "run_nk_grid.sbatch").write_text(
+        "#!/bin/bash\n", encoding="utf-8"
+    )
+    manifest = tmp_path / "panels.yaml"
+    manifest.write_text("panels: []\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sbatch_log = tmp_path / "sbatch.log"
+    fake_python = tmp_path / "fake-python"
+    _write_executable(
+        fake_python,
+        """#!/bin/bash
+if [ "$1" = "-c" ]; then exit 0; fi
+if [ "$3" = "snapshot" ]; then echo 1; exit 0; fi
+if [ "$3" = "indices" ]; then
+  case "$*" in
+    *"--resource-class parallel"*) echo 0 ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "chunk-map" ]; then echo /synthetic/chunk.json; exit 0; fi
+if [ "$3" = "receipt" ]; then echo /synthetic/receipt.json; exit 0; fi
+if [ "$3" = "build-map" ]; then echo "/synthetic/$*.json"; exit 0; fi
+if [ "$3" = "map-count" ]; then echo 1; exit 0; fi
+exit 9
+""",
+    )
+    _write_executable(
+        fake_bin / "sbatch",
+        """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_SBATCH_LOG"
+case "$*" in
+  *"--job-name=al-nk-finalize"*)
+    echo synthetic-finalizer-failure >&2
+    exit 9
+    ;;
+esac
+echo '60001;cluster'
+""",
+    )
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
+            "--manifest",
+            str(manifest),
+            "--max-array-size",
+            "10",
+        ],
+        env={
+            **os.environ,
+            "ENGINE_DIR": str(engine),
+            "VENV": str(tmp_path / "venv"),
+            "PYTHON": str(fake_python),
+            "FAKE_SBATCH_LOG": str(sbatch_log),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert "Seed arrays submitted but finalizer submission failed." in completed.stderr
+    calls = sbatch_log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 2
+    assert "--job-name=al-nk-finalize" in calls[1]
+    assert not any("--job-name=al-nk-publish" in call for call in calls)
+
+
+def test_recovery_with_no_missing_or_incomplete_jobs_submits_nothing(
+    tmp_path,
+):
+    engine = tmp_path / "engine"
+    (engine / "slurm").mkdir(parents=True)
+    snapshot = tmp_path / "jobs.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sbatch_log = tmp_path / "sbatch.log"
+    fake_python = tmp_path / "fake-python"
+    _write_executable(
+        fake_python,
+        """#!/bin/bash
+if [ "$1" = "-c" ]; then exit 0; fi
+if [ "$3" = "count" ]; then echo 1; exit 0; fi
+if [ "$3" = "indices" ]; then
+  case "$*" in
+    *"--resource-class parallel"*) echo 0 ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "dependency-diagnostics" ]; then echo '{}'; exit 0; fi
+if [ "$3" = "recovery-indices" ]; then echo ""; exit 0; fi
+exit 9
+""",
+    )
+    _write_executable(
+        fake_bin / "sbatch",
+        """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_SBATCH_LOG"
+echo '70001;cluster'
+""",
+    )
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
+            "--snapshot",
+            str(snapshot),
+            "--resource-class",
+            "parallel",
+            "--max-array-size",
+            "10",
+        ],
+        env={
+            **os.environ,
+            "ENGINE_DIR": str(engine),
+            "VENV": str(tmp_path / "venv"),
+            "PYTHON": str(fake_python),
+            "FAKE_SBATCH_LOG": str(sbatch_log),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert (
+        "No missing/incomplete matching resource-class tasks were submitted."
+        in completed.stderr
+    )
+    assert not sbatch_log.exists()
 
 
 def test_worker_rejects_restart_count_above_limit_before_starting_python(
@@ -1184,7 +1785,7 @@ def test_panel_declared_large_run_authorization_is_honored(tmp_path):
         n_sizes_k=20,
         allow_large_run=True,
     )
-    jobs = [SlurmJob(panel="big", model="ols", config=oversized)]
+    jobs = [SlurmJob(panel="big", model="ols", seed=123, draws=(0,), config=oversized, final_out=tmp_path / "final.csv")]
 
     # An absent CLI flag arrives as None and must defer to the panel.
     require_large_run_authorization(jobs, allow_large_run=None)
@@ -1193,7 +1794,10 @@ def test_panel_declared_large_run_authorization_is_honored(tmp_path):
         SlurmJob(
             panel="big",
             model="ols",
+            seed=123,
+            draws=(0,),
             config=replace(oversized, allow_large_run=False),
+            final_out=tmp_path / "final.csv",
         )
     ]
     with pytest.raises(ValueError, match="requires --allow-large-run"):
@@ -1207,14 +1811,20 @@ def test_receipt_separates_cli_and_panel_large_run_authorization(tmp_path):
         SlurmJob(
             panel="panel-cli",
             model="ols",
+            seed=123,
+            draws=(0,),
             config=_config(tmp_path, out=tmp_path / "a.csv"),
+            final_out=tmp_path / "final-a.csv",
         ),
         SlurmJob(
             panel="panel-self",
             model="ridge",
+            seed=123,
+            draws=(0,),
             config=_config(
                 tmp_path, out=tmp_path / "b.csv", allow_large_run=True
             ),
+            final_out=tmp_path / "final-b.csv",
         ),
     ]
     snapshot = tmp_path / "jobs.json"

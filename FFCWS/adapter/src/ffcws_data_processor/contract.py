@@ -177,7 +177,6 @@ def write_engine_schema(
         "feature_universe": {
             "mode": "train_pool_screened",
             "definition_file": definition_path.name,
-            "definition_sha256": file_sha256(definition_path),
         },
         "group_column": None,
         "imputation": {

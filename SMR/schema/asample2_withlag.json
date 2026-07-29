@@ -6,7 +6,6 @@
   "feature_manifest_version": 1,
   "feature_universe": {
     "definition_file": "asample2_withlag.feature_universe.json",
-    "definition_sha256": "d1dae8fddceb638624626928302eb91c2beeff3ec6dc5bf72c7e967df3da3c88",
     "mode": "fixed_a_priori"
   },
   "group_column": null,

@@ -12,6 +12,7 @@ import pytest
 
 from aleatoric_nk_grid.experiment import (
     checkpoint_parts_dir,
+    manifest_path,
     write_checkpoint_part,
 )
 from aleatoric_nk_grid.nk_grid import (
@@ -83,11 +84,12 @@ def test_engine_smoke_records_identity_and_k_diagnostics(tmp_path):
     assert result.loc[0, "K"] == 2
     assert result.loc[0, "K_expanded"] == 2
     assert result.loc[0, "K_unobserved"] == 0
-    assert result.loc[0, "experiment_identity_version"] == 3
+    assert result.loc[0, "experiment_id"] == "nkgrid-test-v1"
     manifest = json.loads(out.with_suffix(".manifest.json").read_text())
     assert manifest["failure_policy"]["passed"] is True
     assert manifest["failure_policy"]["denominator"] == 1
-    assert manifest["schema"]["semantic_sha256"]
+    assert manifest["identity"]["mode"] == "explicit-v1"
+    assert manifest["semantic_contract"]["kind"] == "nk_grid"
     assert not checkpoint_parts_dir(out).exists()
 
 
@@ -232,11 +234,6 @@ def test_invalid_run_controls_fail_before_dry_run_arithmetic(overrides, match):
     "model,overrides,error",
     [
         (
-            "bart",
-            {"min_n": 10, "max_n": 10, "bart_min_n": 100},
-            "below BART minimum N/K floor",
-        ),
-        (
             "ridge",
             {"min_n": 1, "max_n": 1},
             "below minimum N for ridge's internal CV",
@@ -265,7 +262,11 @@ def test_floor_skips_do_not_run_full_preprocessing(
     assert row["K_unobserved"] == 0
 
 
-def test_all_unobserved_skip_keeps_priority_over_bart_floor(tmp_path):
+def test_all_unobserved_skip_happens_before_any_preprocessing(tmp_path):
+    # The BART N/K floor used to sit right behind this branch, so this test also
+    # asserted a precedence between the two. With BART gone the only remaining
+    # floor is the CV one, which cannot co-trigger at this N, so precedence is
+    # no longer observable; the early-skip behaviour itself still is.
     frame = _regression_frame(30)[["y", "X_a"]]
     split = split_frame(frame, ["X_a"], "y", test_size=0.3, seed=123)
     order = draw_orders(
@@ -276,14 +277,13 @@ def test_all_unobserved_skip_keeps_priority_over_bart_floor(tmp_path):
     schema = write_schema_bundle(
         tmp_path / "input", frame, predictors=["X_a"]
     )
-    out = tmp_path / "bart.csv"
+    out = tmp_path / "unobserved.csv"
     config = _config(
         schema,
         out,
-        models=("bart",),
+        models=("ols",),
         min_n=10,
         max_n=10,
-        bart_min_n=100,
     )
     with patch(
         "aleatoric_nk_grid.nk_grid.preprocess_cell",
@@ -704,6 +704,130 @@ def test_scheduler_n_jobs_override_does_not_change_experiment_identity(tmp_path)
         first.with_suffix(".manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["design"]["parallelism"]["configured_outer_n_jobs"] == 8
+
+
+def test_exact_output_path_requires_explicit_single_seed_execution(tmp_path):
+    config = _config(
+        tmp_path / "missing-schema.json",
+        tmp_path / "seed.csv",
+        repeat_plan=((11, 0), (22, 0)),
+    )
+    with pytest.raises(ValueError, match="explicit single-seed"):
+        run_nk_grid(config, exact_output_path=True)
+    with pytest.raises(ValueError, match="exactly one seed"):
+        run_nk_grid(
+            config,
+            execution_pairs=((11, 0), (22, 0)),
+            exact_output_path=True,
+        )
+
+
+def test_exact_output_shard_resumes_same_deterministic_path(tmp_path):
+    schema = write_schema_bundle(
+        tmp_path / "input",
+        _regression_frame(),
+        predictors=["X_a", "X_b"],
+    )
+    output = tmp_path / "seed-11.csv"
+    config = _config(
+        schema,
+        output,
+        preset="dev",
+        repeat_plan=((11, 0), (22, 0)),
+        rerun_completed=False,
+    )
+
+    first = run_nk_grid(
+        config,
+        execution_pairs=((11, 0),),
+        exact_output_path=True,
+        defer_failure_policy=True,
+    )
+    with patch(
+        "aleatoric_nk_grid.nk_grid.make_model",
+        side_effect=AssertionError("complete exact shard must be reused"),
+    ):
+        second = run_nk_grid(
+            config,
+            execution_pairs=((11, 0),),
+            exact_output_path=True,
+            defer_failure_policy=True,
+        )
+
+    assert first == output
+    assert second == output
+    assert not list(tmp_path.glob("seed-11_dev_*.csv"))
+    payload = json.loads(
+        output.with_suffix(".manifest.json").read_text(encoding="utf-8")
+    )
+    assert payload["design"]["preset"] == "dev"
+    assert payload["execution"]["mode"] == "seed-shard"
+
+
+def test_exact_output_rejects_identity_mismatch_on_deterministic_path(tmp_path):
+    schema = write_schema_bundle(
+        tmp_path / "input",
+        _regression_frame(),
+        predictors=["X_a", "X_b"],
+    )
+    output = tmp_path / "seed-11.csv"
+    config = _config(
+        schema,
+        output,
+        repeat_plan=((11, 0), (22, 0)),
+        rerun_completed=False,
+    )
+    run_nk_grid(
+        config,
+        execution_pairs=((11, 0),),
+        exact_output_path=True,
+        defer_failure_policy=True,
+    )
+
+    with pytest.raises(ValueError, match=r"identity\.data_version"):
+        run_nk_grid(
+            _config(
+                schema,
+                output,
+                repeat_plan=((11, 0), (22, 0)),
+                rerun_completed=False,
+                data_version="different-data-v2",
+            ),
+            execution_pairs=((11, 0),),
+            exact_output_path=True,
+            defer_failure_policy=True,
+        )
+
+
+def test_explicit_seed_execution_is_labeled_seed_shard_without_exact_path(
+    tmp_path,
+):
+    schema = write_schema_bundle(
+        tmp_path / "input",
+        _regression_frame(),
+        predictors=["X_a", "X_b"],
+    )
+    out = tmp_path / "result.csv"
+    run_nk_grid(
+        _config(
+            schema,
+            out,
+            repeat_plan=((11, 0), (22, 0)),
+            experiment_id="explicit-execution",
+            data_version="data-v1",
+            model_spec_version="models-v1",
+        ),
+        execution_pairs=((11, 0),),
+        defer_failure_policy=True,
+    )
+
+    manifest = json.loads(manifest_path(out).read_text(encoding="utf-8"))
+    assert manifest["execution"] == {
+        "mode": "seed-shard",
+        "seed": 11,
+        "draws": [0],
+        "expected_rows": 1,
+    }
 
 
 def test_checkpoint_boundary_stop_is_resumable(tmp_path):

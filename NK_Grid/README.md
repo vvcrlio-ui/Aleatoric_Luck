@@ -144,7 +144,7 @@ bash NK_Grid/slurm/submit_nk_grid.sh \
 Production submission additionally requires `--allow-large-run`.
 
 The launcher freezes the resolved job mapping before submission and assigns
-models to the `parallel`, `serial`, or `bart` execution class. These labels
+models to the `parallel` or `serial` execution class. These labels
 classify computing requirements.
 `--max-concurrent-per-class` limits each execution class separately.
 

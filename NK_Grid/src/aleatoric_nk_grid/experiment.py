@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import importlib.metadata
 import json
 import math
@@ -25,10 +24,6 @@ import pandas as pd
 
 
 MODEL_ENV_KEYS = (
-    "BART_N_BURN",
-    "BART_N_SAMPLES",
-    "BART_N_TREES",
-    "BART_THIN",
     "LGBM_MAX_ROUNDS",
     "RF_MAX_FEATURES",
     "RF_MIN_SAMPLES_LEAF",
@@ -50,7 +45,6 @@ CHECKPOINT_RESUME_COLUMNS = [
 CHECKPOINT_COMPACTION_LOOSE_PARTS = 50
 CHECKPOINT_SQLITE_INSERT_ROWS = 2_000
 MANIFEST_SCHEMA_VERSION = "1"
-EXPERIMENT_IDENTITY_VERSION = 3
 COMPLETED_CHECKPOINT_STATUSES = frozenset({"ok", "skipped"})
 SERIAL_OUTER_MODELS = frozenset({"lightgbm", "super_learner"})
 
@@ -80,14 +74,6 @@ class CheckpointMaterialization:
     columns: tuple[str, ...]
     summary: CheckpointSummary
     backend: str = "sqlite_streaming"
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -166,6 +152,7 @@ def _atomic_text_writer(target: Path) -> Iterator[Any]:
         if not published:
             tmp.unlink(missing_ok=True)
 
+class OutputRunLockError(RuntimeError): ...
 
 @contextmanager
 def output_run_lock(out_path: Path) -> Iterator[Path]:
@@ -184,7 +171,7 @@ def output_run_lock(out_path: Path) -> Iterator[Path]:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except BlockingIOError as exc:
-            raise RuntimeError(
+            raise OutputRunLockError(
                 f"Another NK Grid worker already holds the output lease: {lock_path}"
             ) from exc
         yield lock_path
@@ -199,45 +186,31 @@ def output_run_lock(out_path: Path) -> Iterator[Path]:
 def build_experiment_metadata(
     *,
     kind: str,
-    data_path: Path,
+    experiment_id: str,
+    data_version: str,
+    model_spec_version: str,
     outcome: str,
     test_size: float,
     split_seed: int,
     algorithm_version: str = "legacy",
-    extra: dict[str, Any] | None = None,
+    semantic_contract: dict[str, Any],
     split_mode: str = "internal_random",
-    test_data_path: Path | None = None,
-    experiment_identity_version: int = EXPERIMENT_IDENTITY_VERSION,
 ) -> dict[str, Any]:
-    """Return stable metadata that distinguishes result-producing inputs."""
+    """Return researcher-declared identity and directly comparable semantics."""
 
-    settings = {
-        "experiment_identity_version": int(experiment_identity_version),
-        "kind": kind,
-        "algorithm_version": algorithm_version,
-        "data_sha256": file_sha256(data_path),
-        "test_data_sha256": (
-            file_sha256(test_data_path) if test_data_path is not None else ""
-        ),
-        "outcome": outcome,
-        "split_mode": split_mode,
-        "split_seed": int(split_seed),
-        "extra": extra or {},
-    }
-    if split_mode == "internal_random":
-        settings["test_size"] = float(test_size)
-    elif split_mode != "external_test":
+    if split_mode not in {"internal_random", "external_test"}:
         raise ValueError(f"Unknown split_mode: {split_mode!r}")
-    encoded = json.dumps(settings, sort_keys=True, separators=(",", ":"))
-    experiment_id = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
     return {
         "experiment_id": experiment_id,
-        "experiment_identity_version": int(experiment_identity_version),
+        "identity": {
+            "mode": "explicit-v1",
+            "experiment_id": experiment_id,
+            "data_version": data_version,
+            "model_spec_version": model_spec_version,
+        },
+        "semantic_contract": semantic_contract,
         "experiment_kind": kind,
         "algorithm_version": algorithm_version,
-        "data_sha256": settings["data_sha256"],
-        "test_data_sha256": settings["test_data_sha256"],
-        "data_path": str(data_path.resolve()),
         "outcome": outcome,
         "test_size": float(test_size) if split_mode == "internal_random" else None,
         "split_mode": split_mode,
@@ -928,6 +901,30 @@ def _sqlite_diagnostics_summary(
             )
             model_summary["fit_seconds_total"] = total if count else 0.0
             model_summary["fit_seconds_median"] = median
+        if "_preprocess_seconds" in columns:
+            count, total, _, _, _ = _numeric_column_summary(
+                connection,
+                column="_preprocess_seconds",
+                experiment_id=experiment_id,
+                model=model,
+            )
+            model_summary["preprocess_seconds_total"] = total if count else 0.0
+        if "_cell_wall_seconds" in columns:
+            count, total, _, _, _ = _numeric_column_summary(
+                connection,
+                column="_cell_wall_seconds",
+                experiment_id=experiment_id,
+                model=model,
+            )
+            model_summary["cell_wall_seconds_total"] = total if count else 0.0
+        if "_peak_rss_bytes" in columns:
+            count, _, _, _, maximum = _numeric_column_summary(
+                connection,
+                column="_peak_rss_bytes",
+                experiment_id=experiment_id,
+                model=model,
+            )
+            model_summary["peak_rss_bytes_max"] = int(maximum) if count else 0
         if "_best_rounds" in columns:
             count, _, median, minimum, maximum = _numeric_column_summary(
                 connection,
@@ -1268,6 +1265,21 @@ def diagnostics_summary(frame: pd.DataFrame) -> dict[str, Any]:
                 timings = pd.to_numeric(all_group["_fit_seconds"], errors="coerce").dropna()
                 summary["fit_seconds_total"] = float(timings.sum())
                 summary["fit_seconds_median"] = float(timings.median()) if len(timings) else None
+            if "_preprocess_seconds" in all_group:
+                preprocess = pd.to_numeric(
+                    all_group["_preprocess_seconds"], errors="coerce"
+                ).dropna()
+                summary["preprocess_seconds_total"] = float(preprocess.sum())
+            if "_cell_wall_seconds" in all_group:
+                wall = pd.to_numeric(
+                    all_group["_cell_wall_seconds"], errors="coerce"
+                ).dropna()
+                summary["cell_wall_seconds_total"] = float(wall.sum())
+            if "_peak_rss_bytes" in all_group:
+                rss = pd.to_numeric(
+                    all_group["_peak_rss_bytes"], errors="coerce"
+                ).dropna()
+                summary["peak_rss_bytes_max"] = int(rss.max()) if len(rss) else 0
             if "_best_rounds" in all_group:
                 rounds = pd.to_numeric(all_group["_best_rounds"], errors="coerce").dropna()
                 summary["best_rounds"] = (
@@ -1282,12 +1294,6 @@ def diagnostics_summary(frame: pd.DataFrame) -> dict[str, Any]:
             by_model[str(model)] = summary
     result["by_model"] = by_model
     return result
-
-
-def parallel_preference(models: Iterable[str]) -> str:
-    """Isolate BART's process-global RNG when jobs run concurrently."""
-
-    return "processes" if "bart" in set(models) else "threads"
 
 
 def effective_outer_n_jobs(model_name: str, configured_n_jobs: int) -> int:

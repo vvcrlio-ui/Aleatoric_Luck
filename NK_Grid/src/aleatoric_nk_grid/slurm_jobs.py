@@ -3,35 +3,86 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shlex
+import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .experiment import (
     MODEL_ENV_KEYS,
     SERIAL_OUTER_MODELS,
-    file_sha256,
     manifest_path as result_manifest_path,
     utc_now,
     write_json_atomic,
 )
 from .helpers_logging import log_progress
-from .nk_grid import LARGE_RUN_THRESHOLD, NKGridConfig, estimate_run_size, run_nk_grid
+from .nk_grid import (
+    LARGE_RUN_THRESHOLD, NKGridConfig, estimate_run_size, run_nk_grid,
+    group_repeat_pairs_by_seed, resolve_repeat_pairs,
+)
 from .run_panels import ROOT, config_to_json, resolved_panels
+
+
+def chunk_master_indices(indices: tuple[int, ...], max_array_size: int) -> tuple[tuple[int, ...], ...]:
+    """Partition master indices while each Slurm array uses local 0..N-1 IDs."""
+    if max_array_size < 1:
+        raise ValueError("max_array_size must be positive")
+    return tuple(tuple(indices[start : start + max_array_size]) for start in range(0, len(indices), max_array_size))
+
+
+def write_chunk_map(snapshot_path: Path, resource_class: str, chunk: tuple[int, ...], ordinal: int) -> Path:
+    """Persist immutable local-array-index to master-job-index mapping."""
+    if not chunk:
+        raise ValueError("chunk must not be empty")
+    path = snapshot_path.parent / f"{snapshot_path.stem}.{resource_class}.chunk-{ordinal:04d}.json"
+    if resource_class not in RESOURCE_CLASSES:
+        raise ValueError(f"Unknown Slurm resource class: {resource_class}")
+    if any(not isinstance(index, int) or isinstance(index, bool) or index < 0 for index in chunk):
+        raise ValueError("chunk indices must be non-negative integers")
+    if len(set(chunk)) != len(chunk):
+        raise ValueError("chunk indices must not contain duplicates")
+    write_json_atomic(path, {"format_version": 1, "snapshot": str(snapshot_path.resolve()), "resource_class": resource_class, "master_indices": list(chunk)})
+    os.chmod(path, 0o444)
+    return path
+
+
+def load_chunk_map(
+    path: Path,
+    *,
+    snapshot_path: Path | None = None,
+    resource_class: str | None = None,
+) -> tuple[int, ...]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    values = payload.get("master_indices")
+    if payload.get("format_version") != 1 or not isinstance(values, list) or not values:
+        raise ValueError(f"Invalid Slurm chunk map: {path}")
+    if not isinstance(payload.get("snapshot"), str) or payload.get("resource_class") not in RESOURCE_CLASSES:
+        raise ValueError(f"Invalid Slurm chunk map: {path}")
+    if snapshot_path is not None and Path(payload["snapshot"]).resolve() != snapshot_path.resolve():
+        raise ValueError("Slurm chunk map belongs to a different snapshot")
+    if resource_class is not None and payload["resource_class"] != resource_class:
+        raise ValueError("Slurm chunk map belongs to a different resource class")
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):
+        raise ValueError(f"Invalid Slurm chunk map: {path}")
+    if len(set(values)) != len(values):
+        raise ValueError(f"Invalid Slurm chunk map: {path}")
+    return tuple(values)
 
 
 @dataclass(frozen=True)
 class SlurmJob:
     panel: str
     model: str
+    seed: int
+    draws: tuple[int, ...]
     config: NKGridConfig
+    final_out: Path
 
 
-RESOURCE_CLASSES = ("parallel", "serial", "bart")
+RESOURCE_CLASSES = ("parallel", "serial", "super_learner")
 OPTIONAL_SLURM_ENV_KEYS = (
     "ALEATORIC_NK_GRID_SOURCE_FALLBACK",
     "PYTHON_MODULE",
@@ -46,9 +97,9 @@ MAX_REQUEUE_WATCHDOG_SECONDS = (
 
 
 def resource_class_for_model(model: str) -> str:
-    if model == "bart":
-        return "bart"
-    if model in SERIAL_OUTER_MODELS:
+    if model == "super_learner":
+        return "super_learner"
+    if model == "lightgbm":
         return "serial"
     return "parallel"
 
@@ -88,8 +139,12 @@ def resource_class_partition(
     return partition
 
 
-def _model_output_path(path: Path, model: str) -> Path:
-    return path.with_name(f"{path.stem}_{model}{path.suffix}")
+def _model_output_path(path: Path, panel: str, model: str, seed: int) -> Path:
+    return path.parent / ".seed-shards" / panel / model / f"seed-{seed}{path.suffix}"
+
+
+def _model_final_output_path(path: Path, panel: str, model: str) -> Path:
+    return path.parent / ".seed-final" / panel / f"{model}{path.suffix}"
 
 
 def build_slurm_jobs(manifest_path: Path) -> list[SlurmJob]:
@@ -98,17 +153,20 @@ def build_slurm_jobs(manifest_path: Path) -> list[SlurmJob]:
     jobs: list[SlurmJob] = []
     for panel_name, config in resolved_panels(manifest_path):
         for model_name in config.models:
-            jobs.append(
-                SlurmJob(
+            for seed, draws in group_repeat_pairs_by_seed(resolve_repeat_pairs(config)).items():
+                jobs.append(SlurmJob(
                     panel=panel_name,
                     model=model_name,
+                    seed=seed,
+                    draws=draws,
                     config=replace(
-                        config,
-                        models=(model_name,),
-                        out=_model_output_path(Path(config.out), model_name),
+                        config, models=(model_name,),
+                        out=_model_output_path(Path(config.out), panel_name, model_name, seed),
                     ),
-                )
-            )
+                    final_out=_model_final_output_path(
+                        Path(config.out), panel_name, model_name
+                    ),
+                ))
     if not jobs:
         raise ValueError(f"No active panel/model jobs found in {manifest_path}")
     _require_unique_output_paths(jobs)
@@ -132,6 +190,18 @@ def _require_unique_output_paths(jobs: list[SlurmJob]) -> None:
             "Slurm panel/model jobs must have unique output paths; duplicate "
             f"targets found ({examples}). Use a distinct 'out' for each panel."
         )
+    final_owners: dict[Path, set[tuple[str, str]]] = {}
+    for job in jobs:
+        final_owners.setdefault(Path(job.final_out).resolve(), set()).add(
+            (job.panel, job.model)
+        )
+    duplicate_finals = {
+        path: owners for path, owners in final_owners.items() if len(owners) > 1
+    }
+    if duplicate_finals:
+        raise ValueError(
+            "Slurm per-model final outputs must be unique within a panel"
+        )
 
 
 def _config_from_json(payload: dict[str, Any]) -> NKGridConfig:
@@ -140,6 +210,11 @@ def _config_from_json(payload: dict[str, Any]) -> NKGridConfig:
         if values.get(key) is not None:
             values[key] = Path(values[key])
     values["models"] = tuple(values["models"])
+    if values.get("repeat_plan") is not None:
+        values["repeat_plan"] = tuple(tuple(pair) for pair in values["repeat_plan"])
+    for field in ("n_grid", "k_grid"):
+        if values.get(field) is not None:
+            values[field] = tuple(values[field])
     return NKGridConfig(**values)
 
 
@@ -172,6 +247,10 @@ def write_job_snapshot(
     payload = {
         "format_version": 1,
         "source_manifest": str(manifest_path),
+        "panel_outputs": {
+            panel_name: str(config.out)
+            for panel_name, config in resolved_panels(manifest_path)
+        },
         "execution_policy": {
             "rerun_completed": bool(rerun_completed),
         },
@@ -179,7 +258,10 @@ def write_job_snapshot(
             {
                 "panel": job.panel,
                 "model": job.model,
+                "seed": job.seed,
+                "draws": list(job.draws),
                 "config": config_to_json(job.config),
+                "final_out": str(job.final_out),
             }
             for job in jobs
         ],
@@ -195,10 +277,8 @@ def write_job_snapshot(
     return jobs
 
 
-def _read_job_snapshot(
-    snapshot_path: Path,
-) -> tuple[dict[str, Any], list[SlurmJob], str]:
-    """Read, validate and hash one frozen snapshot with a single file read."""
+def _read_job_snapshot(snapshot_path: Path) -> tuple[dict[str, Any], list[SlurmJob]]:
+    """Read and validate one frozen snapshot with a single file read."""
 
     raw = snapshot_path.read_bytes()
     payload = json.loads(raw)
@@ -208,20 +288,23 @@ def _read_job_snapshot(
         SlurmJob(
             panel=str(item["panel"]),
             model=str(item["model"]),
+            seed=int(item["seed"]),
+            draws=tuple(int(draw) for draw in item["draws"]),
             config=_config_from_json(item["config"]),
+            final_out=Path(item["final_out"]),
         )
         for item in payload["jobs"]
     ]
     if not jobs:
         raise ValueError(f"No jobs found in Slurm job snapshot: {snapshot_path}")
     _require_unique_output_paths(jobs)
-    return payload, jobs, hashlib.sha256(raw).hexdigest()
+    return payload, jobs
 
 
 def load_job_snapshot(snapshot_path: Path) -> list[SlurmJob]:
     """Load the read-only array mapping produced at submission time."""
 
-    _, jobs, _ = _read_job_snapshot(snapshot_path)
+    _, jobs = _read_job_snapshot(snapshot_path)
     return jobs
 
 
@@ -333,6 +416,8 @@ def write_submission_receipt(
     max_restarts: int = 5,
     requeue_watchdog_seconds: int = 240,
     resource_class: str | None = None,
+    chunk_map: Path | None = None,
+    dependency_job_id: str | None = None,
     receipt_path: Path | None = None,
 ) -> Path:
     """Persist an unambiguous Slurm job-ID to snapshot mapping."""
@@ -365,8 +450,14 @@ def write_submission_receipt(
     environment_controls = {
         key: os.environ.get(key) for key in OPTIONAL_SLURM_ENV_KEYS
     }
-    snapshot_payload, jobs, snapshot_sha256 = _read_job_snapshot(snapshot_path)
-    selected_indices = _expand_array_indices(array_spec, len(jobs))
+    snapshot_payload, jobs = _read_job_snapshot(snapshot_path)
+    if chunk_map is None:
+        selected_indices = _expand_array_indices(array_spec, len(jobs))
+    else:
+        selected_indices = load_chunk_map(chunk_map, snapshot_path=snapshot_path, resource_class=resource_class)
+        local_indices = _expand_array_indices(array_spec, len(selected_indices))
+        if local_indices != tuple(range(len(selected_indices))):
+            raise ValueError("Chunk receipt array must cover all local chunk indices")
     if resource_class is not None:
         if resource_class not in RESOURCE_CLASSES:
             raise ValueError(f"Unknown Slurm resource class: {resource_class}")
@@ -431,6 +522,7 @@ def write_submission_receipt(
                 str(snapshot_path),
                 "1" if allow_large_run else "0",
                 "1" if rerun_completed else "0",
+                *( [str(chunk_map)] if chunk_map is not None else [] ),
             ]
         )
 
@@ -442,10 +534,8 @@ def write_submission_receipt(
         "job_count": len(selected_indices),
         "snapshot_job_count": len(jobs),
         "snapshot": str(snapshot_path),
-        "snapshot_sha256": snapshot_sha256,
         "source_manifest": snapshot_payload.get("source_manifest"),
         "worker_script": str(worker_script),
-        "worker_script_sha256": file_sha256(worker_script),
         "execution_paths": {
             "engine_dir": str(engine_dir),
             "venv": str(venv),
@@ -477,6 +567,11 @@ def write_submission_receipt(
             "memory": memory,
             "time_limit": time_limit,
         },
+        "chunk": {
+            "map": str(chunk_map.resolve()) if chunk_map is not None else None,
+            "master_indices": list(selected_indices),
+            "dependency_job_id": dependency_job_id,
+        },
         "rerun_command_template": rerun_command("<task-index>"),
         "jobs": [
             {
@@ -488,9 +583,11 @@ def write_submission_receipt(
                 "effective_allow_large_run": bool(
                     allow_large_run or job.config.allow_large_run
                 ),
-                "rerun_command": rerun_command(str(index)),
+                "rerun_command": rerun_command(
+                    str(local_index if chunk_map is not None else index)
+                ),
             }
-            for index in selected_indices
+            for local_index, index in enumerate(selected_indices)
             for job in (jobs[index],)
         ],
     }
@@ -499,11 +596,82 @@ def write_submission_receipt(
     return receipt_path
 
 
+def dependency_never_satisfied_diagnostics(
+    snapshot_path: Path,
+    *,
+    scheduler_output: str | None = None,
+    cleanup: bool = False,
+) -> dict[str, Any]:
+    """Inspect only receipt-owned jobs for DependencyNeverSatisfied."""
+
+    snapshot_path = snapshot_path.resolve()
+    receipt_job_ids: set[str] = set()
+    for receipt_path in snapshot_path.parent.glob("slurm-*.json"):
+        try:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        job_id = payload.get("slurm_job_id")
+        if (
+            payload.get("format_version") == 1
+            and isinstance(payload.get("snapshot"), str)
+            and Path(payload["snapshot"]).resolve() == snapshot_path
+            and isinstance(job_id, str)
+            and job_id.isdigit()
+        ):
+            receipt_job_ids.add(job_id)
+
+    ordered_ids = sorted(receipt_job_ids, key=int)
+    if scheduler_output is None and ordered_ids:
+        completed = subprocess.run(
+            [
+                "squeue",
+                "--noheader",
+                "--jobs",
+                ",".join(ordered_ids),
+                "--format",
+                "%A|%r|%T",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        scheduler_output = completed.stdout
+    scheduler_output = scheduler_output or ""
+    never_satisfied: set[str] = set()
+    for line in scheduler_output.splitlines():
+        fields = line.strip().split("|", 2)
+        if len(fields) != 3:
+            continue
+        job_id, reason, _ = fields
+        if (
+            job_id in receipt_job_ids
+            and reason == "DependencyNeverSatisfied"
+        ):
+            never_satisfied.add(job_id)
+    ordered_never_satisfied = sorted(never_satisfied, key=int)
+    cleaned: list[str] = []
+    if cleanup and ordered_never_satisfied:
+        subprocess.run(
+            ["scancel", *ordered_never_satisfied],
+            check=True,
+        )
+        cleaned = ordered_never_satisfied
+    return {
+        "snapshot": str(snapshot_path),
+        "receipt_job_ids": ordered_ids,
+        "dependency_never_satisfied_job_ids": ordered_never_satisfied,
+        "cleaned_job_ids": cleaned,
+    }
+
+
 def job_summary(job: SlurmJob, index: int) -> dict:
     return {
         "index": index,
         "panel": job.panel,
         "model": job.model,
+        "seed": job.seed,
+        "draws": list(job.draws),
         "config": config_to_json(job.config),
         "estimate": estimate_run_size(job.config),
     }
@@ -531,13 +699,22 @@ def require_large_run_authorization(
         )
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Freeze, list, or run panel/model jobs for the NK Grid array."
     )
     parser.add_argument(
         "command",
-        choices=("count", "indices", "list", "snapshot", "receipt", "run"),
+        choices=(
+            "chunk-map",
+            "count",
+            "dependency-diagnostics",
+            "indices",
+            "list",
+            "snapshot",
+            "receipt",
+            "run",
+        ),
     )
     parser.add_argument("--manifest", default=str(ROOT / "panels.yaml"))
     parser.add_argument("--snapshot", default=None)
@@ -546,6 +723,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--array-spec", default=None)
     parser.add_argument("--worker-script", default=None)
     parser.add_argument("--index", type=int, default=None)
+    parser.add_argument("--chunk-map", type=Path, default=None)
     # ``default=None`` keeps an absent flag from overriding a panel that already
     # declares ``allow_large_run``; passing the flag still authorizes every task.
     parser.add_argument("--allow-large-run", action="store_true", default=None)
@@ -556,6 +734,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-restarts", type=int, default=5)
     parser.add_argument("--requeue-watchdog-seconds", type=int, default=240)
     parser.add_argument("--resource-class", choices=RESOURCE_CLASSES, default=None)
+    parser.add_argument("--chunk-map-path", type=Path, default=None)
+    parser.add_argument("--dependency-job-id", default=None)
+    parser.add_argument("--max-array-size", type=int, default=None)
+    parser.add_argument("--chunk-ordinal", type=int, default=None)
+    parser.add_argument("--master-indices", default=None)
+    parser.add_argument(
+        "--cleanup-never-satisfied",
+        action="store_true",
+    )
     args = parser.parse_args(argv)
 
     manifest_path = Path(args.manifest).resolve()
@@ -596,9 +783,25 @@ def main(argv: list[str] | None = None) -> None:
             max_restarts=args.max_restarts,
             requeue_watchdog_seconds=args.requeue_watchdog_seconds,
             resource_class=args.resource_class,
+            chunk_map=args.chunk_map_path,
+            dependency_job_id=args.dependency_job_id,
             receipt_path=Path(args.receipt) if args.receipt else None,
         )
         print(receipt)
+        return
+
+    if args.command == "dependency-diagnostics":
+        if snapshot_path is None:
+            parser.error("dependency-diagnostics requires --snapshot")
+        print(
+            json.dumps(
+                dependency_never_satisfied_diagnostics(
+                    snapshot_path,
+                    cleanup=args.cleanup_never_satisfied,
+                ),
+                sort_keys=True,
+            )
+        )
         return
 
     jobs = (
@@ -635,6 +838,41 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
+    if args.command == "chunk-map":
+        if snapshot_path is None:
+            parser.error("chunk-map requires --snapshot")
+        if args.resource_class is None:
+            parser.error("chunk-map requires --resource-class")
+        if args.max_array_size is None or args.max_array_size < 1:
+            parser.error("chunk-map requires a positive --max-array-size")
+        jobs = load_job_snapshot(snapshot_path)
+        class_indices = resource_class_indices(jobs, args.resource_class)
+        selected_indices = class_indices
+        if args.master_indices is not None:
+            try:
+                selected_indices = tuple(
+                    int(value) for value in args.master_indices.split(",")
+                    if value
+                )
+            except ValueError as exc:
+                parser.error("--master-indices must be comma-separated integers")
+            if (
+                len(selected_indices) != len(set(selected_indices))
+                or any(index not in class_indices for index in selected_indices)
+            ):
+                parser.error(
+                    "--master-indices must be unique members of the "
+                    "declared resource class"
+                )
+        chunks = chunk_master_indices(selected_indices, args.max_array_size)
+        if args.chunk_ordinal is None:
+            print(json.dumps([str(write_chunk_map(snapshot_path, args.resource_class, chunk, ordinal)) for ordinal, chunk in enumerate(chunks)]))
+            return
+        if not 0 <= args.chunk_ordinal < len(chunks):
+            parser.error("--chunk-ordinal is outside the generated chunk range")
+        print(write_chunk_map(snapshot_path, args.resource_class, chunks[args.chunk_ordinal], args.chunk_ordinal))
+        return
+
     require_large_run_authorization(jobs, allow_large_run=args.allow_large_run)
     if args.command == "count":
         print(len(jobs))
@@ -642,6 +880,11 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.index is None:
         parser.error("run requires --index")
+    if args.chunk_map is not None:
+        local_indices = load_chunk_map(args.chunk_map, snapshot_path=snapshot_path)
+        if not 0 <= args.index < len(local_indices):
+            parser.error(f"--index must be between 0 and {len(local_indices) - 1} for chunk map")
+        args.index = local_indices[args.index]
     if not 0 <= args.index < len(jobs):
         parser.error(f"--index must be between 0 and {len(jobs) - 1}")
     job = jobs[args.index]
@@ -666,6 +909,9 @@ def main(argv: list[str] | None = None) -> None:
             (lambda: stop_file.exists()) if stop_file is not None else None
         ),
         defer_materialization_on_stop=stop_file is not None,
+        execution_pairs=tuple((job.seed, draw) for draw in job.draws),
+        defer_failure_policy=True,
+        exact_output_path=True,
     )
     if (
         stop_file is not None
