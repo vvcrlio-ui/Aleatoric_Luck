@@ -1,0 +1,69 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors
+.vscode/
+.idea/
+*~
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+
+# R
+.Rhistory
+.Rapp.history
+.RData
+
+# Data / experiments
+**/data/*
+!**/data/.gitkeep
+datasets/
+**/outputs/*
+!**/outputs/.gitkeep
+!**/outputs/README.md
+results/
+runs/
+plans/
+
+# Local implementation/review notes
+NK_Grid/CODE_REVIEW_REPORT_*.md
+NK_Grid/ADAPTER_TO_NK_GRID_WORKFLOW_HARDENING_PROPOSAL_*.md
+NK_Grid/RISK_REMEDIATION_REVIEW_*.md
+
+# Env / secrets
+.env
+.env.*
+env/
+.direnv/
+
+# Logs
+**/logs/*
+*.log
+*.out
+*.err
+
+# Tool caches and reports
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+
+# Native/joblib crash spillover
+core
+core.[0-9]*
+joblib_memmapping_folder_*/
