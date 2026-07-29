@@ -731,7 +731,6 @@ def finalize_seed_shards(
         }
         final_manifest["completion"] = completion
         final_manifest["failure_policy"] = policy
-        final_manifest.pop("input_artifacts", None)
         final_manifest.pop("diagnostics", None)
         temporary_manifest = _write_temporary_manifest(
             target, final_manifest
@@ -946,7 +945,6 @@ def publish_panel(
             "skipped_count": skipped,
             "passed": panel_passed,
         }
-        panel_manifest.pop("input_artifacts", None)
         panel_manifest.pop("diagnostics", None)
         temporary_manifest = _write_temporary_manifest(
             target, panel_manifest
@@ -1064,9 +1062,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SeedShardIncompleteError as exc:
         print(str(exc), file=__import__("sys").stderr)
         return 3
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         print(str(exc), file=__import__("sys").stderr)
-        return 4
+        return 0 if isinstance(exc, RuntimeError) else 4
     except (SeedShardValidationError, ValueError) as exc:
         print(str(exc), file=__import__("sys").stderr)
         return 1

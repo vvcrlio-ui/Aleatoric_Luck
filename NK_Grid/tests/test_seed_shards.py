@@ -7,7 +7,6 @@ import json
 import os
 import sqlite3
 import threading
-import time
 import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -307,13 +306,16 @@ def test_finalize_and_publish_reruns_replace_equivalent_existing_results(tmp_pat
 
 
 @pytest.mark.parametrize("operation", ["finalize", "publish"])
-def test_concurrent_finalize_and_publish_reserve_distinct_temporary_csvs(
-    tmp_path, monkeypatch, operation
+def test_concurrent_finalize_and_publish_loser_exits_zero_without_traceback(
+    tmp_path, monkeypatch, capsys, operation
 ):
     snapshot = _snapshot(tmp_path, models=("ols", "ridge"))
     if operation == "publish":
         for model in ("ols", "ridge"):
             finalize_seed_shards(snapshot, panel="panel", model=model)
+        task_map = build_publish_map(snapshot)
+    else:
+        task_map = build_finalizer_map(snapshot)
     expected_target = (
         tmp_path / ".seed-final" / "panel" / "ols.csv"
         if operation == "finalize"
@@ -326,7 +328,6 @@ def test_concurrent_finalize_and_publish_reserve_distinct_temporary_csvs(
 
     barrier = threading.Barrier(2)
     reserved: list[Path] = []
-    reserved_threads: set[int] = set()
     reserved_lock = threading.Lock()
     real_reserve = seed_shards._reserve_temporary_csv
 
@@ -334,7 +335,6 @@ def test_concurrent_finalize_and_publish_reserve_distinct_temporary_csvs(
         path = real_reserve(target, operation_name)
         with reserved_lock:
             reserved.append(path)
-            reserved_threads.add(threading.get_ident())
         barrier.wait(timeout=10)
         return path
 
@@ -342,33 +342,63 @@ def test_concurrent_finalize_and_publish_reserve_distinct_temporary_csvs(
         seed_shards, "_reserve_temporary_csv", synchronized_reserve
     )
 
+    publishing = threading.Event()
+    loser_returned = threading.Event()
+    published = threading.Event()
+    real_publish = seed_shards._publish_pair
+
+    def synchronized_publish(*args):
+        publishing.set()
+        assert loser_returned.wait(timeout=10)
+        real_publish(*args)
+        published.set()
+
+    monkeypatch.setattr(seed_shards, "_publish_pair", synchronized_publish)
+    arguments = [
+        operation,
+        "--snapshot",
+        str(snapshot),
+        "--map",
+        str(task_map),
+        "--index",
+        "0",
+    ]
+
     def run():
-        for _ in range(100):
-            try:
-                if operation == "finalize":
-                    return finalize_seed_shards(
-                        snapshot, panel="panel", model="ols"
-                    )
-                return publish_panel(
-                    snapshot, panel="panel", models=("ols", "ridge")
-                )
-            except RuntimeError as exc:
-                assert str(exc) == expected_lock_error
-                with reserved_lock:
-                    if threading.get_ident() in reserved_threads:
-                        return None
-                time.sleep(0.001)
-        pytest.fail("concurrent operation never passed its initial no-op lock")
+        return_code = main(arguments)
+        if publishing.is_set() and not published.is_set():
+            loser_returned.set()
+        return return_code
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: run(), range(2)))
 
+    assert results == [0, 0]
+    assert loser_returned.is_set()
+    assert published.is_set()
+    assert capsys.readouterr().err.splitlines() == [expected_lock_error]
     assert len(reserved) == 2
     assert reserved[0] != reserved[1]
     assert all(not path.exists() for path in reserved)
-    assert expected_target in results
-    assert expected_target.exists()
-    assert manifest_path(expected_target).exists()
+    rows = list(csv.DictReader(expected_target.open(encoding="utf-8")))
+    expected_rows = 2 if operation == "finalize" else 4
+    assert [(row["model"], row["seed"]) for row in rows] == (
+        [("ols", "11"), ("ols", "22")]
+        if operation == "finalize"
+        else [
+            ("ols", "11"),
+            ("ols", "22"),
+            ("ridge", "11"),
+            ("ridge", "22"),
+        ]
+    )
+    manifest = _read_json(manifest_path(expected_target))
+    assert manifest["completion"]["materialized_rows"] == expected_rows
+    assert manifest["execution"]["mode"] == (
+        "finalized-seed-shards"
+        if operation == "finalize"
+        else "published-model-finals"
+    )
 
 
 def test_concurrent_publication_loser_observes_whole_old_pair(tmp_path):
