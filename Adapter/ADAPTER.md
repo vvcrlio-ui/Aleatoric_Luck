@@ -72,9 +72,8 @@ can handle them within each training subsample.
 ## 3. Artifacts, Directories, and Paths
 
 **The schema is the sole semantic entry point:** it references the ARD, feature
-universe, and feature manifest by path. The only exception is `provenance.json`,
-which the engine discovers automatically in the directory containing the training
-table.
+universe, and feature manifest by path. `provenance.json` is optional audit
+metadata and is not read by the engine.
 
 | Artifact | When required |
 |---|---|
@@ -111,16 +110,11 @@ in `YourArticle/schema/`, use the following values:
 | `feature_manifest` | `../data/ard/my_dataset/feature_manifest.csv` |
 | `feature_universe.definition_file` | `my_dataset.feature_universe.json` |
 
-The location of `provenance.json` is hard-coded by the engine: it must be in the
-same directory as the **training table** referenced by `table`, and its filename
-is fixed.
-
 ### Provenance
 
-`provenance.json` is optional and records provenance hashes. The engine validates
-only its `schema_sha256` against the schema actually loaded. Other hashes are for
-auditing only, and their names and granularity may be adjusted as needed. Do not
-record raw IDs or absolute paths.
+`provenance.json` is optional audit metadata. The engine does not read it and no
+longer validates `schema_sha256` or any other digest from it. Do not record raw
+IDs or absolute paths.
 
 ## 4. ARD Requirements
 
@@ -193,17 +187,17 @@ category values and reference-category designation for one-hot features, and the
 level mapping for ordinal features. It allows a run to prove that the feature
 space actually resolved is exactly the one declared by the adapter.
 
-Serialize the content with sorted keys, UTF-8, and no extraneous whitespace before
-computing SHA-256. `canonical_json()` performs this step; do not assemble the JSON
-manually.
+Serialize the content with sorted keys, UTF-8, and no extraneous whitespace.
+`canonical_json()` performs this step; do not assemble the JSON manually.
 
 The engine performs two independent checks when loading:
 
-1. Whether the actual SHA-256 of the definition file equals the
-   `definition_sha256` declared in the schema, which detects file changes.
-2. Whether the universe recomputed from the actual predictors and manifest
+1. Whether the universe recomputed from the actual predictors and manifest
    matches the content of the definition file, which checks that the declaration
    agrees with the data.
+2. The definition content is included in the semantic contract. Finalization and
+   publication compare that contract field by field, so incompatible definition
+   content is rejected when results are merged.
 
 Generate the structure with the engine's `canonical_feature_universe()` function.
 Do not write it manually, because a handwritten structure may drift from the
@@ -319,7 +313,7 @@ are absent from this table.
 | `predictor_columns` / `predictor_prefix` | Both are lists of strings; set exactly one; neither may contain an outcome or ID. |
 | `feature_manifest` | See Section 7. |
 | `exchangeable` | Must be `true` and requires research justification. |
-| `feature_universe` | `{mode, definition_file, definition_sha256}`. |
+| `feature_universe` | Exactly `{mode, definition_file}`. |
 | `group_column` | Must be `null`; grouped splitting is not currently supported. |
 | `imputation` | See below. |
 | `max_train_outcome_missing_ratio` / `max_test_outcome_missing_ratio` | Optional, default `0.5`; document the methodological reason for overriding the default. |
@@ -360,10 +354,10 @@ This example contains three sources: `age` (continuous), `sat` (ordinal, levels
 missing-value codes and text categories.
 
 **The required generation order is ARD → manifest → universe → schema**: the
-universe depends on the manifest, and the schema depends on the universe hash.
+universe depends on the manifest, and the schema references the universe.
 
 ```python
-import hashlib, json
+import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -417,7 +411,7 @@ groups = source_groups(predictors, manifest, {})
 Path("universe.json").write_text(canonical_json(
     canonical_feature_universe(predictors, groups, manifest)))
 
-# --- 4. Schema: note feature_manifest_version and definition_sha256 ---
+# --- 4. Schema: note feature_manifest_version ---
 schema = {
     "schema_version": 1, "feature_manifest_version": 1,
     "dataset": "typed", "table": "data.csv", "test_table": None,
@@ -427,8 +421,6 @@ schema = {
     "feature_manifest": "feature_manifest.csv", "exchangeable": True,
     "feature_universe": {
         "mode": "fixed_a_priori", "definition_file": "universe.json",
-        "definition_sha256": hashlib.sha256(
-            Path("universe.json").read_bytes()).hexdigest(),
     },
     "group_column": None,
     "imputation": {
@@ -454,14 +446,14 @@ registered model; it affects only the check of the training-row lower bound. Set
 `external_test`, `test_size` is ignored.
 
 `validate_input` checks that data tables are readable; version numbers are
-recognized; the provenance schema hash matches; exactly one predictor rule is
+recognized; exactly one predictor rule is
 set and it does not overlap outcomes or the ID; predictors are finite numeric
 values and are not entirely missing; outcome types are valid, missingness ratios
 do not exceed their thresholds, and the row-count lower bound is met after
 missing outcomes are removed; required manifest fields are present and
 `keep=true` covers predictors exactly; ordinal values are valid levels; every
 one-hot row has a valid state; `exchangeable` is true and `group_column` is null;
-and both the feature-universe file hash and content match. Under `external_test`,
+and the feature-universe content matches. Under `external_test`,
 it additionally checks matching table structures, ID integrity, and class
 coverage.
 
@@ -483,8 +475,8 @@ print([(g.name, g.unit_type, len(g.features)) for g in groups])
 
 ### Pre-Delivery Checklist
 
-- [ ] Repeated runs on identical input produce identical ARD, manifest, universe,
-      and hash values.
+- [ ] Repeated runs on identical input produce identical ARD, manifest, and
+      universe content.
 - [ ] Raw special missing-value codes are deterministically converted to `NaN`.
 - [ ] All predictors are numeric; missing values remain `NaN`; no imputation has
       been performed.
@@ -497,8 +489,7 @@ print([(g.name, g.unit_type, len(g.features)) for g in groups])
 - [ ] Under `external_test`, both tables have matching structures; IDs are
       non-missing and unique within each table and do not overlap across tables;
       changing test data leaves the training vocabulary unchanged.
-- [ ] If provenance is provided, it contains only hashes and no raw IDs or
-      absolute paths.
+- [ ] If provenance is provided, it contains no raw IDs or absolute paths.
 - [ ] `validate_input` raises no errors.
 
 After the adapter artifacts pass validation, see
