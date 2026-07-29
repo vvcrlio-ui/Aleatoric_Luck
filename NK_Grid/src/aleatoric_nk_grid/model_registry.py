@@ -596,7 +596,9 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
             (
                 "lightgbm",
                 make_pipeline(
-                    SimpleImputer(strategy="median"),
+                    SimpleImputer(strategy="median").set_output(
+                        transform="pandas"
+                    ),
                     lgb.LGBMRegressor(
                         n_estimators=self.lgbm_n_estimators,
                         learning_rate=self.lgbm_learning_rate,
@@ -705,7 +707,9 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
             (
                 "lightgbm",
                 make_pipeline(
-                    SimpleImputer(strategy="median"),
+                    SimpleImputer(strategy="median").set_output(
+                        transform="pandas"
+                    ),
                     lgb.LGBMClassifier(
                         n_estimators=self.lgbm_n_estimators,
                         learning_rate=self.lgbm_learning_rate,
