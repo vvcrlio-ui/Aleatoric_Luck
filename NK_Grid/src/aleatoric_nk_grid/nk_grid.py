@@ -1364,6 +1364,29 @@ def _run_nk_grid_locked(
     dry_run = config.dry_run if dry_run is None else dry_run
     if max_jobs is not None and max_jobs < 0:
         raise ValueError("max_jobs must be non-negative")
+    repeat_pairs = resolve_repeat_pairs(config)
+    shard_execution_requested = execution_pairs is not None
+    if execution_pairs is None:
+        execution_pairs = repeat_pairs
+    else:
+        execution_pairs = tuple(
+            (int(seed), int(draw)) for seed, draw in execution_pairs
+        )
+        if not execution_pairs or not set(execution_pairs).issubset(
+            set(repeat_pairs)
+        ):
+            raise ValueError(
+                "execution_pairs must be a non-empty subset of repeat_plan"
+            )
+        if len({seed for seed, _ in execution_pairs}) != 1:
+            raise ValueError(
+                "seed-shard execution_pairs must contain exactly one seed"
+            )
+    if exact_output_path and not shard_execution_requested:
+        raise ValueError(
+            "exact_output_path is reserved for explicit single-seed "
+            "shard execution"
+        )
     declared_size = estimate_run_size(config)
     if dry_run:
         print(json.dumps(declared_size, indent=2, sort_keys=True))
@@ -1463,21 +1486,6 @@ def _run_nk_grid_locked(
         split_mode=split_mode,
     )
 
-    repeat_pairs = resolve_repeat_pairs(config)
-    shard_execution_requested = execution_pairs is not None
-    if execution_pairs is None:
-        execution_pairs = repeat_pairs
-    else:
-        execution_pairs = tuple((int(seed), int(draw)) for seed, draw in execution_pairs)
-        if not execution_pairs or not set(execution_pairs).issubset(set(repeat_pairs)):
-            raise ValueError("execution_pairs must be a non-empty subset of repeat_plan")
-        if len({seed for seed, _ in execution_pairs}) != 1:
-            raise ValueError("seed-shard execution_pairs must contain exactly one seed")
-    if exact_output_path:
-        if not shard_execution_requested or len({seed for seed, _ in execution_pairs}) != 1:
-            raise ValueError(
-                "exact_output_path is reserved for explicit single-seed shard execution"
-            )
     split_seeds = sorted({seed for seed, _ in execution_pairs})
     if fixed_split is None:
         splits = {
@@ -1537,6 +1545,20 @@ def _run_nk_grid_locked(
         )
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if exact_output_path and manifest_path(out_path).exists():
+        try:
+            exact_prior = json.loads(
+                manifest_path(out_path).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Existing exact-output manifest cannot be parsed"
+            ) from exc
+        if not isinstance(exact_prior, dict):
+            raise ValueError(
+                "Existing exact-output manifest must be a JSON object"
+            )
+        _require_resumable_manifest(exact_prior, metadata)
     existing_index = load_checkpoint_index(out_path)
     indexed_completed = _completed_jobs_for_experiment(
         existing_index,
@@ -1611,7 +1633,7 @@ def _run_nk_grid_locked(
         task=task,
         schema_path=schema.path,
         semantic_contract=semantic_contract,
-        seed_shard_execution=exact_output_path,
+        seed_shard_execution=shard_execution_requested,
     )
     write_json_atomic(
         current_manifest_path,
@@ -2176,7 +2198,7 @@ def _run_nk_grid_locked(
         task=task,
         schema_path=schema.path,
         semantic_contract=semantic_contract,
-        seed_shard_execution=exact_output_path,
+        seed_shard_execution=shard_execution_requested,
     )
     _preserve_prior_timings(final_manifest, prior_manifest)
     if materialization_deferred:

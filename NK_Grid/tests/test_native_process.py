@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
+import ctypes
+import struct
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from aleatoric_nk_grid import native_process
 from aleatoric_nk_grid.model_registry import load_model_params
 from aleatoric_nk_grid.native_process import (
     IsolatedProcessRunner,
@@ -39,12 +43,45 @@ def _raise_system_exit() -> None:
     raise SystemExit("child requested exit")
 
 
-def _start_blocking_grandchild(pid_file: str) -> None:
+def _start_grandchild(pid_file: str) -> int:
     grandchild = subprocess.Popen(
         [sys.executable, "-c", "import os,sys,time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)", pid_file]
     )
-    while grandchild.poll() is None:
+    deadline = time.monotonic() + 5.0
+    while not Path(pid_file).exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not Path(pid_file).exists():
+        raise RuntimeError("grandchild did not publish its PID")
+    return grandchild.pid
+
+
+def _process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.exists():
+        return proc_stat.read_text(encoding="utf-8").split()[2] != "Z"
+    if sys.platform == "darwin":
+        buffer = ctypes.create_string_buffer(136)
+        result = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo(
+            pid, 3, 0, buffer, len(buffer)
+        )
+        if result <= 0:
+            return False
+        status = struct.unpack_from("I", buffer.raw, 4)[0]
+        return status != 5
+    return True
+
+
+def _wait_not_running(pid: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_is_running(pid):
+            return
         time.sleep(0.05)
+    pytest.fail(f"process {pid} is still running")
 
 
 def test_native_process_crash_is_retried_and_does_not_kill_parent():
@@ -95,35 +132,59 @@ def test_native_process_timeout_kills_worker_and_parent_can_continue():
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are unavailable")
 def test_timeout_kills_native_worker_descendants_and_runner_recovers(tmp_path):
     pid_file = tmp_path / "grandchild.pid"
-    with IsolatedProcessRunner(max_attempts=1, timeout_seconds=1.0, shutdown_grace_seconds=0.2) as runner:
+    with IsolatedProcessRunner(max_attempts=1, timeout_seconds=5.0, shutdown_grace_seconds=0.2) as runner:
         try:
+            worker_pid = runner.run(os.getpid)
+            grandchild_pid = runner.run(_start_grandchild, str(pid_file))
+            assert int(pid_file.read_text(encoding="utf-8")) == grandchild_pid
+            assert _process_is_running(grandchild_pid)
+            runner.timeout_seconds = 0.1
             with pytest.raises(NativeProcessTimedOut):
-                runner.run(_start_blocking_grandchild, str(pid_file))
+                runner.run(_sleep_for, 60.0)
         except (NotImplementedError, PermissionError) as exc:
             pytest.skip(f"processes unavailable in this sandbox: {exc}")
-        deadline = time.monotonic() + 3.0
-        while not pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert pid_file.exists()
-        grandchild_pid = int(pid_file.read_text(encoding="utf-8"))
-        while time.monotonic() < deadline:
-            try:
-                os.kill(grandchild_pid, 0)
-            except ProcessLookupError:
-                break
-            state = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(grandchild_pid)],
-                check=False,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            if state.startswith("Z"):
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("timeout leaked a native worker grandchild")
+        _wait_not_running(worker_pid)
+        _wait_not_running(grandchild_pid)
         runner.timeout_seconds = 5.0
         assert runner.run(os.getpid) != os.getpid()
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are unavailable")
+def test_crash_kills_native_worker_grandchild_and_runner_recovers(tmp_path):
+    pid_file = tmp_path / "grandchild.pid"
+    with IsolatedProcessRunner(max_attempts=1, timeout_seconds=5.0) as runner:
+        try:
+            worker_pid = runner.run(os.getpid)
+            grandchild_pid = runner.run(_start_grandchild, str(pid_file))
+            assert _process_is_running(grandchild_pid)
+            with pytest.raises(NativeProcessCrashed):
+                runner.run(_terminate_child_abruptly)
+        except (NotImplementedError, PermissionError) as exc:
+            pytest.skip(f"processes unavailable in this sandbox: {exc}")
+        _wait_not_running(worker_pid)
+        _wait_not_running(grandchild_pid)
+        assert runner.run(os.getpid) != os.getpid()
+
+
+def test_timeout_escalates_from_sigterm_to_sigkill(tmp_path, monkeypatch):
+    signals: list[int] = []
+    real_killpg = os.killpg
+
+    def delayed_killpg(pid: int, requested_signal: int) -> None:
+        signals.append(requested_signal)
+        if requested_signal == signal.SIGKILL:
+            real_killpg(pid, requested_signal)
+
+    monkeypatch.setattr(native_process.os, "killpg", delayed_killpg)
+    with IsolatedProcessRunner(
+        max_attempts=1,
+        timeout_seconds=0.1,
+        shutdown_grace_seconds=0.1,
+    ) as runner:
+        with pytest.raises(NativeProcessTimedOut):
+            runner.run(_sleep_for, 60.0)
+
+    assert signals[:2] == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_python_exception_crosses_boundary_without_destroying_worker():

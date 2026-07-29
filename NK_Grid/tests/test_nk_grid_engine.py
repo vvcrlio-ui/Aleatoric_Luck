@@ -12,6 +12,7 @@ import pytest
 
 from aleatoric_nk_grid.experiment import (
     checkpoint_parts_dir,
+    manifest_path,
     write_checkpoint_part,
 )
 from aleatoric_nk_grid.nk_grid import (
@@ -703,6 +704,130 @@ def test_scheduler_n_jobs_override_does_not_change_experiment_identity(tmp_path)
         first.with_suffix(".manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["design"]["parallelism"]["configured_outer_n_jobs"] == 8
+
+
+def test_exact_output_path_requires_explicit_single_seed_execution(tmp_path):
+    config = _config(
+        tmp_path / "missing-schema.json",
+        tmp_path / "seed.csv",
+        repeat_plan=((11, 0), (22, 0)),
+    )
+    with pytest.raises(ValueError, match="explicit single-seed"):
+        run_nk_grid(config, exact_output_path=True)
+    with pytest.raises(ValueError, match="exactly one seed"):
+        run_nk_grid(
+            config,
+            execution_pairs=((11, 0), (22, 0)),
+            exact_output_path=True,
+        )
+
+
+def test_exact_output_shard_resumes_same_deterministic_path(tmp_path):
+    schema = write_schema_bundle(
+        tmp_path / "input",
+        _regression_frame(),
+        predictors=["X_a", "X_b"],
+    )
+    output = tmp_path / "seed-11.csv"
+    config = _config(
+        schema,
+        output,
+        preset="dev",
+        repeat_plan=((11, 0), (22, 0)),
+        rerun_completed=False,
+    )
+
+    first = run_nk_grid(
+        config,
+        execution_pairs=((11, 0),),
+        exact_output_path=True,
+        defer_failure_policy=True,
+    )
+    with patch(
+        "aleatoric_nk_grid.nk_grid.make_model",
+        side_effect=AssertionError("complete exact shard must be reused"),
+    ):
+        second = run_nk_grid(
+            config,
+            execution_pairs=((11, 0),),
+            exact_output_path=True,
+            defer_failure_policy=True,
+        )
+
+    assert first == output
+    assert second == output
+    assert not list(tmp_path.glob("seed-11_dev_*.csv"))
+    payload = json.loads(
+        output.with_suffix(".manifest.json").read_text(encoding="utf-8")
+    )
+    assert payload["design"]["preset"] == "dev"
+    assert payload["execution"]["mode"] == "seed-shard"
+
+
+def test_exact_output_rejects_identity_mismatch_on_deterministic_path(tmp_path):
+    schema = write_schema_bundle(
+        tmp_path / "input",
+        _regression_frame(),
+        predictors=["X_a", "X_b"],
+    )
+    output = tmp_path / "seed-11.csv"
+    config = _config(
+        schema,
+        output,
+        repeat_plan=((11, 0), (22, 0)),
+        rerun_completed=False,
+    )
+    run_nk_grid(
+        config,
+        execution_pairs=((11, 0),),
+        exact_output_path=True,
+        defer_failure_policy=True,
+    )
+
+    with pytest.raises(ValueError, match=r"identity\.data_version"):
+        run_nk_grid(
+            _config(
+                schema,
+                output,
+                repeat_plan=((11, 0), (22, 0)),
+                rerun_completed=False,
+                data_version="different-data-v2",
+            ),
+            execution_pairs=((11, 0),),
+            exact_output_path=True,
+            defer_failure_policy=True,
+        )
+
+
+def test_explicit_seed_execution_is_labeled_seed_shard_without_exact_path(
+    tmp_path,
+):
+    schema = write_schema_bundle(
+        tmp_path / "input",
+        _regression_frame(),
+        predictors=["X_a", "X_b"],
+    )
+    out = tmp_path / "result.csv"
+    run_nk_grid(
+        _config(
+            schema,
+            out,
+            repeat_plan=((11, 0), (22, 0)),
+            experiment_id="explicit-execution",
+            data_version="data-v1",
+            model_spec_version="models-v1",
+        ),
+        execution_pairs=((11, 0),),
+        defer_failure_policy=True,
+    )
+
+    manifest = json.loads(manifest_path(out).read_text(encoding="utf-8"))
+    assert manifest["execution"] == {
+        "mode": "seed-shard",
+        "seed": 11,
+        "draws": [0],
+        "expected_rows": 1,
+    }
 
 
 def test_checkpoint_boundary_stop_is_resumable(tmp_path):

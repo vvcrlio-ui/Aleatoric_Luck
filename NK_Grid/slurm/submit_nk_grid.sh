@@ -20,6 +20,8 @@ TIME_LIMIT="4-00:00:00"
 MAX_RESTARTS=5
 REQUEUE_WATCHDOG_SECONDS=240
 ONLY_RESOURCE_CLASS=""
+RECOVERY_MASTER_INDICES=""
+CLEANUP_NEVER_SATISFIED=0
 
 usage() {
   echo "Usage: $0 (--manifest ARTICLE/panels.yaml | --snapshot JOBS.json) [options]"
@@ -27,6 +29,8 @@ usage() {
   echo "  --allow-large-run          authorize production-sized tasks"
   echo "  --rerun-completed          intentionally recompute completed tasks"
   echo "  --resource-class CLASS     submit only parallel, serial, or super_learner (recovery)"
+  echo "  --master-indices CSV       explicit master indices for snapshot recovery"
+  echo "  --cleanup-never-satisfied  cancel only DependencyNeverSatisfied jobs verified from this snapshot's receipts"
   echo "  --max-concurrent-per-class N  cap running tasks in each resource-class array"
   echo "  --cpus-per-task N          CPUs for parallel tasks (default: 8)"
   echo "  --serial-cpus-per-task N   CPUs for serial tasks (default: 1)"
@@ -46,6 +50,8 @@ while [ "$#" -gt 0 ]; do
     --allow-large-run) ALLOW_LARGE_RUN=1; shift ;;
     --rerun-completed) RERUN_COMPLETED=1; shift ;;
     --resource-class) ONLY_RESOURCE_CLASS="${2:?--resource-class requires a value}"; shift 2 ;;
+    --master-indices) RECOVERY_MASTER_INDICES="${2:?--master-indices requires a value}"; shift 2 ;;
+    --cleanup-never-satisfied) CLEANUP_NEVER_SATISFIED=1; shift ;;
     --max-concurrent-per-class) MAX_CONCURRENT_PER_CLASS="${2:?--max-concurrent-per-class requires a value}"; shift 2 ;;
     --max-concurrent)
       echo "--max-concurrent is ambiguous after resource-class splitting; use --max-concurrent-per-class" >&2
@@ -79,6 +85,14 @@ case "$ONLY_RESOURCE_CLASS" in
 esac
 if [ -n "$SNAPSHOT_INPUT" ] && [ -z "$ONLY_RESOURCE_CLASS" ]; then
   echo "--snapshot recovery requires --resource-class to avoid duplicate arrays" >&2
+  exit 2
+fi
+if [ -n "$RECOVERY_MASTER_INDICES" ] && [ -z "$SNAPSHOT_INPUT" ]; then
+  echo "--master-indices is only valid with --snapshot recovery" >&2
+  exit 2
+fi
+if [ "$CLEANUP_NEVER_SATISFIED" = "1" ] && [ -z "$SNAPSHOT_INPUT" ]; then
+  echo "--cleanup-never-satisfied is only valid with --snapshot recovery" >&2
   exit 2
 fi
 if [ -n "$MANIFEST" ] && [[ "$MANIFEST" != /* ]]; then
@@ -198,6 +212,36 @@ if [ "$PLANNED_JOB_COUNT" -ne "$SNAPSHOT_JOB_COUNT" ]; then
   echo "Resource-class plan covers $PLANNED_JOB_COUNT of $SNAPSHOT_JOB_COUNT snapshot jobs; nothing was submitted." >&2
   exit 1
 fi
+if [ -n "$SNAPSHOT_INPUT" ]; then
+  DIAGNOSTIC_ARGS=(
+    dependency-diagnostics --snapshot "$SNAPSHOT"
+  )
+  [ "$CLEANUP_NEVER_SATISFIED" = "0" ] || \
+    DIAGNOSTIC_ARGS+=(--cleanup-never-satisfied)
+  echo "Dependency diagnostics: $(
+    "$PYTHON" -m aleatoric_nk_grid.slurm_jobs "${DIAGNOSTIC_ARGS[@]}"
+  )"
+  RECOVERY_ARGS=(
+    recovery-indices
+    --snapshot "$SNAPSHOT"
+    --resource-class "$ONLY_RESOURCE_CLASS"
+  )
+  [ -z "$RECOVERY_MASTER_INDICES" ] || \
+    RECOVERY_ARGS+=(--master-indices "$RECOVERY_MASTER_INDICES")
+  RECOVERY_MASTER_INDICES=$(
+    "$PYTHON" -m aleatoric_nk_grid.seed_shards "${RECOVERY_ARGS[@]}"
+  )
+  for CLASS_POSITION in "${!RESOURCE_CLASSES[@]}"; do
+    [ "${RESOURCE_CLASSES[$CLASS_POSITION]}" = "$ONLY_RESOURCE_CLASS" ] || continue
+    CLASS_INDICES_BY_POSITION[$CLASS_POSITION]="$RECOVERY_MASTER_INDICES"
+    CLASS_JOB_COUNT=0
+    if [ -n "$RECOVERY_MASTER_INDICES" ]; then
+      IFS=',' read -r -a RECOVERY_INDEX_ARRAY <<< "$RECOVERY_MASTER_INDICES"
+      CLASS_JOB_COUNT="${#RECOVERY_INDEX_ARRAY[@]}"
+    fi
+    CLASS_JOB_COUNTS_BY_POSITION[$CLASS_POSITION]="$CLASS_JOB_COUNT"
+  done
+fi
 
 MAX_SLURM_RESTARTS="$MAX_RESTARTS"
 export ENGINE_DIR VENV PYTHON MAX_SLURM_RESTARTS REQUEUE_WATCHDOG_SECONDS
@@ -221,7 +265,9 @@ for CLASS_POSITION in "${!RESOURCE_CLASSES[@]}"; do
   while [ "$CHUNK_START" -lt "$CLASS_JOB_COUNT" ]; do
     CHUNK_SIZE="$MAX_ARRAY_SIZE"
     [ $((CLASS_JOB_COUNT - CHUNK_START)) -lt "$CHUNK_SIZE" ] && CHUNK_SIZE=$((CLASS_JOB_COUNT - CHUNK_START))
-    CHUNK_MAP=$("$PYTHON" -m aleatoric_nk_grid.slurm_jobs chunk-map --snapshot "$SNAPSHOT" --resource-class "$RESOURCE_CLASS" --max-array-size "$MAX_ARRAY_SIZE" --chunk-ordinal "$CHUNK_ORDINAL")
+    CHUNK_ARGS=(chunk-map --snapshot "$SNAPSHOT" --resource-class "$RESOURCE_CLASS" --max-array-size "$MAX_ARRAY_SIZE" --chunk-ordinal "$CHUNK_ORDINAL")
+    [ -z "$SNAPSHOT_INPUT" ] || CHUNK_ARGS+=(--master-indices "$RECOVERY_MASTER_INDICES")
+    CHUNK_MAP=$("$PYTHON" -m aleatoric_nk_grid.slurm_jobs "${CHUNK_ARGS[@]}")
     ARRAY_SPEC="0-$((CHUNK_SIZE - 1))"
     [ "$CHUNK_SIZE" -eq 1 ] && ARRAY_SPEC="0"
     [ -z "$MAX_CONCURRENT_PER_CLASS" ] || ARRAY_SPEC="${ARRAY_SPEC}%${MAX_CONCURRENT_PER_CLASS}"
@@ -250,15 +296,64 @@ for CLASS_POSITION in "${!RESOURCE_CLASSES[@]}"; do
   LAST_JOB_IDS+=("$CLASS_LAST_JOB")
 done
 
-if [ "$SUBMITTED_ARRAYS" -eq 0 ]; then echo "No matching resource-class tasks were submitted." >&2; exit 1; fi
-if [ -z "$ONLY_RESOURCE_CLASS" ]; then
-  FINALIZER_MAP=$("$PYTHON" -m aleatoric_nk_grid.seed_shards build-map --snapshot "$SNAPSHOT")
-  FINALIZER_COUNT=$(grep -c '"panel"' "$FINALIZER_MAP" || true)
-  case "$FINALIZER_COUNT" in ''|*[!0-9]*|0) echo "Finalizer map is empty: $FINALIZER_MAP" >&2; exit 1 ;; esac
-  FINALIZER_ARRAY="0-$((FINALIZER_COUNT - 1))"; [ "$FINALIZER_COUNT" -eq 1 ] && FINALIZER_ARRAY="0"
-  FINALIZER_DEPENDENCY=$(IFS=:; echo "${LAST_JOB_IDS[*]}")
-  if ! FINALIZER_OUTPUT=$(sbatch --parsable --job-name="al-nk-finalize" --output="$ENGINE_DIR/logs/%x-%A_%a.out" --error="$ENGINE_DIR/logs/%x-%A_%a.err" --chdir="$ENGINE_DIR" --export="$EXPORT_SPEC" --array="$FINALIZER_ARRAY" --dependency="afterany:$FINALIZER_DEPENDENCY" "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch" "$SNAPSHOT" "$FINALIZER_MAP"); then
-    echo "Seed arrays submitted but finalizer submission failed." >&2; exit 1
-  fi
-  echo "Submitted seed finalizer array ${FINALIZER_OUTPUT%%;*} with $FINALIZER_COUNT tasks"
+if [ "$SUBMITTED_ARRAYS" -eq 0 ]; then
+  echo "No missing/incomplete matching resource-class tasks were submitted." >&2
+  exit 1
 fi
+
+FINALIZER_MAP=$(
+  "$PYTHON" -m aleatoric_nk_grid.seed_shards build-map \
+    --snapshot "$SNAPSHOT" --kind finalizer
+)
+PUBLISH_MAP=$(
+  "$PYTHON" -m aleatoric_nk_grid.seed_shards build-map \
+    --snapshot "$SNAPSHOT" --kind publish
+)
+FINALIZER_COUNT=$(
+  "$PYTHON" -m aleatoric_nk_grid.seed_shards map-count --map "$FINALIZER_MAP"
+)
+PUBLISH_COUNT=$(
+  "$PYTHON" -m aleatoric_nk_grid.seed_shards map-count --map "$PUBLISH_MAP"
+)
+case "$FINALIZER_COUNT:$PUBLISH_COUNT" in
+  *[!0-9:]*|0:*|*:0) echo "Finalizer/publish maps must be non-empty." >&2; exit 1 ;;
+esac
+FINALIZER_ARRAY="0-$((FINALIZER_COUNT - 1))"
+[ "$FINALIZER_COUNT" -eq 1 ] && FINALIZER_ARRAY="0"
+FINALIZER_DEPENDENCY=$(IFS=:; echo "${LAST_JOB_IDS[*]}")
+if ! FINALIZER_OUTPUT=$(sbatch --parsable \
+  --job-name="al-nk-finalize" \
+  --output="$ENGINE_DIR/logs/%x-%A_%a.out" \
+  --error="$ENGINE_DIR/logs/%x-%A_%a.err" \
+  --chdir="$ENGINE_DIR" --export="$EXPORT_SPEC" \
+  --cpus-per-task=1 --mem="$MEMORY" --time="$TIME_LIMIT" \
+  --array="$FINALIZER_ARRAY" \
+  --dependency="afterany:$FINALIZER_DEPENDENCY" \
+  "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch" \
+  "$SNAPSHOT" "$FINALIZER_MAP" finalize); then
+  echo "Seed arrays submitted but finalizer submission failed." >&2
+  exit 1
+fi
+FINALIZER_JOB_ID="${FINALIZER_OUTPUT%%;*}"
+[[ "$FINALIZER_JOB_ID" =~ ^[0-9]+$ ]] || {
+  echo "Could not parse finalizer job ID: $FINALIZER_OUTPUT" >&2
+  exit 1
+}
+echo "Submitted seed finalizer array $FINALIZER_JOB_ID with $FINALIZER_COUNT tasks"
+
+PUBLISH_ARRAY="0-$((PUBLISH_COUNT - 1))"
+[ "$PUBLISH_COUNT" -eq 1 ] && PUBLISH_ARRAY="0"
+if ! PUBLISH_OUTPUT=$(sbatch --parsable \
+  --job-name="al-nk-publish" \
+  --output="$ENGINE_DIR/logs/%x-%A_%a.out" \
+  --error="$ENGINE_DIR/logs/%x-%A_%a.err" \
+  --chdir="$ENGINE_DIR" --export="$EXPORT_SPEC" \
+  --cpus-per-task=1 --mem="$MEMORY" --time="$TIME_LIMIT" \
+  --array="$PUBLISH_ARRAY" \
+  --dependency="afterany:$FINALIZER_JOB_ID" \
+  "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch" \
+  "$SNAPSHOT" "$PUBLISH_MAP" publish); then
+  echo "Finalizer submitted but panel publish submission failed." >&2
+  exit 1
+fi
+echo "Submitted panel publish array ${PUBLISH_OUTPUT%%;*} with $PUBLISH_COUNT tasks"

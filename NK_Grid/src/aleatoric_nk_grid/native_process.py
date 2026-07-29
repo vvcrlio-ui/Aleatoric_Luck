@@ -136,7 +136,7 @@ class IsolatedProcessRunner:
             connection.close()
         if process is None:
             return
-        if force and process.is_alive():
+        if force:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:

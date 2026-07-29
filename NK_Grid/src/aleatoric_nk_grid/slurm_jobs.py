@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -142,6 +143,10 @@ def _model_output_path(path: Path, panel: str, model: str, seed: int) -> Path:
     return path.parent / ".seed-shards" / panel / model / f"seed-{seed}{path.suffix}"
 
 
+def _model_final_output_path(path: Path, panel: str, model: str) -> Path:
+    return path.parent / ".seed-final" / panel / f"{model}{path.suffix}"
+
+
 def build_slurm_jobs(manifest_path: Path) -> list[SlurmJob]:
     """Return the active panel/model jobs declared by one manifest."""
 
@@ -158,7 +163,9 @@ def build_slurm_jobs(manifest_path: Path) -> list[SlurmJob]:
                         config, models=(model_name,),
                         out=_model_output_path(Path(config.out), panel_name, model_name, seed),
                     ),
-                    final_out=Path(config.out),
+                    final_out=_model_final_output_path(
+                        Path(config.out), panel_name, model_name
+                    ),
                 ))
     if not jobs:
         raise ValueError(f"No active panel/model jobs found in {manifest_path}")
@@ -182,6 +189,18 @@ def _require_unique_output_paths(jobs: list[SlurmJob]) -> None:
         raise ValueError(
             "Slurm panel/model jobs must have unique output paths; duplicate "
             f"targets found ({examples}). Use a distinct 'out' for each panel."
+        )
+    final_owners: dict[Path, set[tuple[str, str]]] = {}
+    for job in jobs:
+        final_owners.setdefault(Path(job.final_out).resolve(), set()).add(
+            (job.panel, job.model)
+        )
+    duplicate_finals = {
+        path: owners for path, owners in final_owners.items() if len(owners) > 1
+    }
+    if duplicate_finals:
+        raise ValueError(
+            "Slurm per-model final outputs must be unique within a panel"
         )
 
 
@@ -228,6 +247,10 @@ def write_job_snapshot(
     payload = {
         "format_version": 1,
         "source_manifest": str(manifest_path),
+        "panel_outputs": {
+            panel_name: str(config.out)
+            for panel_name, config in resolved_panels(manifest_path)
+        },
         "execution_policy": {
             "rerun_completed": bool(rerun_completed),
         },
@@ -560,15 +583,86 @@ def write_submission_receipt(
                 "effective_allow_large_run": bool(
                     allow_large_run or job.config.allow_large_run
                 ),
-                "rerun_command": rerun_command(str(index)),
+                "rerun_command": rerun_command(
+                    str(local_index if chunk_map is not None else index)
+                ),
             }
-            for index in selected_indices
+            for local_index, index in enumerate(selected_indices)
             for job in (jobs[index],)
         ],
     }
     write_json_atomic(receipt_path, payload)
     os.chmod(receipt_path, 0o444)
     return receipt_path
+
+
+def dependency_never_satisfied_diagnostics(
+    snapshot_path: Path,
+    *,
+    scheduler_output: str | None = None,
+    cleanup: bool = False,
+) -> dict[str, Any]:
+    """Inspect only receipt-owned jobs for DependencyNeverSatisfied."""
+
+    snapshot_path = snapshot_path.resolve()
+    receipt_job_ids: set[str] = set()
+    for receipt_path in snapshot_path.parent.glob("slurm-*.json"):
+        try:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        job_id = payload.get("slurm_job_id")
+        if (
+            payload.get("format_version") == 1
+            and isinstance(payload.get("snapshot"), str)
+            and Path(payload["snapshot"]).resolve() == snapshot_path
+            and isinstance(job_id, str)
+            and job_id.isdigit()
+        ):
+            receipt_job_ids.add(job_id)
+
+    ordered_ids = sorted(receipt_job_ids, key=int)
+    if scheduler_output is None and ordered_ids:
+        completed = subprocess.run(
+            [
+                "squeue",
+                "--noheader",
+                "--jobs",
+                ",".join(ordered_ids),
+                "--format",
+                "%A|%r|%T",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        scheduler_output = completed.stdout
+    scheduler_output = scheduler_output or ""
+    never_satisfied: set[str] = set()
+    for line in scheduler_output.splitlines():
+        fields = line.strip().split("|", 2)
+        if len(fields) != 3:
+            continue
+        job_id, reason, _ = fields
+        if (
+            job_id in receipt_job_ids
+            and reason == "DependencyNeverSatisfied"
+        ):
+            never_satisfied.add(job_id)
+    ordered_never_satisfied = sorted(never_satisfied, key=int)
+    cleaned: list[str] = []
+    if cleanup and ordered_never_satisfied:
+        subprocess.run(
+            ["scancel", *ordered_never_satisfied],
+            check=True,
+        )
+        cleaned = ordered_never_satisfied
+    return {
+        "snapshot": str(snapshot_path),
+        "receipt_job_ids": ordered_ids,
+        "dependency_never_satisfied_job_ids": ordered_never_satisfied,
+        "cleaned_job_ids": cleaned,
+    }
 
 
 def job_summary(job: SlurmJob, index: int) -> dict:
@@ -611,7 +705,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument(
         "command",
-        choices=("chunk-map", "count", "indices", "list", "snapshot", "receipt", "run"),
+        choices=(
+            "chunk-map",
+            "count",
+            "dependency-diagnostics",
+            "indices",
+            "list",
+            "snapshot",
+            "receipt",
+            "run",
+        ),
     )
     parser.add_argument("--manifest", default=str(ROOT / "panels.yaml"))
     parser.add_argument("--snapshot", default=None)
@@ -635,6 +738,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--dependency-job-id", default=None)
     parser.add_argument("--max-array-size", type=int, default=None)
     parser.add_argument("--chunk-ordinal", type=int, default=None)
+    parser.add_argument("--master-indices", default=None)
+    parser.add_argument(
+        "--cleanup-never-satisfied",
+        action="store_true",
+    )
     args = parser.parse_args(argv)
 
     manifest_path = Path(args.manifest).resolve()
@@ -682,6 +790,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(receipt)
         return
 
+    if args.command == "dependency-diagnostics":
+        if snapshot_path is None:
+            parser.error("dependency-diagnostics requires --snapshot")
+        print(
+            json.dumps(
+                dependency_never_satisfied_diagnostics(
+                    snapshot_path,
+                    cleanup=args.cleanup_never_satisfied,
+                ),
+                sort_keys=True,
+            )
+        )
+        return
+
     jobs = (
         load_job_snapshot(snapshot_path)
         if snapshot_path is not None
@@ -724,9 +846,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.max_array_size is None or args.max_array_size < 1:
             parser.error("chunk-map requires a positive --max-array-size")
         jobs = load_job_snapshot(snapshot_path)
-        chunks = chunk_master_indices(
-            resource_class_indices(jobs, args.resource_class), args.max_array_size
-        )
+        class_indices = resource_class_indices(jobs, args.resource_class)
+        selected_indices = class_indices
+        if args.master_indices is not None:
+            try:
+                selected_indices = tuple(
+                    int(value) for value in args.master_indices.split(",")
+                    if value
+                )
+            except ValueError as exc:
+                parser.error("--master-indices must be comma-separated integers")
+            if (
+                len(selected_indices) != len(set(selected_indices))
+                or any(index not in class_indices for index in selected_indices)
+            ):
+                parser.error(
+                    "--master-indices must be unique members of the "
+                    "declared resource class"
+                )
+        chunks = chunk_master_indices(selected_indices, args.max_array_size)
         if args.chunk_ordinal is None:
             print(json.dumps([str(write_chunk_map(snapshot_path, args.resource_class, chunk, ordinal)) for ordinal, chunk in enumerate(chunks)]))
             return
