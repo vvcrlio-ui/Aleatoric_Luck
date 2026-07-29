@@ -3,6 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,6 +27,7 @@ from aleatoric_nk_grid.seed_shards import (
     publish_panel,
     recovery_indices,
 )
+from aleatoric_nk_grid import seed_shards
 from conftest import write_schema_bundle
 
 
@@ -92,6 +96,7 @@ def _write_shard(config: NKGridConfig, *, seed: int, status: str = "ok") -> None
         writer.writeheader()
         writer.writerow({"model": model, "seed": seed, "draw": 0, "N": 10, "K": 1, "status": status, "metric": "1.0"})
     manifest = {
+        "updated_at": f"2026-07-29T00:00:{seed % 60:02d}+00:00",
         "identity": {"mode": "explicit-v1", "experiment_id": "experiment", "data_version": "data-v1", "model_spec_version": "models-v1"},
         "semantic_contract": {"kind": "nk_grid", "model": [model]},
         "design": {"n_grid": [10], "k_grid": [1], "models": [model]},
@@ -276,6 +281,197 @@ def test_finalize_and_publish_noop_for_equivalent_existing_results(tmp_path):
         == panel_out
     )
     assert panel_out.stat().st_mtime_ns == panel_mtime
+
+
+@pytest.mark.parametrize("operation", ["finalize", "publish"])
+def test_concurrent_finalize_and_publish_reserve_distinct_temporary_csvs(
+    tmp_path, monkeypatch, operation
+):
+    snapshot = _snapshot(tmp_path, models=("ols", "ridge"))
+    if operation == "publish":
+        for model in ("ols", "ridge"):
+            finalize_seed_shards(snapshot, panel="panel", model=model)
+    expected_target = (
+        tmp_path / ".seed-final" / "panel" / "ols.csv"
+        if operation == "finalize"
+        else tmp_path / "panel.csv"
+    )
+    expected_lock_error = (
+        "Another NK Grid worker already holds the output lease: "
+        f"{expected_target.parent / '.locks' / f'{expected_target.name}.run.lock'}"
+    )
+
+    barrier = threading.Barrier(2)
+    reserved: list[Path] = []
+    reserved_threads: set[int] = set()
+    reserved_lock = threading.Lock()
+    real_reserve = seed_shards._reserve_temporary_csv
+
+    def synchronized_reserve(target, operation_name):
+        path = real_reserve(target, operation_name)
+        with reserved_lock:
+            reserved.append(path)
+            reserved_threads.add(threading.get_ident())
+        barrier.wait(timeout=10)
+        return path
+
+    monkeypatch.setattr(
+        seed_shards, "_reserve_temporary_csv", synchronized_reserve
+    )
+
+    def run():
+        for _ in range(100):
+            try:
+                if operation == "finalize":
+                    return finalize_seed_shards(
+                        snapshot, panel="panel", model="ols"
+                    )
+                return publish_panel(
+                    snapshot, panel="panel", models=("ols", "ridge")
+                )
+            except RuntimeError as exc:
+                assert str(exc) == expected_lock_error
+                with reserved_lock:
+                    if threading.get_ident() in reserved_threads:
+                        return None
+                time.sleep(0.001)
+        pytest.fail("concurrent operation never passed its initial no-op lock")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: run(), range(2)))
+
+    assert len(reserved) == 2
+    assert reserved[0] != reserved[1]
+    assert all(not path.exists() for path in reserved)
+    assert expected_target in results
+    assert expected_target.exists()
+    assert manifest_path(expected_target).exists()
+
+
+def test_concurrent_publication_loser_observes_whole_old_pair(tmp_path):
+    target = tmp_path / "result.csv"
+    target_manifest = manifest_path(target)
+    target.write_text("generation\nold\n", encoding="utf-8")
+    _write_json(target_manifest, {"generation": "old"})
+    new_csv = seed_shards._reserve_temporary_csv(target, "concurrent-test")
+    new_csv.write_text("generation\nnew\n", encoding="utf-8")
+    new_manifest = seed_shards._write_temporary_manifest(
+        target, {"generation": "new"}
+    )
+    winner_locked = threading.Event()
+    loser_checked = threading.Event()
+    loser_observation: list[tuple[str, dict]] = []
+
+    def winner():
+        with seed_shards.output_run_lock(target):
+            winner_locked.set()
+            assert loser_checked.wait(timeout=10)
+            seed_shards._publish_pair(new_csv, new_manifest, target)
+
+    def loser():
+        assert winner_locked.wait(timeout=10)
+        with pytest.raises(RuntimeError) as error:
+            with seed_shards.output_run_lock(target):
+                pass
+        assert str(error.value) == (
+            "Another NK Grid worker already holds the output lease: "
+            f"{tmp_path / '.locks' / 'result.csv.run.lock'}"
+        )
+        loser_observation.append(
+            (
+                target.read_text(encoding="utf-8"),
+                _read_json(target_manifest),
+            )
+        )
+        loser_checked.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(winner), executor.submit(loser)]
+        for future in futures:
+            future.result(timeout=10)
+
+    assert loser_observation == [
+        ("generation\nold\n", {"generation": "old"})
+    ]
+    assert target.read_text(encoding="utf-8") == "generation\nnew\n"
+    assert _read_json(target_manifest) == {"generation": "new"}
+
+
+def test_finalizer_refuses_noop_when_shard_provenance_changes(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    target = finalize_seed_shards(snapshot, panel="panel", model="ols")
+    original = target.read_bytes()
+    shard = tmp_path / ".seed-shards" / "panel" / "ols" / "seed-22.csv"
+    rows = list(csv.DictReader(shard.open(encoding="utf-8")))
+    rows[0]["metric"] = "2.0"
+    _rewrite_rows(shard, rows)
+    shard_manifest = _read_json(manifest_path(shard))
+    shard_manifest["updated_at"] = "2026-07-29T01:00:22+00:00"
+    _write_json(manifest_path(shard), shard_manifest)
+
+    assert finalize_seed_shards(
+        snapshot, panel="panel", model="ols"
+    ) == target
+
+    changed_rows = list(csv.DictReader(target.open(encoding="utf-8")))
+    assert target.read_bytes() != original
+    assert [row["metric"] for row in changed_rows] == ["1.0", "2.0"]
+    provenance = _read_json(manifest_path(target))["input_artifacts"]
+    assert provenance[1] == {
+        "path": str(shard.resolve()),
+        "rows": 1,
+        "seed": 22,
+        "updated_at": "2026-07-29T01:00:22+00:00",
+    }
+
+
+def test_cli_distinguishes_oserror_from_contract_violation(
+    tmp_path, monkeypatch, capsys
+):
+    def storage_failure(*args, **kwargs):
+        raise PermissionError("storage unavailable")
+
+    monkeypatch.setattr(seed_shards, "_load_map", storage_failure)
+    arguments = [
+        "finalize",
+        "--snapshot",
+        str(tmp_path / "jobs.json"),
+        "--map",
+        str(tmp_path / "map.json"),
+        "--index",
+        "0",
+    ]
+    assert main(arguments) == 4
+    assert capsys.readouterr().err.strip() == "storage unavailable"
+
+    def contract_failure(*args, **kwargs):
+        raise SeedShardValidationError("contract mismatch")
+
+    monkeypatch.setattr(seed_shards, "_load_map", contract_failure)
+    assert main(arguments) == 1
+    assert capsys.readouterr().err.strip() == "contract mismatch"
+
+
+def test_missing_reports_publication_residuals_for_snapshot_targets(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    model_target = tmp_path / ".seed-final" / "panel" / "ols.csv"
+    panel_target = tmp_path / "panel.csv"
+    residuals = (
+        model_target.with_name(f".{model_target.name}.publishing"),
+        model_target.with_name(f".{model_target.name}.previous"),
+        manifest_path(panel_target).with_name(
+            f".{manifest_path(panel_target).name}.previous"
+        ),
+    )
+    for residual in residuals:
+        residual.parent.mkdir(parents=True, exist_ok=True)
+        residual.touch()
+
+    diagnosis = diagnose_missing(snapshot)
+
+    assert diagnosis["publication_residuals"] == [
+        str(path.resolve()) for path in sorted(residuals)
+    ]
 
 
 @pytest.mark.parametrize(

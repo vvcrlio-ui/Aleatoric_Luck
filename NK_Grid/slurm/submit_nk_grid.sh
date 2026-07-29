@@ -17,6 +17,10 @@ SUPER_LEARNER_CPUS_PER_TASK=1
 MAX_ARRAY_SIZE=""
 MEMORY="48G"
 TIME_LIMIT="4-00:00:00"
+FINALIZER_MEMORY="16G"
+FINALIZER_TIME_LIMIT="1-00:00:00"
+PUBLISH_MEMORY="32G"
+PUBLISH_TIME_LIMIT="2-00:00:00"
 MAX_RESTARTS=5
 REQUEUE_WATCHDOG_SECONDS=240
 ONLY_RESOURCE_CLASS=""
@@ -38,6 +42,10 @@ usage() {
   echo "  --max-array-size N         Slurm MaxArraySize override (otherwise auto-detect)"
   echo "  --mem VALUE                memory for parallel/serial tasks (default: 48G)"
   echo "  --time VALUE               time for parallel/serial tasks (default: 4-00:00:00)"
+  echo "  --finalizer-mem VALUE      finalizer memory (default: 16G)"
+  echo "  --finalizer-time VALUE     finalizer time (default: 1-00:00:00)"
+  echo "  --publish-mem VALUE        panel publish memory (default: 32G)"
+  echo "  --publish-time VALUE       panel publish time (default: 2-00:00:00)"
   echo "  --max-restarts N           checkpoint requeues allowed (default: 5)"
   echo "  --requeue-watchdog-seconds N  force requeue after waiting N seconds (default: 240)"
   echo "  --dry-run                  print resolved jobs without submitting"
@@ -63,6 +71,10 @@ while [ "$#" -gt 0 ]; do
     --max-array-size) MAX_ARRAY_SIZE="${2:?--max-array-size requires a value}"; shift 2 ;;
     --mem) MEMORY="${2:?--mem requires a value}"; shift 2 ;;
     --time) TIME_LIMIT="${2:?--time requires a value}"; shift 2 ;;
+    --finalizer-mem) FINALIZER_MEMORY="${2:?--finalizer-mem requires a value}"; shift 2 ;;
+    --finalizer-time) FINALIZER_TIME_LIMIT="${2:?--finalizer-time requires a value}"; shift 2 ;;
+    --publish-mem) PUBLISH_MEMORY="${2:?--publish-mem requires a value}"; shift 2 ;;
+    --publish-time) PUBLISH_TIME_LIMIT="${2:?--publish-time requires a value}"; shift 2 ;;
     --max-restarts) MAX_RESTARTS="${2:?--max-restarts requires a value}"; shift 2 ;;
     --requeue-watchdog-seconds) REQUEUE_WATCHDOG_SECONDS="${2:?--requeue-watchdog-seconds requires a value}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -123,6 +135,10 @@ if [ -n "$MAX_ARRAY_SIZE" ]; then
 fi
 [ -n "$MEMORY" ] || { echo "--mem must not be empty" >&2; exit 2; }
 [ -n "$TIME_LIMIT" ] || { echo "--time must not be empty" >&2; exit 2; }
+[ -n "$FINALIZER_MEMORY" ] || { echo "--finalizer-mem must not be empty" >&2; exit 2; }
+[ -n "$FINALIZER_TIME_LIMIT" ] || { echo "--finalizer-time must not be empty" >&2; exit 2; }
+[ -n "$PUBLISH_MEMORY" ] || { echo "--publish-mem must not be empty" >&2; exit 2; }
+[ -n "$PUBLISH_TIME_LIMIT" ] || { echo "--publish-time must not be empty" >&2; exit 2; }
 case "$MAX_RESTARTS" in
   ''|*[!0-9]*) echo "--max-restarts must be a non-negative integer" >&2; exit 2 ;;
 esac
@@ -213,6 +229,15 @@ if [ "$PLANNED_JOB_COUNT" -ne "$SNAPSHOT_JOB_COUNT" ]; then
   exit 1
 fi
 if [ -n "$SNAPSHOT_INPUT" ]; then
+  if FINALIZATION_STATUS=$(
+    "$PYTHON" -m aleatoric_nk_grid.slurm_jobs \
+      finalization-status --snapshot "$SNAPSHOT" 2>&1
+  ); then
+    echo "Finalization status: $FINALIZATION_STATUS"
+  else
+    echo "Recovery refused because this snapshot has an active finalizer/publish job: $FINALIZATION_STATUS" >&2
+    exit 1
+  fi
   DIAGNOSTIC_ARGS=(
     dependency-diagnostics --snapshot "$SNAPSHOT"
   )
@@ -326,7 +351,7 @@ if ! FINALIZER_OUTPUT=$(sbatch --parsable \
   --output="$ENGINE_DIR/logs/%x-%A_%a.out" \
   --error="$ENGINE_DIR/logs/%x-%A_%a.err" \
   --chdir="$ENGINE_DIR" --export="$EXPORT_SPEC" \
-  --cpus-per-task=1 --mem="$MEMORY" --time="$TIME_LIMIT" \
+  --cpus-per-task=1 --mem="$FINALIZER_MEMORY" --time="$FINALIZER_TIME_LIMIT" \
   --array="$FINALIZER_ARRAY" \
   --dependency="afterany:$FINALIZER_DEPENDENCY" \
   "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch" \
@@ -339,6 +364,29 @@ FINALIZER_JOB_ID="${FINALIZER_OUTPUT%%;*}"
   echo "Could not parse finalizer job ID: $FINALIZER_OUTPUT" >&2
   exit 1
 }
+FINALIZER_RECEIPT_ARGS=(
+  finalization-receipt
+  --snapshot "$SNAPSHOT"
+  --stage finalizer
+  --job-id "$FINALIZER_JOB_ID"
+  --array-spec "$FINALIZER_ARRAY"
+  --finalization-map "$FINALIZER_MAP"
+  --worker-script "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch"
+  --dependency-job-ids "${FINALIZER_DEPENDENCY//:/,}"
+  --cpus-per-task 1
+  --memory "$FINALIZER_MEMORY"
+  --time-limit "$FINALIZER_TIME_LIMIT"
+)
+if FINALIZER_RECEIPT_OUTPUT=$(
+  "$PYTHON" -m aleatoric_nk_grid.slurm_jobs \
+    "${FINALIZER_RECEIPT_ARGS[@]}" 2>&1
+); then
+  echo "Finalizer receipt: $FINALIZER_RECEIPT_OUTPUT"
+else
+  scancel "$FINALIZER_JOB_ID" >/dev/null 2>&1 || true
+  echo "Finalizer receipt failed; cancelled newly submitted job $FINALIZER_JOB_ID: $FINALIZER_RECEIPT_OUTPUT" >&2
+  exit 1
+fi
 echo "Submitted seed finalizer array $FINALIZER_JOB_ID with $FINALIZER_COUNT tasks"
 
 PUBLISH_ARRAY="0-$((PUBLISH_COUNT - 1))"
@@ -348,7 +396,7 @@ if ! PUBLISH_OUTPUT=$(sbatch --parsable \
   --output="$ENGINE_DIR/logs/%x-%A_%a.out" \
   --error="$ENGINE_DIR/logs/%x-%A_%a.err" \
   --chdir="$ENGINE_DIR" --export="$EXPORT_SPEC" \
-  --cpus-per-task=1 --mem="$MEMORY" --time="$TIME_LIMIT" \
+  --cpus-per-task=1 --mem="$PUBLISH_MEMORY" --time="$PUBLISH_TIME_LIMIT" \
   --array="$PUBLISH_ARRAY" \
   --dependency="afterany:$FINALIZER_JOB_ID" \
   "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch" \
@@ -356,4 +404,32 @@ if ! PUBLISH_OUTPUT=$(sbatch --parsable \
   echo "Finalizer submitted but panel publish submission failed." >&2
   exit 1
 fi
-echo "Submitted panel publish array ${PUBLISH_OUTPUT%%;*} with $PUBLISH_COUNT tasks"
+PUBLISH_JOB_ID="${PUBLISH_OUTPUT%%;*}"
+[[ "$PUBLISH_JOB_ID" =~ ^[0-9]+$ ]] || {
+  echo "Could not parse panel publish job ID: $PUBLISH_OUTPUT" >&2
+  exit 1
+}
+PUBLISH_RECEIPT_ARGS=(
+  finalization-receipt
+  --snapshot "$SNAPSHOT"
+  --stage publish
+  --job-id "$PUBLISH_JOB_ID"
+  --array-spec "$PUBLISH_ARRAY"
+  --finalization-map "$PUBLISH_MAP"
+  --worker-script "$ENGINE_DIR/slurm/finalize_seed_shards.sbatch"
+  --dependency-job-ids "$FINALIZER_JOB_ID"
+  --cpus-per-task 1
+  --memory "$PUBLISH_MEMORY"
+  --time-limit "$PUBLISH_TIME_LIMIT"
+)
+if PUBLISH_RECEIPT_OUTPUT=$(
+  "$PYTHON" -m aleatoric_nk_grid.slurm_jobs \
+    "${PUBLISH_RECEIPT_ARGS[@]}" 2>&1
+); then
+  echo "Publish receipt: $PUBLISH_RECEIPT_OUTPUT"
+else
+  scancel "$PUBLISH_JOB_ID" >/dev/null 2>&1 || true
+  echo "Publish receipt failed; cancelled newly submitted job $PUBLISH_JOB_ID: $PUBLISH_RECEIPT_OUTPUT" >&2
+  exit 1
+fi
+echo "Submitted panel publish array $PUBLISH_JOB_ID with $PUBLISH_COUNT tasks"

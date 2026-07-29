@@ -19,6 +19,7 @@ from aleatoric_nk_grid.slurm_jobs import (
     RESOURCE_CLASSES,
     SlurmJob,
     _expand_array_indices,
+    active_finalization_diagnostics,
     apply_worker_overrides,
     build_slurm_jobs,
     chunk_master_indices,
@@ -30,6 +31,7 @@ from aleatoric_nk_grid.slurm_jobs import (
     resource_class_indices,
     write_chunk_map,
     write_job_snapshot,
+    write_finalization_receipt,
     write_submission_receipt,
 )
 
@@ -396,6 +398,97 @@ def test_dependency_never_satisfied_targets_only_current_snapshot_receipts(
         "%A|%r|%T",
     ]
     assert calls[1][0] == ["scancel", "101"]
+
+
+def test_finalization_receipts_drive_snapshot_scoped_active_job_diagnostics(
+    tmp_path, monkeypatch
+):
+    snapshot = tmp_path / "jobs.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    other_snapshot = tmp_path / "other.json"
+    other_snapshot.write_text("{}", encoding="utf-8")
+    finalization_map = tmp_path / "finalizers.json"
+    finalization_map.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "snapshot": str(snapshot.resolve()),
+                "targets": [{"panel": "p", "model": "ols"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt = write_finalization_receipt(
+        snapshot,
+        stage="finalizer",
+        slurm_job_id="201",
+        array_spec="0",
+        finalization_map=finalization_map,
+        worker_script=tmp_path / "finalize.sbatch",
+        dependency_job_ids=("101", "102"),
+        cpus_per_task=1,
+        memory="16G",
+        time_limit="1-00:00:00",
+    )
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["stage"] == "finalizer"
+    assert payload["dependency_job_ids"] == ["101", "102"]
+    assert payload["resources"] == {
+        "cpus_per_task": 1,
+        "memory": "16G",
+        "time_limit": "1-00:00:00",
+    }
+    assert payload["recovery_policy"] == {
+        "strategy": "refuse-active-finalization-chain"
+    }
+    (tmp_path / "slurm-999.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "snapshot": str(other_snapshot.resolve()),
+                "slurm_job_id": "999",
+                "stage": "publish",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="201|PENDING\n999|RUNNING\n777|CONFIGURING\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(slurm_jobs.subprocess, "run", fake_run)
+
+    assert active_finalization_diagnostics(snapshot) == {
+        "snapshot": str(snapshot.resolve()),
+        "receipt_job_ids": ["201"],
+        "active_jobs": [
+            {"job_id": "201", "stage": "finalizer", "state": "PENDING"}
+        ],
+    }
+    assert calls == [
+        (
+            [
+                "squeue",
+                "--noheader",
+                "--jobs",
+                "201",
+                "--format",
+                "%A|%T",
+            ],
+            {
+                "check": True,
+                "capture_output": True,
+                "text": True,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -900,6 +993,7 @@ if [ "$3" = "chunk-map" ]; then
   exit 0
 fi
 if [ "$3" = "receipt" ]; then echo /synthetic/receipt.json; exit 0; fi
+if [ "$3" = "finalization-receipt" ]; then echo /synthetic/finalization-receipt.json; exit 0; fi
 if [ "$3" = "build-map" ]; then echo "/synthetic/$*.json"; exit 0; fi
 if [ "$3" = "map-count" ]; then echo 1; exit 0; fi
 exit 9
@@ -1038,6 +1132,10 @@ if [ "$3" = "receipt" ]; then
   echo /synthetic/receipt.json
   exit 0
 fi
+if [ "$3" = "finalization-receipt" ]; then
+  echo /synthetic/finalization-receipt.json
+  exit 0
+fi
 exit 9
 """,
     )
@@ -1092,6 +1190,14 @@ echo "$((98764 + COUNT));cluster-a"
             "32G",
             "--time",
             "2-00:00:00",
+            "--finalizer-mem",
+            "12G",
+            "--finalizer-time",
+            "08:00:00",
+            "--publish-mem",
+            "24G",
+            "--publish-time",
+            "1-12:00:00",
             "--max-restarts",
             "3",
             "--requeue-watchdog-seconds",
@@ -1124,6 +1230,14 @@ echo "$((98764 + COUNT));cluster-a"
     )
     assert "Submitted seed finalizer array 98768 with 2 tasks" in completed.stdout
     assert "Submitted panel publish array 98769 with 1 tasks" in completed.stdout
+    assert (
+        "Finalizer receipt: /synthetic/finalization-receipt.json"
+        in completed.stdout
+    )
+    assert (
+        "Publish receipt: /synthetic/finalization-receipt.json"
+        in completed.stdout
+    )
     if receipt_fails:
         assert "Receipt:" not in completed.stdout
         for job_id in ("98765", "98766", "98767"):
@@ -1174,8 +1288,12 @@ echo "$((98764 + COUNT));cluster-a"
         assert "--requeue" not in call
         assert "--signal=B:USR1@300" not in call
         assert "--cpus-per-task=1" in call
-        assert "--mem=32G" in call
-        assert "--time=2-00:00:00" in call
+        assert "--mem=32G" not in call
+        assert "--time=2-00:00:00" not in call
+    assert "--mem=12G" in finalizer_call
+    assert "--time=08:00:00" in finalizer_call
+    assert "--mem=24G" in publish_call
+    assert "--time=1-12:00:00" in publish_call
     assert "--dependency=afterany:98765:98766:98767" in finalizer_call
     assert "--array=0-1" in finalizer_call
     assert finalizer_call[-1] == "finalize"
@@ -1209,6 +1327,59 @@ echo "$((98764 + COUNT));cluster-a"
         assert "--max-restarts 3" in receipt_call
         assert "--requeue-watchdog-seconds 120" in receipt_call
         assert "--rerun-completed" in receipt_call
+    finalization_receipts = [
+        shlex.split(call)
+        for call in python_calls
+        if " finalization-receipt " in f" {call} "
+    ]
+    assert len(finalization_receipts) == 2
+    finalizer_receipt, publish_receipt = finalization_receipts
+    assert finalizer_receipt[2:] == [
+        "finalization-receipt",
+        "--snapshot",
+        next(iter(snapshot_paths)),
+        "--stage",
+        "finalizer",
+        "--job-id",
+        "98768",
+        "--array-spec",
+        "0-1",
+        "--finalization-map",
+        str(tmp_path / "finalizers.json"),
+        "--worker-script",
+        str(engine / "slurm" / "finalize_seed_shards.sbatch"),
+        "--dependency-job-ids",
+        "98765,98766,98767",
+        "--cpus-per-task",
+        "1",
+        "--memory",
+        "12G",
+        "--time-limit",
+        "08:00:00",
+    ]
+    assert publish_receipt[2:] == [
+        "finalization-receipt",
+        "--snapshot",
+        next(iter(snapshot_paths)),
+        "--stage",
+        "publish",
+        "--job-id",
+        "98769",
+        "--array-spec",
+        "0",
+        "--finalization-map",
+        str(tmp_path / "publish.json"),
+        "--worker-script",
+        str(engine / "slurm" / "finalize_seed_shards.sbatch"),
+        "--dependency-job-ids",
+        "98768",
+        "--cpus-per-task",
+        "1",
+        "--memory",
+        "24G",
+        "--time-limit",
+        "1-12:00:00",
+    ]
 
 
 def test_submitter_rejects_legacy_max_concurrent_option():
@@ -1278,6 +1449,10 @@ if [ "$3" = "indices" ]; then
   exit 0
 fi
 if [ "$3" = "recovery-indices" ]; then echo "1"; exit 0; fi
+if [ "$3" = "finalization-status" ]; then
+  echo '{"active_jobs":[],"receipt_job_ids":[]}'
+  exit 0
+fi
 if [ "$3" = "dependency-diagnostics" ]; then
   echo '{"dependency_never_satisfied_job_ids":[]}'
   exit 0
@@ -1294,6 +1469,10 @@ fi
 if [ "$3" = "map-count" ]; then echo 1; exit 0; fi
 if [ "$3" = "receipt" ]; then
   echo /synthetic/parallel-receipt.json
+  exit 0
+fi
+if [ "$3" = "finalization-receipt" ]; then
+  echo /synthetic/finalization-receipt.json
   exit 0
 fi
 exit 9
@@ -1432,6 +1611,7 @@ if [ "$3" = "indices" ]; then
 fi
 if [ "$3" = "chunk-map" ]; then echo /synthetic/chunk.json; exit 0; fi
 if [ "$3" = "receipt" ]; then echo /synthetic/receipt.json; exit 0; fi
+if [ "$3" = "finalization-receipt" ]; then echo /synthetic/finalization-receipt.json; exit 0; fi
 if [ "$3" = "build-map" ]; then echo "/synthetic/$*.json"; exit 0; fi
 if [ "$3" = "map-count" ]; then echo 1; exit 0; fi
 exit 9
@@ -1504,6 +1684,7 @@ if [ "$3" = "indices" ]; then
   exit 0
 fi
 if [ "$3" = "dependency-diagnostics" ]; then echo '{}'; exit 0; fi
+if [ "$3" = "finalization-status" ]; then echo '{"active_jobs":[],"receipt_job_ids":[]}'; exit 0; fi
 if [ "$3" = "recovery-indices" ]; then echo ""; exit 0; fi
 exit 9
 """,
@@ -1544,6 +1725,100 @@ echo '70001;cluster'
     assert (
         "No missing/incomplete matching resource-class tasks were submitted."
         in completed.stderr
+    )
+    assert not sbatch_log.exists()
+
+
+def test_recovery_refuses_second_coexisting_finalizer_publish_chain(tmp_path):
+    engine = tmp_path / "engine"
+    (engine / "slurm").mkdir(parents=True)
+    snapshot = tmp_path / "jobs.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python_log = tmp_path / "python.log"
+    sbatch_log = tmp_path / "sbatch.log"
+    fake_python = tmp_path / "fake-python"
+    active_payload = {
+        "active_jobs": [
+            {"job_id": "801", "stage": "finalizer", "state": "PENDING"},
+            {"job_id": "802", "stage": "publish", "state": "PENDING"},
+        ],
+        "receipt_job_ids": ["801", "802"],
+        "snapshot": str(snapshot.resolve()),
+    }
+    _write_executable(
+        fake_python,
+        """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_PYTHON_LOG"
+if [ "$1" = "-c" ]; then exit 0; fi
+if [ "$3" = "count" ]; then echo 1; exit 0; fi
+if [ "$3" = "indices" ]; then
+  case "$*" in
+    *"--resource-class parallel"*) echo 0 ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "finalization-status" ]; then
+  printf '%s\n' "$ACTIVE_FINALIZATION_PAYLOAD"
+  exit 3
+fi
+exit 9
+""",
+    )
+    _write_executable(
+        fake_bin / "sbatch",
+        """#!/bin/bash
+printf '%s\n' "$*" >> "$FAKE_SBATCH_LOG"
+echo '90001;cluster'
+""",
+    )
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
+            "--snapshot",
+            str(snapshot),
+            "--resource-class",
+            "parallel",
+            "--max-array-size",
+            "10",
+        ],
+        env={
+            **os.environ,
+            "ENGINE_DIR": str(engine),
+            "VENV": str(tmp_path / "venv"),
+            "PYTHON": str(fake_python),
+            "FAKE_PYTHON_LOG": str(python_log),
+            "FAKE_SBATCH_LOG": str(sbatch_log),
+            "ACTIVE_FINALIZATION_PAYLOAD": json.dumps(
+                active_payload, sort_keys=True
+            ),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == (
+        "Recovery refused because this snapshot has an active "
+        "finalizer/publish job: "
+        + json.dumps(active_payload, sort_keys=True)
+    )
+    python_calls = python_log.read_text(encoding="utf-8").splitlines()
+    assert python_calls[-1] == (
+        "-m aleatoric_nk_grid.slurm_jobs finalization-status "
+        f"--snapshot {snapshot}"
+    )
+    assert all(
+        " dependency-diagnostics " not in f" {call} "
+        and " recovery-indices " not in f" {call} "
+        for call in python_calls
     )
     assert not sbatch_log.exists()
 
