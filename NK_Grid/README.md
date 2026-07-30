@@ -148,12 +148,6 @@ bash NK_Grid/slurm/submit_nk_grid.sh \
 
 Production submission additionally requires `--allow-large-run`.
 
-The launcher freezes one task per `(panel, model, seed)` and partitions tasks
-into `parallel`, `serial`, and `super_learner` arrays. Each seed task writes one
-shard; one finalizer task per `(panel, model)` merges its seeds, then one publish
-task per panel merges the complete model results. `--max-concurrent-per-class`
-limits each seed execution class separately.
-
 The repository-root `.venv` is used by default. On clusters that require
 different paths or a Python module:
 

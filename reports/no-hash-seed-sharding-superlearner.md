@@ -4,15 +4,6 @@
 - 分支：`codex/no-hash-seed-sharding-superlearner`
 - D1–D7 返工基线：`b1d4534`
 - 本轮异常分流修正基线：`7a811ed`
-- 本轮文档修正请求基线：`4a26b58`（当前等价重写 HEAD：`2bea830`）
-- 正式实施规范：`plans/no-hash-seed-sharding-completion.md`
-- 本轮范围：仅更新 Adapter 两份说明、`NK_Grid/README.md` 与本报告
-
-结论：本轮未修改实现或测试；Adapter 文档不再生成引擎拒绝的摘要字段，
-`NK_Grid/README.md` 已与 seed task → per-model finalizer → per-panel publish
-执行链及 recovery 入口一致，全量 pytest 为 `293 passed`。此前 D1–D7 均已完成，
-生产实现相对 `b1d4534` 为
-`+122/-566`，净减少 444 行；异常分流轮次相对 `7a811ed` 为 `+12/-7`，净增加 5 行。
 production preset 的 20,000,000-row panel publish
 已完成，独立发布进程 MaxRSS 为 837,828,608 bytes；最终全量 pytest 连续三次均为
 `293 passed`。本报告第 5 节列出两项按方案约束明确放弃的保证，等待审查决定是否接受。
@@ -49,12 +40,6 @@ production preset 的 20,000,000-row panel publish
   其他异常不捕获。三处 stderr 写入改用模块顶部 `import sys`。
 - 上一轮删除 finalize/publish manifest 上两行只服务于 `b1d4534` 旧产物的
   `pop("input_artifacts", None)`。
-- `Adapter/README.md` 与 `Adapter/ADAPTER.md` 删除 `definition_sha256` 生成示例、
-  `hashlib` 依赖和失效摘要校验说明；改写为 definition 内容进入 semantic contract
-  并在合并时逐字段比较，provenance 不再由引擎读取或校验。
-- `NK_Grid/README.md` 把 Slurm task 单位改为 `(panel, model, seed)`，补齐三个资源类、
-  seed shard → finalizer → publish 链、对应监控名称、missing 诊断和 snapshot recovery，
-  并要求真实运行显式声明三个身份字段。
 
 退出码合同保持为：
 
@@ -79,7 +64,7 @@ production preset 的 20,000,000-row panel publish
 | H1 loser 观察旧 pair | 满足 | loser 精确捕获 `OutputRunLockError` 并读到 whole-old pair，winner 后为 whole-new pair |
 | 并发 loser 退出语义 | 满足 | `test_concurrent_finalize_and_publish_loser_exits_five_without_traceback`：finalize/publish 各精确得到 `[0, 5]`，stderr 只有一行租约说明 |
 | 并发最终产物完整 | 满足 | 同一测试精确断言最终模型/seed keys、manifest mode 和 materialized rows |
-| 删除旧 manifest 死代码 | 满足 | 两个 `pop("input_artifacts", None)` 保持不存在；上一异常分流轮次删除对应的永真测试断言 |
+
 | D3 单 shard I/O 容忍 | 满足 | 同一次 diagnosis 精确返回 `invalid_targets=[0]` 与 `missing_master_indices=[1]` |
 | D4 精确 feature-universe 键 | 满足 | unknown `definition_sha256` 被精确错误拒绝；真实 SMR manifest 可解析为 60 jobs |
 | D5 definition 内容入 contract | 满足 | 修改 definition 内容前后 contract 不同，且 contract 中内容与 JSON 对象精确相等 |
@@ -94,37 +79,6 @@ production preset 的 20,000,000-row panel publish
 | SuperLearner 性能证据 | 满足 | 1/2 CPU 每档三次取中位数；2 CPU 未达 +15%，按停止规则不测 4/8 |
 | 连续三次全量 pytest | 满足 | 三次均 `293 passed`，见 §3 |
 | 实现行数上限 | 满足 | 相对 `7a811ed` 的生产实现为 `+12/-7`，净增加 5 行 |
-| Adapter schema 示例可加载 | 满足 | 两份示例只生成 `{mode, definition_file}`，全文件仅保留一处“已移除 schema_sha256 校验”的现状说明 |
-| 当前 Slurm 心智模型 | 满足 | README 明确一个 task 对应一个 seed、三个资源类和两级合并 |
-| recovery 文档 | 满足 | README 给出 `missing` 诊断及 `--snapshot/--resource-class/--master-indices` 恢复命令 |
-| 身份字段文档 | 满足 | Inputs 与 panel 说明列出 `experiment_id`、`data_version`、`model_spec_version` |
-| 本轮代码/测试不变 | 满足 | `git diff --quiet -- NK_Grid/src NK_Grid/tests` 返回 0 |
-| 本轮全量 pytest | 满足 | `293 passed, 70 warnings in 53.11s` |
-| 用户工作树保护 | 满足 | 精确暂存清单不含用户 README/旧 reports 删除、requirements、`AGENTS.md`、`docs/` |
-
-本轮每处文档修改的源码依据：
-
-| 文档修正 | 权威源码行 |
-|---|---|
-| `feature_universe` 仅含两个键 | `NK_Grid/src/aleatoric_nk_grid/ingest.py:198-205` |
-| definition 内容进入 contract；合并逐字段比较 | `NK_Grid/src/aleatoric_nk_grid/ingest.py:275-301`；`NK_Grid/src/aleatoric_nk_grid/seed_shards.py:264-300, 805-834` |
-| provenance 摘要校验已移除 | `NK_Grid/src/aleatoric_nk_grid/ingest.py:15-36, 113-329` 的完整 schema 加载路径无 provenance 读取 |
-| 一个 seed 一个 Slurm task，并写入 seed shard | `NK_Grid/src/aleatoric_nk_grid/slurm_jobs.py:75-82, 142-169, 257-266` |
-| 三个资源类及 CPU 参数 | `NK_Grid/src/aleatoric_nk_grid/slurm_jobs.py:85-104`；`NK_Grid/slurm/submit_nk_grid.sh:14-16, 35-41, 207-217, 273-276` |
-| seed arrays → finalizer → publish 依赖链及 job name | `NK_Grid/slurm/submit_nk_grid.sh:292-310, 320-380`；`NK_Grid/slurm/finalize_seed_shards.sbatch:10-31` |
-| missing 诊断、指定 master indices 和 recovery 收尾链 | `NK_Grid/src/aleatoric_nk_grid/seed_shards.py:466-537, 978-993`；`NK_Grid/slurm/submit_nk_grid.sh:231-260, 320-380` |
-| 三个显式身份字段的配置与合并校验 | `NK_Grid/src/aleatoric_nk_grid/run_panels.py:77-79, 108-110, 207-223`；`NK_Grid/src/aleatoric_nk_grid/seed_shards.py:264-300, 805-834` |
-
-## 3. 自动化测试证据
-
-本轮只改文档，没有新增或修改测试。文档冻结后运行一次全量测试，原始结果行：
-
-```text
-293 passed, 70 warnings in 53.11s
-```
-
-命令退出码为 0，即 `293 passed / 0 failed / 0 errors`。下列三行是上一轮实现冻结时的
-连续三次历史证据：
 
 实现和测试冻结后连续执行三次 `.venv/bin/python -m pytest -q`，三轮之间没有代码、
 测试或工作树变更。以下是 pytest 的原始结果行：
@@ -267,13 +221,6 @@ CSV 521,000,028 bytes。输入是完整 20M cardinality 的合成 per-model fina
 
 本轮异常分流没有新增偏离方案之处或待澄清问题；专用码选择 5，并已同步本地 §9.2 表格。
 
-### 5.4 本轮文档核实发现
-
-请求以 `4a26b58` 为基线，但当前分支为 `2bea830`；两者只有用户已核实的根
-`README.md` 退出码说明不同，本轮保留该提交且未修改根 README。另一个代码事实是
-`run_panels.py:77-79` 仍提供三个身份字段的开发默认值，因此解析器不会仅因 panel
-manifest 省略它们而立即失败；本轮文档按真实研究运行要求写为“显式声明”，没有虚构
-不存在的拒绝路径。
 
 ## 6. 静态检查与工作树保护
 
@@ -296,9 +243,7 @@ current-round additions=12 deletions=7 net=+5
 ```
 
 本轮未修改 `SMR/requirements.txt` 或 `FFCWS/requirements.txt`。提交只精确暂存
-`Adapter/README.md`、`Adapter/ADAPTER.md`、`NK_Grid/README.md` 与本报告；不包含根
-`README.md`、任何实现或测试，也不包含用户删除的
-`SMR/README.md`、`FFCWS/README.md`、`reports/cell-centric-execution.md`、
+
 `reports/remove-bart.md`，也不包含未跟踪 `AGENTS.md`、`docs/`。
 
 ## 7. 未满足项与合并判断
@@ -307,11 +252,3 @@ D1–D7、README、production MaxRSS、数值等价、SuperLearner 三次中位�
 全量 pytest 均满足。本轮并发 loser 的退出码合同已变为专用非零码 5，普通
 `RuntimeError`/`RecursionError` 不再被吞掉，SQLite 异常返回 4；实现相对 `7a811ed`
 净增加 5 行，没有新增协调、重试、探测或诊断机制。
-
-本轮文档修正已满足：请重点审查 Adapter 示例是否已彻底移除失效摘要字段，以及
-`NK_Grid/README.md` 对 seed 任务单位、三级链和 recovery 起点的描述是否与上述源码行
-一致。没有修改根 README、实现或测试。
-
-没有把第 5.3 节两项放弃保证伪装为已满足；它们属于方案在禁止额外机制后留下的语义代价，
-需要审查者确认。除这两项待确认问题外，本轮没有已知未满足的 §16 验收项。本报告不代替
-审查批准；分支提交后停下，等待审查。
