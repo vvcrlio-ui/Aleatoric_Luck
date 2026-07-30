@@ -23,7 +23,8 @@ MODEL_PARAM_PATHS = (
     REPO_ROOT / "FFCWS" / "model_params.yaml",
     REPO_ROOT / "SMR" / "model_params.yaml",
 )
-REMOVED_MODEL = next(iter(REMOVED_MODEL_NAMES))
+REMOVED_MODELS = tuple(sorted(REMOVED_MODEL_NAMES))
+EXPECTED_REMOVED_MODEL_COUNT = 2
 
 
 def _document() -> dict:
@@ -79,9 +80,14 @@ def test_model_param_contract_covers_model_space_exactly(params_path, task):
     assert set(selected) == set(MODEL_NAMES)
 
 
-def test_removed_model_request_fails_with_self_explanatory_message():
+def test_removed_model_registry_covers_expected_retirements():
+    assert len(REMOVED_MODELS) == EXPECTED_REMOVED_MODEL_COUNT
+
+
+@pytest.mark.parametrize("removed", REMOVED_MODELS)
+def test_removed_model_request_fails_with_self_explanatory_message(removed):
     with pytest.raises(ValueError, match="removed from the model space"):
-        load_model_params(MODEL_PARAMS, task="regression", models=(REMOVED_MODEL,))
+        load_model_params(MODEL_PARAMS, task="regression", models=(removed,))
 
 
 def test_removed_model_is_absent_from_the_model_space():
