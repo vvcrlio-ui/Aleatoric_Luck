@@ -15,6 +15,7 @@ from aleatoric_nk_grid.experiment import (
     manifest_path,
     write_checkpoint_part,
 )
+from aleatoric_nk_grid.model_registry import REMOVED_MODEL_NAMES
 from aleatoric_nk_grid.nk_grid import (
     CLASSIFICATION_METRIC_COLUMNS,
     NKGridConfig,
@@ -34,6 +35,7 @@ from conftest import write_schema_bundle
 
 
 MODEL_PARAMS = Path(__file__).resolve().parents[1] / "model_params.yaml"
+REMOVED_MODEL = next(iter(REMOVED_MODEL_NAMES))
 
 
 def _config(schema: Path, out: Path, **overrides) -> NKGridConfig:
@@ -221,7 +223,7 @@ def test_nonfinite_predict_proba_fails_the_cell_contract():
         ({"batch_size": 0}, "batch_size must be at least 1"),
         ({"models": ()}, "models must not be empty"),
         ({"models": ("ols", "ols")}, "models must not contain duplicates"),
-        ({"models": ("elast" + "ic_net",)}, "removed from the model space"),
+        ({"models": (REMOVED_MODEL,)}, "removed from the model space"),
         ({"n_jobs": 0}, "n_jobs must not be zero"),
     ],
 )

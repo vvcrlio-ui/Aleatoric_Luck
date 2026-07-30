@@ -8,6 +8,7 @@ import yaml
 from aleatoric_nk_grid.model_registry import (
     MODEL_NAMES,
     REMOVED_MODEL_NAMES,
+    SUPPORTED_MODEL_NAMES,
     load_algorithm_version,
     load_model_params,
     make_model,
@@ -22,6 +23,7 @@ MODEL_PARAM_PATHS = (
     REPO_ROOT / "FFCWS" / "model_params.yaml",
     REPO_ROOT / "SMR" / "model_params.yaml",
 )
+REMOVED_MODEL = next(iter(REMOVED_MODEL_NAMES))
 
 
 def _document() -> dict:
@@ -65,7 +67,9 @@ def test_locked_cv_regression_parameters_load_with_rmse():
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
 @pytest.mark.parametrize("task", ["regression", "classification"])
 def test_model_param_contract_covers_model_space_exactly(params_path, task):
-    assert load_algorithm_version(MODEL_PARAMS) == "nk-grid-v5-adapter-3"
+    assert load_algorithm_version(params_path) == "nk-grid-v5-adapter-3"
+    document = yaml.safe_load(params_path.read_text(encoding="utf-8"))
+    assert set(document[task]) == set(SUPPORTED_MODEL_NAMES)
     selected = load_model_params(
         params_path,
         task=task,
@@ -76,9 +80,8 @@ def test_model_param_contract_covers_model_space_exactly(params_path, task):
 
 
 def test_removed_model_request_fails_with_self_explanatory_message():
-    removed = "elast" + "ic_net"
     with pytest.raises(ValueError, match="removed from the model space"):
-        load_model_params(MODEL_PARAMS, task="regression", models=(removed,))
+        load_model_params(MODEL_PARAMS, task="regression", models=(REMOVED_MODEL,))
 
 
 def test_removed_model_is_absent_from_the_model_space():
