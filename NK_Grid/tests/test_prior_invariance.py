@@ -30,7 +30,7 @@ def _fast_params(model_name: str) -> dict:
             MODEL_PARAMS, task="regression", models=(model_name,)
         )[model_name]
     )
-    if model_name in {"ridge", "lasso", "elastic_net"}:
+    if model_name in {"ridge", "lasso"}:
         params["n_alphas"] = 5
         params["max_cv_folds"] = 2
         if model_name != "ridge":

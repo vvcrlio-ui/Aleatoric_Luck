@@ -74,7 +74,7 @@ To use validation settings that match a planned analysis:
 
 ```bash
 python SMR/adapter/adapter.py \
-  --validation-model ols ridge lasso elastic_net random_forest \
+  --validation-model ols ridge lasso random_forest \
   --min-n 10 \
   --test-size 0.3 \
   --seed 12345

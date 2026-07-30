@@ -13,7 +13,6 @@ panels:
       - ols
       - ridge
       - lasso
-      - elastic_net
       - random_forest
       - xgboost
       - lightgbm

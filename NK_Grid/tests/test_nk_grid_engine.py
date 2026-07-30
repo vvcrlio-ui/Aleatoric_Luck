@@ -221,6 +221,7 @@ def test_nonfinite_predict_proba_fails_the_cell_contract():
         ({"batch_size": 0}, "batch_size must be at least 1"),
         ({"models": ()}, "models must not be empty"),
         ({"models": ("ols", "ols")}, "models must not contain duplicates"),
+        ({"models": ("elast" + "ic_net",)}, "removed from the model space"),
         ({"n_jobs": 0}, "n_jobs must not be zero"),
     ],
 )

@@ -83,7 +83,7 @@ To align validation settings with a planned analysis:
 
 ```bash
 python FFCWS/adapter/adapter.py \
-  --validation-model ols ridge lasso elastic_net random_forest \
+  --validation-model ols ridge lasso random_forest \
   --min-n 10 \
   --seed 12345
 ```

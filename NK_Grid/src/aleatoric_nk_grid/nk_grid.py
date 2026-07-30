@@ -87,6 +87,7 @@ from .model_registry import (
     load_algorithm_version,
     load_model_params,
     make_model,
+    reject_removed_model,
     resolved_model_params,
 )
 from .native_process import IsolatedProcessRunner
@@ -845,6 +846,8 @@ def _validate_config(config: NKGridConfig) -> None:
         raise ValueError("models must not be empty")
     if len(config.models) != len(set(config.models)):
         raise ValueError("models must not contain duplicates")
+    for model_name in config.models:
+        reject_removed_model(model_name)
     unknown_models = sorted(set(config.models) - set(SUPPORTED_MODEL_NAMES))
     if unknown_models:
         raise ValueError(f"Unknown model(s): {', '.join(unknown_models)}")

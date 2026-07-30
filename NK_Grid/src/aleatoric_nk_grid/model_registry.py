@@ -21,7 +21,6 @@ from sklearn.ensemble import (
 )
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import (
-    ElasticNetCV,
     LassoCV,
     LinearRegression,
     LogisticRegression,
@@ -35,7 +34,6 @@ MODEL_NAMES = (
     "ols",
     "ridge",
     "lasso",
-    "elastic_net",
     "random_forest",
     "xgboost",
     "lightgbm",
@@ -49,6 +47,7 @@ MODEL_NAMES = (
 # quietly producing results for one model fewer than it asked for.
 REMOVED_MODEL_NAMES = {
     "bart": "BART was removed from the model space; see plans/remove-bart.md",
+    "elastic_net": "elastic_net was removed from the model space; see plans/remove-elastic-net.md",
 }
 SUPPORTED_MODEL_NAMES = MODEL_NAMES
 
@@ -56,9 +55,10 @@ SUPPORTED_MODEL_NAMES = MODEL_NAMES
 def reject_removed_model(name: str) -> None:
     """Raise a self-explaining error for a model that no longer exists."""
 
-    reason = REMOVED_MODEL_NAMES.get(name)
+    reason = REMOVED_MODEL_NAMES.get(str(name).lower())
     if reason is not None:
         raise ValueError(reason)
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_PARAMS_PATH = ROOT / "model_params.yaml"
@@ -72,10 +72,6 @@ MODEL_PARAM_KEYS = {
         },
         "lasso": {
             "alpha_log10_min", "alpha_log10_max", "n_alphas",
-            "max_cv_folds", "max_iter",
-        },
-        "elastic_net": {
-            "alpha_log10_min", "alpha_log10_max", "n_alphas", "l1_ratio",
             "max_cv_folds", "max_iter",
         },
         "random_forest": {"n_estimators", "max_features", "min_samples_leaf"},
@@ -106,7 +102,6 @@ MODEL_PARAM_KEYS = {
         "ols": {"C", "l1_ratio", "solver", "max_iter"},
         "ridge": {"C", "l1_ratio", "solver", "max_iter"},
         "lasso": {"penalty", "C", "l1_ratio", "solver", "max_iter"},
-        "elastic_net": {"penalty", "C", "solver", "l1_ratio", "max_iter"},
         "random_forest": {"n_estimators", "max_features", "min_samples_leaf"},
         "extra_trees": {"n_estimators", "max_features", "min_samples_leaf"},
         "shallow_neural_network": {
@@ -138,6 +133,7 @@ def _validated_params(
     model_name: str,
     params: Mapping[str, Any],
 ) -> dict[str, Any]:
+    reject_removed_model(model_name)
     allowed = MODEL_PARAM_KEYS.get(task, {}).get(model_name)
     if allowed is None:
         reject_removed_model(model_name)
@@ -478,46 +474,6 @@ class AdaptiveLassoCV(BaseEstimator, RegressorMixin):
         return self.model_.predict(X)
 
 
-class AdaptiveElasticNetCV(BaseEstimator, RegressorMixin):
-    def __init__(
-        self,
-        seed: int,
-        n_jobs: int,
-        *,
-        alpha_log10_min: float,
-        alpha_log10_max: float,
-        n_alphas: int,
-        l1_ratio: Sequence[float],
-        max_cv_folds: int,
-        max_iter: int,
-    ):
-        self.seed = seed
-        self.n_jobs = n_jobs
-        self.alpha_log10_min = alpha_log10_min
-        self.alpha_log10_max = alpha_log10_max
-        self.n_alphas = n_alphas
-        self.l1_ratio = l1_ratio
-        self.max_cv_folds = max_cv_folds
-        self.max_iter = max_iter
-
-    def fit(self, X, y):
-        cv = min(self.max_cv_folds, len(y))
-        if cv < 2:
-            raise ValueError("Elastic Net requires at least two training rows.")
-        self.model_ = ElasticNetCV(
-            alphas=np.logspace(
-                self.alpha_log10_min, self.alpha_log10_max, self.n_alphas
-            ),
-            l1_ratio=self.l1_ratio,
-            cv=cv,
-            max_iter=self.max_iter,
-            n_jobs=self.n_jobs,
-            random_state=self.seed,
-        ).fit(X, y)
-        return self
-
-    def predict(self, X):
-        return self.model_.predict(X)
 
 
 class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
@@ -815,15 +771,6 @@ def _make_classification_model(
                 random_state=seed,
             ),
         )
-    if name == "elastic_net":
-        return make_pipeline(
-            SimpleImputer(strategy="median"),
-            StandardScaler(),
-            LogisticRegression(
-                **params,
-                random_state=seed,
-            ),
-        )
     if name == "random_forest":
         return make_pipeline(
             SimpleImputer(strategy="median"),
@@ -878,6 +825,7 @@ def make_model(
         raise ValueError("task must be 'regression' or 'classification'")
 
     name = model_name.lower()
+    reject_removed_model(name)
     if params is None:
         params = load_model_params(
             DEFAULT_MODEL_PARAMS_PATH,
@@ -924,12 +872,6 @@ def make_model(
             SimpleImputer(strategy="median"),
             StandardScaler(),
             AdaptiveLassoCV(seed=seed, n_jobs=n_jobs, **resolved_params),
-        )
-    if name == "elastic_net":
-        return make_pipeline(
-            SimpleImputer(strategy="median"),
-            StandardScaler(),
-            AdaptiveElasticNetCV(seed=seed, n_jobs=n_jobs, **resolved_params),
         )
     if name == "random_forest":
         return make_pipeline(

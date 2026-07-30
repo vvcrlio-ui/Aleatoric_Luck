@@ -16,6 +16,12 @@ from aleatoric_nk_grid.model_registry import (
 
 
 MODEL_PARAMS = Path(__file__).resolve().parents[1] / "model_params.yaml"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MODEL_PARAM_PATHS = (
+    MODEL_PARAMS,
+    REPO_ROOT / "FFCWS" / "model_params.yaml",
+    REPO_ROOT / "SMR" / "model_params.yaml",
+)
 
 
 def _document() -> dict:
@@ -56,18 +62,23 @@ def test_locked_cv_regression_parameters_load_with_rmse():
     assert selected["lightgbm"]["metric"] == "rmse"
 
 
-def test_elastic_net_search_keeps_range_with_reduced_alpha_count():
+@pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
+@pytest.mark.parametrize("task", ["regression", "classification"])
+def test_model_param_contract_covers_model_space_exactly(params_path, task):
     assert load_algorithm_version(MODEL_PARAMS) == "nk-grid-v5-adapter-3"
     selected = load_model_params(
-        MODEL_PARAMS,
-        task="regression",
-        models=("elastic_net",),
-    )["elastic_net"]
-    assert selected["alpha_log10_min"] == -4
-    assert selected["alpha_log10_max"] == 1
-    assert selected["n_alphas"] == 20
-    assert selected["l1_ratio"] == [0.1, 0.5, 0.9]
-    assert selected["max_cv_folds"] == 5
+        params_path,
+        task=task,
+        models=MODEL_NAMES,
+    )
+    assert len(MODEL_NAMES) == 9
+    assert set(selected) == set(MODEL_NAMES)
+
+
+def test_removed_model_request_fails_with_self_explanatory_message():
+    removed = "elast" + "ic_net"
+    with pytest.raises(ValueError, match="removed from the model space"):
+        load_model_params(MODEL_PARAMS, task="regression", models=(removed,))
 
 
 def test_removed_model_is_absent_from_the_model_space():
