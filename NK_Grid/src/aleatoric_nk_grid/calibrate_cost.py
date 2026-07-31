@@ -28,14 +28,22 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from .experiment import core_environment, git_state, utc_now, write_json_atomic
+from .experiment import (
+    SERIAL_OUTER_MODELS,
+    core_environment,
+    git_state,
+    utc_now,
+    write_json_atomic,
+)
 from .ingest import load_input
 from .model_registry import DEFAULT_MODEL_PARAMS_PATH, load_model_params, make_model
+from .native_process import IsolatedProcessRunner
 from .nk_grid import (
     DrawOrders,
     SplitData,
     _fit_predict_model_cell,
     _process_peak_rss_bytes,
+    _run_native_model_cell_locked,
     draw_orders,
     split_frame,
 )
@@ -61,11 +69,14 @@ MODELS: tuple[str, ...] = (
     "lightgbm",
 )
 
-# Subprocess-based models that hand fitting to a native isolated process in
-# production (see nk_grid.IsolatedProcessRunner). Their peak RSS must be
-# measured via RUSAGE_CHILDREN in production; the calibration harness runs
-# them in-process for simplicity and records that deviation in the report.
-SUBPROCESS_MODELS: frozenset[str] = frozenset({"lightgbm", "xgboost"})
+# Models that production hands to the isolated native subprocess
+# (nk_grid._run_native_model_cell_locked / native_process.IsolatedProcessRunner).
+# This is a direct reference to the engine's own constant -- NOT a locally
+# maintained copy -- so it can never silently drift from production again
+# (round 1 review F1: a hand-copied {"lightgbm", "xgboost"} was wrong on both
+# counts; the real set is {"lightgbm", "super_learner"}).
+# See test_subprocess_model_set_tracks_the_engine for the anti-drift check.
+SUBPROCESS_MODELS: frozenset[str] = SERIAL_OUTER_MODELS
 
 THREAD_ENV_VARS: tuple[str, ...] = (
     "OMP_NUM_THREADS",
@@ -607,11 +618,31 @@ class CalibrationSession:
     imputation: Mapping[str, Any]
     split: SplitData
     model_params: dict[str, dict[str, Any]]
+    # Lazily started: only spawned the first time a SUBPROCESS_MODELS model is
+    # measured, mirroring production's one-reusable-worker design (see
+    # nk_grid._run_native_model_cell_locked / native_process.IsolatedProcessRunner).
+    native_runner: IsolatedProcessRunner | None = None
 
     def orders_for(self, seed: int, draw: int) -> DrawOrders:
         return draw_orders(
             self.split.X_train.index, list(self.feature_units), seed=seed, draw=draw
         )
+
+
+def _native_runner(session: CalibrationSession) -> IsolatedProcessRunner:
+    """Return the session's reusable isolated-subprocess worker, starting it lazily."""
+
+    if session.native_runner is None:
+        session.native_runner = IsolatedProcessRunner()
+    return session.native_runner
+
+
+def close_session(session: CalibrationSession) -> None:
+    """Release the isolated subprocess worker, if one was ever started."""
+
+    if session.native_runner is not None:
+        session.native_runner.close()
+        session.native_runner = None
 
 
 def build_session(schema_path: Path, outcome: str, *, seed: int = 0, test_size: float = 0.2) -> CalibrationSession:
@@ -698,16 +729,40 @@ def measure_one_cell(
         preprocess_seconds = time.perf_counter() - preprocess_started
 
         params = session.model_params[model_name]
-        result = _fit_predict_model_cell(
-            model_name=model_name,
-            model_seed=seed,
-            task=session.task,
-            params=params,
-            X_train=prepared.X_train,
-            y_train=y_sub,
-            X_test=prepared.X_test,
-            model_n_jobs=1,
-        )
+        fit_arguments = {
+            "model_name": model_name,
+            "model_seed": seed,
+            "task": session.task,
+            "params": params,
+            "X_train": prepared.X_train,
+            "y_train": y_sub,
+            "X_test": prepared.X_test,
+            "model_n_jobs": 1,
+        }
+        if model_name in SUBPROCESS_MODELS:
+            # Route through the real isolated-subprocess path so peak RSS
+            # reflects the child process that actually does the fitting (as
+            # production does via _run_native_model_cell_locked), not just
+            # this harness's own RUSAGE_SELF. _fit_predict_model_cell runs
+            # inside that child and reports its own RUSAGE_SELF back over the
+            # pipe, which is exactly what production's diagnostics column
+            # consumes (see nk_grid.py: fit_result["peak_rss_bytes"]).
+            try:
+                result = _run_native_model_cell_locked(
+                    _native_runner(session),
+                    fit_arguments=fit_arguments,
+                    on_native_crash=lambda attempt, exc: None,
+                    on_native_timeout=lambda attempt, exc: None,
+                )
+            except BaseException:
+                # A censored (SIGALRM-interrupted) or crashed call can leave
+                # the reused worker mid-request; discard it so the next
+                # measurement starts a fresh, known-good subprocess instead
+                # of reusing a pipe with an outstanding/mismatched response.
+                close_session(session)
+                raise
+        else:
+            result = _fit_predict_model_cell(**fit_arguments)
 
     return RawMeasurement(
         model=model_name,
@@ -1012,10 +1067,27 @@ def build_calibration_payload(
         "git_commit": git_state(repo_root()).get("commit"),
         "environment": environment,
         "synthetic_data": {
+            # Every SyntheticDataParams field, written explicitly (not just
+            # via the **synthetic_stats spread below) so a reader months from
+            # now can see exactly what assumptions the fitted coefficients
+            # rest on without cross-referencing the generator's source code
+            # (round 1 review F3).
             "n_train": synthetic_params.n_train,
             "n_feature_units": synthetic_params.n_sources,
             "p_onehot": synthetic_stats["n_expanded_predictors"],
             "seed": synthetic_params.seed,
+            "continuous_fraction": synthetic_params.continuous_fraction,
+            "missing_rate_continuous": synthetic_params.missing_rate_continuous,
+            "missing_rate_group": synthetic_params.missing_rate_group,
+            "outcome": synthetic_params.outcome,
+            # The two missing-rate fields above have no empirical basis (real
+            # missingness lives only in FFCWS/data/, which this module never
+            # reads); they are placeholders chosen for plausibility, not
+            # measured. Their effect on *timing* is second-order (imputer
+            # cost is dominated by data scale, and lightgbm/xgboost handle
+            # NaN natively without imputation), so this flag documents the
+            # assumption rather than blocking on finding a real value.
+            "missing_rates_are_unverified_placeholders": True,
             **synthetic_stats,
         },
         "t0_seconds": t0_seconds,
@@ -1131,49 +1203,51 @@ def main(argv: Sequence[str] | None = None) -> None:
         scope_reduction["dimensions_scaled_down"] = False
 
     session = build_session(schema_path, params.outcome, seed=args.seed)
+    try:
+        t0 = measure_t0(schema_path, params.outcome)
 
-    t0 = measure_t0(schema_path, params.outcome)
+        def _progress(message: str) -> None:
+            print(message, file=sys.stderr)
 
-    def _progress(message: str) -> None:
-        print(message, file=sys.stderr)
-
-    raw_a, censored_a = run_stage_a(
-        session, max_seconds=args.max_seconds, progress=_progress
-    )
-
-    if args.stage_b_points:
-        points_to_measure = tuple(
-            tuple(int(v) for v in pair.split(":"))
-            for pair in args.stage_b_points.split(",")
+        raw_a, censored_a = run_stage_a(
+            session, max_seconds=args.max_seconds, progress=_progress
         )
-    else:
-        points_to_measure = STAGE_B_POINTS
-    not_measured = tuple(p for p in STAGE_B_POINTS if p not in points_to_measure)
 
-    raw_b, censored_b = run_stage_b(
-        session, points=points_to_measure, max_seconds=args.max_seconds, progress=_progress
-    )
+        if args.stage_b_points:
+            points_to_measure = tuple(
+                tuple(int(v) for v in pair.split(":"))
+                for pair in args.stage_b_points.split(",")
+            )
+        else:
+            points_to_measure = STAGE_B_POINTS
+        not_measured = tuple(p for p in STAGE_B_POINTS if p not in points_to_measure)
 
-    fit_cost = fit_all_models(raw_a)
-    preprocess_cost = fit_preprocess_by_mode(raw_a)
-    peak_rss_fits = fit_peak_rss(raw_a)
-    validation = build_validation_rows(
-        raw_b, censored_b, fit_cost, STAGE_B_POINTS, MODELS, not_measured_points=not_measured
-    )
+        raw_b, censored_b = run_stage_b(
+            session, points=points_to_measure, max_seconds=args.max_seconds, progress=_progress
+        )
 
-    payload = build_calibration_payload(
-        synthetic_params=params,
-        synthetic_stats=stats,
-        t0_seconds=t0,
-        fit_cost=fit_cost,
-        preprocess_cost=preprocess_cost,
-        peak_rss=peak_rss_fits,
-        validation=validation,
-        censored=[*censored_a, *censored_b],
-        raw_measurements=[*raw_a, *raw_b],
-        thread_env_report=thread_report,
-        scope_reduction=scope_reduction,
-    )
+        fit_cost = fit_all_models(raw_a)
+        preprocess_cost = fit_preprocess_by_mode(raw_a)
+        peak_rss_fits = fit_peak_rss(raw_a)
+        validation = build_validation_rows(
+            raw_b, censored_b, fit_cost, STAGE_B_POINTS, MODELS, not_measured_points=not_measured
+        )
+
+        payload = build_calibration_payload(
+            synthetic_params=params,
+            synthetic_stats=stats,
+            t0_seconds=t0,
+            fit_cost=fit_cost,
+            preprocess_cost=preprocess_cost,
+            peak_rss=peak_rss_fits,
+            validation=validation,
+            censored=[*censored_a, *censored_b],
+            raw_measurements=[*raw_a, *raw_b],
+            thread_env_report=thread_report,
+            scope_reduction=scope_reduction,
+        )
+    finally:
+        close_session(session)
     out_path = write_calibration_file(payload, out_dir)
     print(f"wrote {out_path}")
 

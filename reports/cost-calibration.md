@@ -202,14 +202,15 @@ commit；自那以后合入的提交已经修好了 `test_slurm_jobs.py` 的失�
 
 3. **删失机制用 `signal.SIGALRM`/`setitimer`**：只在 POSIX、且只在主线程里工作
    （macOS/Linux 满足，Windows 不支持）。方案没有规定用什么机制中止一个同步阻塞的
-   `model.fit()`调用；这是一个合理选择,但如果集群运行环境是多线程调度或者
-   `model.fit()`内部生成子进程,行为需要重新验证——特别是 lightgbm/xgboost
-   在生产管线里是通过 `IsolatedProcessRunner` 隔离子进程运行的（见
-   `nk_grid._run_native_model_cell_locked`），calibrate_cost.py **没有**复用该隔离
-   子进程路径,而是直接在本进程内调用 `make_model`+`fit`,理由是简化实现、
-   避免引入子进程 IPC 复杂度；代价是这两个模型的峰值 RSS 用 `RUSAGE_SELF`
-   而不是方案 §4 指定的 `RUSAGE_CHILDREN` 测量，量级会偏低。已在代码里用
-   `SUBPROCESS_MODELS` 常量标注、待审查。
+   `model.fit()`调用；这是一个合理选择,但如果集群运行环境是多线程调度,行为需要
+   重新验证。**在生产管线里真正走 `IsolatedProcessRunner` 隔离子进程的是
+   `lightgbm` 和 `super_learner`**（`experiment.SERIAL_OUTER_MODELS`,不是第 1 轮
+   报告曾经误写的 `lightgbm`/`xgboost`——那是第 1 轮 `SUBPROCESS_MODELS` 常量抄错
+   的连带错误，已在第 2 轮修改中改正,见下方"第 2 轮修改"一节）。这两个模型现在
+   **已经**复用该隔离子进程路径（`nk_grid._run_native_model_cell_locked`），
+   峰值 RSS 测的是子进程自身的 `RUSAGE_SELF`（经 IPC 传回父进程),与生产路径完全
+   一致,不再是已知偏低的近似值。此前"简化为进程内直接拟合、用 `RUSAGE_SELF`
+   偏低"的描述已不适用，见"第 2 轮修改"。
 
 4. **合成数据的类别比例/缺失率（待澄清问题 1 的回答）**：`continuous_fraction`
    固定为 0.622、one-hot 分组尺寸分布**直接采样自**
@@ -251,7 +252,7 @@ commit；自那以后合入的提交已经修好了 `test_slurm_jobs.py` 的失�
 | 2 | t0 四分量 + 10% 一致性 | **未验证** | 未运行实际测量；`measure_t0` 本身的子进程调用路径只在小合成数据上做过探索性冒烟（不计入标定），未做 5 次重复的正式统计，也没有对照"直接测得的端到端启动时间" |
 | 3 | 每模型 c/a/b/R² | **未验证** | 未运行 Stage A；回归算法本身已用合成、已知真值的数据独立验证正确（见测试 1、2） |
 | 4 | 外推校验 ratio∈[0.5,2] | **未验证** | 未运行 Stage B |
-| 5 | 峰值 RSS 三系数 + R² | **未验证** | 未运行任何阶段；且即便跑了，lightgbm/xgboost 的 RSS 测量方式（`RUSAGE_SELF` 而非生产用的 `RUSAGE_CHILDREN`）也是已知的近似,见第 5 节第 3 条 |
+| 5 | 峰值 RSS 三系数 + R² | **未验证** | 未运行任何阶段；测量方式本身在第 2 轮修改后已对齐生产（`lightgbm`/`super_learner` 走隔离子进程,RSS 是子进程自身的 `RUSAGE_SELF`),不再是已知偏差,只是缺实测数据 |
 | 6 | 删失点显式记录 | **机制已验证，无实测数据** | 单测证明删失路径正确；没有真实标定文件可核对"没有静默丢弃" |
 | 7 | 标定文件可读、可复算回归 | **已验证（机制层面）** | round-trip 测试；没有生产标定文件可供人工再核对一次 |
 | 8 | 总测量墙钟时间记录且 <24h 有说明 | **未验证** | 未运行任何测量，无墙钟时间数据 |
@@ -268,8 +269,10 @@ commit；自那以后合入的提交已经修好了 `test_slurm_jobs.py` 的失�
   fallback 触发、`dimension_fallback_triggered=True` 被正确写入 payload）；
   只做过一次真实的探索性验证（8053 源、7.6s、1.3GB，远低于阈值，所以 fallback
   分支实际没有被走到过）。这是一个已知的测试覆盖缺口。
-- `SUBPROCESS_MODELS`（lightgbm、xgboost）峰值 RSS 用 `RUSAGE_SELF` 而不是
-  `RUSAGE_CHILDREN`，如第 5 节所述，是已知偏差，未被修正也未被测试覆盖其偏差量级。
+- （第 2 轮修改后已解决，保留记录）第 1 轮曾经把 `SUBPROCESS_MODELS` 错写成
+  `{lightgbm, xgboost}` 并让这两个模型都走进程内测量；第 2 轮已改为直接引用
+  `experiment.SERIAL_OUTER_MODELS`（真值 `{lightgbm, super_learner}`）并让这两个
+  模型真正经过 `IsolatedProcessRunner`，详见"第 2 轮修改"一节。
 - Stage A/B 的实际运行时间、是否会触发 `--max-seconds` 删失、censored 点分布等，
   完全未知，留给集群实测。
 - 只验证了 `internal_random` + `regression` 任务路径（合成 schema 固定
@@ -282,10 +285,12 @@ commit；自那以后合入的提交已经修好了 `test_slurm_jobs.py` 的失�
 
 1. **本轮"不产出标定文件"的范围收缩是否可接受**——这是与最初任务描述最大的出入，
    需要人工确认后续是"批准并安排集群跑一次"还是"仍要求本地先出一版能用的数字"。
-2. **`SUBPROCESS_MODELS`/RSS 测量方式（第 5 节第 3 条）**：lightgbm、xgboost
-   在生产里走隔离子进程,峰值 RSS 该用 `RUSAGE_CHILDREN`；本工具目前简化为进程内
-   直接拟合、用 `RUSAGE_SELF`，测出来的 RSS 数字系统性偏低，需要确认这个简化在
-   集群实测前是否要先修正,还是等实测阶段再评估影响。
+2. **（第 2 轮已修改，供复核）`SUBPROCESS_MODELS`/RSS 测量方式**：第 1 轮把这个
+   常量抄错、也没有真正走隔离子进程；第 2 轮改为直接引用
+   `experiment.SERIAL_OUTER_MODELS`，并让 `lightgbm`/`super_learner` 经
+   `IsolatedProcessRunner` 测量，RSS 读的是子进程自身的 `RUSAGE_SELF`（经 IPC
+   传回)。请复核这个改法是否真的等价于生产路径的 RSS 归因——详见"第 2 轮修改"
+   一节里对 `nk_grid.py:1967` `fit_result["peak_rss_bytes"]` 数据流的追踪。
 3. **合成数据的缺失率假设（第 5 节第 4 条）**：`missing_rate_continuous=0.10`、
    `missing_rate_group=0.08` 是没有依据的占位数字，直接影响 K_unobserved 的分布,
    进而可能影响 preprocess_cost 的回归结果；如果有更可靠的缺失率来源（哪怕是
@@ -298,3 +303,139 @@ commit；自那以后合入的提交已经修好了 `test_slurm_jobs.py` 的失�
 `t0_seconds.total.median / 0.05` 的量级（例如若集群 t0 中位数是 X 秒，
 `T_target ≈ 20·X` 秒，使 t0 占比 < 5%），这个公式本身可以现在写进
 `flat-task-table`，但数值代入必须等集群实测完成。
+
+## 第 2 轮修改
+
+审查文件：`reports/cost-calibration.review.md`（第 1 轮，审查对象
+`claude/cost-calibration` @ `a49cbd9`）。结论"需要修改"，2 条必改（F1、F2）、
+1 条建议（F3）。以下逐条说明处理位置。
+
+### F1（必改）`SUBPROCESS_MODELS` 是一份抄错的本地副本 —— 已修复
+
+**问题**：`calibrate_cost.py` 里 `SUBPROCESS_MODELS = frozenset({"lightgbm",
+"xgboost"})` 是手抄的常量，两处都错——`xgboost` 不走隔离子进程却被列入，
+`super_learner`（9 个模型里最贵、最需要准确内存估计的）走隔离子进程却被漏掉。
+
+**修法**：删掉本地副本，改为直接引用 `experiment.SERIAL_OUTER_MODELS`：
+
+```python
+from .experiment import SERIAL_OUTER_MODELS
+...
+SUBPROCESS_MODELS: frozenset[str] = SERIAL_OUTER_MODELS
+```
+
+（保留 `SUBPROCESS_MODELS` 这个名字,因为 `measure_one_cell` 等函数用它做路由判断；
+但现在它是对 `SERIAL_OUTER_MODELS` 的直接引用，不是独立维护的集合，两者不可能再
+静默漂移。）
+
+**防漂移测试**：`NK_Grid/tests/test_calibrate_cost.py::test_subprocess_model_set_tracks_the_engine`
+——断言 `cc.SUBPROCESS_MODELS == SERIAL_OUTER_MODELS`,并额外锁定具体成员
+`{"lightgbm", "super_learner"}`,这样引擎那边的常量将来变了,这条测试会先坏,
+而不是本模块继续悄悄用错误的集合。
+
+### F2（必改）峰值 RSS 对子进程模型系统性偏低 —— 已按"方案 1"修复
+
+**审查追出的证据链**：`calibrate_cost.measure_one_cell` 此前总是直接调用
+`nk_grid._fit_predict_model_cell`（本进程内),该函数内部用
+`_process_peak_rss_bytes()` 读 `RUSAGE_SELF`——但生产路径对
+`SERIAL_OUTER_MODELS`（`lightgbm`、`super_learner`）是通过
+`_run_native_model_cell_locked` → `IsolatedProcessRunner` 派一个**真实子进程**
+去跑,所以生产测到的是子进程自己的峰值,而校准工具此前测的是校准harness自己
+（父进程）的峰值,系统性偏低。
+
+**采用了审查意见的"首选"方案（方案 1）**：让 `SUBPROCESS_MODELS`
+（现在 = `SERIAL_OUTER_MODELS`）里的模型真正经过
+`nk_grid._run_native_model_cell_locked` / `native_process.IsolatedProcessRunner`,
+而不是方案 2（把这两个模型的 RSS 标 `null`）。
+
+一个值得记录的技术澄清（追代码之后发现，和审查文字的字面表述略有出入，但结论一致）：
+生产路径**实际上不是**从父进程调用 `RUSAGE_CHILDREN`。真正的机制是：
+`_fit_predict_model_cell` 这个函数本身，是被**送进子进程里执行**的
+（`nk_grid.py:1923` 起的 `_run_native_model_cell_locked(...)`）；它内部对
+`_process_peak_rss_bytes()`（即 `RUSAGE_SELF`）的调用，此时的"self"就是那个
+子进程本身，其返回值经 IPC 管道传回父进程，最终写进
+`fit_result["peak_rss_bytes"]`（`nk_grid.py:1967` 直接消费这个值）。
+也就是说生产从来没有从父进程读过 `RUSAGE_CHILDREN`——它是让测量代码本身在子进程
+里跑,子进程的 `RUSAGE_SELF` 天然就是它自己的峰值。这比父进程读
+`RUSAGE_CHILDREN` 更准确（`IsolatedProcessRunner` 为了性能会**复用同一个 worker
+跑多个 cell**，父进程读 `RUSAGE_CHILDREN` 只有在子进程退出被 reap 时才更新，
+测不出"当前这一个 cell"的峰值；而子进程自报的 `RUSAGE_SELF` 没有这个问题）。
+
+`calibrate_cost.py` 现在的实现完全复刻了这条生产路径：`measure_one_cell` 对
+`SUBPROCESS_MODELS` 里的模型调用 `_run_native_model_cell_locked`，测到的
+`peak_rss_bytes` 就是子进程自己报告的 `RUSAGE_SELF`，与生产管线用的是同一套
+数据流,不再是近似值。
+
+**具体改动**（`NK_Grid/src/aleatoric_nk_grid/calibrate_cost.py`）：
+
+- 新增 import：`from .experiment import SERIAL_OUTER_MODELS`、
+  `from .native_process import IsolatedProcessRunner`、
+  `from .nk_grid import _run_native_model_cell_locked`。
+- `CalibrationSession` 新增可选字段 `native_runner: IsolatedProcessRunner | None`
+  （懒启动,和生产一样"一个 worker 复用到底"）；新增 `_native_runner(session)`
+  懒构造辅助函数和 `close_session(session)` 释放函数。
+- `measure_one_cell`：`model_name in SUBPROCESS_MODELS` 时改走
+  `_run_native_model_cell_locked(_native_runner(session), fit_arguments=...)`；
+  其余模型保持原来的进程内 `_fit_predict_model_cell(**fit_arguments)` 路径。
+  任何异常（含 `MeasurementCensored`，即 SIGALRM 中止)都会触发
+  `close_session(session)` 丢弃当前 worker——因为一次被中止的请求可能让复用中的
+  worker 停在"请求已发出、响应未读"的中间状态，留着复用有把下一次调用的响应错配
+  的风险，不如丢弃重建一个干净的子进程。
+- `main()`：`build_session` 之后的整段测量逻辑包进 `try/finally`，
+  `finally` 里调用 `close_session(session)`，确保无论正常结束还是异常退出都不
+  留下孤儿子进程。
+
+**测试**（`NK_Grid/tests/test_calibrate_cost.py`）：
+
+- `test_measure_one_cell_routes_subprocess_models_through_isolated_runner`：
+  monkeypatch `_run_native_model_cell_locked`/`_fit_predict_model_cell`,断言
+  `lightgbm`/`super_learner` 走前者、`ols`/`xgboost`（**故意包含 xgboost**，
+  验证 F1 的修复确实生效——它现在不在 `SUBPROCESS_MODELS` 里）走后者;并验证
+  `session.native_runner` 在首次子进程调用后被创建、`close_session` 后被清空。
+- `test_measure_one_cell_discards_native_runner_on_failure`：monkeypatch
+  `_run_native_model_cell_locked` 抛异常,断言 `session.native_runner` 被置回
+  `None`（验证异常路径的丢弃逻辑）。
+- 另外做了一次**非 mock 的真实端到端冒烟验证**（不是正式单测,手动跑的）：
+  在合成数据（n_train=200, n_sources=30）上依次测 `lightgbm`、`super_learner`、
+  `ols`、`xgboost`，观察到前两者的单次调用墙钟时间比后两者多约 1.1–1.2 秒
+  （子进程 spawn + 完整 `import aleatoric_nk_grid` 的一次性开销),
+  与"确实经过了一个新的隔离子进程"这一预期吻合；`peak_rss_bytes` 四个模型都返回
+  了合理量级的正整数（约 209–221 MB，该合成数据规模下的预期量级）,
+  `close_session` 后 `session.native_runner` 变回 `None`。
+
+### F3（建议，已采纳）合成数据假设写入标定文件
+
+**发现**：`SyntheticDataParams` 的 `continuous_fraction`/`missing_rate_continuous`/
+`missing_rate_group` 其实已经通过 `generate_synthetic_bundle` 返回的
+`stats` 字典、经 `build_calibration_payload` 里的 `**synthetic_stats` 展开写进了
+`synthetic_data` 段（这三个字段本来就在 `stats` 里）。但审查读代码时只看到
+`synthetic_data` 段顶部显式列出的 `n_train`/`n_feature_units`/`p_onehot`/`seed`
+四个字段,容易误判这三个假设"没有进文件"——为避免这种可读性歧义，按审查建议**显式**
+把 `SyntheticDataParams` 的全部字段（`continuous_fraction`、
+`missing_rate_continuous`、`missing_rate_group`、`outcome`）都列在
+`synthetic_data` 段顶部（不再仅靠 `**synthetic_stats` 隐式带入），并新增
+`"missing_rates_are_unverified_placeholders": true` 标记。
+
+**具体改动**：`build_calibration_payload` 的 `synthetic_data` 字典字面量。
+
+**测试**：`test_synthetic_data_section_records_all_params_and_placeholder_flag`——
+用非默认的 `SyntheticDataParams`（`continuous_fraction=0.5` 等）构造一次 payload,
+断言这些值和标记字段都出现在 `payload["synthetic_data"]` 里。
+
+### 验证
+
+```
+python -m pytest -q
+```
+
+```
+320 passed, 70 warnings in 52.38s
+```
+
+（第 1 轮是 316；本轮净增 4 个测试：F1 的防漂移测试 1 个 + F2 的路由/异常丢弃测试
+2 个 + F3 的字段记录测试 1 个。）
+
+未运行实际的 Stage A/B 测量（延续第 1 轮"不在 MacBook Air 上出生产标定数据"的
+范围决定，本轮只修代码和补测试）。所有对真实 `IsolatedProcessRunner` 子进程的
+验证都是上面提到的一次性手动冒烟（已从磁盘清理，不产出任何文件），不计入标定文件、
+不构成正式测量证据。

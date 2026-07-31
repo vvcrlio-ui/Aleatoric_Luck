@@ -311,3 +311,126 @@ def test_onehot_group_size_pool_only_reads_schema_directory():
     sizes, provenance = cc.onehot_group_size_pool()
     assert len(sizes) > 0
     assert "data" not in provenance or "FFCWS/schema" in provenance
+
+
+# ---------------------------------------------------------------------------
+# Round-1 review regression tests (F1: SUBPROCESS_MODELS must track the
+# engine's own SERIAL_OUTER_MODELS, never a hand-copied set; F2: those models
+# must be measured through the real isolated subprocess so peak RSS reflects
+# the child process that actually does the fitting).
+# ---------------------------------------------------------------------------
+
+
+def test_subprocess_model_set_tracks_the_engine():
+    from aleatoric_nk_grid.experiment import SERIAL_OUTER_MODELS
+
+    assert cc.SUBPROCESS_MODELS == SERIAL_OUTER_MODELS
+    # Lock in the concrete membership too, so a change to the engine's set
+    # shows up here as a meaningful diff, not just an opaque equality change.
+    assert cc.SUBPROCESS_MODELS == frozenset({"lightgbm", "super_learner"})
+
+
+def test_measure_one_cell_routes_subprocess_models_through_isolated_runner(
+    tmp_path, monkeypatch
+):
+    params = cc.SyntheticDataParams(n_train=100, n_sources=10, seed=0)
+    schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    session = cc.build_session(schema_path, "y", seed=0)
+
+    calls: dict[str, list[str]] = {"native": [], "inline": []}
+
+    def _fake_native(runner, *, fit_arguments, on_native_crash, on_native_timeout):
+        assert runner is session.native_runner
+        calls["native"].append(fit_arguments["model_name"])
+        return {
+            "predictions": np.zeros(len(fit_arguments["X_test"])),
+            "fit_seconds": 0.01,
+            "best_rounds": None,
+            "converged": True,
+            "peak_rss_bytes": 123_456_789,
+        }
+
+    def _fake_inline(**kwargs):
+        calls["inline"].append(kwargs["model_name"])
+        return {
+            "predictions": np.zeros(len(kwargs["X_test"])),
+            "fit_seconds": 0.01,
+            "best_rounds": None,
+            "converged": True,
+            "peak_rss_bytes": 111,
+        }
+
+    monkeypatch.setattr(cc, "_run_native_model_cell_locked", _fake_native)
+    monkeypatch.setattr(cc, "_fit_predict_model_cell", _fake_inline)
+
+    for model in ("lightgbm", "super_learner"):
+        measurement = cc.measure_one_cell(
+            session, model_name=model, n=10, k=5, seed=0, draw=0, max_seconds=60
+        )
+        assert measurement.peak_rss_bytes == 123_456_789
+
+    # xgboost is NOT in SUBPROCESS_MODELS (that was F1's bug: xgboost doesn't
+    # go through the isolated subprocess in production) so it must take the
+    # inline path, same as any other non-native model.
+    for model in ("ols", "xgboost"):
+        measurement = cc.measure_one_cell(
+            session, model_name=model, n=10, k=5, seed=0, draw=0, max_seconds=60
+        )
+        assert measurement.peak_rss_bytes == 111
+
+    assert set(calls["native"]) == {"lightgbm", "super_learner"}
+    assert set(calls["inline"]) == {"ols", "xgboost"}
+    assert session.native_runner is not None
+
+    cc.close_session(session)
+    assert session.native_runner is None
+
+
+def test_measure_one_cell_discards_native_runner_on_failure(tmp_path, monkeypatch):
+    params = cc.SyntheticDataParams(n_train=60, n_sources=8, seed=0)
+    schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    session = cc.build_session(schema_path, "y", seed=0)
+
+    def _boom(runner, *, fit_arguments, on_native_crash, on_native_timeout):
+        raise RuntimeError("simulated native subprocess crash")
+
+    monkeypatch.setattr(cc, "_run_native_model_cell_locked", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated native subprocess crash"):
+        cc.measure_one_cell(
+            session, model_name="lightgbm", n=10, k=5, seed=0, draw=0, max_seconds=60
+        )
+
+    # The runner must be discarded (not left in a possibly-corrupted,
+    # mid-request state) so a subsequent call starts a fresh worker.
+    assert session.native_runner is None
+
+
+def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path):
+    params = cc.SyntheticDataParams(
+        n_train=50,
+        n_sources=6,
+        seed=3,
+        continuous_fraction=0.5,
+        missing_rate_continuous=0.2,
+        missing_rate_group=0.15,
+    )
+    _, stats = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    payload = cc.build_calibration_payload(
+        synthetic_params=params,
+        synthetic_stats=stats,
+        t0_seconds={},
+        fit_cost={},
+        preprocess_cost={},
+        peak_rss={},
+        validation=[],
+        censored=[],
+        raw_measurements=[],
+        thread_env_report={"ok": True, "values": {}},
+    )
+    synthetic_data = payload["synthetic_data"]
+    assert synthetic_data["continuous_fraction"] == 0.5
+    assert synthetic_data["missing_rate_continuous"] == 0.2
+    assert synthetic_data["missing_rate_group"] == 0.15
+    assert synthetic_data["outcome"] == params.outcome
+    assert synthetic_data["missing_rates_are_unverified_placeholders"] is True
