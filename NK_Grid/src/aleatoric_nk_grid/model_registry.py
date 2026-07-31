@@ -26,6 +26,7 @@ from sklearn.linear_model import (
     LogisticRegression,
     RidgeCV,
 )
+from sklearn.model_selection import KFold
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -77,7 +78,8 @@ MODEL_PARAM_KEYS = {
         "random_forest": {"n_estimators", "max_features", "min_samples_leaf"},
         "extra_trees": {"n_estimators", "max_features", "min_samples_leaf"},
         "shallow_neural_network": {
-            "hidden_layer_sizes", "activation", "solver", "alpha",
+            "hidden_layer_sizes", "activation", "solver",
+            "alpha_log10_min", "alpha_log10_max", "n_alphas", "max_cv_folds",
             "learning_rate_init", "max_iter", "early_stopping",
             "validation_fraction", "n_iter_no_change",
         },
@@ -474,6 +476,91 @@ class AdaptiveLassoCV(BaseEstimator, RegressorMixin):
         return self.model_.predict(X)
 
 
+class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
+    """MLP whose L2 penalty is chosen per fit by internal K-fold CV.
+
+    Mirrors AdaptiveLassoCV/RidgeCV: the alpha grid is the locked contract;
+    the value a cell actually uses is selected inside that cell's training
+    rows only, so no test-split information leaks into the choice. A fixed
+    alpha cannot suit both (N=10, K=100) and (N=4242, K=1) corners of the
+    grid, which is why the other penalized models already CV their strength.
+    """
+
+    def __init__(
+        self,
+        seed: int,
+        *,
+        hidden_layer_sizes: Sequence[int],
+        activation: str,
+        solver: str,
+        learning_rate_init: float,
+        max_iter: int,
+        early_stopping: bool,
+        alpha_log10_min: float,
+        alpha_log10_max: float,
+        n_alphas: int,
+        max_cv_folds: int,
+        validation_fraction: float = 0.1,
+        n_iter_no_change: int = 10,
+    ):
+        self.seed = seed
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.activation = activation
+        self.solver = solver
+        self.learning_rate_init = learning_rate_init
+        self.max_iter = max_iter
+        self.early_stopping = early_stopping
+        self.alpha_log10_min = alpha_log10_min
+        self.alpha_log10_max = alpha_log10_max
+        self.n_alphas = n_alphas
+        self.max_cv_folds = max_cv_folds
+        self.validation_fraction = validation_fraction
+        self.n_iter_no_change = n_iter_no_change
+
+    def _mlp(self, alpha: float) -> MLPRegressor:
+        return MLPRegressor(
+            hidden_layer_sizes=tuple(self.hidden_layer_sizes),
+            activation=self.activation,
+            solver=self.solver,
+            alpha=alpha,
+            learning_rate_init=self.learning_rate_init,
+            max_iter=self.max_iter,
+            early_stopping=self.early_stopping,
+            validation_fraction=self.validation_fraction,
+            n_iter_no_change=self.n_iter_no_change,
+            random_state=self.seed,
+        )
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+        if len(y) < 2:
+            raise ValueError(
+                "shallow_neural_network requires at least two training rows."
+            )
+        alphas = np.logspace(
+            self.alpha_log10_min, self.alpha_log10_max, self.n_alphas
+        )
+        cv = min(self.max_cv_folds, len(y))
+        # shuffle=False keeps fold membership a pure function of row order,
+        # so a cell's result stays reproducible bit-for-bit.
+        folds = tuple(KFold(n_splits=cv, shuffle=False).split(X))
+        mean_mse = []
+        for alpha in alphas:
+            fold_mse = []
+            for train_rows, val_rows in folds:
+                model = self._mlp(alpha).fit(X[train_rows], y[train_rows])
+                residual = model.predict(X[val_rows]) - y[val_rows]
+                fold_mse.append(float(np.mean(residual**2)))
+            mean_mse.append(float(np.mean(fold_mse)))
+        # argmin ties resolve to the smallest alpha; deterministic either way.
+        self.alpha_ = float(alphas[int(np.argmin(mean_mse))])
+        self.cv_mse_ = tuple(mean_mse)
+        self.model_ = self._mlp(self.alpha_).fit(X, y)
+        return self
+
+    def predict(self, X):
+        return self.model_.predict(np.asarray(X, dtype=float))
 
 
 class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
@@ -896,15 +983,11 @@ def make_model(
             ),
         )
     if name == "shallow_neural_network":
-        neural_params = dict(resolved_params)
-        neural_params["hidden_layer_sizes"] = tuple(
-            neural_params["hidden_layer_sizes"]
-        )
         return make_pipeline(
             SimpleImputer(strategy="median"),
             StandardScaler(),
             TransformedTargetRegressor(
-                regressor=MLPRegressor(**neural_params, random_state=seed),
+                regressor=AdaptiveMLPRegressor(seed=seed, **resolved_params),
                 transformer=StandardScaler(),
             ),
         )

@@ -51,6 +51,8 @@ def _fast_params(model_name: str) -> dict:
             hidden_layer_sizes=[4],
             max_iter=30,
             early_stopping=False,
+            n_alphas=2,
+            max_cv_folds=2,
         )
     elif model_name == "super_learner":
         params.update(
