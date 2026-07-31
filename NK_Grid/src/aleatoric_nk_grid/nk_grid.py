@@ -101,6 +101,19 @@ from .validate_input import REGRESSION_CV_MIN_N, validate_input
 
 LARGE_RUN_THRESHOLD = 250_000
 
+# Row-level metadata is deliberately scalar-only. The complete artifact-level
+# identity and semantic contract belong in the sidecar manifest, where
+# _manifest_payload() records them once instead of once per checkpoint row.
+ROW_METADATA_FIELDS = (
+    "experiment_id",
+    "experiment_kind",
+    "algorithm_version",
+    "outcome",
+    "test_size",
+    "split_mode",
+    "split_seed",
+)
+
 # Super Learner fits each of its 4 base learners once per CV fold plus one final
 # refit on the full subsample: 4 x (cv + 1) with cv=5.
 SUPER_LEARNER_FITS_PER_CELL = 24
@@ -1487,6 +1500,7 @@ def _run_nk_grid_locked(
         semantic_contract=semantic_contract,
         split_mode=split_mode,
     )
+    row_metadata = {field: metadata[field] for field in ROW_METADATA_FIELDS}
 
     split_seeds = sorted({seed for seed, _ in execution_pairs})
     if fixed_split is None:
@@ -1737,7 +1751,7 @@ def _run_nk_grid_locked(
                             "status": "failed",
                             "error": f"{type(exc).__name__}: {exc}",
                         },
-                        metadata,
+                        row_metadata,
                     )
                 )
             return failed_rows
@@ -1797,7 +1811,7 @@ def _run_nk_grid_locked(
                         "status": status,
                         "error": error,
                     },
-                    metadata,
+                    row_metadata,
                 )
 
             empty_metrics = (

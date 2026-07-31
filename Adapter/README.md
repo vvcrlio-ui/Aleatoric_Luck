@@ -42,7 +42,7 @@ produces the analysis-ready data table, predictor-universe definition, and
 schema in that order, then validates them immediately.
 
 ```python
-import hashlib, json
+import json
 from pathlib import Path
 import pandas as pd
 from aleatoric_nk_grid.preprocessing import source_groups
@@ -82,8 +82,6 @@ schema = {
     "feature_universe": {
         "mode": "fixed_a_priori",         # Fixed in advance, with no row-level screening
         "definition_file": "universe.json",
-        "definition_sha256": hashlib.sha256(
-            Path("universe.json").read_bytes()).hexdigest(),
     },
     "group_column": None,
     "imputation": {

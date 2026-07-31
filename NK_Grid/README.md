@@ -26,8 +26,13 @@ An analysis requires:
 | Analysis-ready dataset | Outcome and model input columns |
 | Predictor manifest | Maps model input columns to the predictor variables counted in \(K\) |
 | Schema | Defines outcomes, data split, variable types, missing-value treatment, and predictor eligibility |
-| Panel specification | Defines the \(N\) and \(K\) values, repeated draws, random seeds, outcomes, and models |
+| Panel specification | Defines the \(N\) and \(K\) values, repeated draws, seeds, outcomes, models, and explicit run identity |
 | Model parameters | Records model-specific settings |
+
+For a real run, declare `experiment_id`, `data_version`, and
+`model_spec_version` at the manifest root or on each panel. These values identify
+the experiment, analysis-ready data, and model specification carried into every
+result manifest.
 
 The common data-preparation requirements are documented in
 [`../Adapter/ADAPTER.md`](../Adapter/ADAPTER.md).
@@ -79,7 +84,7 @@ specifications provide the authoritative preset selection.
 
 ## Local execution
 
-Run one outcome:
+Run one panel:
 
 ```bash
 aleatoric-nk-grid-panels \
@@ -121,7 +126,7 @@ Before submission:
    output directories are visible to every compute node at the same paths; and
 4. review both the local dry run and the Slurm dry run.
 
-Preview the outcome–model job mapping:
+Preview the seed-shard task mapping:
 
 ```bash
 bash NK_Grid/slurm/submit_nk_grid.sh \
@@ -142,11 +147,6 @@ bash NK_Grid/slurm/submit_nk_grid.sh \
 ```
 
 Production submission additionally requires `--allow-large-run`.
-
-The launcher freezes the resolved job mapping before submission and assigns
-models to the `parallel` or `serial` execution class. These labels
-classify computing requirements.
-`--max-concurrent-per-class` limits each execution class separately.
 
 The repository-root `.venv` is used by default. On clusters that require
 different paths or a Python module:
@@ -171,39 +171,54 @@ sacct -j JOB_ID \
   --format=JobID,JobName%30,State,Elapsed,MaxRSS,ExitCode
 
 tail -f NK_Grid/logs/al-nk-grid-serial-JOB_ID_ARRAY_INDEX.out
+tail -f NK_Grid/logs/al-nk-finalize-JOB_ID_ARRAY_INDEX.out
+tail -f NK_Grid/logs/al-nk-publish-JOB_ID_ARRAY_INDEX.out
 ```
 
 Execution records and Slurm logs are written below `NK_Grid/logs/`.
 
-Work is saved in small, atomic checkpoint parts. Before the wall-time limit,
-the worker stops after a completed checkpoint and requests requeue. A restarted
-job resumes cells with pending or invalid records. Final results are
-materialized only after the expected analysis-cell index passes integrity
-checks.
+In `squeue`, seed arrays are named `al-nk-grid-parallel`,
+`al-nk-grid-serial`, or `al-nk-grid-super_learner`; they are followed by
+`al-nk-finalize` and `al-nk-publish`. Workers checkpoint within their seed
+shard and may requeue at a checkpoint boundary. Finalizers and publishers run
+after their dependencies and refuse incomplete inputs instead of publishing a
+partial result.
 
-If one execution class fails to submit after another has been accepted, first
-inspect the accepted jobs with `squeue`. Then submit only the missing class from
-the frozen snapshot printed by the original command:
+Diagnose a frozen snapshot before recovery:
+
+```bash
+python -m aleatoric_nk_grid.seed_shards missing \
+  --snapshot NK_Grid/logs/slurm-specs/jobs-TIMESTAMP-PID.json
+```
+
+The JSON reports missing and incomplete master indices plus invalid targets.
+Recover a chosen resource class from that snapshot; omit `--master-indices` to
+select all missing or incomplete tasks in the class, or pass the diagnosed
+subset:
 
 ```bash
 bash NK_Grid/slurm/submit_nk_grid.sh \
   --snapshot NK_Grid/logs/slurm-specs/jobs-TIMESTAMP-PID.json \
   --resource-class serial \
+  --master-indices 12,90 \
   --max-concurrent-per-class 4 \
   --serial-cpus-per-task 1 \
   --mem 48G \
   --time 4-00:00:00
 ```
 
-Reusing the snapshot preserves the reviewed job mapping. Re-reading a changed
-panel specification may produce a different mapping.
+Repeat per affected resource class. Recovery starts from the selected seed
+tasks, then submits fresh finalizer and publish arrays. Reusing the snapshot
+preserves the reviewed mapping.
 
 ## Output integrity
 
-Every result is identified by the application, outcome, model, random seed,
-draw, \(N\), and \(K\). Resume logic checks this identity before accepting
-prior work. Duplicate writers for the same output are rejected through a
-filesystem lease, and completed results are published atomically.
+Every shard carries `experiment_id`, `data_version`, and
+`model_spec_version`, plus its model, seed, draws, and resolved \(N\)/\(K\)
+design. Finalizers compare identity and semantic contracts across seed shards;
+publishers repeat those checks across model results. Duplicate publishers for
+the same output are rejected through a filesystem lease, and completed results
+are published atomically.
 
 Checkpointing protects against interrupted execution. Long-term preservation
 requires checksums and independent archival storage.

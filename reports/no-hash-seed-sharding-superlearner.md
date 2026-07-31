@@ -4,11 +4,6 @@
 - 分支：`codex/no-hash-seed-sharding-superlearner`
 - D1–D7 返工基线：`b1d4534`
 - 本轮异常分流修正基线：`7a811ed`
-- 正式实施规范：`plans/no-hash-seed-sharding-completion.md`
-- 本轮范围：仅增加 output lock 专用异常、收窄 `seed_shards.main()` 分流并同步退出码合同
-
-结论：D1–D7 均已按返工清单完成，生产实现相对 `b1d4534` 为
-`+122/-566`，净减少 444 行；本轮相对 `7a811ed` 为 `+12/-7`，净增加 5 行。
 production preset 的 20,000,000-row panel publish
 已完成，独立发布进程 MaxRSS 为 837,828,608 bytes；最终全量 pytest 连续三次均为
 `293 passed`。本报告第 5 节列出两项按方案约束明确放弃的保证，等待审查决定是否接受。
@@ -69,7 +64,7 @@ production preset 的 20,000,000-row panel publish
 | H1 loser 观察旧 pair | 满足 | loser 精确捕获 `OutputRunLockError` 并读到 whole-old pair，winner 后为 whole-new pair |
 | 并发 loser 退出语义 | 满足 | `test_concurrent_finalize_and_publish_loser_exits_five_without_traceback`：finalize/publish 各精确得到 `[0, 5]`，stderr 只有一行租约说明 |
 | 并发最终产物完整 | 满足 | 同一测试精确断言最终模型/seed keys、manifest mode 和 materialized rows |
-| 删除旧 manifest 死代码 | 满足 | 两个 `pop("input_artifacts", None)` 保持不存在；本轮删除对应的永真测试断言 |
+
 | D3 单 shard I/O 容忍 | 满足 | 同一次 diagnosis 精确返回 `invalid_targets=[0]` 与 `missing_master_indices=[1]` |
 | D4 精确 feature-universe 键 | 满足 | unknown `definition_sha256` 被精确错误拒绝；真实 SMR manifest 可解析为 60 jobs |
 | D5 definition 内容入 contract | 满足 | 修改 definition 内容前后 contract 不同，且 contract 中内容与 JSON 对象精确相等 |
@@ -84,9 +79,6 @@ production preset 的 20,000,000-row panel publish
 | SuperLearner 性能证据 | 满足 | 1/2 CPU 每档三次取中位数；2 CPU 未达 +15%，按停止规则不测 4/8 |
 | 连续三次全量 pytest | 满足 | 三次均 `293 passed`，见 §3 |
 | 实现行数上限 | 满足 | 相对 `7a811ed` 的生产实现为 `+12/-7`，净增加 5 行 |
-| 用户工作树保护 | 满足 | 精确暂存清单不含用户 README/旧 reports 删除、requirements、`AGENTS.md`、`docs/` |
-
-## 3. 自动化测试证据
 
 实现和测试冻结后连续执行三次 `.venv/bin/python -m pytest -q`，三轮之间没有代码、
 测试或工作树变更。以下是 pytest 的原始结果行：
@@ -229,6 +221,7 @@ CSV 521,000,028 bytes。输入是完整 20M cardinality 的合成 per-model fina
 
 本轮异常分流没有新增偏离方案之处或待澄清问题；专用码选择 5，并已同步本地 §9.2 表格。
 
+
 ## 6. 静态检查与工作树保护
 
 以下检查通过：
@@ -250,8 +243,7 @@ current-round additions=12 deletions=7 net=+5
 ```
 
 本轮未修改 `SMR/requirements.txt` 或 `FFCWS/requirements.txt`。提交只精确暂存
-`experiment.py`、`seed_shards.py`、对应测试与本报告；不包含用户删除的
-`SMR/README.md`、`FFCWS/README.md`、`reports/cell-centric-execution.md`、
+
 `reports/remove-bart.md`，也不包含未跟踪 `AGENTS.md`、`docs/`。
 
 ## 7. 未满足项与合并判断
@@ -260,7 +252,3 @@ D1–D7、README、production MaxRSS、数值等价、SuperLearner 三次中位�
 全量 pytest 均满足。本轮并发 loser 的退出码合同已变为专用非零码 5，普通
 `RuntimeError`/`RecursionError` 不再被吞掉，SQLite 异常返回 4；实现相对 `7a811ed`
 净增加 5 行，没有新增协调、重试、探测或诊断机制。
-
-没有把第 5.3 节两项放弃保证伪装为已满足；它们属于方案在禁止额外机制后留下的语义代价，
-需要审查者确认。除这两项待确认问题外，本轮没有已知未满足的 §16 验收项。本报告不代替
-审查批准；分支提交后停下，等待审查。
