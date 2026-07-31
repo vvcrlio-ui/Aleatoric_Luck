@@ -28,7 +28,10 @@ regression:
       - 32
     activation: relu
     solver: adam
-    alpha: 0.01
+    alpha_log10_min: -2
+    alpha_log10_max: 2
+    n_alphas: 5
+    max_cv_folds: 3
     learning_rate_init: 0.001
     max_iter: 500
     early_stopping: false

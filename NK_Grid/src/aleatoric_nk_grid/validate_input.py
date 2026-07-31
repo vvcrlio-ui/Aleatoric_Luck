@@ -17,6 +17,7 @@ from .preprocessing import SourceGroup, source_groups, validate_onehot_states
 REGRESSION_CV_MIN_N = {
     "ridge": 2,
     "lasso": 2,
+    "shallow_neural_network": 2,
     "lightgbm": 5,
     "super_learner": 5,
 }
