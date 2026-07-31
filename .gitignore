@@ -36,6 +36,7 @@ datasets/
 results/
 runs/
 plans/
+reports/
 
 # Local implementation/review notes
 NK_Grid/CODE_REVIEW_REPORT_*.md
