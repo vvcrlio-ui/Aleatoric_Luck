@@ -353,6 +353,33 @@ def test_different_experiment_id_does_not_reuse_preset_output(tmp_path):
     assert make_model.called
 
 
+def test_staged_draw_expansion_matches_one_shot_and_fits_only_new_cells(tmp_path):
+    schema = write_schema_bundle(
+        tmp_path / "input", _regression_frame(), predictors=["X_a", "X_b"]
+    )
+    staged_declared = tmp_path / "staged.csv"
+    run_nk_grid(
+        _config(
+            schema, staged_declared, preset="pilot", n_draws=3,
+            rerun_completed=False,
+        )
+    )
+    import aleatoric_nk_grid.nk_grid as nk_grid
+
+    with patch("aleatoric_nk_grid.nk_grid.make_model", wraps=nk_grid.make_model) as make_model:
+        staged = run_nk_grid(
+            _config(
+                schema, staged_declared, preset="medium", n_draws=9,
+                rerun_completed=False,
+            )
+        )
+    assert make_model.call_count == 6
+
+    one_shot = tmp_path / "one-shot.csv"
+    run_nk_grid(_config(schema, one_shot, n_draws=9, rerun_completed=False))
+    assert staged.read_bytes() == one_shot.read_bytes()
+
+
 @pytest.mark.parametrize("corruption", ["duplicate", "extra"])
 def test_completed_output_with_non_exact_cell_index_fails_integrity_check(
     tmp_path,
