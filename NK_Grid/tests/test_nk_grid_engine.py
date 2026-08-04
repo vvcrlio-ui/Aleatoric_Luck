@@ -331,7 +331,7 @@ def test_completed_preset_can_be_reused_without_recomputation(tmp_path):
     ):
         second = run_nk_grid(config)
     assert second == first
-    assert len(list(tmp_path.glob("result_dev_*.csv"))) == 1
+    assert len(list(tmp_path.glob("result_nkgrid-test-v1_*.csv"))) == 1
 
 
 @pytest.mark.parametrize("corruption", ["duplicate", "extra"])
@@ -402,7 +402,7 @@ def test_completed_output_with_malformed_manifest_structure_is_rebuilt(
 
 def test_preset_resume_reuses_matching_manifest_before_first_checkpoint(tmp_path):
     declared = tmp_path / "result.csv"
-    candidate = tmp_path / "result_dev_20260724-120000.csv"
+    candidate = tmp_path / "result_matching-experiment_20260724-120000.csv"
     candidate.with_suffix(".manifest.json").write_text(
         json.dumps({"experiment_id": "matching-experiment"}),
         encoding="utf-8",
@@ -419,9 +419,35 @@ def test_preset_resume_reuses_matching_manifest_before_first_checkpoint(tmp_path
     assert selected == candidate
 
 
+@pytest.mark.parametrize("bad_id", ("bad/id", r"bad\\id", "bad id", "..", ""))
+def test_preset_output_rejects_unsafe_experiment_id_before_writing(tmp_path, bad_id):
+    declared = tmp_path / "result.csv"
+    with pytest.raises(ValueError, match="experiment_id"):
+        _select_output_path(
+            declared,
+            preset="dev",
+            experiment_id=bad_id,
+            jobs=[],
+            rerun_completed=False,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_preset_discovery_uses_experiment_id_not_preset(tmp_path):
+    declared = tmp_path / "result.csv"
+    candidate = tmp_path / "result_shared-experiment_20260724-120000.csv"
+    candidate.with_suffix(".manifest.json").write_text(
+        json.dumps({"experiment_id": "shared-experiment"}), encoding="utf-8"
+    )
+    assert _select_output_path(
+        declared, preset="production", experiment_id="shared-experiment",
+        jobs=[("ols", 123, 0, 10, 2)], rerun_completed=True,
+    ) == candidate
+
+
 def test_preset_resume_retries_failed_only_checkpoint_in_place(tmp_path):
     declared = tmp_path / "result.csv"
-    candidate = tmp_path / "result_dev_20260724-120000.csv"
+    candidate = tmp_path / "result_matching-experiment_20260724-120000.csv"
     pd.DataFrame(
         [
             {
@@ -449,7 +475,7 @@ def test_preset_resume_retries_failed_only_checkpoint_in_place(tmp_path):
 
 def test_preset_resume_discovers_orphan_checkpoint_parts(tmp_path):
     declared = tmp_path / "result.csv"
-    candidate = tmp_path / "result_dev_20260724-120000.csv"
+    candidate = tmp_path / "result_matching-experiment_20260724-120000.csv"
     write_checkpoint_part(
         [
             {
@@ -483,8 +509,8 @@ def test_preset_resume_discovers_orphan_checkpoint_parts(tmp_path):
 
 def test_preset_scan_skips_newer_unrelated_corrupt_candidate(tmp_path):
     declared = tmp_path / "result.csv"
-    valid = tmp_path / "result_dev_20260724-110000.csv"
-    corrupt = tmp_path / "result_dev_20260724-120000.csv"
+    valid = tmp_path / "result_matching-experiment_20260724-110000.csv"
+    corrupt = tmp_path / "result_matching-experiment_20260724-120000.csv"
     job = ("ols", 123, 0, 10, 2)
     pd.DataFrame(
         [
@@ -516,8 +542,8 @@ def test_preset_scan_skips_newer_unrelated_corrupt_candidate(tmp_path):
 
 def test_preset_scan_skips_non_object_manifest_on_unreadable_candidate(tmp_path):
     declared = tmp_path / "result.csv"
-    valid = tmp_path / "result_dev_20260724-110000.csv"
-    invalid = tmp_path / "result_dev_20260724-120000.csv"
+    valid = tmp_path / "result_matching-experiment_20260724-110000.csv"
+    invalid = tmp_path / "result_matching-experiment_20260724-120000.csv"
     job = ("ols", 123, 0, 10, 2)
     pd.DataFrame(
         [
@@ -550,8 +576,8 @@ def test_preset_scan_skips_non_object_manifest_on_unreadable_candidate(tmp_path)
 
 def test_preset_scan_does_not_resume_manifest_only_non_object_json(tmp_path):
     declared = tmp_path / "result.csv"
-    candidate = tmp_path / "result_dev_20260724-120000.csv"
-    fresh = tmp_path / "result_dev_20260724-130000.csv"
+    candidate = tmp_path / "result_matching-experiment_20260724-120000.csv"
+    fresh = tmp_path / "result_matching-experiment_20260724-130000.csv"
     candidate.with_suffix(".manifest.json").write_text("[]", encoding="utf-8")
 
     with patch(
@@ -571,8 +597,8 @@ def test_preset_scan_does_not_resume_manifest_only_non_object_json(tmp_path):
 
 def test_completed_preset_starts_new_output_when_rerun_is_requested(tmp_path):
     declared = tmp_path / "result.csv"
-    candidate = tmp_path / "result_dev_20260724-120000.csv"
-    fresh = tmp_path / "result_dev_20260724-130000.csv"
+    candidate = tmp_path / "result_matching-experiment_20260724-120000.csv"
+    fresh = tmp_path / "result_matching-experiment_20260724-130000.csv"
     job = ("ols", 123, 0, 10, 2)
     pd.DataFrame(
         [
@@ -605,9 +631,9 @@ def test_completed_preset_starts_new_output_when_rerun_is_requested(tmp_path):
 
 def test_completed_newest_preset_does_not_revive_older_partial_on_rerun(tmp_path):
     declared = tmp_path / "result.csv"
-    older = tmp_path / "result_dev_20260724-110000.csv"
-    newest = tmp_path / "result_dev_20260724-120000.csv"
-    fresh = tmp_path / "result_dev_20260724-130000.csv"
+    older = tmp_path / "result_matching-experiment_20260724-110000.csv"
+    newest = tmp_path / "result_matching-experiment_20260724-120000.csv"
+    fresh = tmp_path / "result_matching-experiment_20260724-130000.csv"
     jobs = [
         ("ols", 123, 0, 10, 1),
         ("ols", 123, 0, 10, 2),

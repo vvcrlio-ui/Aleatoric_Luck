@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import resource
 import shutil
 import sys
@@ -677,10 +678,21 @@ def _checkpoint_index_exactly_matches_jobs(
     return len(completed) == len(jobs) and all(job in completed for job in jobs)
 
 
-def _timestamped_out_path(directory: Path, stem: str, preset: str, suffix: str) -> Path:
+def _identity_path_segment(experiment_id: str) -> str:
+    """Validate that experiment_id is safe as a filename segment."""
+
+    if experiment_id in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._-]+", experiment_id):
+        raise ValueError(
+            "experiment_id must be a non-empty filename segment containing only "
+            "ASCII letters, digits, dots, underscores, or hyphens"
+        )
+    return experiment_id
+
+
+def _timestamped_out_path(directory: Path, stem: str, segment: str, suffix: str) -> Path:
     while True:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_path = directory / f"{stem}_{preset}_{timestamp}{suffix}"
+        out_path = directory / f"{stem}_{segment}_{timestamp}{suffix}"
         if not any(
             (
                 out_path.exists(),
@@ -700,19 +712,21 @@ def _select_output_path(
     jobs: list[tuple],
     rerun_completed: bool,
 ) -> Path:
+    segment = _identity_path_segment(experiment_id)
     if preset is None:
+        # This distinguishes direct CLI output from panel-managed output paths.
         return declared
 
     # With a panel preset, config.out is only a template for directory/stem.
-    # Actual writes go to {stem}_{preset}_{timestamp}{suffix}.
+    # Actual writes use experiment_id as their resumable namespace segment.
     directory = declared.parent
     stem = declared.stem
     suffix = declared.suffix
     candidates_by_path = {
         path: path.stat().st_mtime
-        for path in directory.glob(f"{stem}_{preset}_*{suffix}")
+        for path in directory.glob(f"{stem}_{segment}_*{suffix}")
     }
-    for candidate_manifest in directory.glob(f"{stem}_{preset}_*.manifest.json"):
+    for candidate_manifest in directory.glob(f"{stem}_{segment}_*.manifest.json"):
         candidate = candidate_manifest.with_name(
             candidate_manifest.name.removesuffix(".manifest.json") + suffix
         )
@@ -720,7 +734,7 @@ def _select_output_path(
             candidates_by_path.get(candidate, float("-inf")),
             candidate_manifest.stat().st_mtime,
         )
-    for candidate_parts in directory.glob(f"{stem}_{preset}_*.parts"):
+    for candidate_parts in directory.glob(f"{stem}_{segment}_*.parts"):
         if not candidate_parts.is_dir():
             continue
         candidate = candidate_parts.with_suffix(suffix)
@@ -787,8 +801,8 @@ def _select_output_path(
         )
         # The newest matching run is complete. Do not fall through and revive
         # an older partial run when the caller explicitly requested a rerun.
-        return _timestamped_out_path(directory, stem, preset, suffix)
-    return _timestamped_out_path(directory, stem, preset, suffix)
+        return _timestamped_out_path(directory, stem, segment, suffix)
+    return _timestamped_out_path(directory, stem, segment, suffix)
 
 
 def estimate_run_size(config: NKGridConfig) -> dict[str, int | str]:
