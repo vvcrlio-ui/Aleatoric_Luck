@@ -68,7 +68,7 @@ def test_locked_cv_regression_parameters_load_with_rmse():
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
 @pytest.mark.parametrize("task", ["regression", "classification"])
 def test_model_param_contract_covers_model_space_exactly(params_path, task):
-    assert load_algorithm_version(params_path) == "nk-grid-v5-adapter-3"
+    assert load_algorithm_version(params_path) == "nk-grid-v5-adapter-4"
     document = yaml.safe_load(params_path.read_text(encoding="utf-8"))
     assert set(document[task]) == set(SUPPORTED_MODEL_NAMES)
     selected = load_model_params(

@@ -270,7 +270,12 @@ def _apply_environment_overrides(
 
 
 class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
-    """Source-aligned XGBoost: depth 2, eta .3, CV-selected rounds <= 90."""
+    """Source-aligned XGBoost: depth 2, eta .3, CV-selected rounds <= 90.
+
+    CV folds are generated from a private ``RandomState`` and passed explicitly
+    to ``xgboost.cv``.  This avoids its module-global NumPy RNG, which is shared
+    by concurrent cell workers even when both ``seed`` and ``nthread`` are fixed.
+    """
 
     def __init__(
         self,
@@ -305,6 +310,21 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
             "nthread": self.n_jobs,
             "seed": self.seed,
         }
+        # ``xgboost.cv`` otherwise calls ``np.random.seed(seed)`` then uses the
+        # module-global generator to shuffle folds.  Concurrent callers race on
+        # that shared generator, so give it the same legacy MT19937 permutation
+        # from an instance-local generator instead.
+        fold_order = np.random.RandomState(self.seed).permutation(len(y))
+        test_folds = np.array_split(fold_order, self.cv_folds)
+        folds = [
+            (
+                np.concatenate(
+                    [test_folds[index] for index in range(self.cv_folds) if index != fold]
+                ),
+                test_folds[fold],
+            )
+            for fold in range(self.cv_folds)
+        ]
         cv = xgb.cv(
             self.params_,
             dtrain,
@@ -312,6 +332,7 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
             nfold=self.cv_folds,
             seed=self.seed,
             shuffle=True,
+            folds=folds,
             verbose_eval=False,
         )
         metric_key = "test-rmse-mean"

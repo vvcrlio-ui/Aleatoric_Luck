@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v5-adapter-3
+algorithm_version: nk-grid-v5-adapter-4
 
 regression:
   ols:
