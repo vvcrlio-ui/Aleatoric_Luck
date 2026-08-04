@@ -712,10 +712,11 @@ def _select_output_path(
     jobs: list[tuple],
     rerun_completed: bool,
 ) -> Path:
-    segment = _identity_path_segment(experiment_id)
     if preset is None:
         # This distinguishes direct CLI output from panel-managed output paths.
         return declared
+
+    segment = _identity_path_segment(experiment_id)
 
     # With a panel preset, config.out is only a template for directory/stem.
     # Actual writes use experiment_id as their resumable namespace segment.

@@ -334,6 +334,25 @@ def test_completed_preset_can_be_reused_without_recomputation(tmp_path):
     assert len(list(tmp_path.glob("result_nkgrid-test-v1_*.csv"))) == 1
 
 
+def test_completed_cells_are_reused_across_presets_without_recomputation(tmp_path):
+    schema = write_schema_bundle(
+        tmp_path / "input", _regression_frame(), predictors=["X_a", "X_b"]
+    )
+    first = _config(schema, tmp_path / "result.csv", preset="pilot", rerun_completed=False)
+    out = run_nk_grid(first)
+    second = _config(schema, tmp_path / "result.csv", preset="medium", rerun_completed=False)
+    with patch("aleatoric_nk_grid.nk_grid.make_model", side_effect=AssertionError("existing cell recomputed")):
+        assert run_nk_grid(second) == out
+
+
+def test_different_experiment_id_does_not_reuse_preset_output(tmp_path):
+    schema = write_schema_bundle(tmp_path / "input", _regression_frame(), predictors=["X_a", "X_b"])
+    run_nk_grid(_config(schema, tmp_path / "result.csv", preset="pilot", experiment_id="first"))
+    with patch("aleatoric_nk_grid.nk_grid.make_model", wraps=__import__("aleatoric_nk_grid.nk_grid", fromlist=["make_model"]).make_model) as make_model:
+        run_nk_grid(_config(schema, tmp_path / "result.csv", preset="pilot", experiment_id="second"))
+    assert make_model.called
+
+
 @pytest.mark.parametrize("corruption", ["duplicate", "extra"])
 def test_completed_output_with_non_exact_cell_index_fails_integrity_check(
     tmp_path,
@@ -431,6 +450,13 @@ def test_preset_output_rejects_unsafe_experiment_id_before_writing(tmp_path, bad
             rerun_completed=False,
         )
     assert list(tmp_path.iterdir()) == []
+
+
+def test_direct_output_does_not_validate_unused_experiment_id(tmp_path):
+    declared = tmp_path / "direct.csv"
+    assert _select_output_path(
+        declared, preset=None, experiment_id="bad/id", jobs=[], rerun_completed=False
+    ) == declared
 
 
 def test_preset_discovery_uses_experiment_id_not_preset(tmp_path):
