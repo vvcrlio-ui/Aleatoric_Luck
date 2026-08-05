@@ -4,9 +4,11 @@ import csv
 import inspect
 import stat
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import aleatoric_nk_grid.flat_task_table as flat_task_table
+import yaml
 
 from aleatoric_nk_grid.flat_task_table import (
     ResourceRequest,
@@ -20,13 +22,19 @@ from aleatoric_nk_grid.flat_task_table import (
     read_chunk,
     resource_class_for_rows,
     resource_request,
+    measure_chunk_read_rss,
     run_chunk,
     sbatch_resource_args,
     run_snapshot_chunk,
     write_chunk_snapshot,
     write_task_table,
+    write_synthetic_task_table,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
+from aleatoric_nk_grid.seed_shards import (
+    build_chunk_finalizer_map,
+    finalize_chunk_shards as finalize_chunk_shards_via_seed_shards,
+)
 from conftest import write_schema_bundle
 import numpy as np
 import pandas as pd
@@ -41,6 +49,20 @@ def _config(tmp_path: Path) -> NKGridConfig:
     )
 
 
+def _fast_model_params(tmp_path: Path) -> Path:
+    source = Path(__file__).resolve().parents[1] / "model_params.yaml"
+    payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+    regression = payload["regression"]
+    regression["lightgbm"].update({"max_rounds": 2, "cv_folds": 2})
+    regression["xgboost"].update({"max_rounds": 2, "cv_folds": 2})
+    regression["super_learner"].update({
+        "cv": 2, "n_estimators": 1, "max_iter": 2, "lgbm_n_estimators": 1,
+    })
+    path = tmp_path / "fast-model-params.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    return path
+
+
 def test_task_table_is_reproducible_and_has_one_row_group_per_chunk(tmp_path):
     rows = build_rows(_config(tmp_path), n_grid=(10, 20), k_grid=(1, 2))
     first = pack_lpt(rows, budget=2)
@@ -53,6 +75,15 @@ def test_task_table_is_reproducible_and_has_one_row_group_per_chunk(tmp_path):
     assert all("ols" not in row.models or "ridge" in row.models for row in loaded if row.group == "imputed_core")
     assert not path.stat().st_mode & stat.S_IWUSR
     assert "sqlite" not in inspect.getsource(flat_task_table).lower()
+
+
+def test_rss_harness_streams_synthetic_design_and_reads_one_chunk(tmp_path):
+    path = write_synthetic_task_table(
+        tmp_path / "synthetic.parquet", row_count=5_000, rows_per_chunk=1_000,
+    )
+    measured = measure_chunk_read_rss(path, chunk_id=2)
+    assert measured["rows"] == 1_000
+    assert measured["rss_delta_bytes"] >= 0
 
 
 def test_lpt_obeys_budget_except_single_over_budget_rows():
@@ -117,29 +148,76 @@ def test_resource_framework_requires_stage_b_values():
     with pytest.raises(ValueError, match="No Stage-B"):
         resource_request(serial, {})
     values = {
-        "serial": ResourceRequest("serial", 1, "long", "8G", "00:30:00")
+        "serial": ResourceRequest("serial", 1, "long", "8G", "00:30:00"),
+        "super_learner": ResourceRequest("super_learner", 2, "long", "16G", "00:30:00"),
     }
     assert resource_request(serial, values).cpus_per_task == 1
     assert sbatch_resource_args(serial, values) == (
         "--partition=long", "--cpus-per-task=1", "--mem=8G", "--time=00:30:00",
     )
+    assert resource_request(super_rows, values).cpus_per_task == 2
+    assert "--cpus-per-task=2" in sbatch_resource_args(super_rows, values)
 
 
-def test_chunk_execution_matches_direct_cell_group_metrics(tmp_path):
-    values = np.arange(40, dtype=float)
-    frame = pd.DataFrame({"y": values * 2, "x1": values, "x2": values % 3})
-    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x1", "x2"])
-    config = NKGridConfig(
-        schema=schema, out=tmp_path / "direct.csv", outcome="y", models=("ols", "ridge"),
-        seed=17, test_size=0.25, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
-        max_n=10, max_k=1, min_n=10, batch_size=2, n_jobs=1,
-        repeat_plan=((17, 0),), n_grid=(10,), k_grid=(1,), rerun_completed=False,
+@pytest.mark.parametrize(
+    ("models", "expected_group", "n_jobs"),
+    [
+        (("ols", "ridge"), "imputed_core", 1),
+        (("lightgbm", "xgboost"), "passthrough", 1),
+        (("super_learner",), "imputed_core", 2),
+    ],
+    ids=("imputed", "passthrough", "super-learner-isolated"),
+)
+def test_chunk_execution_matches_direct_cell_group_metrics(
+    tmp_path, models, expected_group, n_jobs,
+):
+    values = np.arange(72, dtype=float)
+    frame = pd.DataFrame({
+        "y": values * 2 + values % 5,
+        "x1": values,
+        "x2": values % 3,
+        "x3": values % 7,
+    })
+    schema = write_schema_bundle(
+        tmp_path / "input", frame, predictors=["x1", "x2", "x3"],
+        imputation={
+            "continuous": "median", "ordinal": "most_frequent",
+            "onehot_group": "atomic_mode",
+            "model_overrides": {"lightgbm": "passthrough", "xgboost": "passthrough"},
+        },
     )
-    rows = pack_lpt(build_rows(config, n_grid=(10,), k_grid=(1,)), budget=1)
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "direct.csv", outcome="y", models=models,
+        seed=17, test_size=0.25, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=12, max_k=1, min_n=10, batch_size=2, n_jobs=n_jobs,
+        repeat_plan=((17, 0),), n_grid=(10, 12), k_grid=(1,), rerun_completed=False,
+        model_params=_fast_model_params(tmp_path),
+    )
+    rows = pack_lpt(build_rows(config, n_grid=(10, 12), k_grid=(1,)), budget=1)
+    assert {row.group for row in rows} == {expected_group}
+    assert len({row.chunk_id for row in rows}) >= 2
     table = write_task_table(tmp_path / "tasks.parquet", rows)
-    chunk_output = run_chunk(table, 0, config, output=tmp_path / "chunk-0.csv")
+    chunk_outputs = {
+        chunk_id: run_chunk(table, chunk_id, config, output=tmp_path / f"chunk-{chunk_id}.csv")
+        for chunk_id in range(2)
+    }
+    chunk_output = finalize_chunk_shards(table, chunk_outputs, tmp_path / "chunk-final.csv")
     from aleatoric_nk_grid.nk_grid import METRIC_COLUMNS, run_nk_grid
-    run_nk_grid(config)
+    if models == ("super_learner",):
+        native_calls: list[dict] = []
+        from aleatoric_nk_grid import nk_grid
+        original = nk_grid._run_native_model_cell_locked
+
+        def observe(*args, **kwargs):
+            native_calls.append(dict(kwargs["fit_arguments"]))
+            return original(*args, **kwargs)
+
+        with patch("aleatoric_nk_grid.nk_grid._run_native_model_cell_locked", side_effect=observe):
+            run_nk_grid(config)
+        assert native_calls
+        assert {call["model_n_jobs"] for call in native_calls} == {2}
+    else:
+        run_nk_grid(config)
     sort_columns = ["model", "seed", "draw", "N", "K"]
     left = pd.read_csv(chunk_output).sort_values(sort_columns).reset_index(drop=True)
     right = pd.read_csv(config.out).sort_values(sort_columns).reset_index(drop=True)
@@ -161,3 +239,19 @@ def test_snapshot_freezes_chunk_array_mapping(tmp_path):
     assert payload["task_table"] == str(table.resolve())
     with pytest.raises(IndexError, match="outside"):
         run_snapshot_chunk(snapshot, 8)
+
+
+def test_seed_shard_finalizer_map_uses_chunk_id_targets(tmp_path):
+    config = _config(tmp_path)
+    table = write_task_table(tmp_path / "tasks.parquet", pack_lpt(
+        build_rows(config, n_grid=(10,), k_grid=(1,)), budget=1
+    ))
+    snapshot = write_chunk_snapshot(
+        tmp_path / "snapshot.json", table_path=table, panel="panel", config=config,
+        output_dir=tmp_path / "chunks",
+    )
+    finalizer_map = build_chunk_finalizer_map(snapshot)
+    import json
+    payload = json.loads(finalizer_map.read_text(encoding="utf-8"))
+    assert payload["kind"] == "chunk-finalizer"
+    assert payload["targets"][0]["chunk_count"] == 8

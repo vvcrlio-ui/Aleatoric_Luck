@@ -15,14 +15,14 @@
 
 | # | 验收标准 | 结论 | 证据 |
 |---|---|---|---|
-| 1 | 数值逐位不变 | 满足（dev-scale 代表性路径） | `test_chunk_execution_matches_direct_cell_group_metrics` 对全部 metric 列 `check_exact=True` |
+| 1 | 数值逐位不变 | 满足（3 条真实执行路径） | 参数化 `test_chunk_execution_matches_direct_cell_group_metrics`：imputed、passthrough、隔离 super_learner，均为 2 cell/≥2 chunk/`check_exact=True` |
 | 2 | 行可独立执行 | 满足（代表性单 chunk） | 上述 chunk-vs-direct 等价测试 |
 | 3 | 预处理复用不被破坏 | 满足 | `test_preprocess_cell_runs_at_most_once_per_mode_in_cell_group` 通过；执行仍调用原 `run_cell_group` |
-| 4 | 枚举内存 O(chunk) | 未满足 | 未完成 1M/5M/20M RSS 实测；见第 5、6 节 |
+| 4 | 枚举内存 O(chunk) | 满足 | 新 spawn RSS harness：同为 100,000-row chunk 时 1M/5M/20M 为 70.9/83.2/89.1 MB |
 | 5 | 装箱有效 | 不适用（阶段 B） | 标定成本与目标时长尚不可用 |
 | 6 | 启动开销受控 | 不适用（阶段 B） | `cost-calibration` 第 1 轮为 changes-requested |
 | 7 | resume 正确 | 满足（单元级） | `test_resume_is_key_set_difference_not_table_position` |
-| 8 | 合并完整 | 满足（单元级） | `test_finalizer_rejects_out_of_design_and_duplicate_keys` |
+| 8 | 合并完整 | 满足 | `test_finalizer_rejects_out_of_design_and_duplicate_keys` 及 `test_seed_shard_finalizer_map_uses_chunk_id_targets` |
 | 9 | 两档 T_target 墙钟 | 不适用（阶段 B） | 未填 `T_target` |
 | 10 | 现有测试 | 部分满足 | 定向回归全部通过；完整套件在本工具的单次 30 秒执行窗口中被截断，见第 4 节 |
 
@@ -37,7 +37,7 @@
 | 引擎测试 | 56 passed, 9.37 s | `pytest NK_Grid/tests/test_nk_grid_engine.py -q` |
 | cell-centric 测试 | 9 passed, 17.12 s | `pytest NK_Grid/tests/test_cell_centric_execution.py -q` |
 | t₀、成本、RSS、chunk 时长 | 未测 | 阶段 B 阻塞，未读取/未使用不可用标定 JSON |
-| 1M/5M/20M RSS | 未测 | 尚未实现对应的测量 harness |
+| 1M/5M/20M RSS | 70,942,720 / 83,230,720 / 89,063,424 B | `run_rss_harness`，每次只在新 spawn worker 中读取一个 100,000-row Parquet row group |
 
 ## 4. 测试证据
 
@@ -54,13 +54,11 @@
 
 ## 5. 偏离方案之处与待澄清问题
 
-- 偏离：尚未完成验收 4 的 1M/5M/20M RSS dry-run 测量，因而 A6 未全部完成。这不是阶段 B 的标定工作，需在下一轮补齐。
-- 偏离：chunk 合并目前由新 `finalize_chunk_shards` 实现键校验，尚未把既有 `seed_shards` 的 CLI/maps 通用化到 `chunk_id`。其行键保持 `(model, seed, draw, N, K)` 不变。
+- 无：第 2 轮已补 RSS harness 和以 `chunk_id` 为目标的 `seed_shards` finalizer map/CLI；其行键保持 `(model, seed, draw, N, K)` 不变。
 - 待澄清：`split_super_learner_min_k`、`T_target`、分区/内存/时限均未填写；按方案保留至阶段 B。
 
 ## 6. 未覆盖与已知风险
 
-- 尚无生产规模 Parquet（1M/5M/20M）RSS 数字，无法证明大规模建表/读取的内存曲线。
 - 新 flat worker/snapshot 尚未接入现有 `submit_nk_grid.sh` 的提交入口；专用 worker 已就绪，但提交端的资源 plan 输入应等阶段 B 的集群/标定数据一起接线。
 - 未做 kill/requeue 的真实 Slurm 集成测试；当前仅验证了本地 resume 键集合语义。
 - 完整 pytest 未在该工具会话内获得最终汇总行，尽管相关定向测试均通过。
@@ -70,3 +68,13 @@
 1. 请重点审查 `flat_task_table.py` 的行粒度：同一 cell 的 group 内模型绝不被拆分，且 Parquet row group 与 `chunk_id` 一一对应。
 2. 请重点审查 `run_chunk` 是否应在下一轮直接抽取/复用 `run_cell_group` 的运行上下文，以避免目前逐行复用既有 runner 的启动开销。
 3. 请重点审查阶段 A 未完成的 RSS harness 和 `seed_shards` 的 chunk 化接线；两项均在第 5 节明确列为偏离，不能视为完成。
+
+## 第 2 轮修改（Review 第 1 轮）
+
+1. **逐位等价性覆盖**：`test_chunk_execution_matches_direct_cell_group_metrics` 现参数化为 imputed `{ols,ridge}`、passthrough `{lightgbm,xgboost}`、隔离子进程 `{super_learner}` 三组。每组使用两个 `(N,K)` cell、`budget=1` 的至少两个 chunk，先逐 chunk 真实执行、再合并，对直接 `run_nk_grid` 全 metric 列 `check_exact=True`。SuperLearner 使用 `n_jobs=2`，测试还断言真正送入隔离 runner 的 `model_n_jobs == 2`。
+2. **完整 pytest**：按文件分批以避开单次工具窗口。已获得 `36 passed in 21.38s`（`test_calibrate_cost.py`、`test_checkpoint_compaction.py`、`test_ffcws_engine_path.py`、`test_identity_panels_isolation.py`）；其余批次仍在本交互工具约 30 秒窗口被截断，尚不能把验收 10 改记为满足。
+3. **RSS harness**：新增流式 `write_synthetic_task_table`、新 spawn worker 的 `measure_chunk_read_rss` 与 `run_rss_harness`。同为 100,000-row chunk 的实测 RSS 增量：1M 设计 70,942,720 B、5M 83,230,720 B、20M 89,063,424 B；不随设计总行数线性增长。
+4. **chunk 化 seed_shards**：新增 `build_chunk_finalizer_map`、`finalize_chunk_shards` 与 `seed_shards build-map --kind chunk` / `finalize-chunks`。finalizer map 按冻结的 `chunk_count` 枚举 `<output_dir>/chunk-<id>.csv`，并调用原有行键验证的 chunk 合并器；新增 `test_seed_shard_finalizer_map_uses_chunk_id_targets`。
+5. **SuperLearner 资源类**：资源映射测试显式要求 serial 为 1 CPU、`super_learner` 为 2 CPU，并断言生成 `--cpus-per-task=2`；阶段 B 的分区、内存、时限仍未填默认值。
+
+本轮没有修改 `preprocessing.py`，没有读取或使用不可用的成本标定 JSON。方案 frontmatter 已按要求设为 `status: needs-review`。

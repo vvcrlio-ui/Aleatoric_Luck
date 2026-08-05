@@ -588,6 +588,42 @@ def build_publish_map(master_snapshot: Path, path: Path | None = None) -> Path:
     return target_path
 
 
+def build_chunk_finalizer_map(snapshot_path: Path, path: Path | None = None) -> Path:
+    """Build the same immutable finalizer-map protocol for chunk shards."""
+    snapshot = _load_json(Path(snapshot_path), "chunk snapshot")
+    try:
+        chunk_count = int(snapshot["chunk_count"])
+        table = Path(snapshot["task_table"]).resolve()
+        output_dir = Path(snapshot["output_dir"]).resolve()
+        panel = str(snapshot["panel"])
+        final_output = Path(snapshot["config"]["out"]).resolve()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SeedShardValidationError("Invalid flat-task snapshot") from exc
+    if snapshot.get("format_version") != 1 or chunk_count < 1:
+        raise SeedShardValidationError("Invalid flat-task snapshot")
+    target_path = path or snapshot_path.parent / f"{snapshot_path.stem}.chunk-finalizers.json"
+    write_json_atomic(target_path, {
+        "format_version": 1, "kind": "chunk-finalizer", "snapshot": str(Path(snapshot_path).resolve()),
+        "targets": [{"panel": panel, "task_table": str(table), "output_dir": str(output_dir), "final_output": str(final_output), "chunk_count": chunk_count}],
+    })
+    os.chmod(target_path, 0o444)
+    return target_path
+
+
+def finalize_chunk_shards(snapshot_path: Path, *, target: Mapping[str, Any]) -> Path:
+    """Reuse the shard finalizer entrypoint with ``chunk_id`` as the shard key."""
+    try:
+        count = int(target["chunk_count"])
+        table = Path(target["task_table"])
+        output_dir = Path(target["output_dir"])
+        final_output = Path(target["final_output"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SeedShardValidationError("Invalid chunk finalizer target") from exc
+    from .flat_task_table import finalize_chunk_shards as merge_chunks
+    outputs = {chunk_id: output_dir / f"chunk-{chunk_id}.csv" for chunk_id in range(count)}
+    return merge_chunks(table, outputs, final_output)
+
+
 def _load_map(
     master_snapshot: Path, map_path: Path, index: int
 ) -> Mapping[str, Any]:
@@ -979,7 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
     missing.add_argument("--snapshot", type=Path, required=True)
     build = subparsers.add_parser("build-map")
     build.add_argument("--snapshot", type=Path, required=True)
-    build.add_argument("--kind", choices=("finalizer", "publish"), required=True)
+    build.add_argument("--kind", choices=("finalizer", "publish", "chunk"), required=True)
     build.add_argument("--map", dest="finalization_map", type=Path)
     count = subparsers.add_parser("map-count")
     count.add_argument("--map", dest="finalization_map", type=Path, required=True)
@@ -991,6 +1027,10 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     recovery.add_argument("--master-indices")
+    chunk_finalize = subparsers.add_parser("finalize-chunks")
+    chunk_finalize.add_argument("--snapshot", type=Path, required=True)
+    chunk_finalize.add_argument("--map", dest="finalization_map", type=Path, required=True)
+    chunk_finalize.add_argument("--index", type=int, required=True)
     return parser
 
 
@@ -1001,11 +1041,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(diagnose_missing(args.snapshot), sort_keys=True))
             return 0
         if args.command == "build-map":
-            builder = (
-                build_finalizer_map
-                if args.kind == "finalizer"
-                else build_publish_map
-            )
+            builder = {"finalizer": build_finalizer_map, "publish": build_publish_map, "chunk": build_chunk_finalizer_map}[args.kind]
             print(builder(args.snapshot, args.finalization_map))
             return 0
         if args.command == "map-count":
@@ -1038,7 +1074,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         target = _load_map(
             args.snapshot, args.finalization_map, args.index
         )
-        if args.command == "finalize":
+        if args.command == "finalize-chunks":
+            finalize_chunk_shards(args.snapshot, target=target)
+        elif args.command == "finalize":
             if not isinstance(target.get("panel"), str) or not isinstance(
                 target.get("model"), str
             ):

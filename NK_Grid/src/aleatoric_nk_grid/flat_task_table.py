@@ -10,15 +10,19 @@ from __future__ import annotations
 
 import csv
 import argparse
+import gc
 import hashlib
 import json
+import multiprocessing
 import os
+import resource
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import numpy as np
 
 from .experiment import manifest_path, write_json_atomic
 from .nk_grid import NKGridConfig, resolve_repeat_pairs, run_nk_grid
@@ -218,6 +222,93 @@ def read_chunk(path: Path, chunk_id: int) -> tuple[TaskRow, ...]:
     return rows
 
 
+def _synthetic_arrow_table(start: int, count: int, *, chunk_id: int) -> pa.Table:
+    del start
+    zeros = np.zeros(count, dtype=np.int32)
+    models = pa.array([["ols", "ridge"]]).take(pa.array(zeros))
+    return pa.table({
+        "row_id": pa.array(["synthetic"]).take(pa.array(zeros)),
+        "seed": zeros, "draw": zeros, "N": np.full(count, 100, dtype=np.int32),
+        "K": np.full(count, 10, dtype=np.int32),
+        "group": pa.array(["imputed_core"]).take(pa.array(zeros)), "models": models,
+        "est_cost": np.ones(count, dtype=np.float64), "chunk_id": np.full(count, chunk_id, dtype=np.int32),
+    })
+
+
+def write_synthetic_task_table(
+    path: Path, *, row_count: int, rows_per_chunk: int = 100_000,
+) -> Path:
+    """Stream a synthetic design table without retaining all rows in RAM.
+
+    This is solely the acceptance-test harness for the 1M/5M/20M read-RSS
+    check; production tables continue to use ``write_task_table``.
+    """
+    if row_count < 1 or rows_per_chunk < 1:
+        raise ValueError("row_count and rows_per_chunk must be positive")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    schema = _synthetic_arrow_table(0, 1, chunk_id=0).schema
+    writer = pq.ParquetWriter(temporary, schema, compression="zstd")
+    try:
+        for start in range(0, row_count, rows_per_chunk):
+            count = min(rows_per_chunk, row_count - start)
+            writer.write_table(_synthetic_arrow_table(start, count, chunk_id=start // rows_per_chunk))
+    finally:
+        writer.close()
+    os.replace(temporary, path)
+    os.chmod(path, 0o444)
+    return path
+
+
+def _ru_maxrss_bytes() -> int:
+    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    # macOS reports bytes; Linux/BSD commonly report KiB.
+    return value if os.uname().sysname == "Darwin" else value * 1024
+
+
+def _read_chunk_rss_worker(path: str, chunk_id: int, connection) -> None:
+    try:
+        before = _ru_maxrss_bytes()
+        rows = read_chunk(Path(path), chunk_id)
+        after = _ru_maxrss_bytes()
+        connection.send({"rows": len(rows), "rss_delta_bytes": max(0, after - before)})
+    finally:
+        connection.close()
+
+
+def measure_chunk_read_rss(path: Path, *, chunk_id: int = 0) -> dict[str, int]:
+    """Measure a fresh worker's RSS increment when it reads one row group."""
+    parent, child = multiprocessing.get_context("spawn").Pipe(duplex=False)
+    process = multiprocessing.get_context("spawn").Process(
+        target=_read_chunk_rss_worker, args=(str(Path(path)), int(chunk_id), child),
+    )
+    process.start()
+    child.close()
+    payload = parent.recv()
+    process.join()
+    parent.close()
+    if process.exitcode != 0:
+        raise RuntimeError(f"RSS worker failed with exit code {process.exitcode}")
+    return {"rows": int(payload["rows"]), "rss_delta_bytes": int(payload["rss_delta_bytes"])}
+
+
+def run_rss_harness(
+    directory: Path, *, sizes: Sequence[int] = (1_000_000, 5_000_000, 20_000_000),
+    rows_per_chunk: int = 100_000,
+) -> list[dict[str, int]]:
+    """Produce the required 1M/5M/20M table-read RSS measurements."""
+    results: list[dict[str, int]] = []
+    for size in sizes:
+        table = write_synthetic_task_table(
+            Path(directory) / f"synthetic-{int(size)}.parquet",
+            row_count=int(size), rows_per_chunk=rows_per_chunk,
+        )
+        results.append({"design_rows": int(size), **measure_chunk_read_rss(table)})
+        gc.collect()
+    return results
+
+
 def expected_model_keys(rows: Iterable[TaskRow]) -> set[tuple[str, int, int, int, int]]:
     return {(model, row.seed, row.draw, row.n_samples, row.k_features) for row in rows for model in row.models}
 
@@ -259,7 +350,9 @@ def run_chunk(table_path: Path, chunk_id: int, config: NKGridConfig, *, output: 
         row_out = output.parent / f".{output.stem}.chunk-{chunk_id}.{row.row_id}.csv"
         row_config = replace(
             config, out=row_out, models=row.models, n_grid=(row.n_samples,), k_grid=(row.k_features,),
-            n_seeds=1, n_draws=1, repeat_plan=((row.seed, row.draw),), n_jobs=1,
+            n_seeds=1, n_draws=1, repeat_plan=((row.seed, row.draw),),
+            # Only SuperLearner has legitimate model-internal parallelism.
+            n_jobs=config.n_jobs if row.models == ("super_learner",) else 1,
         )
         run_nk_grid(row_config, execution_pairs=((row.seed, row.draw),), exact_output_path=True, defer_failure_policy=True)
         current_header, current_rows = _read_csv_keys(row_out)
