@@ -390,3 +390,55 @@ def test_preprocess_cell_rejects_overlapping_groups():
 
     with pytest.raises(ValueError, match="share feature"):
         preprocess_cell(frame, frame, groups, IMPUTATION, model_name="ols")
+
+
+@pytest.mark.parametrize(
+    "dtypes",
+    [
+        ("int8", "int16", "int32", "int64"),
+        ("float32", "float64", "float32", "float64"),
+        ("int8", "int16", "int32", "float64"),
+        ("float32", "float64", "int32", "int64"),
+        ("int8", "int16", "int32", "int64", "float32", "float64"),
+    ],
+)
+@pytest.mark.parametrize("passthrough", [False, True])
+@pytest.mark.parametrize("missing_in", ["train", "test"])
+def test_vectorized_mixed_numeric_dtypes_match_reference_exactly(
+    dtypes, passthrough, missing_in
+):
+    columns = [f"x{index}" for index in range(len(dtypes))]
+    train = pd.DataFrame({column: np.array([1, 2, 3], dtype=dtype) for column, dtype in zip(columns, dtypes)})
+    test = pd.DataFrame({column: np.array([3, 2], dtype=dtype) for column, dtype in zip(columns, dtypes)})
+    float_column = next(
+        (column for column, dtype in zip(columns, dtypes) if dtype.startswith("float")),
+        None,
+    )
+    if float_column is not None:
+        (train if missing_in == "train" else test).loc[0, float_column] = np.nan
+    groups = tuple(
+        SourceGroup(column, (column,), index, "continuous", source_prior=0.0)
+        for index, column in enumerate(columns)
+    )
+    model_name = "xgboost" if passthrough else "ols"
+    expected = preprocessing._preprocess_cell_reference(
+        train, test, groups, IMPUTATION, model_name=model_name
+    )
+    actual = preprocess_cell(train, test, groups, IMPUTATION, model_name=model_name)
+    pd.testing.assert_frame_equal(actual.X_train, expected.X_train, check_exact=True)
+    pd.testing.assert_frame_equal(actual.X_test, expected.X_test, check_exact=True)
+    assert actual.K_unobserved == expected.K_unobserved
+    assert actual.X_train.attrs["_preprocess_vectorized"] is (not passthrough)
+
+
+def test_vectorized_mixed_onehot_group_keeps_group_observation_semantics():
+    groups = (
+        SourceGroup("mixed", ("float_dummy", "int_dummy"), 0, "onehot_group", drop_first=True),
+    )
+    train = pd.DataFrame({"float_dummy": np.array([np.nan, 1.0, 0.0], dtype="float32"), "int_dummy": np.array([0, 0, 1], dtype="int16")})
+    test = pd.DataFrame({"float_dummy": np.array([np.nan, 0.0], dtype="float32"), "int_dummy": np.array([0, 1], dtype="int16")})
+    expected = preprocessing._preprocess_cell_reference(train, test, groups, IMPUTATION, model_name="ols")
+    actual = preprocess_cell(train, test, groups, IMPUTATION, model_name="ols")
+    pd.testing.assert_frame_equal(actual.X_train, expected.X_train, check_exact=True)
+    pd.testing.assert_frame_equal(actual.X_test, expected.X_test, check_exact=True)
+    assert actual.X_train.attrs["_preprocess_vectorized"] is True

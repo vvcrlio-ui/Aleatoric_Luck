@@ -536,25 +536,24 @@ def _validate_disjoint_group_features(groups: Sequence[SourceGroup]) -> None:
 def _supports_vectorized_preprocessing(
     X_train: pd.DataFrame, X_test: pd.DataFrame
 ) -> bool:
-    """Return whether a single ndarray preserves the legacy frame dtypes.
-
-    The production engine passes homogeneous floating-point predictor frames.
-    Direct callers may pass mixed, extension, or object dtypes; those retain the
-    reference path because a single ndarray would alter their dtype semantics.
-    """
+    """Return whether numeric numpy columns can retain legacy dtype semantics."""
 
     if not X_train.columns.is_unique or not X_test.columns.is_unique:
         return False
-    train_dtypes = tuple(X_train.dtypes)
-    test_dtypes = tuple(X_test.dtypes)
-    if not train_dtypes or not test_dtypes:
+    if not len(X_train.columns) or not len(X_test.columns):
         return False
-    dtype = train_dtypes[0]
-    return (
-        all(candidate == dtype for candidate in train_dtypes)
-        and all(candidate == dtype for candidate in test_dtypes)
-        and pd.api.types.is_float_dtype(dtype)
-        and not pd.api.types.is_extension_array_dtype(dtype)
+    return all(
+        train_dtype == test_dtype
+        and pd.api.types.is_numeric_dtype(train_dtype)
+        and not pd.api.types.is_extension_array_dtype(train_dtype)
+        for train_dtype, test_dtype in zip(X_train.dtypes, X_test.dtypes)
+    )
+
+
+def _homogeneous_float_frame(frame: pd.DataFrame) -> bool:
+    dtypes = tuple(frame.dtypes)
+    return bool(dtypes) and all(dtype == dtypes[0] for dtype in dtypes) and (
+        pd.api.types.is_float_dtype(dtypes[0])
     )
 
 
@@ -669,6 +668,113 @@ def _preprocess_cell_vectorized(
     )
 
 
+def _preprocess_cell_vectorized_mixed(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    groups: Sequence[SourceGroup],
+    imputation: Mapping[str, Any],
+) -> CellPreprocessingResult:
+    """Vectorize writes to float columns while preserving integer columns.
+
+    Integer numpy columns cannot contain NaN, so they need no imputation writes.
+    Group-level observation decisions are nevertheless made from every feature,
+    which preserves mixed one-hot group semantics.
+    """
+
+    train = X_train.copy()
+    test = X_test.copy()
+    float_columns = [
+        column for column, dtype in X_train.dtypes.items()
+        if pd.api.types.is_float_dtype(dtype)
+    ]
+    train_values = {
+        column: X_train[column].to_numpy(copy=True) for column in float_columns
+    }
+    test_values = {
+        column: X_test[column].to_numpy(copy=True) for column in float_columns
+    }
+
+    def values(column: str, *, is_test: bool = False) -> np.ndarray:
+        if column in train_values:
+            return (test_values if is_test else train_values)[column]
+        return (X_test if is_test else X_train)[column].to_numpy(copy=False)
+
+    unobserved = 0
+    for group in groups:
+        features = list(group.features)
+        train_group = np.column_stack([values(feature) for feature in features])
+        missing = pd.isna(train_group).all(axis=1)
+        observed = ~missing
+        if not observed.any():
+            unobserved += 1
+            if group.unit_type == "onehot_group":
+                fill = _reference_vector(group)
+                for feature, value in zip(features, fill):
+                    train_values[feature][:] = value
+                    test_values[feature][:] = value
+            else:
+                feature = features[0]
+                train_values[feature][:] = group.source_prior
+                test_values[feature][:] = group.source_prior
+            continue
+        if group.unit_type == "continuous":
+            feature = features[0]
+            if feature not in train_values:
+                continue
+            train_missing = ~observed
+            test_missing = np.isnan(test_values[feature])
+            if not train_missing.any() and not test_missing.any():
+                continue
+            source = X_train[feature]
+            statistic = (
+                float(source.median())
+                if imputation["continuous"] == "median"
+                else float(source.mean())
+            )
+            train_values[feature][train_missing] = statistic
+            test_values[feature][test_missing] = statistic
+        elif group.unit_type == "ordinal":
+            feature = features[0]
+            if feature not in train_values:
+                continue
+            train_missing = ~observed
+            test_missing = np.isnan(test_values[feature])
+            if not train_missing.any() and not test_missing.any():
+                continue
+            statistic = _ordinal_statistic(X_train[feature], group, imputation["ordinal"])
+            train_values[feature][train_missing] = statistic
+            test_values[feature][test_missing] = statistic
+        else:
+            test_group = np.column_stack(
+                [values(feature, is_test=True) for feature in features]
+            )
+            train_missing = pd.isna(train_group).all(axis=1)
+            test_missing = pd.isna(test_group).all(axis=1)
+            if not train_missing.any() and not test_missing.any():
+                continue
+            observed_values = train_group[~train_missing]
+            states = observed_values.argmax(axis=1)
+            if group.drop_first:
+                states = states.copy()
+                states[observed_values.sum(axis=1) == 0] = len(features)
+            counts = np.bincount(states, minlength=len(features) + 1)
+            candidates = np.flatnonzero(counts == counts.max())
+            mode = min(
+                (int(state) for state in candidates),
+                key=lambda state: -1 if state == len(features) else state,
+            )
+            fill = _reference_vector(group) if mode == len(features) else np.eye(1, len(features), mode)[0]
+            for feature, value in zip(features, fill):
+                train_values[feature][train_missing] = value
+                test_values[feature][test_missing] = value
+    for column in float_columns:
+        train[column] = train_values[column]
+        test[column] = test_values[column]
+    train.attrs["_preprocess_vectorized"] = True
+    test.attrs["_preprocess_vectorized"] = True
+    return CellPreprocessingResult(train, test, unobserved, False)
+
+
 def preprocess_cell(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
@@ -682,7 +788,15 @@ def preprocess_cell(
     _validate_disjoint_group_features(groups)
     passthrough = imputation["model_overrides"].get(model_name) == "passthrough"
     if passthrough or not _supports_vectorized_preprocessing(X_train, X_test):
-        return _preprocess_cell_reference(
+        result = _preprocess_cell_reference(
             X_train, X_test, groups, imputation, model_name=model_name
         )
-    return _preprocess_cell_vectorized(X_train, X_test, groups, imputation)
+        result.X_train.attrs["_preprocess_vectorized"] = False
+        result.X_test.attrs["_preprocess_vectorized"] = False
+        return result
+    if _homogeneous_float_frame(X_train) and _homogeneous_float_frame(X_test):
+        result = _preprocess_cell_vectorized(X_train, X_test, groups, imputation)
+        result.X_train.attrs["_preprocess_vectorized"] = True
+        result.X_test.attrs["_preprocess_vectorized"] = True
+        return result
+    return _preprocess_cell_vectorized_mixed(X_train, X_test, groups, imputation)

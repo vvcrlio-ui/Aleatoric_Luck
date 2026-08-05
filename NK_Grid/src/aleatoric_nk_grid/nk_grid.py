@@ -558,6 +558,7 @@ def _empty_diagnostics() -> dict[str, float | bool]:
         "_best_rounds": np.nan,
         "_preprocess_seconds": 0.0,
         "_preprocess_computed": False,
+        "_preprocess_vectorized": False,
         "_slice_seconds": 0.0,
         "_cell_wall_seconds": 0.0,
         "_peak_rss_bytes": 0,
@@ -1890,6 +1891,9 @@ def _run_nk_grid_locked(
                         raise mismatch
                     prepared[mode] = prepared_cell
                 prepared_cell = prepared[mode]
+                diagnostics["_preprocess_vectorized"] = bool(
+                    prepared_cell.X_train.attrs.get("_preprocess_vectorized", False)
+                )
                 X_prepared = prepared_cell.X_train
                 X_test_prepared = prepared_cell.X_test
                 k_varying = int(

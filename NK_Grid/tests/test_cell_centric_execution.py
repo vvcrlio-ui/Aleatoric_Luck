@@ -481,6 +481,8 @@ def test_preprocess_telemetry_counts_only_mode_misses_and_matches_manifest(
     assert int(one["_preprocess_computed"].astype(bool).sum()) == 1
     assert int(three["_preprocess_computed"].astype(bool).sum()) == 1
     assert int(three["_preprocess_seconds"].gt(0).sum()) == 1
+    assert one["_preprocess_vectorized"].astype(bool).all()
+    assert three["_preprocess_vectorized"].astype(bool).all()
     assert int(three["_slice_seconds"].gt(0).sum()) == 1
     assert three["_cell_wall_seconds"].gt(0).all()
     assert three["_peak_rss_bytes"].gt(0).all()
