@@ -44,7 +44,7 @@ def _fast_model_params(model_name: str, task: str) -> dict:
     elif model_name == "xgboost":
         if task == "regression":
             # Keep >1 rounds so xgboost.cv still constructs and evaluates folds.
-            params.update(max_rounds=20, cv_folds=2)
+            params.update(max_rounds=60, cv_folds=2)
         else:
             params["n_estimators"] = 3
     elif model_name == "lightgbm":
@@ -61,9 +61,6 @@ def _fast_model_params(model_name: str, task: str) -> dict:
         params.update(
             hidden_layer_sizes=[4],
             max_iter=30,
-            early_stopping=True,
-            validation_fraction=0.4,
-            n_iter_no_change=2,
         )
         if task == "regression":
             # Both stay >1 to exercise AdaptiveMLPRegressor's CV selection.
