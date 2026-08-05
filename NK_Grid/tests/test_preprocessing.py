@@ -8,6 +8,7 @@ import pytest
 
 import aleatoric_nk_grid.preprocessing as preprocessing
 from aleatoric_nk_grid.preprocessing import (
+    SourceGroup,
     preprocess_cell,
     source_groups,
     validate_onehot_states,
@@ -229,3 +230,163 @@ def test_manifest_source_order_and_type_must_be_consistent():
     manifest.loc[3, "unit_type"] = "continuous"
     with pytest.raises(ValueError, match="inconsistent unit_type"):
         source_groups(["x", "o", "c0", "c1"], manifest)
+
+
+def _equivalence_groups(k: int) -> tuple[SourceGroup, ...]:
+    """Build disjoint groups covering each imputation unit type."""
+
+    assert k >= 3
+    groups = [
+        SourceGroup(
+            name="continuous",
+            features=("continuous",),
+            source_order=0,
+            unit_type="continuous",
+            source_prior=11.0,
+        ),
+        SourceGroup(
+            name="ordinal",
+            features=("ordinal",),
+            source_order=1,
+            unit_type="ordinal",
+            ordinal_levels=(1, 2, 3),
+            source_prior=1,
+        ),
+        SourceGroup(
+            name="onehot",
+            features=("onehot_0", "onehot_1"),
+            source_order=2,
+            unit_type="onehot_group",
+            drop_first=True,
+            reference_level=0,
+            level_values=(1, 2),
+        ),
+    ]
+    groups.extend(
+        SourceGroup(
+            name=f"extra_{index}",
+            features=(f"extra_{index}",),
+            source_order=index,
+            unit_type="continuous",
+            source_prior=0.0,
+        )
+        for index in range(3, k)
+    )
+    return tuple(groups)
+
+
+def _equivalence_frames(
+    n: int,
+    k: int,
+    *,
+    homogeneous: bool = False,
+    unobserved_onehot: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Create exact, mixed-dtype inputs with opposing train/test missingness."""
+
+    continuous_dtype = float if homogeneous else np.float32
+    test_n = max(2, n // 4)
+    train_columns: dict[str, np.ndarray] = {
+        "continuous": np.arange(n, dtype=continuous_dtype),
+        "ordinal": np.resize(np.array([1.0, 2.0, 3.0]), n),
+        "onehot_0": np.resize(np.array([0.0, 1.0, 0.0]), n),
+        "onehot_1": np.resize(np.array([0.0, 0.0, 1.0]), n),
+    }
+    test_columns: dict[str, np.ndarray] = {
+        "continuous": np.arange(test_n, dtype=continuous_dtype),
+        "ordinal": np.resize(np.array([1.0, 3.0]), test_n),
+        "onehot_0": np.resize(np.array([0.0, 1.0]), test_n),
+        "onehot_1": np.resize(np.array([0.0, 0.0]), test_n),
+    }
+    for index in range(3, k):
+        name = f"extra_{index}"
+        train_values = np.arange(n, dtype=continuous_dtype)
+        test_values = np.arange(test_n, dtype=continuous_dtype)
+        if index % 11 == 0:
+            train_values[:] = np.nan  # fully unobserved source
+        elif index % 2 == 0:
+            train_values[0] = np.nan
+        else:
+            test_values[0] = np.nan
+        train_columns[name] = train_values
+        test_columns[name] = test_values
+    train = pd.DataFrame(train_columns)
+    test = pd.DataFrame(test_columns)
+    train.loc[0, ["continuous", "ordinal", "onehot_0", "onehot_1"]] = np.nan
+    test.loc[1, ["continuous", "ordinal", "onehot_0", "onehot_1"]] = np.nan
+    if unobserved_onehot:
+        train.loc[:, ["onehot_0", "onehot_1"]] = np.nan
+    return train, test
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("k", [10, 100, 1000, 3125])
+@pytest.mark.parametrize("n", [10, 1000, 4242])
+@pytest.mark.parametrize("model_name", ["ols", "xgboost"])
+def test_preprocess_cell_matches_reference_across_scale_matrix(k, n, model_name):
+    """The fast implementation is exactly equal to the retained reference."""
+
+    groups = _equivalence_groups(k)
+    train, test = _equivalence_frames(n, k)
+    expected = preprocessing._preprocess_cell_reference(
+        train, test, groups, IMPUTATION, model_name=model_name
+    )
+    actual = preprocess_cell(train, test, groups, IMPUTATION, model_name=model_name)
+
+    pd.testing.assert_frame_equal(actual.X_train, expected.X_train, check_exact=True)
+    pd.testing.assert_frame_equal(actual.X_test, expected.X_test, check_exact=True)
+    assert actual.K_unobserved == expected.K_unobserved
+    assert actual.passthrough == expected.passthrough
+
+
+def test_preprocess_cell_does_not_mutate_mixed_dtype_inputs():
+    groups = _equivalence_groups(10)
+    train, test = _equivalence_frames(20, 10)
+    train_before = train.copy(deep=True)
+    test_before = test.copy(deep=True)
+
+    preprocess_cell(train, test, groups, IMPUTATION, model_name="ols")
+
+    pd.testing.assert_frame_equal(train, train_before, check_exact=True)
+    pd.testing.assert_frame_equal(test, test_before, check_exact=True)
+
+
+@pytest.mark.parametrize("n,k", [(10, 10), (1000, 100)])
+@pytest.mark.parametrize("unobserved_onehot", [False, True])
+def test_vectorized_preprocess_cell_matches_reference_exactly(
+    n, k, unobserved_onehot
+):
+    groups = _equivalence_groups(k)
+    train, test = _equivalence_frames(
+        n, k, homogeneous=True, unobserved_onehot=unobserved_onehot
+    )
+    assert preprocessing._supports_vectorized_preprocessing(train, test)
+
+    expected = preprocessing._preprocess_cell_reference(
+        train, test, groups, IMPUTATION, model_name="ols"
+    )
+    actual = preprocess_cell(train, test, groups, IMPUTATION, model_name="ols")
+
+    pd.testing.assert_frame_equal(actual.X_train, expected.X_train, check_exact=True)
+    pd.testing.assert_frame_equal(actual.X_test, expected.X_test, check_exact=True)
+    assert actual.K_unobserved == expected.K_unobserved
+
+
+def test_source_groups_have_disjoint_feature_sets():
+    groups = source_groups(["x", "o", "c0", "c1"], _manifest())
+    seen: set[str] = set()
+    for group in groups:
+        overlap = seen.intersection(group.features)
+        assert not overlap
+        seen.update(group.features)
+
+
+def test_preprocess_cell_rejects_overlapping_groups():
+    groups = (
+        SourceGroup("left", ("x",), 0, "continuous", source_prior=0.0),
+        SourceGroup("right", ("x",), 1, "continuous", source_prior=0.0),
+    )
+    frame = pd.DataFrame({"x": [1.0, np.nan]})
+
+    with pytest.raises(ValueError, match="share feature"):
+        preprocess_cell(frame, frame, groups, IMPUTATION, model_name="ols")

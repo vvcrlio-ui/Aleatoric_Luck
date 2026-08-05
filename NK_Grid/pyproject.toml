@@ -36,4 +36,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not slow'"
+markers = ["slow: large synthetic performance or equivalence benchmark, run explicitly"]

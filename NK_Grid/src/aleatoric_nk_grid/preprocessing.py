@@ -440,7 +440,7 @@ class CellPreprocessingResult:
     passthrough: bool
 
 
-def preprocess_cell(
+def _preprocess_cell_reference(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     groups: Sequence[SourceGroup],
@@ -448,7 +448,7 @@ def preprocess_cell(
     *,
     model_name: str,
 ) -> CellPreprocessingResult:
-    """Fit preprocessing only on one cell and apply the learned state to test."""
+    """Original pandas implementation, retained only as the test oracle."""
 
     train = X_train.copy()
     test = X_test.copy()
@@ -516,3 +516,173 @@ def preprocess_cell(
         K_unobserved=unobserved,
         passthrough=passthrough,
     )
+
+
+def _validate_disjoint_group_features(groups: Sequence[SourceGroup]) -> None:
+    """Reject input for which delayed writes would change legacy semantics."""
+
+    owners: dict[str, str] = {}
+    for group in groups:
+        for feature in group.features:
+            previous = owners.get(feature)
+            if previous is not None:
+                raise ValueError(
+                    f"source groups {previous!r} and {group.name!r} share feature "
+                    f"{feature!r}"
+                )
+            owners[feature] = group.name
+
+
+def _supports_vectorized_preprocessing(
+    X_train: pd.DataFrame, X_test: pd.DataFrame
+) -> bool:
+    """Return whether a single ndarray preserves the legacy frame dtypes.
+
+    The production engine passes homogeneous floating-point predictor frames.
+    Direct callers may pass mixed, extension, or object dtypes; those retain the
+    reference path because a single ndarray would alter their dtype semantics.
+    """
+
+    if not X_train.columns.is_unique or not X_test.columns.is_unique:
+        return False
+    train_dtypes = tuple(X_train.dtypes)
+    test_dtypes = tuple(X_test.dtypes)
+    if not train_dtypes or not test_dtypes:
+        return False
+    dtype = train_dtypes[0]
+    return (
+        all(candidate == dtype for candidate in train_dtypes)
+        and all(candidate == dtype for candidate in test_dtypes)
+        and pd.api.types.is_float_dtype(dtype)
+        and not pd.api.types.is_extension_array_dtype(dtype)
+    )
+
+
+def _vectorized_onehot_fill(
+    train_values: np.ndarray,
+    test_values: np.ndarray,
+    positions: np.ndarray,
+    group: SourceGroup,
+) -> None:
+    """Apply `_fill_onehot`'s exact state and tie-break rules to ndarrays."""
+
+    train_group = train_values[:, positions]
+    test_group = test_values[:, positions]
+    train_missing = np.isnan(train_group).all(axis=1)
+    test_missing = np.isnan(test_group).all(axis=1)
+    if not train_missing.any() and not test_missing.any():
+        return
+
+    observed = train_group[~train_missing]
+    states = observed.argmax(axis=1)
+    if group.drop_first:
+        states = states.copy()
+        states[observed.sum(axis=1) == 0] = len(group.features)
+    counts = np.bincount(states, minlength=len(group.features) + 1)
+    max_count = counts.max()
+    candidates = np.flatnonzero(counts == max_count)
+    mode_state = min(
+        (int(state) for state in candidates),
+        key=lambda state: -1 if state == len(group.features) else state,
+    )
+    if mode_state == len(group.features):
+        fill = _reference_vector(group)
+    else:
+        fill = np.zeros(len(group.features), dtype=float)
+        fill[mode_state] = 1.0
+    if train_missing.any():
+        train_values[np.ix_(train_missing, positions)] = fill
+    if test_missing.any():
+        test_values[np.ix_(test_missing, positions)] = fill
+
+
+def _preprocess_cell_vectorized(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    groups: Sequence[SourceGroup],
+    imputation: Mapping[str, Any],
+) -> CellPreprocessingResult:
+    """Vectorized imputed preprocessing for homogeneous floating-point frames."""
+
+    train_values = X_train.to_numpy(copy=True)
+    test_values = X_test.to_numpy(copy=True)
+    positions = {column: index for index, column in enumerate(X_train.columns)}
+    unobserved = 0
+    for group in groups:
+        group_positions = np.fromiter(
+            (positions[feature] for feature in group.features), dtype=np.intp
+        )
+        train_group = train_values[:, group_positions]
+        missing = np.isnan(train_group).all(axis=1)
+        observed = ~missing
+        if not observed.any():
+            unobserved += 1
+            if group.unit_type == "onehot_group":
+                prior = _reference_vector(group)
+                train_values[:, group_positions] = prior
+                test_values[:, group_positions] = prior
+            else:
+                feature_position = int(group_positions[0])
+                train_values[:, feature_position] = group.source_prior
+                test_values[:, feature_position] = group.source_prior
+            continue
+        if group.unit_type == "continuous":
+            feature = group.features[0]
+            feature_position = int(group_positions[0])
+            train_missing = ~observed
+            test_missing = np.isnan(test_values[:, feature_position])
+            if not train_missing.any() and not test_missing.any():
+                continue
+            values = X_train[feature]
+            statistic = (
+                float(values.median())
+                if imputation["continuous"] == "median"
+                else float(values.mean())
+            )
+            if train_missing.any():
+                train_values[train_missing, feature_position] = statistic
+            if test_missing.any():
+                test_values[test_missing, feature_position] = statistic
+        elif group.unit_type == "ordinal":
+            feature = group.features[0]
+            feature_position = int(group_positions[0])
+            train_missing = ~observed
+            test_missing = np.isnan(test_values[:, feature_position])
+            if not train_missing.any() and not test_missing.any():
+                continue
+            statistic = _ordinal_statistic(
+                X_train[feature], group, imputation["ordinal"]
+            )
+            if train_missing.any():
+                train_values[train_missing, feature_position] = statistic
+            if test_missing.any():
+                test_values[test_missing, feature_position] = statistic
+        else:
+            _vectorized_onehot_fill(
+                train_values, test_values, group_positions, group
+            )
+    return CellPreprocessingResult(
+        X_train=pd.DataFrame(train_values, index=X_train.index, columns=X_train.columns),
+        X_test=pd.DataFrame(test_values, index=X_test.index, columns=X_test.columns),
+        K_unobserved=unobserved,
+        passthrough=False,
+    )
+
+
+def preprocess_cell(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    groups: Sequence[SourceGroup],
+    imputation: Mapping[str, Any],
+    *,
+    model_name: str,
+) -> CellPreprocessingResult:
+    """Fit preprocessing only on one cell and apply the learned state to test."""
+
+    _validate_disjoint_group_features(groups)
+    passthrough = imputation["model_overrides"].get(model_name) == "passthrough"
+    if passthrough or not _supports_vectorized_preprocessing(X_train, X_test):
+        return _preprocess_cell_reference(
+            X_train, X_test, groups, imputation, model_name=model_name
+        )
+    return _preprocess_cell_vectorized(X_train, X_test, groups, imputation)
