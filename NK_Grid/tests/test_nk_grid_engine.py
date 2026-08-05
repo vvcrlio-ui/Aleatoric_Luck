@@ -788,7 +788,7 @@ def test_scheduler_n_jobs_override_does_not_change_experiment_identity(tmp_path)
     manifest = json.loads(
         first.with_suffix(".manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["design"]["parallelism"]["configured_outer_n_jobs"] == 8
+    assert manifest["design"]["parallelism"]["configured_outer_n_jobs"] == 1
 
 
 def test_exact_output_path_requires_explicit_single_seed_execution(tmp_path):

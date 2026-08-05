@@ -19,7 +19,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
 from scipy import stats
 from sklearn.metrics import (
     accuracy_score,
@@ -902,24 +901,21 @@ def _relative_path(path: Path) -> str:
 
 
 def _parallelism_payload(config: NKGridConfig) -> dict[str, Any]:
-    """Describe the scheduler policy actually used by cell windows."""
+    """Describe the scheduler policy actually used by one array worker."""
 
     selected = set(config.models)
     native = selected & set(SERIAL_OUTER_MODELS)
     super_learner = selected == {"super_learner"}
     return {
-        "outer_cell_n_jobs": 1 if super_learner or selected == {"lightgbm"} else int(config.n_jobs),
+        "outer_cell_n_jobs": 1,
         "model_internal_n_jobs": int(config.n_jobs) if super_learner else 1,
         "base_estimator_n_jobs": 1,
-        "configured_outer_n_jobs": int(config.n_jobs),
-        "window_policy": {
+        "configured_outer_n_jobs": 1,
+        "chunk_policy": {
             "parallel_unit": "cell_group",
-            "prefer": "threads",
+            "prefer": "serial",
             "contains_native": bool(native),
-            "n_jobs_rule": {
-                "all_models_native": 1,
-                "otherwise": int(config.n_jobs),
-            },
+            "n_jobs_rule": "one array worker executes its groups serially",
             "native_calls_serialized": bool(native),
         },
         "native_process_isolated_models": sorted(native),
@@ -1673,7 +1669,7 @@ def _run_nk_grid_locked(
     log_progress(
         f"jobs total={expected_rows} completed={len(completed)} "
         f"pending={len(pending)} batch_size={config.batch_size} "
-        f"window_policy={_parallelism_payload(config)['window_policy']}"
+        f"chunk_policy={_parallelism_payload(config)['chunk_policy']}"
     )
     # The pending list is now authoritative. Release the full design list,
     # projected index and completed-key set before model fitting so a resumed
@@ -2017,25 +2013,6 @@ def _run_nk_grid_locked(
     ] = {}
     for job in pending:
         pending_cell_groups.setdefault(job[1:], []).append(job)
-    execution_windows: list[
-        list[
-            tuple[
-                tuple[int, int, int, int],
-                list[tuple[str, int, int, int, int]],
-            ]
-        ]
-    ] = []
-    accumulating_window = []
-    accumulating_rows = 0
-    for cell_group in pending_cell_groups.items():
-        accumulating_window.append(cell_group)
-        accumulating_rows += len(cell_group[1])
-        if accumulating_rows >= config.batch_size:
-            execution_windows.append(accumulating_window)
-            accumulating_window = []
-            accumulating_rows = 0
-    if accumulating_window:
-        execution_windows.append(accumulating_window)
     total_batches = (
         int(np.ceil(len(pending) / config.batch_size)) if pending else 0
     )
@@ -2044,55 +2021,20 @@ def _run_nk_grid_locked(
     processed_rows = 0
     checkpoint_buffer: list[dict] = []
     checkpoint_batch_index = 0
-    for execution_window in execution_windows:
-        rows_by_cell: dict[
-            tuple[int, int, int, int], dict[str, dict]
-        ] = {}
-        if execution_window:
-            window_models = {
-                job[0] for _, cell_jobs in execution_window for job in cell_jobs
-            }
-            group_n_jobs = 1 if "super_learner" in window_models or window_models <= {"lightgbm"} else config.n_jobs
-            log_progress(
-                f"cell window groups={len(execution_window)} "
-                f"models={sorted(window_models)} n_jobs={group_n_jobs} "
-                f"joblib_prefer=threads"
-            )
-            grouped_rows = Parallel(
-                n_jobs=group_n_jobs,
-                batch_size=1,
-                prefer="threads",
-            )(
-                delayed(run_cell_group)(
-                    seed,
-                    draw,
-                    n_samples,
-                    k_features,
-                    tuple(job[0] for job in cell_jobs),
-                    # Thread workers share the frozen parent cache.
-                    orders=cached_draw_orders(seed, draw),
-                )
-                for (
-                    seed,
-                    draw,
-                    n_samples,
-                    k_features,
-                ), cell_jobs in execution_window
-            )
-            for (cell_key, cell_jobs), cell_rows in zip(
-                execution_window, grouped_rows
-            ):
-                rows_by_cell.setdefault(cell_key, {}).update(
-                    {
-                        job[0]: row
-                        for job, row in zip(cell_jobs, cell_rows)
-                    }
-                )
-        checkpoint_buffer.extend(
-            rows_by_cell[cell_key][job[0]]
-            for cell_key, cell_jobs in execution_window
-            for job in cell_jobs
+    # Array workers are the only outer concurrency layer.  Keep one complete
+    # cell group together so its imputation cache remains shared, but execute
+    # groups serially: no joblib windows and therefore no window barrier.
+    for cell_key, cell_jobs in pending_cell_groups.items():
+        seed, draw, n_samples, k_features = cell_key
+        cell_rows = run_cell_group(
+            seed,
+            draw,
+            n_samples,
+            k_features,
+            tuple(job[0] for job in cell_jobs),
+            orders=cached_draw_orders(seed, draw),
         )
+        checkpoint_buffer.extend(cell_rows)
         while len(checkpoint_buffer) >= config.batch_size:
             checkpoint_batch_index += 1
             batch_rows = checkpoint_buffer[: config.batch_size]
