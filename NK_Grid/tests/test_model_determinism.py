@@ -50,7 +50,7 @@ def _fast_model_params(model_name: str, task: str) -> dict:
     elif model_name == "lightgbm":
         if task == "regression":
             params.update(
-                max_rounds=3,
+                max_rounds=200,
                 cv_folds=2,
                 early_stopping_rounds=1,
                 min_data_in_leaf=2,
