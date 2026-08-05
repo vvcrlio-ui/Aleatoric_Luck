@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -23,6 +24,62 @@ from conftest import write_schema_bundle
 
 MODEL_PARAMS = Path(__file__).resolve().parents[1] / "model_params.yaml"
 REPEATS = 24
+
+
+def _fast_model_params(model_name: str, task: str) -> dict:
+    """Return small test-only parameters without bypassing model code paths."""
+
+    params = deepcopy(
+        load_model_params(
+            MODEL_PARAMS, task=task, models=[model_name]
+        )[model_name]
+    )
+    if model_name in {"ridge", "lasso"}:
+        if task == "regression":
+            params.update(n_alphas=2, max_cv_folds=2)
+        if model_name == "lasso" or task == "classification":
+            params["max_iter"] = 100
+    elif model_name in {"random_forest", "extra_trees"}:
+        params.update(n_estimators=8, min_samples_leaf=1)
+    elif model_name == "xgboost":
+        if task == "regression":
+            # Keep >1 rounds so xgboost.cv still constructs and evaluates folds.
+            params.update(max_rounds=20, cv_folds=2)
+        else:
+            params["n_estimators"] = 3
+    elif model_name == "lightgbm":
+        if task == "regression":
+            params.update(
+                max_rounds=3,
+                cv_folds=2,
+                early_stopping_rounds=1,
+                min_data_in_leaf=2,
+            )
+        else:
+            params.update(n_estimators=3, min_data_in_leaf=2)
+    elif model_name == "shallow_neural_network":
+        params.update(
+            hidden_layer_sizes=[4],
+            max_iter=30,
+            early_stopping=True,
+            validation_fraction=0.4,
+            n_iter_no_change=2,
+        )
+        if task == "regression":
+            # Both stay >1 to exercise AdaptiveMLPRegressor's CV selection.
+            params.update(n_alphas=2, max_cv_folds=2)
+    elif model_name == "super_learner":
+        # Retain the same base-estimator family and the stacking CV pathway.
+        params.update(
+            cv=2,
+            n_estimators=8,
+            min_samples_leaf=1,
+            hidden_layer_sizes=[4],
+            max_iter=30,
+            lgbm_n_estimators=5,
+            lgbm_min_data_in_leaf=2,
+        )
+    return params
 
 
 def _data(n_samples: int, task: str) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
@@ -49,9 +106,7 @@ def _fit_repeatedly(
     outer_n_jobs: int,
 ) -> list[dict]:
     X_train, y_train, X_test = _data(n_samples, task)
-    params = load_model_params(
-        MODEL_PARAMS, task=task, models=[model_name]
-    )[model_name]
+    params = _fast_model_params(model_name, task)
     return Parallel(n_jobs=outer_n_jobs, prefer="threads")(
         delayed(_fit_predict_model_cell)(
             model_name=model_name,
