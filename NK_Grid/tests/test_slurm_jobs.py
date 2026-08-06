@@ -398,6 +398,24 @@ def test_dependency_never_satisfied_targets_only_current_snapshot_receipts(
     assert calls[1][0] == ["scancel", "101"]
 
 
+def test_dependency_diagnostics_warns_for_corrupt_receipt_but_not_absent_receipts(
+    tmp_path, capsys,
+):
+    snapshot = tmp_path / "jobs.json"
+    snapshot.write_text("{}", encoding="utf-8")
+
+    assert dependency_never_satisfied_diagnostics(
+        snapshot, scheduler_output=""
+    )["receipt_job_ids"] == []
+    assert capsys.readouterr().err == ""
+
+    (tmp_path / "slurm-corrupt.json").write_text("{not-json", encoding="utf-8")
+    assert dependency_never_satisfied_diagnostics(
+        snapshot, scheduler_output=""
+    )["receipt_job_ids"] == []
+    assert "could not read existing Slurm submission receipt" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("array_spec", "job_count", "expected"),
     [
@@ -933,6 +951,7 @@ echo "$((50000 + LINES));cluster"
         command,
         env={
             **os.environ,
+            "ALLOW_PRE_TABLE_SUBMISSION": "1",
             "ENGINE_DIR": str(engine),
             "VENV": str(tmp_path / "venv"),
             "PYTHON": str(fake_python),
@@ -1061,6 +1080,7 @@ echo "$((98764 + COUNT));cluster-a"
     unrelated.mkdir()
     environment = {
         **os.environ,
+        "ALLOW_PRE_TABLE_SUBMISSION": "1",
         "ENGINE_DIR": str(engine),
         "VENV": str(tmp_path / "venv"),
         "PYTHON": str(fake_python),
@@ -1228,7 +1248,25 @@ echo "$((98764 + COUNT));cluster-a"
     )
 
 
-def test_submitter_rejects_legacy_max_concurrent_option():
+def test_submitter_requires_explicit_pre_table_escape_hatch():
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ENGINE_DIR / "slurm" / "submit_nk_grid.sh"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert (
+        "Refusing the pre-table Slurm submission path" in completed.stderr
+    )
+    assert "submit_flat_task_table.sh" in completed.stderr
+
+
+def test_submitter_rejects_legacy_max_concurrent_option_after_explicit_escape():
     completed = subprocess.run(
         [
             "bash",
@@ -1236,6 +1274,7 @@ def test_submitter_rejects_legacy_max_concurrent_option():
             "--max-concurrent",
             "2",
         ],
+        env={**os.environ, "ALLOW_PRE_TABLE_SUBMISSION": "1"},
         check=False,
         capture_output=True,
         text=True,
@@ -1334,6 +1373,7 @@ echo '41001;cluster-a'
     )
     environment = {
         **os.environ,
+        "ALLOW_PRE_TABLE_SUBMISSION": "1",
         "ENGINE_DIR": str(engine),
         "VENV": str(tmp_path / "venv"),
         "PYTHON": str(fake_python),
@@ -1478,6 +1518,7 @@ echo '60001;cluster'
         ],
         env={
             **os.environ,
+            "ALLOW_PRE_TABLE_SUBMISSION": "1",
             "ENGINE_DIR": str(engine),
             "VENV": str(tmp_path / "venv"),
             "PYTHON": str(fake_python),
@@ -1546,6 +1587,7 @@ echo '70001;cluster'
         ],
         env={
             **os.environ,
+            "ALLOW_PRE_TABLE_SUBMISSION": "1",
             "ENGINE_DIR": str(engine),
             "VENV": str(tmp_path / "venv"),
             "PYTHON": str(fake_python),

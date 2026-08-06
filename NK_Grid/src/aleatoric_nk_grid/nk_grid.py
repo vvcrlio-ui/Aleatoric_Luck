@@ -1199,7 +1199,12 @@ def _read_prior_manifest(path: Path, experiment_id: str) -> dict | None:
         return None
     try:
         prior = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        if path.exists():
+            log_progress(
+                f"warning: could not read existing prior manifest {path}: "
+                f"{type(exc).__name__}: {exc}"
+            )
         return None
     if not isinstance(prior, dict):
         return None

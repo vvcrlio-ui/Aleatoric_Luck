@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 import aleatoric_nk_grid.flat_task_table as flat_task_table
+import aleatoric_nk_grid.nk_grid as nk_grid
 import yaml
 
 from aleatoric_nk_grid.flat_task_table import (
@@ -84,6 +85,10 @@ def test_rss_harness_streams_synthetic_design_and_reads_one_chunk(tmp_path):
     measured = measure_chunk_read_rss(path, chunk_id=2)
     assert measured["rows"] == 1_000
     assert measured["rss_delta_bytes"] >= 0
+
+
+def test_chunk_read_rss_uses_the_engine_peak_rss_conversion():
+    assert flat_task_table._process_peak_rss_bytes is nk_grid._process_peak_rss_bytes
 
 
 def test_lpt_obeys_budget_except_single_over_budget_rows():

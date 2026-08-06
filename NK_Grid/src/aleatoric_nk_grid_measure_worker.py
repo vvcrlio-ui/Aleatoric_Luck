@@ -33,13 +33,6 @@ def _record_import_state(path: str | None) -> None:
         )
 
 
-def import_state_probe_target(cgroup_path: str | None, observation_path: str) -> None:
-    """Test target proving cgroup join precedes heavyweight project imports."""
-
-    _join_cgroup(cgroup_path)
-    _record_import_state(observation_path)
-
-
 def cell_worker_target(
     cgroup_path: str | None,
     result_path: str,

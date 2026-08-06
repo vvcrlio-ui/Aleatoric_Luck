@@ -2,6 +2,14 @@
 
 set -euo pipefail
 
+if [ "${ALLOW_PRE_TABLE_SUBMISSION:-0}" != "1" ]; then
+  echo "Refusing the pre-table Slurm submission path: it bypasses calibrated-cost resource classes, packing, and acceptance gates." >&2
+  echo "Its built-in defaults are CPUS_PER_TASK=8, MEMORY=48G, TIME_LIMIT=4-00:00:00, and it supplies no partition; that can submit a four-day job to the default short partition." >&2
+  echo "Build a calibrated flat-task plan, then use slurm/submit_flat_task_table.sh [--submit] PLAN.json." >&2
+  echo "For an intentionally small pre-table debugging run only, set ALLOW_PRE_TABLE_SUBMISSION=1." >&2
+  exit 2
+fi
+
 ENGINE_DIR="${ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VENV="${VENV:-$(cd "$ENGINE_DIR/.." && pwd)/.venv}"
 PYTHON="${PYTHON:-$VENV/bin/python}"

@@ -83,6 +83,7 @@ class SlurmJob:
 
 
 RESOURCE_CLASSES = ("parallel", "serial", "super_learner")
+SUBMISSION_RECEIPT_FORMAT_VERSION = 1
 OPTIONAL_SLURM_ENV_KEYS = (
     "ALEATORIC_NK_GRID_SOURCE_FALLBACK",
     "PYTHON_MODULE",
@@ -527,7 +528,7 @@ def write_submission_receipt(
         )
 
     payload = {
-        "format_version": 1,
+        "format_version": SUBMISSION_RECEIPT_FORMAT_VERSION,
         "created_at": utc_now(),
         "slurm_job_id": slurm_job_id,
         "array": array_spec,
@@ -609,11 +610,16 @@ def dependency_never_satisfied_diagnostics(
     for receipt_path in snapshot_path.parent.glob("slurm-*.json"):
         try:
             payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            if receipt_path.exists():
+                log_progress(
+                    f"warning: could not read existing Slurm submission receipt "
+                    f"{receipt_path}: {type(exc).__name__}: {exc}"
+                )
             continue
         job_id = payload.get("slurm_job_id")
         if (
-            payload.get("format_version") == 1
+            payload.get("format_version") == SUBMISSION_RECEIPT_FORMAT_VERSION
             and isinstance(payload.get("snapshot"), str)
             and Path(payload["snapshot"]).resolve() == snapshot_path
             and isinstance(job_id, str)

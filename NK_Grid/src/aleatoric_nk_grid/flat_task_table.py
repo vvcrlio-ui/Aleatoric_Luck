@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import csv
 import argparse
-import gc
 import hashlib
 import json
 import multiprocessing
 import os
-import resource
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -25,7 +23,12 @@ import pyarrow.parquet as pq
 import numpy as np
 
 from .experiment import manifest_path, write_json_atomic
-from .nk_grid import NKGridConfig, resolve_repeat_pairs, run_nk_grid
+from .nk_grid import (
+    NKGridConfig,
+    _process_peak_rss_bytes,
+    resolve_repeat_pairs,
+    run_nk_grid,
+)
 
 
 TABLE_FORMAT_VERSION = 1
@@ -281,17 +284,11 @@ def write_synthetic_task_table(
     return path
 
 
-def _ru_maxrss_bytes() -> int:
-    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    # macOS reports bytes; Linux/BSD commonly report KiB.
-    return value if os.uname().sysname == "Darwin" else value * 1024
-
-
 def _read_chunk_rss_worker(path: str, chunk_id: int, connection) -> None:
     try:
-        before = _ru_maxrss_bytes()
+        before = _process_peak_rss_bytes()
         rows = read_chunk(Path(path), chunk_id)
-        after = _ru_maxrss_bytes()
+        after = _process_peak_rss_bytes()
         connection.send({"rows": len(rows), "rss_delta_bytes": max(0, after - before)})
     finally:
         connection.close()
@@ -311,22 +308,6 @@ def measure_chunk_read_rss(path: Path, *, chunk_id: int = 0) -> dict[str, int]:
     if process.exitcode != 0:
         raise RuntimeError(f"RSS worker failed with exit code {process.exitcode}")
     return {"rows": int(payload["rows"]), "rss_delta_bytes": int(payload["rss_delta_bytes"])}
-
-
-def run_rss_harness(
-    directory: Path, *, sizes: Sequence[int] = (1_000_000, 5_000_000, 20_000_000),
-    rows_per_chunk: int = 100_000,
-) -> list[dict[str, int]]:
-    """Produce the required 1M/5M/20M table-read RSS measurements."""
-    results: list[dict[str, int]] = []
-    for size in sizes:
-        table = write_synthetic_task_table(
-            Path(directory) / f"synthetic-{int(size)}.parquet",
-            row_count=int(size), rows_per_chunk=rows_per_chunk,
-        )
-        results.append({"design_rows": int(size), **measure_chunk_read_rss(table)})
-        gc.collect()
-    return results
 
 
 def expected_model_keys(rows: Iterable[TaskRow]) -> set[tuple[str, int, int, int, int]]:

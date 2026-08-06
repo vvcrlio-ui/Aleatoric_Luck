@@ -750,17 +750,6 @@ def generate_synthetic_bundle(
     return schema_path, stats
 
 
-def assert_frame_determinism(params: SyntheticDataParams, tmp_a: Path, tmp_b: Path) -> None:
-    """Generate the same bundle twice and assert exact value/dtype equality."""
-
-    _, stats_a = generate_synthetic_bundle(tmp_a, params)
-    _, stats_b = generate_synthetic_bundle(tmp_b, params)
-    frame_a = pd.read_parquet(tmp_a / "train.parquet")
-    frame_b = pd.read_parquet(tmp_b / "train.parquet")
-    pd.testing.assert_frame_equal(frame_a, frame_b, check_exact=True)
-    assert stats_a == stats_b
-
-
 # ---------------------------------------------------------------------------
 # t0 measurement (fresh-process, component split)
 # ---------------------------------------------------------------------------

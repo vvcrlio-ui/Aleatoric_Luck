@@ -377,30 +377,6 @@ def add_metadata(row: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any
     return {**metadata, **row}
 
 
-def write_checkpoint(
-    existing: pd.DataFrame,
-    rows: Iterable[dict[str, Any]],
-    out_path: Path,
-    *,
-    key_columns: list[str],
-    sort_columns: list[str],
-) -> None:
-    """Atomically merge rows without deduplicating across experiments."""
-
-    new_rows = pd.DataFrame(list(rows))
-    frames = [frame for frame in (existing, new_rows) if not frame.empty]
-    if not frames:
-        return
-    result = pd.concat(frames, ignore_index=True)
-    result = _prefer_completed_checkpoint_rows(
-        result, ["experiment_id", *key_columns]
-    )
-    _write_dataframe_atomic(
-        result.sort_values(["experiment_id", *sort_columns]),
-        out_path,
-    )
-
-
 def checkpoint_parts_dir(out_path: Path) -> Path:
     """Return ``result.parts`` for ``result.csv``."""
 
@@ -1294,12 +1270,6 @@ def diagnostics_summary(frame: pd.DataFrame) -> dict[str, Any]:
             by_model[str(model)] = summary
     result["by_model"] = by_model
     return result
-
-
-def effective_outer_n_jobs(model_name: str, configured_n_jobs: int) -> int:
-    """Return safe Joblib parallelism for one selected model."""
-
-    return 1 if model_name in SERIAL_OUTER_MODELS else configured_n_jobs
 
 
 def model_run_settings(models: Iterable[str]) -> dict[str, Any]:

@@ -22,6 +22,7 @@ from aleatoric_nk_grid.nk_grid import (
     RunFailureThresholdExceeded,
     _ols_is_underdetermined,
     _positive_class_probability,
+    _read_prior_manifest,
     _select_output_path,
     _timestamped_out_path,
     compute_classification_metrics,
@@ -70,6 +71,19 @@ def _regression_frame(rows: int = 40) -> pd.DataFrame:
             "X_b": x % 4,
         }
     )
+
+
+def test_prior_manifest_logs_a_warning_only_when_an_existing_file_is_unreadable(
+    tmp_path, capsys,
+):
+    missing = tmp_path / "missing.manifest.json"
+    assert _read_prior_manifest(missing, "experiment") is None
+    assert capsys.readouterr().err == ""
+
+    corrupt = tmp_path / "corrupt.manifest.json"
+    corrupt.write_text("{not-json", encoding="utf-8")
+    assert _read_prior_manifest(corrupt, "experiment") is None
+    assert "could not read existing prior manifest" in capsys.readouterr().err
 
 
 def test_engine_smoke_records_identity_and_k_diagnostics(tmp_path):
