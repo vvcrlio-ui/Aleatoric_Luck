@@ -5,8 +5,8 @@ RSS, and preprocessing cost -- entirely on locally generated synthetic data.
 Produces ``NK_Grid/calibration/cost_model_<UTC-date>.json``.
 
 This module is purely additive: it does not change any engine execution
-logic, does not touch ``SMR/data/`` or ``FFCWS/data/`` (private data, not in
-the repository), and never inspects or reports any metric value (``r2_test``,
+logic, does not touch private observation data (example only, never a dataset-
+name guard criterion), and never inspects or reports any metric value (``r2_test``,
 ``rmse``, etc). See ``plans/cost-calibration.md`` for the full specification.
 """
 
@@ -96,10 +96,6 @@ THREAD_ENV_VARS: tuple[str, ...] = (
     "NUMEXPR_NUM_THREADS",
 )
 
-# Directory fragments that must never be read by this module. Checked with
-# forward slashes after normalizing the resolved path.
-FORBIDDEN_DATA_FRAGMENTS: tuple[str, ...] = ("SMR/data", "FFCWS/data")
-
 # Human-pre-measured t_import value (see plans/cost-calibration.md sec 2 and
 # the tonight-only scope reduction). Not remeasured by this module.
 T_IMPORT_PREMEASURED: dict[str, Any] = {
@@ -137,17 +133,98 @@ class PrivateDataAccessError(PermissionError):
     """Raised when the measurement path would touch private data."""
 
 
-def guard_not_private_data(path: Path | str) -> Path:
-    """Refuse any path under SMR/data or FFCWS/data (private, not in repo)."""
+def _default_calibration_read_roots() -> tuple[Path, ...]:
+    """Locations the calibration harness owns or may safely use by default."""
 
-    resolved = Path(path).resolve()
-    normalized = resolved.as_posix()
-    for fragment in FORBIDDEN_DATA_FRAGMENTS:
-        if f"/{fragment}/" in f"{normalized}/" or normalized.endswith(f"/{fragment}"):
-            raise PrivateDataAccessError(
-                f"refusing to read private data path: {resolved}"
+    return (
+        Path(tempfile.gettempdir()).resolve(),
+        (repo_root() / "NK_Grid" / "calibration" / "_scratch").resolve(),
+    )
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _looks_like_file_path(value: str) -> bool:
+    if not value or "\x00" in value:
+        return False
+    candidate = Path(value)
+    return (
+        candidate.is_absolute()
+        or value.startswith(("./", "../", "~"))
+        or "/" in value
+        or "\\" in value
+        or bool(candidate.suffix)
+    )
+
+
+def _schema_referenced_paths(document: Any, schema_directory: Path) -> set[Path]:
+    """Collect path-like strings recursively without depending on field names."""
+
+    paths: set[Path] = set()
+
+    def _visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                _visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                _visit(nested)
+        elif isinstance(value, str) and _looks_like_file_path(value):
+            candidate = Path(value).expanduser()
+            paths.add(
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (schema_directory / candidate).resolve()
             )
-    return resolved
+
+    _visit(document)
+    return paths
+
+
+def guard_not_private_data(
+    schema_path: Path | str,
+    *,
+    allowed_roots: Sequence[Path | str] = (),
+) -> Path:
+    """Fail closed unless a schema and every referenced file are allowlisted."""
+
+    resolved_schema = Path(schema_path).resolve()
+    whitelist = tuple(
+        dict.fromkeys(
+            [
+                resolved_schema,
+                *(_default_calibration_read_roots()),
+                *(Path(root).resolve() for root in allowed_roots),
+            ]
+        )
+    )
+
+    def _require_allowed(path: Path) -> None:
+        if not any(_is_within(path, root) for root in whitelist):
+            rendered = ", ".join(str(root) for root in whitelist) or "<empty>"
+            raise PrivateDataAccessError(
+                f"refusing calibration read outside whitelist: {path}; "
+                f"allowed roots: [{rendered}]"
+            )
+
+    _require_allowed(resolved_schema)
+    try:
+        document = json.loads(resolved_schema.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PrivateDataAccessError(
+            f"cannot inspect calibration schema before data access: {resolved_schema}: {exc}"
+        ) from exc
+    for referenced_path in sorted(
+        _schema_referenced_paths(document, resolved_schema.parent), key=str
+    ):
+        _require_allowed(referenced_path)
+    return resolved_schema
 
 
 def repo_root() -> Path:
@@ -252,29 +329,30 @@ class SyntheticDataParams:
 def onehot_group_size_pool(root: Path | None = None) -> tuple[tuple[int, ...], str]:
     """Return (sizes, provenance) for one-hot group widths.
 
-    Informed by FFCWS/schema/ffc_median_missing_indicator.feature_universe.json
-    (a schema file, not private data: it holds only feature/source structure,
-    no observations) when available; otherwise a documented hardcoded fallback.
+    Uses the first discovered feature-universe schema (structure only, never
+    observations) when available; otherwise a documented fallback. This
+    discovery is temporary: ①-B will make shape inputs explicit.
     """
 
-    schema_path = (root or repo_root()) / "FFCWS" / "schema" / (
-        "ffc_median_missing_indicator.feature_universe.json"
-    )
-    guard_not_private_data(schema_path)
-    try:
-        document = json.loads(schema_path.read_text(encoding="utf-8"))
-        sizes = tuple(
-            len(source["features"])
-            for source in document.get("sources", [])
-            if source.get("unit_type") == "onehot_group"
-        )
-        if sizes:
-            return sizes, (
-                f"FFCWS/schema/{schema_path.name} onehot_group feature counts "
-                f"(n_groups={len(sizes)}, mean={float(np.mean(sizes)):.3f})"
+    search_root = (root or repo_root()).resolve()
+    schema_paths = sorted(search_root.glob("*/schema/*.feature_universe.json"))
+    for schema_path in schema_paths:
+        guard_not_private_data(schema_path, allowed_roots=(schema_path.parent,))
+        try:
+            document = json.loads(schema_path.read_text(encoding="utf-8"))
+            sizes = tuple(
+                len(source["features"])
+                for source in document.get("sources", [])
+                if source.get("unit_type") == "onehot_group"
             )
-    except (OSError, json.JSONDecodeError, KeyError):
-        pass
+            if sizes:
+                relative = schema_path.relative_to(search_root)
+                return sizes, (
+                    f"{relative} onehot_group feature counts "
+                    f"(n_groups={len(sizes)}, mean={float(np.mean(sizes)):.3f})"
+                )
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
     fallback = (2, 3, 3, 4, 4, 5)
     return fallback, "fallback hardcoded distribution (schema file unavailable)"
 
@@ -693,8 +771,15 @@ def close_session(session: CalibrationSession) -> None:
         session.native_runner = None
 
 
-def build_session(schema_path: Path, outcome: str, *, seed: int = 0, test_size: float = 0.2) -> CalibrationSession:
-    guard_not_private_data(schema_path)
+def build_session(
+    schema_path: Path,
+    outcome: str,
+    *,
+    seed: int = 0,
+    test_size: float = 0.2,
+    allowed_roots: Sequence[Path | str] = (),
+) -> CalibrationSession:
+    guard_not_private_data(schema_path, allowed_roots=allowed_roots)
     raw_loaded = load_input(schema_path, outcome)
     loaded, groups = validate_input(
         raw_loaded,
@@ -1579,8 +1664,8 @@ def build_calibration_payload(
             "missing_rate_group": synthetic_params.missing_rate_group,
             "outcome": synthetic_params.outcome,
             # The two missing-rate fields above have no empirical basis (real
-            # missingness lives only in FFCWS/data/, which this module never
-            # reads); they are placeholders chosen for plausibility, not
+            # missingness lives only in private observation data (example,
+            # never a dataset-name guard criterion); these are placeholders, not
             # measured. Their effect on *timing* is second-order (imputer
             # cost is dominated by data scale, and lightgbm/xgboost handle
             # NaN natively without imputation), so this flag documents the

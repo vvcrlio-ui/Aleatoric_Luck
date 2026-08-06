@@ -451,19 +451,76 @@ def test_check_thread_env_ok_when_all_set_to_one():
 # ---------------------------------------------------------------------------
 
 
-def test_guard_rejects_smr_and_ffcws_data_paths():
-    with pytest.raises(cc.PrivateDataAccessError):
-        cc.guard_not_private_data(Path("/Users/x/Aleatoric_Luck/SMR/data/table.csv"))
-    with pytest.raises(cc.PrivateDataAccessError):
-        cc.guard_not_private_data(Path("/Users/x/Aleatoric_Luck/FFCWS/data/ard/table.parquet"))
+def _write_path_guard_schema(
+    schema_dir: Path,
+    *,
+    table: str,
+    extra: dict[str, object] | None = None,
+) -> Path:
+    schema_dir.mkdir(parents=True)
+    document: dict[str, object] = {"table": table, "task": "regression"}
+    if extra:
+        document.update(extra)
+    schema_path = schema_dir / "panel.json"
+    schema_path.write_text(json.dumps(document), encoding="utf-8")
+    return schema_path
 
 
-def test_guard_allows_schema_and_scratch_paths(tmp_path):
-    # FFCWS/schema is allowed (it holds only structure, not observations).
-    schema_dir = cc.repo_root() / "FFCWS" / "schema"
-    if schema_dir.exists():
-        cc.guard_not_private_data(schema_dir / "README.md")
-    cc.guard_not_private_data(tmp_path / "synthetic.parquet")
+def test_build_session_rejects_cross_directory_data_before_load(tmp_path, monkeypatch):
+    schema_dir = tmp_path / "unseen_cohort" / "schema"
+    data_path = tmp_path / "unseen_cohort" / "observations" / "table.parquet"
+    schema_path = _write_path_guard_schema(
+        schema_dir, table="../observations/table.parquet"
+    )
+    monkeypatch.setattr(cc, "_default_calibration_read_roots", lambda: (schema_dir.resolve(),))
+    load_called = False
+
+    def _unexpected_load(*args, **kwargs):
+        nonlocal load_called
+        load_called = True
+        raise AssertionError("load_input must not run before the path guard")
+
+    monkeypatch.setattr(cc, "load_input", _unexpected_load)
+    with pytest.raises(cc.PrivateDataAccessError) as caught:
+        cc.build_session(schema_path, "y")
+
+    assert load_called is False
+    assert str(data_path.resolve()) in str(caught.value)
+    assert str(schema_dir.resolve()) in str(caught.value)
+
+
+def test_guard_is_dataset_count_agnostic(tmp_path, monkeypatch):
+    schema_dir = tmp_path / "new_dataset_number_n" / "metadata"
+    schema_path = _write_path_guard_schema(
+        schema_dir, table="../restricted/data.arrow"
+    )
+    monkeypatch.setattr(cc, "_default_calibration_read_roots", lambda: (schema_dir.resolve(),))
+    with pytest.raises(cc.PrivateDataAccessError, match="data.arrow"):
+        cc.guard_not_private_data(schema_path)
+
+
+def test_guard_discovers_future_path_field_without_field_name_changes(tmp_path, monkeypatch):
+    schema_dir = tmp_path / "metadata"
+    schema_path = _write_path_guard_schema(
+        schema_dir,
+        table="local.parquet",
+        extra={"future_auxiliary_binary": "../restricted/future_payload.bin"},
+    )
+    monkeypatch.setattr(cc, "_default_calibration_read_roots", lambda: (schema_dir.resolve(),))
+    with pytest.raises(cc.PrivateDataAccessError, match="future_payload.bin"):
+        cc.guard_not_private_data(schema_path)
+
+
+def test_guard_allows_tmp_bundle_and_explicit_additional_root(tmp_path, monkeypatch):
+    tmp_schema = _write_path_guard_schema(tmp_path / "tmp-bundle", table="table.parquet")
+    assert cc.guard_not_private_data(tmp_schema) == tmp_schema.resolve()
+
+    explicit_root = tmp_path / "explicit-bundle"
+    explicit_schema = _write_path_guard_schema(explicit_root, table="table.parquet")
+    monkeypatch.setattr(cc, "_default_calibration_read_roots", lambda: ())
+    assert cc.guard_not_private_data(
+        explicit_schema, allowed_roots=(explicit_root,)
+    ) == explicit_schema.resolve()
 
 
 def test_build_session_never_opens_private_data_paths(tmp_path, monkeypatch):
@@ -486,15 +543,15 @@ def test_build_session_never_opens_private_data_paths(tmp_path, monkeypatch):
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
     cc.build_session(schema_path, "y", seed=0)
 
-    for path in opened_paths:
-        assert "SMR/data" not in path
-        assert "FFCWS/data" not in path
+    bundle_root = schema_path.parent.resolve()
+    assert opened_paths
+    assert all(cc._is_within(Path(path).resolve(), bundle_root) for path in opened_paths)
 
 
 def test_onehot_group_size_pool_only_reads_schema_directory():
     sizes, provenance = cc.onehot_group_size_pool()
     assert len(sizes) > 0
-    assert "data" not in provenance or "FFCWS/schema" in provenance
+    assert "data" not in provenance.lower()
 
 
 # ---------------------------------------------------------------------------
