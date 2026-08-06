@@ -1,5 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=al-nk-finalize
+#SBATCH --output=logs/%x-%A_%a.out
+#SBATCH --error=logs/%x-%A_%a.err
+# Partition, wall-clock and memory are supplied by the submitter, exactly as
+# for the chunk workers.  They are deliberately absent from this header:
+# inheriting a partition default is how a job silently lands somewhere whose
+# wall-clock limit is shorter than the work needs.
 #SBATCH --open-mode=append
 
 set -euo pipefail

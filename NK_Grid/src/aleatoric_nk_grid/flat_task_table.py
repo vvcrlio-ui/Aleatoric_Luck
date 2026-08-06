@@ -104,6 +104,26 @@ def execution_groups(
     return tuple(groups)
 
 
+#: Preprocessing mode per execution group produced by ``execution_groups``.
+#: Kept next to the producer so the two can never drift apart.
+GROUP_PREPROCESS_MODES: Mapping[str, str] = {
+    "imputed_core": "imputed",
+    "super_learner": "imputed",
+    "passthrough": "passthrough",
+}
+
+
+def preprocess_mode_for_group(group: str) -> str:
+    """Return the preprocessing mode a group pays for exactly once."""
+    try:
+        return GROUP_PREPROCESS_MODES[str(group)]
+    except KeyError:
+        raise ValueError(
+            f"unknown execution group {group!r}; expected one of "
+            f"{', '.join(sorted(GROUP_PREPROCESS_MODES))}"
+        ) from None
+
+
 def _row_id(seed: int, draw: int, n_samples: int, k_features: int, group: str, models: tuple[str, ...]) -> str:
     raw = json.dumps([seed, draw, n_samples, k_features, group, list(models)], separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
