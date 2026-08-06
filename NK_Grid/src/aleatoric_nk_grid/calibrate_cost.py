@@ -5,8 +5,8 @@ RSS, and preprocessing cost -- entirely on locally generated synthetic data.
 Produces ``NK_Grid/calibration/cost_model_<UTC-date>.json``.
 
 This module is purely additive: it does not change any engine execution
-logic, does not touch ``SMR/data/`` or ``FFCWS/data/`` (private data, not in
-the repository), and never inspects or reports any metric value (``r2_test``,
+logic, does not touch private observation data (example only, never a dataset-
+name guard criterion), and never inspects or reports any metric value (``r2_test``,
 ``rmse``, etc). See ``plans/cost-calibration.md`` for the full specification.
 """
 
@@ -59,10 +59,9 @@ from .validate_input import canonical_feature_universe, validate_input
 # Constants
 # ---------------------------------------------------------------------------
 
-# Version 3 rejects both the first process-lifetime RSS format and v2, which
-# lacked self-migration verification, scope-suspect flags, and actual sampling
-# cadence. Neither can be safely reinterpreted as this format.
-FORMAT_VERSION = 3
+# Version 4 adds the explicit schema-derived panel shape and its derived K
+# grids. Earlier files have neither and must never be interpreted as v4.
+FORMAT_VERSION = 4
 MEMORY_SAMPLE_INTERVAL_SECONDS = 0.01
 MEMORY_METHOD_CGROUP_PEAK = "cgroup_v2_memory_peak"
 MEMORY_METHOD_CGROUP_CURRENT = "cgroup_v2_memory_current_sampled"
@@ -96,10 +95,6 @@ THREAD_ENV_VARS: tuple[str, ...] = (
     "NUMEXPR_NUM_THREADS",
 )
 
-# Directory fragments that must never be read by this module. Checked with
-# forward slashes after normalizing the resolved path.
-FORBIDDEN_DATA_FRAGMENTS: tuple[str, ...] = ("SMR/data", "FFCWS/data")
-
 # Human-pre-measured t_import value (see plans/cost-calibration.md sec 2 and
 # the tonight-only scope reduction). Not remeasured by this module.
 T_IMPORT_PREMEASURED: dict[str, Any] = {
@@ -114,15 +109,10 @@ T_IMPORT_PREMEASURED: dict[str, Any] = {
     ),
 }
 
-STAGE_A_N: tuple[int, ...] = (10, 100, 1000, 4242)
-STAGE_A_K: tuple[int, ...] = (10, 100, 1000)
+DEFAULT_STAGE_A_N: tuple[int, ...] = (10, 100, 1000)
+DEFAULT_STAGE_A_K_BASE: tuple[int, ...] = (10, 100, 1000)
+DEFAULT_STAGE_A_K_INTERMEDIATE_POINTS = 2
 STAGE_A_REPS = 3
-
-STAGE_B_POINTS: tuple[tuple[int, int], ...] = (
-    (4242, 8053),
-    (1000, 8053),
-    (4242, 3125),
-)
 
 DEFAULT_MAX_SECONDS = 3600.0
 T0_REPS = 5
@@ -137,17 +127,98 @@ class PrivateDataAccessError(PermissionError):
     """Raised when the measurement path would touch private data."""
 
 
-def guard_not_private_data(path: Path | str) -> Path:
-    """Refuse any path under SMR/data or FFCWS/data (private, not in repo)."""
+def _default_calibration_read_roots() -> tuple[Path, ...]:
+    """Locations the calibration harness owns or may safely use by default."""
 
-    resolved = Path(path).resolve()
-    normalized = resolved.as_posix()
-    for fragment in FORBIDDEN_DATA_FRAGMENTS:
-        if f"/{fragment}/" in f"{normalized}/" or normalized.endswith(f"/{fragment}"):
-            raise PrivateDataAccessError(
-                f"refusing to read private data path: {resolved}"
+    return (
+        Path(tempfile.gettempdir()).resolve(),
+        (repo_root() / "NK_Grid" / "calibration" / "_scratch").resolve(),
+    )
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _looks_like_file_path(value: str) -> bool:
+    if not value or "\x00" in value:
+        return False
+    candidate = Path(value)
+    return (
+        candidate.is_absolute()
+        or value.startswith(("./", "../", "~"))
+        or "/" in value
+        or "\\" in value
+        or bool(candidate.suffix)
+    )
+
+
+def _schema_referenced_paths(document: Any, schema_directory: Path) -> set[Path]:
+    """Collect path-like strings recursively without depending on field names."""
+
+    paths: set[Path] = set()
+
+    def _visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                _visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                _visit(nested)
+        elif isinstance(value, str) and _looks_like_file_path(value):
+            candidate = Path(value).expanduser()
+            paths.add(
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (schema_directory / candidate).resolve()
             )
-    return resolved
+
+    _visit(document)
+    return paths
+
+
+def guard_not_private_data(
+    schema_path: Path | str,
+    *,
+    allowed_roots: Sequence[Path | str] = (),
+) -> Path:
+    """Fail closed unless a schema and every referenced file are allowlisted."""
+
+    resolved_schema = Path(schema_path).resolve()
+    whitelist = tuple(
+        dict.fromkeys(
+            [
+                resolved_schema,
+                *(_default_calibration_read_roots()),
+                *(Path(root).resolve() for root in allowed_roots),
+            ]
+        )
+    )
+
+    def _require_allowed(path: Path) -> None:
+        if not any(_is_within(path, root) for root in whitelist):
+            rendered = ", ".join(str(root) for root in whitelist) or "<empty>"
+            raise PrivateDataAccessError(
+                f"refusing calibration read outside whitelist: {path}; "
+                f"allowed roots: [{rendered}]"
+            )
+
+    _require_allowed(resolved_schema)
+    try:
+        document = json.loads(resolved_schema.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PrivateDataAccessError(
+            f"cannot inspect calibration schema before data access: {resolved_schema}: {exc}"
+        ) from exc
+    for referenced_path in sorted(
+        _schema_referenced_paths(document, resolved_schema.parent), key=str
+    ):
+        _require_allowed(referenced_path)
+    return resolved_schema
 
 
 def repo_root() -> Path:
@@ -241,42 +312,142 @@ def summarize_reps(values: Sequence[float]) -> dict[str, Any]:
 @dataclass(frozen=True)
 class SyntheticDataParams:
     n_train: int
-    n_sources: int
+    shape: "PanelShape"
     seed: int
-    continuous_fraction: float = 0.622
     missing_rate_continuous: float = 0.10
     missing_rate_group: float = 0.08
     outcome: str = "y"
 
 
-def onehot_group_size_pool(root: Path | None = None) -> tuple[tuple[int, ...], str]:
-    """Return (sizes, provenance) for one-hot group widths.
+@dataclass(frozen=True)
+class ShapeSource:
+    """One source unit and the dtypes of its expanded feature columns."""
 
-    Informed by FFCWS/schema/ffc_median_missing_indicator.feature_universe.json
-    (a schema file, not private data: it holds only feature/source structure,
-    no observations) when available; otherwise a documented hardcoded fallback.
+    unit_type: str
+    feature_dtypes: tuple[str, ...]
+
+    @property
+    def width(self) -> int:
+        return len(self.feature_dtypes)
+
+
+@dataclass(frozen=True)
+class PanelShape:
+    """A reproducible synthetic-panel shape derived from one structure schema."""
+
+    schema_path: str
+    sources: tuple[ShapeSource, ...]
+
+    @property
+    def n_sources(self) -> int:
+        return len(self.sources)
+
+    @property
+    def onehot_group_sizes(self) -> tuple[int, ...]:
+        return tuple(source.width for source in self.sources if source.unit_type == "onehot_group")
+
+    @property
+    def onehot_source_fraction(self) -> float:
+        return (
+            len(self.onehot_group_sizes) / self.n_sources
+            if self.n_sources
+            else 0.0
+        )
+
+    @property
+    def expanded_dtype_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for source in self.sources:
+            for dtype in source.feature_dtypes:
+                counts[dtype] = counts.get(dtype, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_path": self.schema_path,
+            "n_sources": self.n_sources,
+            "onehot_source_fraction": self.onehot_source_fraction,
+            "onehot_group_sizes": list(self.onehot_group_sizes),
+            "expanded_dtype_counts": self.expanded_dtype_counts,
+        }
+
+
+def shape_from_schema(schema_path: Path | str) -> PanelShape:
+    """Read an explicit feature-universe schema without opening observation data.
+
+    ``dtype`` is optional metadata on each expanded feature.  Schemas predating
+    that metadata are unambiguously represented as float64, preserving their
+    previous synthetic-panel behaviour while allowing newer schemas to state
+    integer-heavy layouts exactly.
     """
 
-    schema_path = (root or repo_root()) / "FFCWS" / "schema" / (
-        "ffc_median_missing_indicator.feature_universe.json"
-    )
-    guard_not_private_data(schema_path)
+    resolved = Path(schema_path).resolve()
+    guard_not_private_data(resolved, allowed_roots=(resolved.parent,))
     try:
-        document = json.loads(schema_path.read_text(encoding="utf-8"))
-        sizes = tuple(
-            len(source["features"])
-            for source in document.get("sources", [])
-            if source.get("unit_type") == "onehot_group"
-        )
-        if sizes:
-            return sizes, (
-                f"FFCWS/schema/{schema_path.name} onehot_group feature counts "
-                f"(n_groups={len(sizes)}, mean={float(np.mean(sizes)):.3f})"
-            )
-    except (OSError, json.JSONDecodeError, KeyError):
-        pass
-    fallback = (2, 3, 3, 4, 4, 5)
-    return fallback, "fallback hardcoded distribution (schema file unavailable)"
+        document = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid feature-universe schema: {resolved}: {exc}") from exc
+    raw_sources = document.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError(f"feature-universe schema has no sources: {resolved}")
+
+    sources: list[ShapeSource] = []
+    for index, raw_source in enumerate(raw_sources):
+        if not isinstance(raw_source, Mapping):
+            raise ValueError(f"source {index} is not an object in {resolved}")
+        unit_type = raw_source.get("unit_type")
+        features = raw_source.get("features")
+        if unit_type not in {"continuous", "onehot_group"} or not isinstance(features, list) or not features:
+            raise ValueError(f"source {index} has invalid unit_type or features in {resolved}")
+        dtypes: list[str] = []
+        for feature in features:
+            if not isinstance(feature, Mapping):
+                raise ValueError(f"source {index} has a non-object feature in {resolved}")
+            try:
+                dtypes.append(np.dtype(feature.get("dtype", "float64")).name)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"source {index} has invalid dtype metadata in {resolved}") from exc
+        sources.append(ShapeSource(unit_type=unit_type, feature_dtypes=tuple(dtypes)))
+    return PanelShape(schema_path=str(resolved), sources=tuple(sources))
+
+
+def k_grid_from_shape(
+    shape: PanelShape,
+    *,
+    base_anchors: Sequence[int] = DEFAULT_STAGE_A_K_BASE,
+    intermediate_points: int = DEFAULT_STAGE_A_K_INTERMEDIATE_POINTS,
+) -> tuple[int, ...]:
+    """Return a shape-bounded K grid with geometric interior production probes."""
+
+    if shape.n_sources < 1:
+        raise ValueError("panel shape must contain at least one source")
+    if intermediate_points < 0:
+        raise ValueError("intermediate_points must be non-negative")
+    anchors = {int(k) for k in base_anchors if 0 < int(k) < shape.n_sources}
+    anchors.add(shape.n_sources)
+    lower = max(anchors - {shape.n_sources}, default=1)
+    if lower < shape.n_sources:
+        log_lower, log_upper = math.log(lower), math.log(shape.n_sources)
+        for position in range(1, intermediate_points + 1):
+            candidate = int(round(math.exp(log_lower + (log_upper - log_lower) * position / (intermediate_points + 1))))
+            if lower < candidate < shape.n_sources:
+                anchors.add(candidate)
+    return tuple(sorted(anchors))
+
+
+def default_stage_b_points(
+    *, n_train: int, stage_a_n: Sequence[int], k_grid: Sequence[int]
+) -> tuple[tuple[int, int], ...]:
+    """Derive validation points from caller-provided N and schema-derived K."""
+
+    if n_train < 1 or not stage_a_n or not k_grid:
+        raise ValueError("n_train, stage_a_n, and k_grid must be non-empty positive values")
+    points = [(n_train, int(k_grid[-1]))]
+    if len(stage_a_n) > 1:
+        points.append((min(n_train, max(stage_a_n)), int(k_grid[-1])))
+    if len(k_grid) > 1:
+        points.append((n_train, int(k_grid[-2])))
+    return tuple(dict.fromkeys(points))
 
 
 def generate_synthetic_bundle(
@@ -291,72 +462,62 @@ def generate_synthetic_bundle(
     """
 
     rng = np.random.default_rng(params.seed)
-    n_continuous = int(round(params.n_sources * params.continuous_fraction))
-    n_onehot = params.n_sources - n_continuous
-    sizes_pool, sizes_provenance = onehot_group_size_pool()
-    sizes = (
-        rng.choice(np.array(sizes_pool, dtype=int), size=n_onehot, replace=True)
-        if n_onehot > 0
-        else np.array([], dtype=int)
-    )
-
     columns: dict[str, np.ndarray] = {}
     manifest_rows: list[dict[str, Any]] = []
-    source_order = 0
-
-    for i in range(n_continuous):
-        name = f"N_src{i:05d}"
-        values = rng.normal(size=params.n_train).astype(float)
-        missing_mask = rng.random(params.n_train) < params.missing_rate_continuous
-        values[missing_mask] = np.nan
-        columns[name] = values
-        manifest_rows.append(
-            {
-                "source_column": name,
-                "feature_name": name,
-                "keep": True,
-                "source_order": source_order,
-                "feature_order": 0,
-                "unit_type": "continuous",
-                "drop_first": False,
-                "is_reference": False,
-                "reference_level": None,
-                "level_value": None,
-                "ordinal_levels": None,
-                "source_prior": None,
-            }
-        )
-        source_order += 1
-
-    for j, raw_size in enumerate(sizes):
-        size = int(raw_size)
-        base = f"C_src{j:05d}"
-        feats = [f"{base}__lvl{k}" for k in range(size)]
-        weights = rng.dirichlet(np.ones(size))
-        choice = rng.choice(size, size=params.n_train, p=weights)
-        missing_mask = rng.random(params.n_train) < params.missing_rate_group
-        block = np.zeros((params.n_train, size), dtype=float)
-        block[np.arange(params.n_train), choice] = 1.0
-        block[missing_mask, :] = np.nan
-        for k, feat in enumerate(feats):
-            columns[feat] = block[:, k]
+    for source_order, source in enumerate(params.shape.sources):
+        base = f"S_src{source_order:05d}"
+        if source.unit_type == "continuous":
+            dtype = np.dtype(source.feature_dtypes[0])
+            values = rng.normal(size=params.n_train).astype(dtype)
+            if np.issubdtype(dtype, np.floating):
+                values[rng.random(params.n_train) < params.missing_rate_continuous] = np.nan
+            columns[base] = values
             manifest_rows.append(
                 {
                     "source_column": base,
-                    "feature_name": feat,
+                    "feature_name": base,
                     "keep": True,
                     "source_order": source_order,
-                    "feature_order": k,
-                    "unit_type": "onehot_group",
+                    "feature_order": 0,
+                    "unit_type": "continuous",
                     "drop_first": False,
-                    "is_reference": k == 0,
-                    "reference_level": 0.0,
-                    "level_value": float(k),
+                    "is_reference": False,
+                    "reference_level": None,
+                    "level_value": None,
                     "ordinal_levels": None,
                     "source_prior": None,
                 }
             )
-        source_order += 1
+            continue
+
+        size = source.width
+        feats = [f"{base}__lvl{k}" for k in range(size)]
+        choice = rng.choice(size, size=params.n_train, p=rng.dirichlet(np.ones(size)))
+        block = np.zeros((params.n_train, size), dtype=float)
+        block[np.arange(params.n_train), choice] = 1.0
+        # Integer dummy columns cannot encode a missing group. Preserve their
+        # dtype by leaving that source fully observed; float groups retain the
+        # existing synthetic missingness behaviour.
+        if all(np.issubdtype(np.dtype(dtype), np.floating) for dtype in source.feature_dtypes):
+            block[rng.random(params.n_train) < params.missing_rate_group, :] = np.nan
+        for feature_order, (feature, dtype_name) in enumerate(zip(feats, source.feature_dtypes)):
+            columns[feature] = block[:, feature_order].astype(np.dtype(dtype_name))
+            manifest_rows.append(
+                {
+                    "source_column": base,
+                    "feature_name": feature,
+                    "keep": True,
+                    "source_order": source_order,
+                    "feature_order": feature_order,
+                    "unit_type": "onehot_group",
+                    "drop_first": False,
+                    "is_reference": feature_order == 0,
+                    "reference_level": 0.0,
+                    "level_value": float(feature_order),
+                    "ordinal_levels": None,
+                    "source_prior": None,
+                }
+            )
 
     outcome_values = rng.normal(size=params.n_train)
     frame = pd.DataFrame(columns)
@@ -412,13 +573,12 @@ def generate_synthetic_bundle(
 
     stats = {
         "n_train": params.n_train,
-        "n_sources": params.n_sources,
-        "n_continuous_sources": n_continuous,
-        "n_onehot_sources": n_onehot,
+        "n_sources": params.shape.n_sources,
+        "n_continuous_sources": sum(source.unit_type == "continuous" for source in params.shape.sources),
+        "n_onehot_sources": len(params.shape.onehot_group_sizes),
         "n_expanded_predictors": len(predictors),
         "seed": params.seed,
-        "onehot_group_size_source": sizes_provenance,
-        "continuous_fraction": params.continuous_fraction,
+        "shape": params.shape.as_dict(),
         "missing_rate_continuous": params.missing_rate_continuous,
         "missing_rate_group": params.missing_rate_group,
         "outcome": params.outcome,
@@ -693,8 +853,15 @@ def close_session(session: CalibrationSession) -> None:
         session.native_runner = None
 
 
-def build_session(schema_path: Path, outcome: str, *, seed: int = 0, test_size: float = 0.2) -> CalibrationSession:
-    guard_not_private_data(schema_path)
+def build_session(
+    schema_path: Path,
+    outcome: str,
+    *,
+    seed: int = 0,
+    test_size: float = 0.2,
+    allowed_roots: Sequence[Path | str] = (),
+) -> CalibrationSession:
+    guard_not_private_data(schema_path, allowed_roots=allowed_roots)
     raw_loaded = load_input(schema_path, outcome)
     loaded, groups = validate_input(
         raw_loaded,
@@ -1284,8 +1451,8 @@ def measure_task_cgroup_peak_n_jobs_8(
 def run_stage_a(
     session: CalibrationSession,
     *,
-    n_grid: Sequence[int] = STAGE_A_N,
-    k_grid: Sequence[int] = STAGE_A_K,
+    n_grid: Sequence[int] = DEFAULT_STAGE_A_N,
+    k_grid: Sequence[int] = DEFAULT_STAGE_A_K_BASE,
     n_reps: int = STAGE_A_REPS,
     max_seconds: float = DEFAULT_MAX_SECONDS,
     models: Sequence[str] = MODELS,
@@ -1330,7 +1497,7 @@ def run_stage_a(
 def run_stage_b(
     session: CalibrationSession,
     *,
-    points: Sequence[tuple[int, int]] = STAGE_B_POINTS,
+    points: Sequence[tuple[int, int]],
     max_seconds: float = DEFAULT_MAX_SECONDS,
     models: Sequence[str] = MODELS,
     progress: Callable[[str], None] | None = None,
@@ -1555,6 +1722,7 @@ def build_calibration_payload(
     thread_env_report: Mapping[str, Any],
     scope_reduction: Mapping[str, Any] | None = None,
     task_cgroup_peak_n_jobs_8: MemoryPeak | None = None,
+    stage_a_k_grid: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     environment = core_environment()
     environment["platform"] = _platform_string()
@@ -1571,16 +1739,19 @@ def build_calibration_payload(
             # rest on without cross-referencing the generator's source code
             # (round 1 review F3).
             "n_train": synthetic_params.n_train,
-            "n_feature_units": synthetic_params.n_sources,
+            "n_feature_units": synthetic_params.shape.n_sources,
             "p_onehot": synthetic_stats["n_expanded_predictors"],
             "seed": synthetic_params.seed,
-            "continuous_fraction": synthetic_params.continuous_fraction,
+            "panel_shape": synthetic_params.shape.as_dict(),
+            "stage_a_k_grid": list(
+                stage_a_k_grid if stage_a_k_grid is not None else k_grid_from_shape(synthetic_params.shape)
+            ),
             "missing_rate_continuous": synthetic_params.missing_rate_continuous,
             "missing_rate_group": synthetic_params.missing_rate_group,
             "outcome": synthetic_params.outcome,
             # The two missing-rate fields above have no empirical basis (real
-            # missingness lives only in FFCWS/data/, which this module never
-            # reads); they are placeholders chosen for plausibility, not
+            # missingness lives only in private observation data (example,
+            # never a dataset-name guard criterion); these are placeholders, not
             # measured. Their effect on *timing* is second-order (imputer
             # cost is dominated by data scale, and lightgbm/xgboost handle
             # NaN natively without imputation), so this flag documents the
@@ -1652,10 +1823,14 @@ def read_calibration_file(path: Path) -> dict[str, Any]:
             f"unsupported calibration format_version={payload.get('format_version')!r}; "
             f"expected {FORMAT_VERSION}. Earlier peak_rss_bytes formats are invalid."
         )
-    required = {"memory_measurement", "raw_measurements", "peak_rss_bytes"}
+    required = {"memory_measurement", "raw_measurements", "peak_rss_bytes", "synthetic_data"}
     missing = required.difference(payload)
     if missing:
         raise ValueError(f"calibration file is missing required fields: {sorted(missing)}")
+    shape_fields = {"panel_shape", "stage_a_k_grid"}
+    missing_shape = shape_fields.difference(payload["synthetic_data"])
+    if missing_shape:
+        raise ValueError(f"calibration file is missing schema-derived shape fields: {sorted(missing_shape)}")
     return payload
 
 
@@ -1670,8 +1845,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "and peak RSS on synthetic data; never reads private data or model metrics."
     )
     parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS)
-    parser.add_argument("--n-train", type=int, default=4242)
-    parser.add_argument("--n-feature-units", type=int, default=8053)
+    parser.add_argument(
+        "--shape-schema",
+        type=Path,
+        required=True,
+        help="Explicit feature-universe schema used to derive the synthetic panel shape.",
+    )
+    parser.add_argument("--n-train", type=int, required=True)
+    parser.add_argument(
+        "--stage-a-n",
+        type=str,
+        default=",".join(str(value) for value in DEFAULT_STAGE_A_N),
+        help="Comma-separated N values for the stage-A fit grid.",
+    )
+    parser.add_argument(
+        "--stage-a-k-base",
+        type=str,
+        default=",".join(str(value) for value in DEFAULT_STAGE_A_K_BASE),
+        help="Lower K anchors; the schema-derived source maximum is always included.",
+    )
+    parser.add_argument(
+        "--stage-a-k-intermediate-points",
+        type=int,
+        default=DEFAULT_STAGE_A_K_INTERMEDIATE_POINTS,
+        help="Number of geometric K probes between the largest lower anchor and schema maximum.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--work-dir", type=Path, default=None)
@@ -1684,16 +1882,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--stage-b-points",
         type=str,
         default=None,
-        help="Comma-separated N:K pairs to actually measure in stage B "
-        "(default: all three plan points). Points not listed are recorded "
-        "as not_measured, never fabricated.",
-    )
-    parser.add_argument(
-        "--fallback-feature-units",
-        type=int,
-        default=None,
-        help="If full-dimension generation exceeds the feasibility budget, "
-        "regenerate at this many feature units instead.",
+        help="Comma-separated N:K pairs to actually measure in stage B. "
+        "Default is derived from --n-train and the schema-derived K grid.",
     )
     parser.add_argument("--generation-time-budget-seconds", type=float, default=300.0)
     parser.add_argument("--generation-rss-budget-bytes", type=int, default=6 * 1024**3)
@@ -1732,16 +1922,32 @@ def parse_task_memory_cells(specification: str, *, max_seconds: float) -> tuple[
     return tuple(requests)
 
 
+def parse_positive_int_grid(specification: str, *, option: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(value) for value in specification.split(","))
+    except ValueError as exc:
+        raise ValueError(f"{option} must be comma-separated positive integers") from exc
+    if not values or any(value < 1 for value in values):
+        raise ValueError(f"{option} must be comma-separated positive integers")
+    return tuple(dict.fromkeys(values))
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     thread_report = enforce_thread_env(strict=not args.allow_nonproduction_threads)
 
     work_dir = args.work_dir or (repo_root() / "NK_Grid" / "calibration" / "_scratch")
     out_dir = args.out_dir or (repo_root() / "NK_Grid" / "calibration")
-
-    params = SyntheticDataParams(
-        n_train=args.n_train, n_sources=args.n_feature_units, seed=args.seed
+    shape = shape_from_schema(args.shape_schema)
+    stage_a_n = parse_positive_int_grid(args.stage_a_n, option="--stage-a-n")
+    if max(stage_a_n) > args.n_train:
+        raise ValueError("--stage-a-n values cannot exceed --n-train")
+    stage_a_k = k_grid_from_shape(
+        shape,
+        base_anchors=parse_positive_int_grid(args.stage_a_k_base, option="--stage-a-k-base"),
+        intermediate_points=args.stage_a_k_intermediate_points,
     )
+    params = SyntheticDataParams(n_train=args.n_train, shape=shape, seed=args.seed)
 
     generation_start = time.perf_counter()
     peak_rss_before = _process_peak_rss_bytes()
@@ -1759,20 +1965,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if (
         generation_seconds > args.generation_time_budget_seconds
         or peak_rss_after > args.generation_rss_budget_bytes
-    ) and args.fallback_feature_units:
-        scope_reduction["dimension_fallback_triggered"] = True
-        scope_reduction["dimensions_scaled_down"] = True
-        scope_reduction["fallback_note"] = (
-            "维度已缩放，系数需在全维度上重新标定"
+    ):
+        raise RuntimeError(
+            "synthetic panel generation exceeded its feasibility budget; "
+            "choose an explicitly smaller shape schema instead of silently changing dimensions"
         )
-        params = SyntheticDataParams(
-            n_train=args.n_train, n_sources=args.fallback_feature_units, seed=args.seed
-        )
-        bundle_root = work_dir / "fallback"
-        schema_path, stats = generate_synthetic_bundle(bundle_root, params)
-    else:
-        scope_reduction["dimension_fallback_triggered"] = False
-        scope_reduction["dimensions_scaled_down"] = False
 
     session = build_session(schema_path, params.outcome, seed=args.seed)
     try:
@@ -1792,7 +1989,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(message, file=sys.stderr)
 
         raw_a, censored_a = run_stage_a(
-            session, max_seconds=args.max_seconds, progress=_progress
+            session,
+            n_grid=stage_a_n,
+            k_grid=stage_a_k,
+            max_seconds=args.max_seconds,
+            progress=_progress,
         )
 
         if args.stage_b_points:
@@ -1801,8 +2002,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 for pair in args.stage_b_points.split(",")
             )
         else:
-            points_to_measure = STAGE_B_POINTS
-        not_measured = tuple(p for p in STAGE_B_POINTS if p not in points_to_measure)
+            points_to_measure = default_stage_b_points(
+                n_train=args.n_train, stage_a_n=stage_a_n, k_grid=stage_a_k
+            )
+        validation_points = default_stage_b_points(
+            n_train=args.n_train, stage_a_n=stage_a_n, k_grid=stage_a_k
+        )
+        not_measured = tuple(p for p in validation_points if p not in points_to_measure)
 
         raw_b, censored_b = run_stage_b(
             session, points=points_to_measure, max_seconds=args.max_seconds, progress=_progress
@@ -1812,7 +2018,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         preprocess_cost = fit_preprocess_by_mode(raw_a)
         peak_rss_fits = fit_peak_rss(raw_a)
         validation = build_validation_rows(
-            raw_b, censored_b, fit_cost, STAGE_B_POINTS, MODELS, not_measured_points=not_measured
+            raw_b, censored_b, fit_cost, validation_points, MODELS, not_measured_points=not_measured
         )
 
         payload = build_calibration_payload(
@@ -1828,6 +2034,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             thread_env_report=thread_report,
             scope_reduction=scope_reduction,
             task_cgroup_peak_n_jobs_8=task_peak,
+            stage_a_k_grid=stage_a_k,
         )
     finally:
         close_session(session)

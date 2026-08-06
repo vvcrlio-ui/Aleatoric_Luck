@@ -21,6 +21,25 @@ def _allocate_bytes_for_peak(byte_count: int, seconds: float = 0.15) -> None:
     time.sleep(seconds)
 
 
+def _test_shape(
+    n_sources: int,
+    *,
+    onehot_sources: int | None = None,
+    onehot_dtype: str = "float64",
+    continuous_dtype: str = "float64",
+) -> cc.PanelShape:
+    """Small explicit shape for tests that do not exercise schema parsing."""
+
+    n_onehot = n_sources // 2 if onehot_sources is None else onehot_sources
+    return cc.PanelShape(
+        schema_path="<test-shape>",
+        sources=tuple(
+            [cc.ShapeSource("continuous", (continuous_dtype,)) for _ in range(n_sources - n_onehot)]
+            + [cc.ShapeSource("onehot_group", (onehot_dtype, onehot_dtype, onehot_dtype)) for _ in range(n_onehot)]
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. Power-law regression recovers known exponents
 # ---------------------------------------------------------------------------
@@ -67,7 +86,7 @@ def test_fit_power_law_rejects_too_few_points():
 
 
 def test_synthetic_bundle_generation_is_deterministic(tmp_path):
-    params = cc.SyntheticDataParams(n_train=120, n_sources=15, seed=42)
+    params = cc.SyntheticDataParams(n_train=120, shape=_test_shape(15), seed=42)
     schema_a, stats_a = cc.generate_synthetic_bundle(tmp_path / "a", params)
     schema_b, stats_b = cc.generate_synthetic_bundle(tmp_path / "b", params)
 
@@ -80,8 +99,8 @@ def test_synthetic_bundle_generation_is_deterministic(tmp_path):
 
 
 def test_synthetic_bundle_generation_differs_across_seeds(tmp_path):
-    params_a = cc.SyntheticDataParams(n_train=80, n_sources=10, seed=1)
-    params_b = cc.SyntheticDataParams(n_train=80, n_sources=10, seed=2)
+    params_a = cc.SyntheticDataParams(n_train=80, shape=_test_shape(10), seed=1)
+    params_b = cc.SyntheticDataParams(n_train=80, shape=_test_shape(10), seed=2)
     cc.generate_synthetic_bundle(tmp_path / "a", params_a)
     cc.generate_synthetic_bundle(tmp_path / "b", params_b)
 
@@ -98,7 +117,7 @@ def test_synthetic_bundle_generation_differs_across_seeds(tmp_path):
 def test_measure_one_cell_records_censoring_and_excludes_from_regression(
     tmp_path, monkeypatch
 ):
-    params = cc.SyntheticDataParams(n_train=100, n_sources=10, seed=0)
+    params = cc.SyntheticDataParams(n_train=100, shape=_test_shape(10), seed=0)
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
     session = cc.build_session(schema_path, "y", seed=0)
 
@@ -200,7 +219,7 @@ def test_calibration_file_round_trip_recomputes_fit_cost(tmp_path):
     fit_cost = cc.fit_all_models(raw, models=("ols", "ridge"))
     raw[0].memory_scope_suspect = True
     payload = cc.build_calibration_payload(
-        synthetic_params=cc.SyntheticDataParams(n_train=10, n_sources=10, seed=0),
+        synthetic_params=cc.SyntheticDataParams(n_train=10, shape=_test_shape(10), seed=0),
         synthetic_stats={"n_expanded_predictors": 10},
         t0_seconds={
             "import": cc.T_IMPORT_PREMEASURED,
@@ -290,7 +309,7 @@ def test_fresh_spawn_process_peak_does_not_inherit_parent_high_water():
 
 
 def test_cell_measurement_records_distinct_spawn_and_whole_tree_numbers(tmp_path, monkeypatch):
-    params = cc.SyntheticDataParams(n_train=80, n_sources=8, seed=0)
+    params = cc.SyntheticDataParams(n_train=80, shape=_test_shape(8), seed=0)
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
     session = cc.build_session(schema_path, "y", seed=0)
     # The desktop sandbox intentionally denies ``ps``.  Mock the platform
@@ -320,7 +339,7 @@ def test_cell_measurement_records_distinct_spawn_and_whole_tree_numbers(tmp_path
 
 
 def test_macos_fallback_is_explicit_tree_rss_with_sampling_interval(tmp_path, monkeypatch):
-    params = cc.SyntheticDataParams(n_train=80, n_sources=8, seed=1)
+    params = cc.SyntheticDataParams(n_train=80, shape=_test_shape(8), seed=1)
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
     session = cc.build_session(schema_path, "y", seed=0)
     # This is the normal macOS state, forced so the assertion is portable on
@@ -412,9 +431,10 @@ def test_task_memory_cli_requires_an_explicit_eight_cell_task_shape():
         cc.parse_task_memory_cells("ols:10:5", max_seconds=12.5)
 
 
-def test_calibration_reader_rejects_invalid_v1_peak_rss_file(tmp_path):
-    old_path = tmp_path / "old.json"
-    old_path.write_text(json.dumps({"format_version": 1}), encoding="utf-8")
+@pytest.mark.parametrize("old_version", (1, 2, 3))
+def test_calibration_reader_rejects_old_calibration_formats(tmp_path, old_version):
+    old_path = tmp_path / f"old-v{old_version}.json"
+    old_path.write_text(json.dumps({"format_version": old_version}), encoding="utf-8")
     with pytest.raises(ValueError, match="Earlier peak_rss_bytes formats are invalid"):
         cc.read_calibration_file(old_path)
 
@@ -451,19 +471,76 @@ def test_check_thread_env_ok_when_all_set_to_one():
 # ---------------------------------------------------------------------------
 
 
-def test_guard_rejects_smr_and_ffcws_data_paths():
-    with pytest.raises(cc.PrivateDataAccessError):
-        cc.guard_not_private_data(Path("/Users/x/Aleatoric_Luck/SMR/data/table.csv"))
-    with pytest.raises(cc.PrivateDataAccessError):
-        cc.guard_not_private_data(Path("/Users/x/Aleatoric_Luck/FFCWS/data/ard/table.parquet"))
+def _write_path_guard_schema(
+    schema_dir: Path,
+    *,
+    table: str,
+    extra: dict[str, object] | None = None,
+) -> Path:
+    schema_dir.mkdir(parents=True)
+    document: dict[str, object] = {"table": table, "task": "regression"}
+    if extra:
+        document.update(extra)
+    schema_path = schema_dir / "panel.json"
+    schema_path.write_text(json.dumps(document), encoding="utf-8")
+    return schema_path
 
 
-def test_guard_allows_schema_and_scratch_paths(tmp_path):
-    # FFCWS/schema is allowed (it holds only structure, not observations).
-    schema_dir = cc.repo_root() / "FFCWS" / "schema"
-    if schema_dir.exists():
-        cc.guard_not_private_data(schema_dir / "README.md")
-    cc.guard_not_private_data(tmp_path / "synthetic.parquet")
+def test_build_session_rejects_cross_directory_data_before_load(tmp_path, monkeypatch):
+    schema_dir = tmp_path / "unseen_cohort" / "schema"
+    data_path = tmp_path / "unseen_cohort" / "observations" / "table.parquet"
+    schema_path = _write_path_guard_schema(
+        schema_dir, table="../observations/table.parquet"
+    )
+    monkeypatch.setattr(cc, "_default_calibration_read_roots", lambda: (schema_dir.resolve(),))
+    load_called = False
+
+    def _unexpected_load(*args, **kwargs):
+        nonlocal load_called
+        load_called = True
+        raise AssertionError("load_input must not run before the path guard")
+
+    monkeypatch.setattr(cc, "load_input", _unexpected_load)
+    with pytest.raises(cc.PrivateDataAccessError) as caught:
+        cc.build_session(schema_path, "y")
+
+    assert load_called is False
+    assert str(data_path.resolve()) in str(caught.value)
+    assert str(schema_dir.resolve()) in str(caught.value)
+
+
+def test_guard_is_dataset_count_agnostic(tmp_path, monkeypatch):
+    schema_dir = tmp_path / "new_dataset_number_n" / "metadata"
+    schema_path = _write_path_guard_schema(
+        schema_dir, table="../restricted/data.arrow"
+    )
+    monkeypatch.setattr(cc, "_default_calibration_read_roots", lambda: (schema_dir.resolve(),))
+    with pytest.raises(cc.PrivateDataAccessError, match="data.arrow"):
+        cc.guard_not_private_data(schema_path)
+
+
+def test_guard_discovers_future_path_field_without_field_name_changes(tmp_path, monkeypatch):
+    schema_dir = tmp_path / "metadata"
+    schema_path = _write_path_guard_schema(
+        schema_dir,
+        table="local.parquet",
+        extra={"future_auxiliary_binary": "../restricted/future_payload.bin"},
+    )
+    monkeypatch.setattr(cc, "_default_calibration_read_roots", lambda: (schema_dir.resolve(),))
+    with pytest.raises(cc.PrivateDataAccessError, match="future_payload.bin"):
+        cc.guard_not_private_data(schema_path)
+
+
+def test_guard_allows_tmp_bundle_and_explicit_additional_root(tmp_path, monkeypatch):
+    tmp_schema = _write_path_guard_schema(tmp_path / "tmp-bundle", table="table.parquet")
+    assert cc.guard_not_private_data(tmp_schema) == tmp_schema.resolve()
+
+    explicit_root = tmp_path / "explicit-bundle"
+    explicit_schema = _write_path_guard_schema(explicit_root, table="table.parquet")
+    monkeypatch.setattr(cc, "_default_calibration_read_roots", lambda: ())
+    assert cc.guard_not_private_data(
+        explicit_schema, allowed_roots=(explicit_root,)
+    ) == explicit_schema.resolve()
 
 
 def test_build_session_never_opens_private_data_paths(tmp_path, monkeypatch):
@@ -482,19 +559,130 @@ def test_build_session_never_opens_private_data_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(pd, "read_parquet", _tracking_read_parquet)
     monkeypatch.setattr(pd, "read_csv", _tracking_read_csv)
 
-    params = cc.SyntheticDataParams(n_train=60, n_sources=8, seed=0)
+    params = cc.SyntheticDataParams(n_train=60, shape=_test_shape(8), seed=0)
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
     cc.build_session(schema_path, "y", seed=0)
 
-    for path in opened_paths:
-        assert "SMR/data" not in path
-        assert "FFCWS/data" not in path
+    bundle_root = schema_path.parent.resolve()
+    assert opened_paths
+    assert all(cc._is_within(Path(path).resolve(), bundle_root) for path in opened_paths)
 
 
-def test_onehot_group_size_pool_only_reads_schema_directory():
-    sizes, provenance = cc.onehot_group_size_pool()
-    assert len(sizes) > 0
-    assert "data" not in provenance or "FFCWS/schema" in provenance
+def _write_feature_universe_schema(
+    path: Path,
+    source_specs: list[tuple[str, tuple[str, ...]]],
+) -> Path:
+    sources = []
+    for source_order, (unit_type, dtypes) in enumerate(source_specs):
+        sources.append(
+            {
+                "source": f"source_{source_order}",
+                "source_order": source_order,
+                "unit_type": unit_type,
+                "features": [
+                    {"feature": f"f_{source_order}_{feature_order}", "dtype": dtype}
+                    for feature_order, dtype in enumerate(dtypes)
+                ],
+            }
+        )
+    path.write_text(json.dumps({"predictors": [], "sources": sources}), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("source_specs", "expected_counts", "expected_onehot_fraction"),
+    [
+        (
+            [("continuous", ("float64",)), ("onehot_group", ("float64", "float64"))],
+            {"float64": 3},
+            0.5,
+        ),
+        (
+            [
+                ("continuous", ("float32",)),
+                ("onehot_group", ("int64", "int64", "int64")),
+                ("onehot_group", ("int64", "int64")),
+            ],
+            {"float32": 1, "int64": 5},
+            2 / 3,
+        ),
+        (
+            [("continuous", ("float32",)), ("continuous", ("float64",)), ("onehot_group", ("int16", "int16"))],
+            {"float32": 1, "float64": 1, "int16": 2},
+            1 / 3,
+        ),
+    ],
+)
+def test_shape_from_schema_and_synthetic_bundle_preserve_parameterized_dtypes(
+    tmp_path, source_specs, expected_counts, expected_onehot_fraction
+):
+    schema = _write_feature_universe_schema(tmp_path / "shape.feature_universe.json", source_specs)
+    shape = cc.shape_from_schema(schema)
+
+    assert shape.n_sources == len(source_specs)
+    assert shape.expanded_dtype_counts == expected_counts
+    assert shape.onehot_source_fraction == pytest.approx(expected_onehot_fraction)
+    params = cc.SyntheticDataParams(n_train=20, shape=shape, seed=4)
+    cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    generated = pd.read_parquet(tmp_path / "bundle" / "train.parquet")
+    assert {
+        str(dtype): sum(generated[column].dtype == dtype for column in generated.columns if column != "y")
+        for dtype in generated.drop(columns="y").dtypes.unique()
+    } == expected_counts
+
+
+def test_k_grid_uses_each_schema_shape_maximum_and_has_interior_probes(tmp_path):
+    small = cc.shape_from_schema(
+        _write_feature_universe_schema(
+            tmp_path / "small.feature_universe.json",
+            [("continuous", ("float64",))] * 40,
+        )
+    )
+    large = cc.shape_from_schema(
+        _write_feature_universe_schema(
+            tmp_path / "large.feature_universe.json",
+            [("continuous", ("float64",))] * 4000,
+        )
+    )
+    small_grid = cc.k_grid_from_shape(small, base_anchors=(10,), intermediate_points=2)
+    large_grid = cc.k_grid_from_shape(large, base_anchors=(10, 100, 1000), intermediate_points=2)
+
+    assert small_grid[-1] == 40
+    assert large_grid[-1] == 4000
+    assert sum(10 < point < 40 for point in small_grid) == 2
+    assert sum(1000 < point < 4000 for point in large_grid) == 2
+
+
+def test_shape_from_existing_structure_schema_is_self_consistent():
+    schema = next((cc.repo_root() / "SMR" / "schema").glob("*.feature_universe.json"))
+    document = json.loads(schema.read_text(encoding="utf-8"))
+    shape = cc.shape_from_schema(schema)
+
+    assert shape.n_sources == len(document["sources"])
+    assert sum(shape.expanded_dtype_counts.values()) == sum(
+        len(source["features"]) for source in document["sources"]
+    )
+
+
+def test_shape_export_passes_only_its_schema_directory_to_private_data_guard(tmp_path, monkeypatch):
+    schema = _write_feature_universe_schema(
+        tmp_path / "shape.feature_universe.json", [("continuous", ("float64",))]
+    )
+    calls = []
+
+    def _guard(path, *, allowed_roots=()):
+        calls.append((Path(path), tuple(Path(root) for root in allowed_roots)))
+        return Path(path).resolve()
+
+    monkeypatch.setattr(cc, "guard_not_private_data", _guard)
+    cc.shape_from_schema(schema)
+
+    assert calls == [(schema.resolve(), (schema.parent.resolve(),))]
+
+
+def test_cli_requires_explicit_shape_schema():
+    with pytest.raises(SystemExit):
+        cc.parse_args(["--n-train", "20"])
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +705,7 @@ def test_subprocess_model_set_tracks_the_engine():
 def test_measure_one_cell_routes_subprocess_models_through_isolated_runner(
     tmp_path, monkeypatch
 ):
-    params = cc.SyntheticDataParams(n_train=100, n_sources=10, seed=0)
+    params = cc.SyntheticDataParams(n_train=100, shape=_test_shape(10), seed=0)
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
     session = cc.build_session(schema_path, "y", seed=0)
 
@@ -571,7 +759,7 @@ def test_measure_one_cell_routes_subprocess_models_through_isolated_runner(
 
 
 def test_measure_one_cell_discards_native_runner_on_failure(tmp_path, monkeypatch):
-    params = cc.SyntheticDataParams(n_train=60, n_sources=8, seed=0)
+    params = cc.SyntheticDataParams(n_train=60, shape=_test_shape(8), seed=0)
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
     session = cc.build_session(schema_path, "y", seed=0)
 
@@ -593,9 +781,8 @@ def test_measure_one_cell_discards_native_runner_on_failure(tmp_path, monkeypatc
 def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path):
     params = cc.SyntheticDataParams(
         n_train=50,
-        n_sources=6,
+        shape=_test_shape(6, onehot_sources=3),
         seed=3,
-        continuous_fraction=0.5,
         missing_rate_continuous=0.2,
         missing_rate_group=0.15,
     )
@@ -613,7 +800,7 @@ def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path
         thread_env_report={"ok": True, "values": {}},
     )
     synthetic_data = payload["synthetic_data"]
-    assert synthetic_data["continuous_fraction"] == 0.5
+    assert synthetic_data["panel_shape"] == params.shape.as_dict()
     assert synthetic_data["missing_rate_continuous"] == 0.2
     assert synthetic_data["missing_rate_group"] == 0.15
     assert synthetic_data["outcome"] == params.outcome

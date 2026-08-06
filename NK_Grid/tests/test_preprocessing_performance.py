@@ -84,7 +84,16 @@ def test_preprocess_cell_scaling_and_peak_memory_benchmark(tmp_path, record_prop
     assert thread_report["ok"], thread_report
     schema_path, _ = cc.generate_synthetic_bundle(
         tmp_path / "bundle",
-        cc.SyntheticDataParams(n_train=5303, n_sources=8053, seed=0),
+        cc.SyntheticDataParams(
+            n_train=5303,
+            shape=cc.PanelShape(
+                schema_path="<performance-fixture>",
+                sources=tuple(
+                    cc.ShapeSource("continuous", ("float64",)) for _ in range(8053)
+                ),
+            ),
+            seed=0,
+        ),
     )
     measurements = [
         _measure(schema_path, k, mode)
