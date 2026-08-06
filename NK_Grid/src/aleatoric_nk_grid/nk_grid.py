@@ -632,6 +632,44 @@ def _model_best_rounds(model) -> float:
     return np.nan
 
 
+def _model_solver(model) -> str | None:
+    """Find an estimator's fitted solver through common wrapper layers.
+
+    ``solver_`` records the solver actually selected by estimators that accept
+    an automatic choice, so it wins globally over a configured ``solver``.
+    The traversal is deliberately duck-typed and model-agnostic.
+    """
+
+    def find(attribute: str) -> str | None:
+        seen: set[int] = set()
+
+        def visit(estimator) -> str | None:
+            if estimator is None or id(estimator) in seen:
+                return None
+            seen.add(id(estimator))
+            value = getattr(estimator, attribute, None)
+            if value is not None:
+                return str(value)
+            if hasattr(estimator, "steps"):
+                for _, step in estimator.steps:
+                    found = visit(step)
+                    if found is not None:
+                        return found
+            for child_attribute in ("regressor_", "model_", "final_estimator_"):
+                found = visit(getattr(estimator, child_attribute, None))
+                if found is not None:
+                    return found
+            for fitted_estimator in getattr(estimator, "estimators_", ()):
+                found = visit(fitted_estimator)
+                if found is not None:
+                    return found
+            return None
+
+        return visit(model)
+
+    return find("solver_") or find("solver")
+
+
 def _model_seed(seed: int, draw: int, n_samples: int, k_features: int) -> int:
     return int(
         np.random.SeedSequence(
@@ -1330,6 +1368,7 @@ def _fit_predict_model_cell(
         "fit_seconds": time.perf_counter() - fit_started,
         "best_rounds": _model_best_rounds(model),
         "converged": _model_converged(model),
+        "solver": _model_solver(model),
         "peak_rss_bytes": _process_peak_rss_bytes(),
     }
 

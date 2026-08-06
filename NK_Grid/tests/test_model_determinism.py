@@ -16,6 +16,7 @@ from aleatoric_nk_grid.model_registry import (
 from aleatoric_nk_grid.nk_grid import (
     NKGridConfig,
     _fit_predict_model_cell,
+    _model_solver,
     run_nk_grid,
 )
 
@@ -154,6 +155,30 @@ def test_all_registered_models_are_bitwise_deterministic(
             )
 
 
+class _SolverEstimator:
+    def __init__(self, *, solver_=None, solver=None, **children):
+        self.solver_ = solver_
+        self.solver = solver
+        for name, value in children.items():
+            setattr(self, name, value)
+
+
+@pytest.mark.parametrize(
+    ("estimator", "expected"),
+    [
+        (_SolverEstimator(solver_="actual-direct", solver="configured"), "actual-direct"),
+        (_SolverEstimator(steps=[("last", _SolverEstimator(solver_="actual-pipeline"))]), "actual-pipeline"),
+        (_SolverEstimator(regressor_=_SolverEstimator(solver_="actual-regressor")), "actual-regressor"),
+        (_SolverEstimator(solver="configured-only"), "configured-only"),
+        (_SolverEstimator(), None),
+    ],
+)
+def test_model_solver_finds_fitted_or_configured_solver_through_generic_wrappers(
+    estimator, expected
+):
+    assert _model_solver(estimator) == expected
+
+
 def _toy_panel(rows: int = 48) -> pd.DataFrame:
     values = np.arange(rows, dtype=float)
     return pd.DataFrame(
@@ -200,6 +225,7 @@ def test_xgboost_toy_panel_final_csv_is_bitwise_identical_across_five_runs(
 
     reference = outputs[0].read_bytes()
     assert all(path.read_bytes() == reference for path in outputs[1:])
+    assert "solver" not in pd.read_csv(outputs[0], nrows=0).columns
     manifest = json.loads(
         outputs[0].with_suffix(".manifest.json").read_text(encoding="utf-8")
     )

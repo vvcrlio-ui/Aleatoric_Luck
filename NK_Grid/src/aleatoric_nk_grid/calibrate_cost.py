@@ -994,6 +994,21 @@ class RawMeasurement:
     cell_memory_sampling_interval_max_seconds: float | None = MEMORY_SAMPLE_INTERVAL_SECONDS
     memory_scope_suspect: bool = False
     preprocess_vectorized: bool = False
+    converged: bool | None = None
+    best_rounds: float | None = None
+    solver: str | None = None
+
+
+def _finite_or_none(value: Any) -> float | None:
+    """Preserve measured finite numeric telemetry and make absent values JSON-null."""
+
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 @dataclass(frozen=True)
@@ -1214,6 +1229,9 @@ def _measure_one_cell_in_process(
         peak_rss_bytes=0,
         stage="",
         preprocess_vectorized=preprocess_vectorized,
+        converged=(None if result.get("converged") is None else bool(result["converged"])),
+        best_rounds=_finite_or_none(result.get("best_rounds")),
+        solver=(None if result.get("solver") is None else str(result["solver"])),
     )
 
 
@@ -1488,6 +1506,9 @@ def _raw_measurement_from_dict(row: Mapping[str, Any]) -> RawMeasurement:
         ),
         memory_scope_suspect=bool(row.get("memory_scope_suspect", False)),
         preprocess_vectorized=bool(row.get("preprocess_vectorized", False)),
+        converged=(None if row.get("converged") is None else bool(row["converged"])),
+        best_rounds=_finite_or_none(row.get("best_rounds")),
+        solver=(None if row.get("solver") is None else str(row["solver"])),
     )
 
 
@@ -2010,6 +2031,67 @@ def _fit_to_dict(fit: PowerLawFit | None) -> dict[str, Any] | None:
     }
 
 
+def summarize_fit_telemetry(raw_measurements: Sequence[RawMeasurement]) -> dict[str, Any]:
+    """Summarize fitted-state telemetry by model and feature-unit count.
+
+    Raw rows remain the complete audit trail. This compact view makes a
+    K-dependent regime change visible without tying the harness to any model
+    implementation or dataset shape.
+    """
+
+    grouped: dict[tuple[str, int], list[RawMeasurement]] = {}
+    for measurement in raw_measurements:
+        grouped.setdefault((measurement.model, measurement.k), []).append(measurement)
+
+    by_model_k: list[dict[str, Any]] = []
+    for (model, k), measurements in sorted(grouped.items()):
+        converged = [m.converged for m in measurements if m.converged is not None]
+        best_rounds = [m.best_rounds for m in measurements if m.best_rounds is not None]
+        solver_counts: dict[str, int] = {}
+        for solver in (m.solver for m in measurements):
+            if solver is not None:
+                solver_counts[solver] = solver_counts.get(solver, 0) + 1
+        by_model_k.append(
+            {
+                "model": model,
+                "k": k,
+                "n_measurements": len(measurements),
+                "converged": {
+                    "observed": len(converged),
+                    "true": sum(value is True for value in converged),
+                    "false": sum(value is False for value in converged),
+                    "true_fraction": (
+                        None if not converged else sum(value is True for value in converged) / len(converged)
+                    ),
+                },
+                "best_rounds": {
+                    "observed": len(best_rounds),
+                    "values": sorted(best_rounds),
+                    "min": None if not best_rounds else min(best_rounds),
+                    "median": None if not best_rounds else float(np.median(best_rounds)),
+                    "max": None if not best_rounds else max(best_rounds),
+                },
+                "solver": {
+                    "observed": sum(solver_counts.values()),
+                    "counts": dict(sorted(solver_counts.items())),
+                },
+            }
+        )
+
+    has_converged = any(row["converged"]["observed"] for row in by_model_k)
+    has_best_rounds = any(row["best_rounds"]["observed"] for row in by_model_k)
+    has_solver = any(row["solver"]["observed"] for row in by_model_k)
+    return {
+        "status": "collected" if by_model_k else "not_measured",
+        "by_model_k": by_model_k,
+        "fields_with_observations": {
+            "converged": has_converged,
+            "best_rounds": has_best_rounds,
+            "solver": has_solver,
+        },
+    }
+
+
 def _raw_to_dict(measurement: RawMeasurement) -> dict[str, Any]:
     return {
         "model": measurement.model,
@@ -2027,6 +2109,9 @@ def _raw_to_dict(measurement: RawMeasurement) -> dict[str, Any]:
         "cell_memory_sampling_interval_max_seconds": measurement.cell_memory_sampling_interval_max_seconds,
         "memory_scope_suspect": measurement.memory_scope_suspect,
         "preprocess_vectorized": measurement.preprocess_vectorized,
+        "converged": measurement.converged,
+        "best_rounds": measurement.best_rounds,
+        "solver": measurement.solver,
         "stage": measurement.stage,
     }
 
@@ -2120,20 +2205,7 @@ def build_calibration_payload(
             if parallel_efficiency_measurement is None
             else {"status": "measured", **dict(parallel_efficiency_measurement)}
         ),
-        # Fitted estimators are owned inside nk_grid._fit_predict_model_cell
-        # and that production entry point intentionally returns only numeric
-        # results. This harness must not change production model code merely
-        # to inspect lasso.n_iter_ / RidgeCV solver selection, so the absence
-        # is explicit rather than silently omitted.
-        "telemetry": {
-            "status": "unavailable_without_production_entrypoint_change",
-            "requested": ["lasso.n_iter_", "ridge.selected_solver"],
-            "reason": (
-                "fitted estimators are not exposed by the existing numeric-only "
-                "production fit result; calibrate_cost does not modify nk_grid.py "
-                "or model_registry.py"
-            ),
-        },
+        "telemetry": summarize_fit_telemetry(raw_measurements),
         "fit_quality": {
             "r2_threshold": R2_EXPLANATION_THRESHOLD,
             "models_below_r2_threshold": [

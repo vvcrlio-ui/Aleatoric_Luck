@@ -173,6 +173,45 @@ def test_synthetic_observed_missingness_exposes_an_all_integer_zero_missing_pane
     assert observed["missing_cells_fraction"] == 0.0
 
 
+def test_small_calibration_collects_fit_telemetry_from_real_fits(tmp_path):
+    params = cc.SyntheticDataParams(n_train=100, shape=_test_shape(8), seed=11)
+    schema_path, stats = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    session = cc.build_session(schema_path, "y", seed=0)
+    # Test-only reduced settings retain each production estimator path while
+    # making this a small telemetry smoke test rather than a calibration run.
+    session.model_params["xgboost"].update(max_rounds=5, cv_folds=2)
+    session.model_params["shallow_neural_network"].update(
+        hidden_layer_sizes=[3], max_iter=5, n_alphas=2, max_cv_folds=2
+    )
+    measurements = []
+    try:
+        for model_name in ("lasso", "ridge", "xgboost", "shallow_neural_network"):
+            measurement = cc._measure_one_cell_in_process(
+                session, model_name=model_name, n=20, k=4, seed=0, draw=0, max_seconds=60
+            )
+            measurement.stage = "A"
+            measurements.append(measurement)
+    finally:
+        cc.close_session(session)
+
+    payload = cc.build_calibration_payload(
+        synthetic_params=params,
+        synthetic_stats=stats,
+        t0_seconds={}, fit_cost={}, preprocess_cost={}, peak_rss={}, validation=[], censored=[],
+        raw_measurements=measurements, thread_env_report={"ok": True, "values": {}},
+    )
+    telemetry = payload["telemetry"]
+
+    assert telemetry["status"] == "collected"
+    assert telemetry["fields_with_observations"] == {
+        "converged": True, "best_rounds": True, "solver": True
+    }
+    assert all(
+        {"converged", "best_rounds", "solver"}.issubset(row)
+        for row in payload["raw_measurements"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # 3. Censoring path
 # ---------------------------------------------------------------------------
@@ -1024,6 +1063,14 @@ def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path
     assert synthetic_data["outcome"] == params.outcome
     assert synthetic_data["observed_missingness"] == stats["observed_missingness"]
     assert payload["parallel_efficiency"] == {"status": "not_measured"}
-    assert payload["telemetry"]["status"] == "unavailable_without_production_entrypoint_change"
+    assert payload["telemetry"] == {
+        "status": "not_measured",
+        "by_model_k": [],
+        "fields_with_observations": {
+            "converged": False,
+            "best_rounds": False,
+            "solver": False,
+        },
+    }
     assert payload["fit_quality"]["models_below_r2_threshold"] == []
     assert payload["wall_clock_seconds"] == {"status": "not_measured"}
