@@ -81,7 +81,7 @@ def _row(models: tuple[str, ...], *, group: str = "imputed_core", n: int = 10, k
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 5, None])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 6, None])
 def test_only_the_current_calibration_format_is_accepted(tmp_path, version):
     path = _calibration(tmp_path, version=version)
     with pytest.raises(CalibrationUnusable, match="format_version"):

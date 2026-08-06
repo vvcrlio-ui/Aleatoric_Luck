@@ -30,7 +30,11 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from aleatoric_nk_grid_measure_worker import cell_worker_target, task_cell_worker_target
+from aleatoric_nk_grid_measure_worker import (
+    cell_worker_target,
+    parallel_efficiency_cell_worker_target,
+    task_cell_worker_target,
+)
 
 from .experiment import (
     SERIAL_OUTER_MODELS,
@@ -59,9 +63,10 @@ from .validate_input import canonical_feature_universe, validate_input
 # Constants
 # ---------------------------------------------------------------------------
 
-# Version 4 adds the explicit schema-derived panel shape and its derived K
-# grids. Earlier files have neither and must never be interpreted as v4.
-FORMAT_VERSION = 4
+# Version 5 adds measured parallel efficiency, a runtime t0 import
+# measurement/end-to-end consistency check, actual synthetic missingness, and
+# calibration-run reporting. Earlier files must never be interpreted as v5.
+FORMAT_VERSION = 5
 MEMORY_SAMPLE_INTERVAL_SECONDS = 0.01
 MEMORY_METHOD_CGROUP_PEAK = "cgroup_v2_memory_peak"
 MEMORY_METHOD_CGROUP_CURRENT = "cgroup_v2_memory_current_sampled"
@@ -95,20 +100,6 @@ THREAD_ENV_VARS: tuple[str, ...] = (
     "NUMEXPR_NUM_THREADS",
 )
 
-# Human-pre-measured t_import value (see plans/cost-calibration.md sec 2 and
-# the tonight-only scope reduction). Not remeasured by this module.
-T_IMPORT_PREMEASURED: dict[str, Any] = {
-    "median": 1.18,
-    "min": 1.156,
-    "max": 1.234,
-    "n_reps": 5,
-    "bare_interpreter_seconds": 0.019,
-    "source": (
-        "pre-measured by human operator, 2026-07-31, local SSD, "
-        "not remeasured this run"
-    ),
-}
-
 DEFAULT_STAGE_A_N: tuple[int, ...] = (10, 100, 1000)
 DEFAULT_STAGE_A_K_BASE: tuple[int, ...] = (10, 100, 1000)
 DEFAULT_STAGE_A_K_INTERMEDIATE_POINTS = 2
@@ -116,6 +107,8 @@ STAGE_A_REPS = 3
 
 DEFAULT_MAX_SECONDS = 3600.0
 T0_REPS = 5
+PARALLEL_EFFICIENCY_REPS = 3
+R2_EXPLANATION_THRESHOLD = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +334,7 @@ class PanelShape:
     dtype_metadata_declared: int
     dtype_metadata_total: int
     dtype_profile_path: str | None = None
+    dtype_profile_allocation_rule: str = "declared_per_feature"
 
     @property
     def n_sources(self) -> int:
@@ -382,13 +376,14 @@ class PanelShape:
             "dtype_metadata_declared": self.dtype_metadata_declared,
             "dtype_metadata_total": self.dtype_metadata_total,
             "dtype_profile_path": self.dtype_profile_path,
+            "dtype_profile_allocation_rule": self.dtype_profile_allocation_rule,
         }
 
 
 def shape_from_schema(
     schema_path: Path | str,
     *,
-    feature_dtype_profile: Mapping[str, int] | None = None,
+    feature_dtype_profile: Mapping[str, Any] | None = None,
     assume_feature_dtype: str | None = None,
     dtype_profile_path: Path | str | None = None,
 ) -> PanelShape:
@@ -397,9 +392,17 @@ def shape_from_schema(
     Dtype composition is a property of the expanded *data*, not of a structure
     schema, so it can never be inferred from structure alone. It must come from
     either per-feature ``dtype`` metadata declared by the schema, or a read-only
-    dtype probe supplied through ``feature_dtype_profile``. A caller may instead
-    make an explicit uniform assumption with ``assume_feature_dtype``; unlike the
-    old implicit float64 fallback, that choice is recorded in the shape and JSON.
+    dtype probe supplied through ``feature_dtype_profile``. A flat profile maps
+    dtype names to counts and is allocated in dtype-name alphabetical order then
+    schema source/feature order. A structure-aware profile instead maps each
+    unit type (``continuous`` or ``onehot_group``) to such a dtype map, and is
+    allocated in dtype-name alphabetical order within that unit type while
+    preserving schema order inside the unit type. The latter can express a
+    realistic allocation such as float continuous variables plus integer
+    one-hot groups without relying on source ordering. A caller may instead
+    make an explicit uniform assumption with ``assume_feature_dtype``; unlike
+    the old implicit float64 fallback, that choice is recorded in the shape and
+    JSON.
     """
 
     if feature_dtype_profile is not None and assume_feature_dtype is not None:
@@ -431,24 +434,76 @@ def shape_from_schema(
         source_rows.append((unit_type, features))
 
     total_count = sum(len(features) for _, features in source_rows)
-    if feature_dtype_profile is not None:
+    def _expand_profile(counts: Mapping[str, Any], *, context: str) -> list[str]:
         profile: list[str] = []
-        for raw_dtype, raw_count in sorted(feature_dtype_profile.items()):
+        for raw_dtype, raw_count in sorted(counts.items()):
             try:
                 dtype = np.dtype(raw_dtype).name
                 count = int(raw_count)
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"invalid feature dtype profile entry: {raw_dtype!r}: {raw_count!r}") from exc
+                raise ValueError(
+                    f"invalid feature dtype profile entry in {context}: "
+                    f"{raw_dtype!r}: {raw_count!r}"
+                ) from exc
             if count < 0:
                 raise ValueError("feature dtype profile counts must be non-negative")
             profile.extend([dtype] * count)
-        if len(profile) != total_count:
+        return profile
+
+    if feature_dtype_profile is not None:
+        profile_values = list(feature_dtype_profile.values())
+        grouped_profile = bool(profile_values) and all(
+            isinstance(value, Mapping) for value in profile_values
+        )
+        flat_profile = bool(profile_values) and all(
+            not isinstance(value, Mapping) for value in profile_values
+        )
+        if not (grouped_profile or flat_profile):
             raise ValueError(
-                "feature dtype profile count does not match expanded feature count: "
-                f"{len(profile)} != {total_count}"
+                "feature dtype profile must be either a flat dtype-count mapping or "
+                "a unit_type-to-dtype-count mapping; mixed forms are not allowed"
+            )
+        if grouped_profile:
+            allowed_types = {unit_type for unit_type, _ in source_rows}
+            supplied_types = set(feature_dtype_profile)
+            if supplied_types != allowed_types:
+                raise ValueError(
+                    "unit-type dtype profile keys must exactly match schema unit types: "
+                    f"expected {sorted(allowed_types)}, got {sorted(supplied_types)}"
+                )
+            profile_by_unit_type = {
+                str(unit_type): _expand_profile(counts, context=f"unit_type {unit_type!r}")
+                for unit_type, counts in feature_dtype_profile.items()
+            }
+            expected_counts = {
+                unit_type: sum(len(features) for source_type, features in source_rows if source_type == unit_type)
+                for unit_type in allowed_types
+            }
+            for unit_type, profile in profile_by_unit_type.items():
+                if len(profile) != expected_counts[unit_type]:
+                    raise ValueError(
+                        "unit-type feature dtype profile count does not match expanded "
+                        f"feature count for {unit_type!r}: {len(profile)} != "
+                        f"{expected_counts[unit_type]}"
+                    )
+            profile_iterators = {
+                unit_type: iter(profile) for unit_type, profile in profile_by_unit_type.items()
+            }
+            dtype_profile_allocation_rule = (
+                "unit_type_grouped_dtype_name_sorted_then_schema_source_order_within_unit_type"
+            )
+        else:
+            profile = _expand_profile(feature_dtype_profile, context="flat profile")
+            if len(profile) != total_count:
+                raise ValueError(
+                    "feature dtype profile count does not match expanded feature count: "
+                    f"{len(profile)} != {total_count}"
+                )
+            profile_iterators = {"__flat__": iter(profile)}
+            dtype_profile_allocation_rule = (
+                "flat_dtype_name_sorted_then_schema_source_and_feature_order"
             )
         dtype_source = "external_profile"
-        profile_iterator = iter(profile)
     else:
         missing_count = total_count - declared_count
         if missing_count and assume_feature_dtype is None:
@@ -469,15 +524,21 @@ def shape_from_schema(
             dtype_source = f"defaulted_{assumed_dtype}"
         else:
             dtype_source = f"declared_with_assumed_{assumed_dtype}"
-        profile_iterator = None
+        profile_iterators = None
+        dtype_profile_allocation_rule = (
+            "declared_per_feature" if missing_count == 0 else "declared_or_explicit_uniform_assumption_per_feature"
+        )
 
     sources: list[ShapeSource] = []
     for source_index, (unit_type, features) in enumerate(source_rows):
         dtypes: list[str] = []
         for feature in features:
             try:
-                if profile_iterator is not None:
-                    dtype = next(profile_iterator)
+                if profile_iterators is not None:
+                    iterator = profile_iterators.get(unit_type, profile_iterators.get("__flat__"))
+                    if iterator is None:
+                        raise AssertionError("validated dtype profile lacks a required unit type")
+                    dtype = next(iterator)
                 else:
                     dtype = np.dtype(feature.get("dtype", assumed_dtype)).name
             except (TypeError, ValueError) as exc:
@@ -495,6 +556,7 @@ def shape_from_schema(
         dtype_profile_path=(
             str(Path(dtype_profile_path).resolve()) if dtype_profile_path is not None else None
         ),
+        dtype_profile_allocation_rule=dtype_profile_allocation_rule,
     )
 
 
@@ -611,6 +673,10 @@ def generate_synthetic_bundle(
     frame.insert(0, params.outcome, outcome_values)
     manifest = pd.DataFrame(manifest_rows)
     predictors = [column for column in frame.columns if column != params.outcome]
+    predictor_values = frame.loc[:, predictors]
+    missing_mask = predictor_values.isna()
+    columns_with_missing = int(missing_mask.any(axis=0).sum())
+    missing_cells = int(missing_mask.to_numpy().sum())
     groups = source_groups(predictors, manifest)
     definition = canonical_feature_universe(predictors, groups, manifest)
 
@@ -668,6 +734,16 @@ def generate_synthetic_bundle(
         "shape": params.shape.as_dict(),
         "missing_rate_continuous": params.missing_rate_continuous,
         "missing_rate_group": params.missing_rate_group,
+        # These are observed in the generated panel, not a proxy inferred from
+        # configured injection rates. They reveal, for example, a valid but
+        # uninformative all-integer profile that necessarily contains no NaNs.
+        "observed_missingness": {
+            "expanded_columns_with_nan": columns_with_missing,
+            "expanded_columns_with_nan_fraction": columns_with_missing / len(predictors),
+            "missing_cells": missing_cells,
+            "total_predictor_cells": int(predictor_values.size),
+            "missing_cells_fraction": missing_cells / int(predictor_values.size),
+        },
         "outcome": params.outcome,
         "table_format": "parquet",
     }
@@ -689,12 +765,17 @@ def assert_frame_determinism(params: SyntheticDataParams, tmp_a: Path, tmp_b: Pa
 # t0 measurement (fresh-process, component split)
 # ---------------------------------------------------------------------------
 
-_T0_SUBPROCESS_SCRIPT = """
+_T0_IMPORT_SUBPROCESS_SCRIPT = """
+from aleatoric_nk_grid.ingest import load_input
+from aleatoric_nk_grid.nk_grid import draw_orders, split_frame
+from aleatoric_nk_grid.preprocessing import source_groups
+"""
+
+_T0_COMPONENTS_SUBPROCESS_SCRIPT = """
 import json
 import sys
 import time
 
-t_after_import_start = time.perf_counter()
 from aleatoric_nk_grid.ingest import load_input
 from aleatoric_nk_grid.nk_grid import draw_orders, split_frame
 from aleatoric_nk_grid.preprocessing import source_groups
@@ -727,6 +808,30 @@ print(json.dumps({
 """
 
 
+def t0_component_consistency(
+    component_total_seconds: float,
+    end_to_end_seconds: float,
+    *,
+    tolerance: float = 0.10,
+) -> dict[str, Any]:
+    """Describe whether independent startup timing agrees with component sums."""
+
+    if component_total_seconds < 0 or end_to_end_seconds <= 0:
+        raise ValueError("t0 consistency requires non-negative component and positive end-to-end times")
+    if tolerance < 0:
+        raise ValueError("t0 consistency tolerance must be non-negative")
+    difference = abs(component_total_seconds - end_to_end_seconds)
+    relative_difference = difference / end_to_end_seconds
+    return {
+        "component_total_median": component_total_seconds,
+        "end_to_end_median": end_to_end_seconds,
+        "absolute_difference_seconds": difference,
+        "relative_difference": relative_difference,
+        "tolerance": tolerance,
+        "exceeds_tolerance": relative_difference > tolerance,
+    }
+
+
 def measure_t0(
     schema_path: Path,
     outcome: str,
@@ -734,11 +839,15 @@ def measure_t0(
     n_reps: int = T0_REPS,
     python_executable: str | None = None,
     env: Mapping[str, str] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> dict[str, Any]:
-    """Measure t_load/t_split/t_orders across n_reps fresh interpreter starts.
+    """Measure all t0 components and an independent end-to-end startup path.
 
-    t_import is NOT remeasured; the pre-measured value is substituted (see
-    plans/cost-calibration.md's tonight-only scope reduction).
+    Each observation uses a fresh interpreter. ``import`` is an outer
+    wall-clock measurement of interpreter launch plus the engine imports;
+    ``load``, ``split``, and ``orders`` are measured within separate full-path
+    processes. ``end_to_end`` independently times that full path from before
+    interpreter launch through order construction, exposing unaccounted setup.
     """
 
     import os
@@ -753,24 +862,39 @@ def measure_t0(
     t_load: list[float] = []
     t_split: list[float] = []
     t_orders: list[float] = []
+    t_import: list[float] = []
+    t_end_to_end: list[float] = []
     for _ in range(n_reps):
-        result = subprocess.run(
-            [executable, "-c", _T0_SUBPROCESS_SCRIPT, str(schema_path), outcome],
+        import_started = clock()
+        subprocess.run(
+            [executable, "-c", _T0_IMPORT_SUBPROCESS_SCRIPT],
             capture_output=True,
             text=True,
             env=run_env,
             check=True,
         )
+        t_import.append(clock() - import_started)
+
+        end_to_end_started = clock()
+        result = subprocess.run(
+            [executable, "-c", _T0_COMPONENTS_SUBPROCESS_SCRIPT, str(schema_path), outcome],
+            capture_output=True,
+            text=True,
+            env=run_env,
+            check=True,
+        )
+        t_end_to_end.append(clock() - end_to_end_started)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         t_load.append(float(payload["t_load"]))
         t_split.append(float(payload["t_split"]))
         t_orders.append(float(payload["t_orders"]))
 
-    import_summary = dict(T_IMPORT_PREMEASURED)
+    import_summary = summarize_reps(t_import)
+    import_summary["source"] = "measured_in_current_runtime_fresh_interpreter"
     load_summary = summarize_reps(t_load)
     split_summary = summarize_reps(t_split)
     orders_summary = summarize_reps(t_orders)
-    total_median = (
+    component_total_median = (
         import_summary["median"]
         + load_summary["median"]
         + split_summary["median"]
@@ -781,7 +905,11 @@ def measure_t0(
         "load": load_summary,
         "split": split_summary,
         "orders": orders_summary,
-        "total": {"median": total_median, "n_reps": n_reps},
+        "total": {"median": component_total_median, "n_reps": n_reps},
+        "end_to_end": summarize_reps(t_end_to_end),
+        "component_vs_end_to_end": t0_component_consistency(
+            component_total_median, float(np.median(t_end_to_end))
+        ),
     }
 
 
@@ -865,6 +993,7 @@ class RawMeasurement:
     cell_memory_sampling_interval_seconds: float | None = MEMORY_SAMPLE_INTERVAL_SECONDS
     cell_memory_sampling_interval_max_seconds: float | None = MEMORY_SAMPLE_INTERVAL_SECONDS
     memory_scope_suspect: bool = False
+    preprocess_vectorized: bool = False
 
 
 @dataclass(frozen=True)
@@ -1031,6 +1160,9 @@ def _measure_one_cell_in_process(
             X_sub_raw, X_test_raw, selected_groups, session.imputation, model_name=model_name
         )
         preprocess_seconds = time.perf_counter() - preprocess_started
+        preprocess_vectorized = bool(
+            prepared.X_train.attrs.get("_preprocess_vectorized", False)
+        )
 
         params = session.model_params[model_name]
         fit_arguments = {
@@ -1081,6 +1213,7 @@ def _measure_one_cell_in_process(
         # sampler fills the real cell peak after this private call returns.
         peak_rss_bytes=0,
         stage="",
+        preprocess_vectorized=preprocess_vectorized,
     )
 
 
@@ -1354,6 +1487,7 @@ def _raw_measurement_from_dict(row: Mapping[str, Any]) -> RawMeasurement:
             "cell_memory_sampling_interval_max_seconds"
         ),
         memory_scope_suspect=bool(row.get("memory_scope_suspect", False)),
+        preprocess_vectorized=bool(row.get("preprocess_vectorized", False)),
     )
 
 
@@ -1533,6 +1667,116 @@ def measure_task_cgroup_peak_n_jobs_8(
         ],
         sample_interval_seconds=sample_interval_seconds,
     )
+
+
+# ---------------------------------------------------------------------------
+# Parallel-efficiency measurement (independent from memory probes)
+# ---------------------------------------------------------------------------
+
+
+def parallel_efficiency(
+    t1_seconds: float, t8_seconds: float, *, n_jobs: int = 8
+) -> float:
+    """Return eta = T1 / (n_jobs * Tn), with no machine-dependent defaults."""
+
+    if n_jobs < 2:
+        raise ValueError("parallel efficiency requires at least two jobs")
+    if t1_seconds <= 0 or t8_seconds <= 0:
+        raise ValueError("parallel efficiency requires positive wall-clock measurements")
+    return float(t1_seconds / (n_jobs * t8_seconds))
+
+
+def _parallel_efficiency_worker_args(
+    session: CalibrationSession, requests: Sequence[CellMeasurementRequest]
+) -> list[tuple[Any, ...]]:
+    if len(requests) != 8:
+        raise ValueError("parallel efficiency requires exactly eight fixed cell workloads")
+    return [
+        (
+            str(session.schema_path),
+            session.outcome,
+            request.model_name,
+            request.n,
+            request.k,
+            request.seed,
+            request.draw,
+            request.max_seconds,
+        )
+        for request in requests
+    ]
+
+
+def _run_parallel_efficiency_cells(
+    worker_args: Sequence[tuple[Any, ...]], *, n_jobs: int
+) -> None:
+    """Run fixed cell workloads via spawn without cgroups or memory sampling."""
+
+    if n_jobs < 1:
+        raise ValueError("n_jobs must be positive")
+    context = mp.get_context("spawn")
+    pending = iter(worker_args)
+    while True:
+        batch = list()
+        for _ in range(n_jobs):
+            try:
+                args = next(pending)
+            except StopIteration:
+                break
+            process = context.Process(target=parallel_efficiency_cell_worker_target, args=args)
+            process.start()
+            batch.append(process)
+        if not batch:
+            return
+        for process in batch:
+            process.join()
+            if process.exitcode != 0:
+                raise RuntimeError(
+                    "parallel-efficiency spawn worker failed "
+                    f"(pid={process.pid}, exitcode={process.exitcode})"
+                )
+
+
+def measure_parallel_efficiency(
+    session: CalibrationSession,
+    requests: Sequence[CellMeasurementRequest],
+    *,
+    n_reps: int = PARALLEL_EFFICIENCY_REPS,
+    clock: Callable[[], float] = time.perf_counter,
+) -> dict[str, Any]:
+    """Measure serial and n_jobs=8 wall clocks for the same fixed eight cells.
+
+    This deliberately shares neither a cgroup nor a memory sampler with the
+    item-1 task-memory probe.  It exists solely to estimate the time-model
+    denominator used by Stage B's multi-CPU split decision.
+    """
+
+    if n_reps < 1:
+        raise ValueError("parallel efficiency n_reps must be positive")
+    worker_args = _parallel_efficiency_worker_args(session, requests)
+    t1_values: list[float] = []
+    t8_values: list[float] = []
+    for _ in range(n_reps):
+        started = clock()
+        _run_parallel_efficiency_cells(worker_args, n_jobs=1)
+        t1_values.append(clock() - started)
+        started = clock()
+        _run_parallel_efficiency_cells(worker_args, n_jobs=8)
+        t8_values.append(clock() - started)
+    t1_summary = summarize_reps(t1_values)
+    t8_summary = summarize_reps(t8_values)
+    return {
+        "worker_start_method": "spawn",
+        "n_jobs": 8,
+        "n_reps": n_reps,
+        "cell_workloads": [
+            {"model": request.model_name, "n": request.n, "k": request.k,
+             "seed": request.seed, "draw": request.draw}
+            for request in requests
+        ],
+        "t1_seconds": t1_summary,
+        "t8_seconds": t8_summary,
+        "eta": parallel_efficiency(t1_summary["median"], t8_summary["median"]),
+    }
 
 
 def run_stage_a(
@@ -1782,6 +2026,7 @@ def _raw_to_dict(measurement: RawMeasurement) -> dict[str, Any]:
         "cell_memory_sampling_interval_seconds": measurement.cell_memory_sampling_interval_seconds,
         "cell_memory_sampling_interval_max_seconds": measurement.cell_memory_sampling_interval_max_seconds,
         "memory_scope_suspect": measurement.memory_scope_suspect,
+        "preprocess_vectorized": measurement.preprocess_vectorized,
         "stage": measurement.stage,
     }
 
@@ -1810,6 +2055,8 @@ def build_calibration_payload(
     scope_reduction: Mapping[str, Any] | None = None,
     task_cgroup_peak_n_jobs_8: MemoryPeak | None = None,
     stage_a_k_grid: Sequence[int] | None = None,
+    parallel_efficiency_measurement: Mapping[str, Any] | None = None,
+    wall_clock_seconds: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     environment = core_environment()
     environment["platform"] = _platform_string()
@@ -1836,14 +2083,6 @@ def build_calibration_payload(
             "missing_rate_continuous": synthetic_params.missing_rate_continuous,
             "missing_rate_group": synthetic_params.missing_rate_group,
             "outcome": synthetic_params.outcome,
-            # The two missing-rate fields above have no empirical basis (real
-            # missingness lives only in private observation data (example,
-            # never a dataset-name guard criterion); these are placeholders, not
-            # measured. Their effect on *timing* is second-order (imputer
-            # cost is dominated by data scale, and lightgbm/xgboost handle
-            # NaN natively without imputation), so this flag documents the
-            # assumption rather than blocking on finding a real value.
-            "missing_rates_are_unverified_placeholders": True,
             **synthetic_stats,
         },
         "t0_seconds": t0_seconds,
@@ -1876,6 +2115,38 @@ def build_calibration_payload(
                 }
             ),
         },
+        "parallel_efficiency": (
+            {"status": "not_measured"}
+            if parallel_efficiency_measurement is None
+            else {"status": "measured", **dict(parallel_efficiency_measurement)}
+        ),
+        # Fitted estimators are owned inside nk_grid._fit_predict_model_cell
+        # and that production entry point intentionally returns only numeric
+        # results. This harness must not change production model code merely
+        # to inspect lasso.n_iter_ / RidgeCV solver selection, so the absence
+        # is explicit rather than silently omitted.
+        "telemetry": {
+            "status": "unavailable_without_production_entrypoint_change",
+            "requested": ["lasso.n_iter_", "ridge.selected_solver"],
+            "reason": (
+                "fitted estimators are not exposed by the existing numeric-only "
+                "production fit result; calibrate_cost does not modify nk_grid.py "
+                "or model_registry.py"
+            ),
+        },
+        "fit_quality": {
+            "r2_threshold": R2_EXPLANATION_THRESHOLD,
+            "models_below_r2_threshold": [
+                {"model": name, "r2": fit.r2}
+                for name, fit in sorted(fit_cost.items())
+                if fit is not None and fit.r2 < R2_EXPLANATION_THRESHOLD
+            ],
+        },
+        "wall_clock_seconds": (
+            {"status": "not_measured"}
+            if wall_clock_seconds is None
+            else {"status": "measured", **dict(wall_clock_seconds)}
+        ),
         "validation": list(validation),
         "censored": list(censored),
         "raw_measurements": [_raw_to_dict(m) for m in raw_measurements],
@@ -1910,7 +2181,10 @@ def read_calibration_file(path: Path) -> dict[str, Any]:
             f"unsupported calibration format_version={payload.get('format_version')!r}; "
             f"expected {FORMAT_VERSION}. Earlier peak_rss_bytes formats are invalid."
         )
-    required = {"memory_measurement", "raw_measurements", "peak_rss_bytes", "synthetic_data"}
+    required = {
+        "memory_measurement", "raw_measurements", "peak_rss_bytes", "synthetic_data",
+        "parallel_efficiency", "telemetry", "fit_quality", "wall_clock_seconds",
+    }
     missing = required.difference(payload)
     if missing:
         raise ValueError(f"calibration file is missing required fields: {sorted(missing)}")
@@ -1918,6 +2192,12 @@ def read_calibration_file(path: Path) -> dict[str, Any]:
     missing_shape = shape_fields.difference(payload["synthetic_data"])
     if missing_shape:
         raise ValueError(f"calibration file is missing schema-derived shape fields: {sorted(missing_shape)}")
+    missing_missingness = {"observed_missingness"}.difference(payload["synthetic_data"])
+    if missing_missingness:
+        raise ValueError(
+            "calibration file is missing observed synthetic missingness fields: "
+            f"{sorted(missing_missingness)}"
+        )
     return payload
 
 
@@ -1997,6 +2277,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "task_cgroup_peak_n_jobs_8; omit only when no task composition is known."
         ),
     )
+    parser.add_argument(
+        "--parallel-efficiency-cells",
+        type=str,
+        default=None,
+        help=(
+            "Exactly eight fixed model:N:K cell workloads used for both the serial "
+            "and n_jobs=8 spawn-only eta measurement; independent from --task-memory-cells."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-efficiency-reps",
+        type=int,
+        default=PARALLEL_EFFICIENCY_REPS,
+        help="Repeated serial/concurrent wall-clock pairs for eta.",
+    )
     return parser.parse_args(argv)
 
 
@@ -2044,8 +2339,12 @@ def read_feature_dtype_profile(path: Path | str) -> dict[str, int]:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    calibration_started = time.perf_counter()
     args = parse_args(argv)
+    if args.parallel_efficiency_cells is None:
+        raise ValueError("--parallel-efficiency-cells is required for format-v5 calibration")
     thread_report = enforce_thread_env(strict=not args.allow_nonproduction_threads)
+    phase_seconds: dict[str, float] = {}
 
     work_dir = args.work_dir or (repo_root() / "NK_Grid" / "calibration" / "_scratch")
     out_dir = args.out_dir or (repo_root() / "NK_Grid" / "calibration")
@@ -2075,6 +2374,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     bundle_root = work_dir / "full"
     schema_path, stats = generate_synthetic_bundle(bundle_root, params)
     generation_seconds = time.perf_counter() - generation_start
+    phase_seconds["synthetic_generation"] = generation_seconds
     peak_rss_after = _process_peak_rss_bytes()
 
     scope_reduction: dict[str, Any] = {
@@ -2094,7 +2394,19 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     session = build_session(schema_path, params.outcome, seed=args.seed)
     try:
+        phase_started = time.perf_counter()
         t0 = measure_t0(schema_path, params.outcome)
+        phase_seconds["t0"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
+        eta_measurement = measure_parallel_efficiency(
+            session,
+            parse_task_memory_cells(
+                args.parallel_efficiency_cells, max_seconds=args.max_seconds
+            ),
+            n_reps=args.parallel_efficiency_reps,
+        )
+        phase_seconds["parallel_efficiency"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         task_peak = (
             None
             if args.task_memory_cells is None
@@ -2105,10 +2417,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
             )
         )
+        phase_seconds["task_memory"] = time.perf_counter() - phase_started
 
         def _progress(message: str) -> None:
             print(message, file=sys.stderr)
 
+        phase_started = time.perf_counter()
         raw_a, censored_a = run_stage_a(
             session,
             n_grid=stage_a_n,
@@ -2116,6 +2430,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_seconds=args.max_seconds,
             progress=_progress,
         )
+        phase_seconds["stage_a"] = time.perf_counter() - phase_started
 
         if args.stage_b_points:
             points_to_measure = tuple(
@@ -2131,16 +2446,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         not_measured = tuple(p for p in validation_points if p not in points_to_measure)
 
+        phase_started = time.perf_counter()
         raw_b, censored_b = run_stage_b(
             session, points=points_to_measure, max_seconds=args.max_seconds, progress=_progress
         )
+        phase_seconds["stage_b"] = time.perf_counter() - phase_started
 
+        phase_started = time.perf_counter()
         fit_cost = fit_all_models(raw_a)
         preprocess_cost = fit_preprocess_by_mode(raw_a)
         peak_rss_fits = fit_peak_rss(raw_a)
         validation = build_validation_rows(
             raw_b, censored_b, fit_cost, validation_points, MODELS, not_measured_points=not_measured
         )
+        phase_seconds["fit_and_validation"] = time.perf_counter() - phase_started
+
+        wall_clock_seconds = {
+            "phases": phase_seconds,
+            "total": time.perf_counter() - calibration_started,
+        }
 
         payload = build_calibration_payload(
             synthetic_params=params,
@@ -2156,6 +2480,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             scope_reduction=scope_reduction,
             task_cgroup_peak_n_jobs_8=task_peak,
             stage_a_k_grid=stage_a_k,
+            parallel_efficiency_measurement=eta_measurement,
+            wall_clock_seconds=wall_clock_seconds,
         )
     finally:
         close_session(session)

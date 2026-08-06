@@ -4,6 +4,7 @@ import json
 import multiprocessing as mp
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -112,6 +113,64 @@ def test_synthetic_bundle_generation_differs_across_seeds(tmp_path):
     frame_a = pd.read_parquet(tmp_path / "a" / "train.parquet")
     frame_b = pd.read_parquet(tmp_path / "b" / "train.parquet")
     assert not frame_a.equals(frame_b)
+
+
+def test_t0_component_consistency_flags_more_than_ten_percent_gap():
+    consistent = cc.t0_component_consistency(10.0, 10.9)
+    inconsistent = cc.t0_component_consistency(10.0, 12.0)
+
+    assert consistent["exceeds_tolerance"] is False
+    assert inconsistent["exceeds_tolerance"] is True
+    assert inconsistent["relative_difference"] == pytest.approx(2.0 / 12.0)
+
+
+def test_payload_lists_every_fit_below_the_r2_explanation_threshold():
+    low = cc.PowerLawFit(0.0, 1.0, 1.0, 0.79, (0.0, 0.0), 3)
+    acceptable = cc.PowerLawFit(0.0, 1.0, 1.0, 0.80, (0.0, 0.0), 3)
+    payload = cc.build_calibration_payload(
+        synthetic_params=cc.SyntheticDataParams(n_train=10, shape=_test_shape(4), seed=0),
+        synthetic_stats={"n_expanded_predictors": 8, "observed_missingness": {}},
+        t0_seconds={}, fit_cost={"ridge": low, "ols": acceptable}, preprocess_cost={},
+        peak_rss={}, validation=[], censored=[], raw_measurements=[],
+        thread_env_report={"ok": True, "values": {}},
+    )
+
+    assert payload["fit_quality"]["models_below_r2_threshold"] == [
+        {"model": "ridge", "r2": 0.79}
+    ]
+
+
+def test_parallel_efficiency_measurement_uses_injected_clock_without_real_workers(monkeypatch):
+    session = SimpleNamespace(schema_path=Path("synthetic-schema.json"), outcome="y")
+    requests = tuple(cc.CellMeasurementRequest("ols", 10, 5) for _ in range(8))
+    observed_jobs: list[int] = []
+    clock_values = iter((0.0, 16.0, 20.0, 24.0))
+
+    def _fake_run(worker_args, *, n_jobs):
+        assert len(worker_args) == 8
+        observed_jobs.append(n_jobs)
+
+    monkeypatch.setattr(cc, "_run_parallel_efficiency_cells", _fake_run)
+    measurement = cc.measure_parallel_efficiency(
+        session, requests, n_reps=1, clock=lambda: next(clock_values)
+    )
+
+    assert observed_jobs == [1, 8]
+    assert measurement["t1_seconds"]["median"] == 16.0
+    assert measurement["t8_seconds"]["median"] == 4.0
+    assert measurement["eta"] == pytest.approx(0.5)
+    assert measurement["worker_start_method"] == "spawn"
+
+
+def test_synthetic_observed_missingness_exposes_an_all_integer_zero_missing_panel(tmp_path):
+    shape = _test_shape(8, onehot_sources=4, onehot_dtype="int64", continuous_dtype="int64")
+    _, stats = cc.generate_synthetic_bundle(
+        tmp_path / "integer-panel", cc.SyntheticDataParams(n_train=30, shape=shape, seed=4)
+    )
+
+    observed = stats["observed_missingness"]
+    assert observed["expanded_columns_with_nan_fraction"] == 0.0
+    assert observed["missing_cells_fraction"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +282,18 @@ def test_calibration_file_round_trip_recomputes_fit_cost(tmp_path):
 
     fit_cost = cc.fit_all_models(raw, models=("ols", "ridge"))
     raw[0].memory_scope_suspect = True
+    raw[0].preprocess_vectorized = True
     payload = cc.build_calibration_payload(
         synthetic_params=cc.SyntheticDataParams(n_train=10, shape=_test_shape(10), seed=0),
-        synthetic_stats={"n_expanded_predictors": 10},
+        synthetic_stats={
+            "n_expanded_predictors": 10,
+            "observed_missingness": {
+                "expanded_columns_with_nan_fraction": 0.0,
+                "missing_cells_fraction": 0.0,
+            },
+        },
         t0_seconds={
-            "import": cc.T_IMPORT_PREMEASURED,
+            "import": {"median": 1.18, "min": 1.156, "max": 1.234, "n_reps": 5},
             "load": {"median": 0.1, "min": 0.09, "max": 0.11, "n_reps": 5},
             "split": {"median": 0.01, "min": 0.009, "max": 0.011, "n_reps": 5},
             "orders": {"median": 0.001, "min": 0.0009, "max": 0.0011, "n_reps": 5},
@@ -269,9 +335,10 @@ def test_calibration_file_round_trip_recomputes_fit_cost(tmp_path):
         "raw_measurements",
     }
     assert required_top_level.issubset(reloaded.keys())
-    assert reloaded["t0_seconds"]["import"]["source"].startswith("pre-measured")
+    assert reloaded["t0_seconds"]["import"]["median"] == 1.18
     assert reloaded["memory_measurement"]["cell_memory_scope_suspect_count"] == 1
     assert reloaded["raw_measurements"][0]["memory_scope_suspect"] is True
+    assert reloaded["raw_measurements"][0]["preprocess_vectorized"] is True
     task_peak = reloaded["memory_measurement"]["task_cgroup_peak_n_jobs_8"]
     assert task_peak == {
         "status": "measured",
@@ -436,11 +503,11 @@ def test_task_memory_cli_requires_an_explicit_eight_cell_task_shape():
         cc.parse_task_memory_cells("ols:10:5", max_seconds=12.5)
 
 
-@pytest.mark.parametrize("old_version", (1, 2, 3))
+@pytest.mark.parametrize("old_version", (1, 2, 3, 4))
 def test_calibration_reader_rejects_old_calibration_formats(tmp_path, old_version):
     old_path = tmp_path / f"old-v{old_version}.json"
     old_path.write_text(json.dumps({"format_version": old_version}), encoding="utf-8")
-    with pytest.raises(ValueError, match="Earlier peak_rss_bytes formats are invalid"):
+    with pytest.raises(ValueError, match="expected 5"):
         cc.read_calibration_file(old_path)
 
 
@@ -674,6 +741,43 @@ def test_external_dtype_profile_drives_generated_panel_and_is_recorded(tmp_path)
     assert description["dtype_source"] == "external_profile"
     assert description["dtype_metadata_coverage"] == "0/5"
     assert description["dtype_profile_path"] == str(profile_path.resolve())
+
+
+@pytest.mark.parametrize(
+    ("source_specs", "profile", "expected_dtypes"),
+    [
+        (
+            [("onehot_group", (None, None, None)), ("continuous", (None,)), ("continuous", (None,))],
+            {"continuous": {"float64": 2}, "onehot_group": {"int64": 3}},
+            [("int64", "int64", "int64"), ("float64",), ("float64",)],
+        ),
+        (
+            [("continuous", (None,)), ("onehot_group", (None, None)), ("onehot_group", (None, None))],
+            {"continuous": {"float32": 1}, "onehot_group": {"int16": 4}},
+            [("float32",), ("int16", "int16"), ("int16", "int16")],
+        ),
+    ],
+)
+def test_unit_type_grouped_dtype_profile_is_schema_order_independent(
+    tmp_path, source_specs, profile, expected_dtypes
+):
+    schema = _write_feature_universe_schema(tmp_path / "grouped.json", source_specs)
+    shape = cc.shape_from_schema(schema, feature_dtype_profile=profile)
+
+    assert [source.feature_dtypes for source in shape.sources] == expected_dtypes
+    assert shape.dtype_profile_allocation_rule == (
+        "unit_type_grouped_dtype_name_sorted_then_schema_source_order_within_unit_type"
+    )
+
+
+def test_unit_type_dtype_profile_requires_complete_structure_coverage(tmp_path):
+    schema = _write_feature_universe_schema(
+        tmp_path / "incomplete-grouped.json",
+        [("continuous", (None,)), ("onehot_group", (None, None))],
+    )
+
+    with pytest.raises(ValueError, match="exactly match schema unit types"):
+        cc.shape_from_schema(schema, feature_dtype_profile={"continuous": {"float64": 1}})
 
 
 def test_json_distinguishes_declared_defaulted_and_partial_dtype_sources(tmp_path):
@@ -918,4 +1022,8 @@ def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path
     assert synthetic_data["missing_rate_continuous"] == 0.2
     assert synthetic_data["missing_rate_group"] == 0.15
     assert synthetic_data["outcome"] == params.outcome
-    assert synthetic_data["missing_rates_are_unverified_placeholders"] is True
+    assert synthetic_data["observed_missingness"] == stats["observed_missingness"]
+    assert payload["parallel_efficiency"] == {"status": "not_measured"}
+    assert payload["telemetry"]["status"] == "unavailable_without_production_entrypoint_change"
+    assert payload["fit_quality"]["models_below_r2_threshold"] == []
+    assert payload["wall_clock_seconds"] == {"status": "not_measured"}

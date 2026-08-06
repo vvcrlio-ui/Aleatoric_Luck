@@ -22,10 +22,10 @@ from typing import Iterable, Mapping
 from .flat_task_table import CostFunction, TaskRow, preprocess_mode_for_group
 
 
-#: Only this calibration format is understood.  Older files carried a
-#: process-lifetime RSS high-water mark and unvalidated dtype assumptions; they
-#: must be rejected rather than reinterpreted.
-CALIBRATION_FORMAT_VERSION = 4
+#: Only this calibration format is understood. Older files lack either the
+#: isolated memory scopes, schema-derived shape, or v5 measured timing fields;
+#: they must be rejected rather than reinterpreted.
+CALIBRATION_FORMAT_VERSION = 5
 
 #: A power-law fit is only usable for packing inside this predicted/actual band.
 #: Matches ``cost-calibration`` acceptance criterion 4.
@@ -128,8 +128,8 @@ class CalibratedCostModel:
         if version != CALIBRATION_FORMAT_VERSION:
             raise CalibrationUnusable(
                 f"calibration format_version={version!r} is not supported; "
-                f"Stage B requires {CALIBRATION_FORMAT_VERSION}. Earlier formats carried "
-                "process-lifetime RSS and implicit dtype assumptions and must be re-measured."
+                f"Stage B requires {CALIBRATION_FORMAT_VERSION}. Earlier formats lack "
+                "required measured calibration fields and must be re-measured."
             )
 
         fit_cost = _fits(payload.get("fit_cost") or {}, what="fit_cost")

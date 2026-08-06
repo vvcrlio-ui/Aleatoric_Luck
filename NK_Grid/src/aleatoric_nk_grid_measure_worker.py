@@ -96,3 +96,22 @@ def task_cell_worker_target(
     _run_task_cell_after_join(
         schema_path, outcome, model_name, n, k, seed, draw, max_seconds
     )
+
+
+def parallel_efficiency_cell_worker_target(
+    schema_path: str,
+    outcome: str,
+    model_name: str,
+    n: int,
+    k: int,
+    seed: int,
+    draw: int,
+    max_seconds: float,
+) -> None:
+    """Spawn-only worker for timing efficiency; intentionally no cgroup probe."""
+
+    from aleatoric_nk_grid.calibrate_cost import _run_task_cell_after_join
+
+    _run_task_cell_after_join(
+        schema_path, outcome, model_name, n, k, seed, draw, max_seconds
+    )
