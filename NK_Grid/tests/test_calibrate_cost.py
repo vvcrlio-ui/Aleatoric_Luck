@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,14 @@ import pandas as pd
 import pytest
 
 from aleatoric_nk_grid import calibrate_cost as cc
+
+
+def _allocate_bytes_for_peak(byte_count: int, seconds: float = 0.15) -> None:
+    """Module-level so multiprocessing ``spawn`` can import it in a child."""
+
+    payload = bytearray(byte_count)
+    payload[::4096] = b"\x01" * len(payload[::4096])
+    time.sleep(seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +108,11 @@ def test_measure_one_cell_records_censoring_and_excludes_from_regression(
 
     monkeypatch.setattr(cc, "_fit_predict_model_cell", _always_times_out)
 
+    # The public entry point is a fresh spawn process.  Exercise the budget
+    # implementation directly here; monkeypatches do not cross a spawn
+    # boundary (which is exactly the isolation the calibration needs).
     with pytest.raises(cc.MeasurementCensored):
-        cc.measure_one_cell(
+        cc._measure_one_cell_in_process(
             session,
             model_name="ols",
             n=10,
@@ -110,6 +122,10 @@ def test_measure_one_cell_records_censoring_and_excludes_from_regression(
             max_seconds=0.05,
         )
 
+    monkeypatch.setattr(
+        cc, "measure_one_cell",
+        lambda *args, **kwargs: (_ for _ in ()).throw(cc.MeasurementCensored("test")),
+    )
     raw, censored = cc.run_stage_a(
         session,
         n_grid=(10,),
@@ -197,12 +213,18 @@ def test_calibration_file_round_trip_recomputes_fit_cost(tmp_path):
         censored=[],
         raw_measurements=raw,
         thread_env_report={"ok": True, "values": {name: "1" for name in cc.THREAD_ENV_VARS}},
+        task_cgroup_peak_n_jobs_8=cc.MemoryPeak(
+            bytes=987_654_321,
+            method=cc.MEMORY_METHOD_CGROUP_PEAK,
+            sampling_interval_seconds=None,
+        ),
     )
 
     out_path = cc.write_calibration_file(payload, tmp_path, date="2026-07-31")
     assert out_path.name == "cost_model_2026-07-31.json"
 
-    reloaded = json.loads(out_path.read_text(encoding="utf-8"))
+    reloaded = cc.read_calibration_file(out_path)
+    assert reloaded["format_version"] == cc.FORMAT_VERSION
 
     required_top_level = {
         "format_version",
@@ -214,12 +236,20 @@ def test_calibration_file_round_trip_recomputes_fit_cost(tmp_path):
         "fit_cost",
         "preprocess_cost",
         "peak_rss_bytes",
+        "memory_measurement",
         "validation",
         "censored",
         "raw_measurements",
     }
     assert required_top_level.issubset(reloaded.keys())
     assert reloaded["t0_seconds"]["import"]["source"].startswith("pre-measured")
+    task_peak = reloaded["memory_measurement"]["task_cgroup_peak_n_jobs_8"]
+    assert task_peak == {
+        "status": "measured",
+        "bytes": 987_654_321,
+        "method": cc.MEMORY_METHOD_CGROUP_PEAK,
+        "sampling_interval_seconds": None,
+    }
 
     recomputed = cc.recompute_fit_cost_from_raw(
         reloaded["raw_measurements"], models=("ols", "ridge")
@@ -233,6 +263,99 @@ def test_calibration_file_round_trip_recomputes_fit_cost(tmp_path):
         assert abs(fit.log_c - reloaded["fit_cost"][model_name]["log_c"]) < 1e-9
         assert abs(fit.a - reloaded["fit_cost"][model_name]["a"]) < 1e-9
         assert abs(fit.b - reloaded["fit_cost"][model_name]["b"]) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# 4A. Round-2 memory measurement: independent spawn RSS plus cgroup fallbacks
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_spawn_process_peak_does_not_inherit_parent_high_water():
+    # This reproduces the rejected shape in reverse: the parent runs both
+    # calls, but each reported high-water mark belongs only to its own spawn
+    # child.  The small second workload must not report the first workload's
+    # allocation as would RUSAGE_SELF in a reused harness process.
+    large = cc.measure_process_peak_rss(_allocate_bytes_for_peak, 48 * 1024 * 1024)
+    small = cc.measure_process_peak_rss(_allocate_bytes_for_peak, 1 * 1024 * 1024)
+    assert large > 0
+    assert small > 0
+    assert small < large * 0.85
+
+
+def test_cell_measurement_records_distinct_spawn_and_whole_tree_numbers(tmp_path, monkeypatch):
+    params = cc.SyntheticDataParams(n_train=80, n_sources=8, seed=0)
+    schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    session = cc.build_session(schema_path, "y", seed=0)
+    # The desktop sandbox intentionally denies ``ps``.  Mock the platform
+    # primitive so this test covers the collection *scope* without depending
+    # on a cgroup-enabled Linux host or sandbox process inspection rights.
+    monkeypatch.setattr(cc, "_process_tree_rss_bytes", lambda pid: 321_000_000)
+    measurement = cc.measure_one_cell(
+        session, model_name="ols", n=10, k=5, seed=0, draw=0, max_seconds=60
+    )
+    assert measurement.process_peak_rss_bytes > 0
+    assert measurement.cell_cgroup_peak_bytes > 0
+    assert measurement.peak_rss_bytes == measurement.cell_cgroup_peak_bytes
+    assert measurement.cell_memory_method in {
+        cc.MEMORY_METHOD_CGROUP_PEAK,
+        cc.MEMORY_METHOD_CGROUP_CURRENT,
+        cc.MEMORY_METHOD_PROCESS_TREE,
+    }
+    if measurement.cell_memory_method == cc.MEMORY_METHOD_CGROUP_PEAK:
+        assert measurement.cell_memory_sampling_interval_seconds is None
+    else:
+        assert measurement.cell_memory_sampling_interval_seconds == cc.MEMORY_SAMPLE_INTERVAL_SECONDS
+
+
+def test_macos_fallback_is_explicit_tree_rss_with_sampling_interval(tmp_path, monkeypatch):
+    params = cc.SyntheticDataParams(n_train=80, n_sources=8, seed=1)
+    schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    session = cc.build_session(schema_path, "y", seed=0)
+    # This is the normal macOS state, forced so the assertion is portable on
+    # Linux CI as well: no cgroup may be claimed when one is unavailable.
+    monkeypatch.setattr(cc, "_create_measurement_cgroup", lambda pid: None)
+    monkeypatch.setattr(cc, "_process_tree_rss_bytes", lambda pid: 123_000_000)
+    measurement = cc.measure_one_cell(
+        session, model_name="ols", n=10, k=5, seed=0, draw=0, max_seconds=60
+    )
+    assert measurement.cell_memory_method == cc.MEMORY_METHOD_PROCESS_TREE
+    assert measurement.cell_memory_sampling_interval_seconds == cc.MEMORY_SAMPLE_INTERVAL_SECONDS
+    assert measurement.cell_cgroup_peak_bytes > 0
+
+
+def test_task_peak_uses_eight_spawn_workers_and_returns_its_own_scope(monkeypatch):
+    monkeypatch.setattr(cc, "_create_measurement_cgroup", lambda pid: None)
+    monkeypatch.setattr(cc, "_process_tree_rss_bytes", lambda pid: 2_000_000)
+    peak = cc._measure_task_peak_n_jobs_8(
+        _allocate_bytes_for_peak,
+        [(2 * 1024 * 1024, 0.2)] * 8,
+    )
+    assert peak.bytes > 0
+    assert peak.method in {
+        cc.MEMORY_METHOD_CGROUP_PEAK,
+        cc.MEMORY_METHOD_CGROUP_CURRENT,
+        cc.MEMORY_METHOD_PROCESS_TREE,
+    }
+    if peak.method == cc.MEMORY_METHOD_CGROUP_PEAK:
+        assert peak.sampling_interval_seconds is None
+    else:
+        assert peak.sampling_interval_seconds == cc.MEMORY_SAMPLE_INTERVAL_SECONDS
+
+
+def test_task_memory_cli_requires_an_explicit_eight_cell_task_shape():
+    specs = ",".join(["ols:10:5"] * 8)
+    requests = cc.parse_task_memory_cells(specs, max_seconds=12.5)
+    assert len(requests) == 8
+    assert requests[0] == cc.CellMeasurementRequest("ols", 10, 5, max_seconds=12.5)
+    with pytest.raises(ValueError, match="exactly eight"):
+        cc.parse_task_memory_cells("ols:10:5", max_seconds=12.5)
+
+
+def test_calibration_reader_rejects_invalid_v1_peak_rss_file(tmp_path):
+    old_path = tmp_path / "old.json"
+    old_path.write_text(json.dumps({"format_version": 1}), encoding="utf-8")
+    with pytest.raises(ValueError, match="Version 1 peak_rss_bytes is invalid"):
+        cc.read_calibration_file(old_path)
 
 
 # ---------------------------------------------------------------------------
@@ -364,19 +487,19 @@ def test_measure_one_cell_routes_subprocess_models_through_isolated_runner(
     monkeypatch.setattr(cc, "_fit_predict_model_cell", _fake_inline)
 
     for model in ("lightgbm", "super_learner"):
-        measurement = cc.measure_one_cell(
+        measurement = cc._measure_one_cell_in_process(
             session, model_name=model, n=10, k=5, seed=0, draw=0, max_seconds=60
         )
-        assert measurement.peak_rss_bytes == 123_456_789
+        assert measurement.fit_seconds == 0.01
 
     # xgboost is NOT in SUBPROCESS_MODELS (that was F1's bug: xgboost doesn't
     # go through the isolated subprocess in production) so it must take the
     # inline path, same as any other non-native model.
     for model in ("ols", "xgboost"):
-        measurement = cc.measure_one_cell(
+        measurement = cc._measure_one_cell_in_process(
             session, model_name=model, n=10, k=5, seed=0, draw=0, max_seconds=60
         )
-        assert measurement.peak_rss_bytes == 111
+        assert measurement.fit_seconds == 0.01
 
     assert set(calls["native"]) == {"lightgbm", "super_learner"}
     assert set(calls["inline"]) == {"ols", "xgboost"}
@@ -397,7 +520,7 @@ def test_measure_one_cell_discards_native_runner_on_failure(tmp_path, monkeypatc
     monkeypatch.setattr(cc, "_run_native_model_cell_locked", _boom)
 
     with pytest.raises(RuntimeError, match="simulated native subprocess crash"):
-        cc.measure_one_cell(
+        cc._measure_one_cell_in_process(
             session, model_name="lightgbm", n=10, k=5, seed=0, draw=0, max_seconds=60
         )
 

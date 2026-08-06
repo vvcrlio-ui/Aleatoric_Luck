@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import resource
 import signal
 import subprocess
@@ -55,7 +56,14 @@ from .validate_input import canonical_feature_universe, validate_input
 # Constants
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION = 1
+# Version 2 deliberately rejects the first calibration format.  Its
+# ``peak_rss_bytes`` values were process-lifetime high-water marks and are not
+# safe to reinterpret as per-cell memory measurements.
+FORMAT_VERSION = 2
+MEMORY_SAMPLE_INTERVAL_SECONDS = 0.01
+MEMORY_METHOD_CGROUP_PEAK = "cgroup_v2_memory_peak"
+MEMORY_METHOD_CGROUP_CURRENT = "cgroup_v2_memory_current_sampled"
+MEMORY_METHOD_PROCESS_TREE = "process_tree_rss_sampled_conservative_upper_bound"
 
 MODELS: tuple[str, ...] = (
     "ols",
@@ -598,6 +606,39 @@ class RawMeasurement:
     preprocess_mode: str
     peak_rss_bytes: int
     stage: str
+    # ``peak_rss_bytes`` remains the fitted, whole-tree cell peak for
+    # compatibility with the cost model name.  The following fields preserve
+    # the distinct measurement scopes instead of silently conflating them.
+    process_peak_rss_bytes: int = 0
+    cell_cgroup_peak_bytes: int = 0
+    cell_memory_method: str = MEMORY_METHOD_PROCESS_TREE
+    cell_memory_sampling_interval_seconds: float | None = MEMORY_SAMPLE_INTERVAL_SECONDS
+
+
+@dataclass(frozen=True)
+class MemoryPeak:
+    """A whole-workload peak with an explicit collection method.
+
+    ``process_tree_rss_sampled_conservative_upper_bound`` is intentionally
+    verbose: summing RSS across a tree double-counts shared pages and must not
+    be presented as an exact cgroup number.
+    """
+
+    bytes: int
+    method: str
+    sampling_interval_seconds: float | None
+
+
+@dataclass(frozen=True)
+class CellMeasurementRequest:
+    """One complete cell workload for the n_jobs=8 memory probe."""
+
+    model_name: str
+    n: int
+    k: int
+    seed: int = 0
+    draw: int = 0
+    max_seconds: float = DEFAULT_MAX_SECONDS
 
 
 @dataclass
@@ -686,7 +727,7 @@ def build_session(schema_path: Path, outcome: str, *, seed: int = 0, test_size: 
     )
 
 
-def measure_one_cell(
+def _measure_one_cell_in_process(
     session: CalibrationSession,
     *,
     model_name: str,
@@ -696,9 +737,11 @@ def measure_one_cell(
     draw: int,
     max_seconds: float,
 ) -> RawMeasurement:
-    """Fit one (model, N, K) cell once, returning fit+preprocess timing and RSS.
+    """Run the cell in the current process.
 
-    Raises MeasurementCensored if fitting exceeds max_seconds.
+    This is deliberately private.  Public calibration measurements call it
+    only from a new ``spawn`` child so ``RUSAGE_SELF`` cannot inherit a prior
+    grid point's high-water mark.
     """
 
     orders = session.orders_for(seed, draw)
@@ -772,8 +815,367 @@ def measure_one_cell(
         fit_seconds=float(result["fit_seconds"]),
         preprocess_seconds=float(preprocess_seconds),
         preprocess_mode=mode,
-        peak_rss_bytes=int(result["peak_rss_bytes"]),
+        # The production diagnostic is intentionally not used for calibration:
+        # it is a lifetime high-water mark in a reusable process.  The parent
+        # sampler fills the real cell peak after this private call returns.
+        peak_rss_bytes=0,
         stage="",
+    )
+
+
+def _cgroup_v2_path_for_pid(pid: int) -> Path | None:
+    """Return the v2 cgroup path for *pid*, or None off Linux/cgroup v2."""
+
+    cgroup_file = Path(f"/proc/{pid}/cgroup")
+    root = Path("/sys/fs/cgroup")
+    if not cgroup_file.exists() or not root.exists():
+        return None
+    try:
+        for line in cgroup_file.read_text(encoding="utf-8").splitlines():
+            hierarchy, controllers, relative = line.split(":", 2)
+            if hierarchy == "0" and controllers == "":
+                path = root / relative.lstrip("/")
+                return path if path.exists() else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _create_measurement_cgroup(pid: int) -> Path | None:
+    """Move a spawned worker into a fresh child cgroup when permitted.
+
+    Cluster job cgroups commonly permit this; macOS and locked-down Linux
+    installations do not.  We then fall through to the documented sampler,
+    never pretending a shared task cgroup is an isolated cell measurement.
+    """
+
+    parent = _cgroup_v2_path_for_pid(pid)
+    if parent is None:
+        return None
+    child = parent / f"cost-calibration-{pid}-{time.monotonic_ns()}"
+    try:
+        child.mkdir()
+        (child / "cgroup.procs").write_text(str(pid), encoding="ascii")
+        return child
+    except OSError:
+        try:
+            child.rmdir()
+        except OSError:
+            pass
+        return None
+
+
+def _remove_measurement_cgroup(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.rmdir()
+    except OSError:
+        # A process can briefly remain while its multiprocessing handle has
+        # exited.  Leaving an empty, uniquely-named cgroup is safer than
+        # moving another task's processes while cleaning up.
+        pass
+
+
+def _read_cgroup_bytes(path: Path, filename: str) -> int | None:
+    try:
+        value = (path / filename).read_text(encoding="ascii").strip()
+        return int(value) if value != "max" else None
+    except (OSError, ValueError):
+        return None
+
+
+def _process_tree_rss_bytes(root_pid: int) -> int:
+    """Return RSS summed over a process tree (a conservative upper bound)."""
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,rss="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return 0
+    parents: dict[int, list[int]] = {}
+    rss: dict[int, int] = {}
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            pid, ppid, rss_kib = (int(value) for value in fields)
+        except ValueError:
+            continue
+        parents.setdefault(ppid, []).append(pid)
+        rss[pid] = rss_kib * 1024
+    descendants = [root_pid]
+    seen: set[int] = set()
+    total = 0
+    while descendants:
+        pid = descendants.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += rss.get(pid, 0)
+        descendants.extend(parents.get(pid, ()))
+    return total
+
+
+def _monitor_peak(process: mp.Process, cgroup: Path | None, *, interval: float) -> MemoryPeak:
+    """Monitor one spawned process and all of its descendants until exit."""
+
+    if cgroup is not None and (cgroup / "memory.peak").exists():
+        process.join()
+        peak = _read_cgroup_bytes(cgroup, "memory.peak")
+        if peak is not None:
+            return MemoryPeak(peak, MEMORY_METHOD_CGROUP_PEAK, None)
+
+    if cgroup is not None and (cgroup / "memory.current").exists():
+        method = MEMORY_METHOD_CGROUP_CURRENT
+        sample = lambda: _read_cgroup_bytes(cgroup, "memory.current") or 0
+    else:
+        method = MEMORY_METHOD_PROCESS_TREE
+        sample = lambda: _process_tree_rss_bytes(process.pid or 0)
+
+    peak = 0
+    while process.is_alive():
+        peak = max(peak, sample())
+        time.sleep(interval)
+    # Take one final sample to include a short-lived child which completed
+    # between polls where the platform still exposes it/cgroup accounting.
+    peak = max(peak, sample())
+    process.join()
+    return MemoryPeak(peak, method, interval)
+
+
+def _process_peak_worker(connection: Any, target: Callable[..., None], args: tuple[Any, ...]) -> None:
+    """Execute a picklable workload and report this fresh process's RSS peak."""
+
+    try:
+        target(*args)
+        connection.send({"ok": True, "process_peak_rss_bytes": _process_peak_rss_bytes()})
+    except BaseException as exc:
+        connection.send({"ok": False, "type": type(exc).__name__, "message": str(exc)})
+    finally:
+        connection.close()
+
+
+def measure_process_peak_rss(
+    target: Callable[..., None], *args: Any
+) -> int:
+    """Measure one workload in a fresh ``spawn`` worker, then discard it.
+
+    This diagnostic deliberately says nothing about worker children; callers
+    needing allocation-level memory must use one of the cgroup/tree routines.
+    """
+
+    context = mp.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(target=_process_peak_worker, args=(child_connection, target, args))
+    process.start()
+    child_connection.close()
+    process.join()
+    try:
+        if not parent_connection.poll():
+            raise RuntimeError(f"spawned RSS worker exited without a result (exitcode={process.exitcode})")
+        response = parent_connection.recv()
+    finally:
+        parent_connection.close()
+    if not response["ok"]:
+        raise RuntimeError(f"spawned RSS worker {response['type']}: {response['message']}")
+    return int(response["process_peak_rss_bytes"])
+
+
+def _cell_worker(
+    connection: Any,
+    schema_path: str,
+    outcome: str,
+    seed: int,
+    model_name: str,
+    n: int,
+    k: int,
+    draw: int,
+    max_seconds: float,
+) -> None:
+    """Spawn target: rebuild the session and run precisely one cell."""
+
+    session: CalibrationSession | None = None
+    try:
+        session = build_session(Path(schema_path), outcome, seed=seed)
+        measurement = _measure_one_cell_in_process(
+            session, model_name=model_name, n=n, k=k, seed=seed, draw=draw,
+            max_seconds=max_seconds,
+        )
+        connection.send(
+            {"ok": True, "measurement": _raw_to_dict(measurement),
+             "process_peak_rss_bytes": _process_peak_rss_bytes()}
+        )
+    except BaseException as exc:
+        connection.send({"ok": False, "type": type(exc).__name__, "message": str(exc)})
+    finally:
+        if session is not None:
+            close_session(session)
+        connection.close()
+
+
+def _raw_measurement_from_dict(row: Mapping[str, Any]) -> RawMeasurement:
+    return RawMeasurement(
+        model=str(row["model"]), n=int(row["n"]), k=int(row["k"]), rep=int(row["rep"]),
+        fit_seconds=float(row["fit_seconds"]), preprocess_seconds=float(row["preprocess_seconds"]),
+        preprocess_mode=str(row["preprocess_mode"]), peak_rss_bytes=int(row["peak_rss_bytes"]),
+        stage=str(row["stage"]),
+        process_peak_rss_bytes=int(row.get("process_peak_rss_bytes", 0)),
+        cell_cgroup_peak_bytes=int(row.get("cell_cgroup_peak_bytes", 0)),
+        cell_memory_method=str(row.get("cell_memory_method", MEMORY_METHOD_PROCESS_TREE)),
+        cell_memory_sampling_interval_seconds=row.get("cell_memory_sampling_interval_seconds"),
+    )
+
+
+def measure_one_cell(
+    session: CalibrationSession,
+    *,
+    model_name: str,
+    n: int,
+    k: int,
+    seed: int,
+    draw: int,
+    max_seconds: float,
+) -> RawMeasurement:
+    """Measure a cell in a fresh ``spawn`` process, never a forked child."""
+
+    context = mp.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_cell_worker,
+        args=(child_connection, str(session.schema_path), session.outcome, seed,
+              model_name, n, k, draw, max_seconds),
+    )
+    process.start()
+    child_connection.close()
+    cgroup = _create_measurement_cgroup(process.pid)
+    try:
+        cell_peak = _monitor_peak(process, cgroup, interval=MEMORY_SAMPLE_INTERVAL_SECONDS)
+        if not parent_connection.poll():
+            raise RuntimeError(f"spawned cell worker exited without a result (exitcode={process.exitcode})")
+        response = parent_connection.recv()
+    finally:
+        parent_connection.close()
+        _remove_measurement_cgroup(cgroup)
+    if not response["ok"]:
+        if response["type"] == "MeasurementCensored":
+            raise MeasurementCensored(response["message"])
+        raise RuntimeError(f"spawned cell worker {response['type']}: {response['message']}")
+    measurement = _raw_measurement_from_dict(response["measurement"])
+    measurement.process_peak_rss_bytes = int(response["process_peak_rss_bytes"])
+    measurement.cell_cgroup_peak_bytes = cell_peak.bytes
+    measurement.peak_rss_bytes = cell_peak.bytes
+    measurement.cell_memory_method = cell_peak.method
+    measurement.cell_memory_sampling_interval_seconds = cell_peak.sampling_interval_seconds
+    return measurement
+
+
+def _monitor_processes(
+    processes: Sequence[mp.Process], cgroup: Path | None, *, interval: float
+) -> MemoryPeak:
+    """As ``_monitor_peak``, but for the complete concurrent task scope."""
+
+    if cgroup is not None and (cgroup / "memory.peak").exists():
+        for process in processes:
+            process.join()
+        peak = _read_cgroup_bytes(cgroup, "memory.peak")
+        if peak is not None:
+            return MemoryPeak(peak, MEMORY_METHOD_CGROUP_PEAK, None)
+    if cgroup is not None and (cgroup / "memory.current").exists():
+        method = MEMORY_METHOD_CGROUP_CURRENT
+        sample = lambda: _read_cgroup_bytes(cgroup, "memory.current") or 0
+    else:
+        method = MEMORY_METHOD_PROCESS_TREE
+        sample = lambda: sum(_process_tree_rss_bytes(process.pid or 0) for process in processes)
+    peak = 0
+    while any(process.is_alive() for process in processes):
+        peak = max(peak, sample())
+        time.sleep(interval)
+    peak = max(peak, sample())
+    for process in processes:
+        process.join()
+    return MemoryPeak(peak, method, interval)
+
+
+def _measure_task_peak_n_jobs_8(
+    target: Callable[..., None],
+    worker_args: Sequence[tuple[Any, ...]],
+    *,
+    sample_interval_seconds: float = MEMORY_SAMPLE_INTERVAL_SECONDS,
+) -> MemoryPeak:
+    """Measure the memory of one complete eight-worker task.
+
+    ``target`` must be a module-level spawn-picklable worker.  The caller
+    supplies exactly eight complete cell workloads; this keeps the memory
+    measurement separate from ①-C's parallel-efficiency experiment.
+    """
+
+    if len(worker_args) != 8:
+        raise ValueError("task_cgroup_peak_n_jobs_8 requires exactly eight workers")
+    context = mp.get_context("spawn")
+    processes = [context.Process(target=target, args=args) for args in worker_args]
+    for process in processes:
+        process.start()
+    cgroup = _create_measurement_cgroup(processes[0].pid)
+    if cgroup is not None:
+        for process in processes[1:]:
+            try:
+                (cgroup / "cgroup.procs").write_text(str(process.pid), encoding="ascii")
+            except OSError:
+                _remove_measurement_cgroup(cgroup)
+                cgroup = None
+                break
+    try:
+        return _monitor_processes(processes, cgroup, interval=sample_interval_seconds)
+    finally:
+        _remove_measurement_cgroup(cgroup)
+
+
+def _task_cell_worker(
+    schema_path: str, outcome: str, request: CellMeasurementRequest
+) -> None:
+    """Spawn target for a real calibration cell in the task-memory probe."""
+
+    session: CalibrationSession | None = None
+    try:
+        session = build_session(Path(schema_path), outcome, seed=request.seed)
+        _measure_one_cell_in_process(
+            session,
+            model_name=request.model_name,
+            n=request.n,
+            k=request.k,
+            seed=request.seed,
+            draw=request.draw,
+            max_seconds=request.max_seconds,
+        )
+    finally:
+        if session is not None:
+            close_session(session)
+
+
+def measure_task_cgroup_peak_n_jobs_8(
+    session: CalibrationSession,
+    requests: Sequence[CellMeasurementRequest],
+    *,
+    sample_interval_seconds: float = MEMORY_SAMPLE_INTERVAL_SECONDS,
+) -> MemoryPeak:
+    """Measure a real complete eight-cell calibration task.
+
+    This is intentionally an explicit caller-controlled task composition:
+    only the scheduler knows which eight cells will actually overlap in the
+    production resource class.  Its result is the sole memory number suitable
+    for ``--mem``.
+    """
+
+    return _measure_task_peak_n_jobs_8(
+        _task_cell_worker,
+        [(str(session.schema_path), session.outcome, request) for request in requests],
+        sample_interval_seconds=sample_interval_seconds,
     )
 
 
@@ -1018,6 +1420,10 @@ def _raw_to_dict(measurement: RawMeasurement) -> dict[str, Any]:
         "preprocess_seconds": measurement.preprocess_seconds,
         "preprocess_mode": measurement.preprocess_mode,
         "peak_rss_bytes": measurement.peak_rss_bytes,
+        "process_peak_rss_bytes": measurement.process_peak_rss_bytes,
+        "cell_cgroup_peak_bytes": measurement.cell_cgroup_peak_bytes,
+        "cell_memory_method": measurement.cell_memory_method,
+        "cell_memory_sampling_interval_seconds": measurement.cell_memory_sampling_interval_seconds,
         "stage": measurement.stage,
     }
 
@@ -1027,20 +1433,7 @@ def recompute_fit_cost_from_raw(
 ) -> dict[str, PowerLawFit | None]:
     """Recompute fit_cost coefficients from raw_measurements alone (round-trip check)."""
 
-    reconstructed = [
-        RawMeasurement(
-            model=str(row["model"]),
-            n=int(row["n"]),
-            k=int(row["k"]),
-            rep=int(row["rep"]),
-            fit_seconds=float(row["fit_seconds"]),
-            preprocess_seconds=float(row["preprocess_seconds"]),
-            preprocess_mode=str(row["preprocess_mode"]),
-            peak_rss_bytes=int(row["peak_rss_bytes"]),
-            stage=str(row["stage"]),
-        )
-        for row in raw_measurements
-    ]
+    reconstructed = [_raw_measurement_from_dict(row) for row in raw_measurements]
     return fit_all_models(reconstructed, models)
 
 
@@ -1057,6 +1450,7 @@ def build_calibration_payload(
     raw_measurements: Sequence[RawMeasurement],
     thread_env_report: Mapping[str, Any],
     scope_reduction: Mapping[str, Any] | None = None,
+    task_cgroup_peak_n_jobs_8: MemoryPeak | None = None,
 ) -> dict[str, Any]:
     environment = core_environment()
     environment["platform"] = _platform_string()
@@ -1094,6 +1488,25 @@ def build_calibration_payload(
         "fit_cost": {name: _fit_to_dict(fit) for name, fit in fit_cost.items()},
         "preprocess_cost": {name: _fit_to_dict(fit) for name, fit in preprocess_cost.items()},
         "peak_rss_bytes": {name: _fit_to_dict(fit) for name, fit in peak_rss.items()},
+        "memory_measurement": {
+            "process_peak_rss": "fresh_spawn_worker_RUSAGE_SELF",
+            "cell_cgroup_peak": "per-raw-measurement fields",
+            "task_cgroup_peak_n_jobs_8": (
+                {
+                    "status": "not_measured",
+                    "bytes": None,
+                    "method": None,
+                    "sampling_interval_seconds": None,
+                }
+                if task_cgroup_peak_n_jobs_8 is None
+                else {
+                    "status": "measured",
+                    "bytes": task_cgroup_peak_n_jobs_8.bytes,
+                    "method": task_cgroup_peak_n_jobs_8.method,
+                    "sampling_interval_seconds": task_cgroup_peak_n_jobs_8.sampling_interval_seconds,
+                }
+            ),
+        },
         "validation": list(validation),
         "censored": list(censored),
         "raw_measurements": [_raw_to_dict(m) for m in raw_measurements],
@@ -1117,6 +1530,22 @@ def write_calibration_file(payload: Mapping[str, Any], out_dir: Path, *, date: s
     out_path = out_dir / f"cost_model_{utc_date}.json"
     write_json_atomic(out_path, dict(payload))
     return out_path
+
+
+def read_calibration_file(path: Path) -> dict[str, Any]:
+    """Load only the current calibration schema; old RSS files are invalid."""
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("format_version") != FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported calibration format_version={payload.get('format_version')!r}; "
+            f"expected {FORMAT_VERSION}. Version 1 peak_rss_bytes is invalid."
+        )
+    required = {"memory_measurement", "raw_measurements", "peak_rss_bytes"}
+    missing = required.difference(payload)
+    if missing:
+        raise ValueError(f"calibration file is missing required fields: {sorted(missing)}")
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1157,7 +1586,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--generation-time-budget-seconds", type=float, default=300.0)
     parser.add_argument("--generation-rss-budget-bytes", type=int, default=6 * 1024**3)
+    parser.add_argument(
+        "--task-memory-cells",
+        type=str,
+        default=None,
+        help=(
+            "Exactly eight model:N:K cell workloads that will overlap in one "
+            "n_jobs=8 production task, comma-separated. Measures and records "
+            "task_cgroup_peak_n_jobs_8; omit only when no task composition is known."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def parse_task_memory_cells(specification: str, *, max_seconds: float) -> tuple[CellMeasurementRequest, ...]:
+    """Parse the explicit eight-cell task shape used for the --mem probe."""
+
+    requests: list[CellMeasurementRequest] = []
+    for token in specification.split(","):
+        try:
+            model_name, n_text, k_text = token.split(":")
+            request = CellMeasurementRequest(
+                model_name=model_name, n=int(n_text), k=int(k_text), max_seconds=max_seconds
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "--task-memory-cells must be eight comma-separated model:N:K entries"
+            ) from exc
+        if request.model_name not in MODELS or request.n < 1 or request.k < 1:
+            raise ValueError(f"invalid task-memory cell {token!r}")
+        requests.append(request)
+    if len(requests) != 8:
+        raise ValueError("--task-memory-cells must describe exactly eight n_jobs=8 workers")
+    return tuple(requests)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1205,6 +1666,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     session = build_session(schema_path, params.outcome, seed=args.seed)
     try:
         t0 = measure_t0(schema_path, params.outcome)
+        task_peak = (
+            None
+            if args.task_memory_cells is None
+            else measure_task_cgroup_peak_n_jobs_8(
+                session,
+                parse_task_memory_cells(
+                    args.task_memory_cells, max_seconds=args.max_seconds
+                ),
+            )
+        )
 
         def _progress(message: str) -> None:
             print(message, file=sys.stderr)
@@ -1245,6 +1716,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             raw_measurements=[*raw_a, *raw_b],
             thread_env_report=thread_report,
             scope_reduction=scope_reduction,
+            task_cgroup_peak_n_jobs_8=task_peak,
         )
     finally:
         close_session(session)
