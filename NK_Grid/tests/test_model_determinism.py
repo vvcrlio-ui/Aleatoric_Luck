@@ -16,6 +16,9 @@ from aleatoric_nk_grid.model_registry import (
 from aleatoric_nk_grid.nk_grid import (
     NKGridConfig,
     _fit_predict_model_cell,
+    _model_alpha,
+    _model_converged,
+    _model_iterations,
     _model_solver,
     run_nk_grid,
 )
@@ -179,6 +182,44 @@ def test_model_solver_finds_fitted_or_configured_solver_through_generic_wrappers
     assert _model_solver(estimator) == expected
 
 
+@pytest.mark.parametrize(
+    ("estimator", "expected_iterations", "expected_alpha"),
+    [
+        (_SolverEstimator(n_iter_=7, alpha_=0.5), 7.0, 0.5),
+        (
+            _SolverEstimator(
+                n_iter_=2,
+                steps=[("last", _SolverEstimator(n_iter_=np.array([3.0, np.nan, 8.0]), alpha_=0.2))],
+            ),
+            8.0,
+            0.2,
+        ),
+        (_SolverEstimator(regressor_=_SolverEstimator(n_iter_=np.array([1.0, 5.0]), alpha_=0.3)), 5.0, 0.3),
+        (_SolverEstimator(alpha_=0.4), np.nan, 0.4),
+        (_SolverEstimator(), np.nan, np.nan),
+    ],
+)
+def test_model_iterations_and_alpha_use_generic_wrapper_traversal(
+    estimator, expected_iterations, expected_alpha
+):
+    actual_iterations = _model_iterations(estimator)
+    actual_alpha = _model_alpha(estimator)
+    if np.isnan(expected_iterations):
+        assert np.isnan(actual_iterations)
+    else:
+        assert actual_iterations == expected_iterations
+    if np.isnan(expected_alpha):
+        assert np.isnan(actual_alpha)
+    else:
+        assert actual_alpha == expected_alpha
+
+
+def test_converged_without_iteration_telemetry_is_explicitly_distinguishable():
+    estimator = _SolverEstimator()
+    assert _model_converged(estimator) is True
+    assert np.isnan(_model_iterations(estimator))
+
+
 def _toy_panel(rows: int = 48) -> pd.DataFrame:
     values = np.arange(rows, dtype=float)
     return pd.DataFrame(
@@ -225,7 +266,8 @@ def test_xgboost_toy_panel_final_csv_is_bitwise_identical_across_five_runs(
 
     reference = outputs[0].read_bytes()
     assert all(path.read_bytes() == reference for path in outputs[1:])
-    assert "solver" not in pd.read_csv(outputs[0], nrows=0).columns
+    columns = pd.read_csv(outputs[0], nrows=0).columns
+    assert {"solver", "iterations", "alpha"}.isdisjoint(columns)
     manifest = json.loads(
         outputs[0].with_suffix(".manifest.json").read_text(encoding="utf-8")
     )

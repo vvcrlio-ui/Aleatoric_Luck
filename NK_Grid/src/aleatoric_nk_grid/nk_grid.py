@@ -632,6 +632,36 @@ def _model_best_rounds(model) -> float:
     return np.nan
 
 
+def _model_attribute_values(model, attribute: str) -> list[Any]:
+    """Read one fitted attribute through common estimator wrappers.
+
+    The traversal is deliberately model-agnostic and shared by all fit-state
+    diagnostics so a wrapper added to one diagnostic cannot silently be absent
+    from another.
+    """
+
+    values: list[Any] = []
+    seen: set[int] = set()
+
+    def visit(estimator) -> None:
+        if estimator is None or id(estimator) in seen:
+            return
+        seen.add(id(estimator))
+        value = getattr(estimator, attribute, None)
+        if value is not None:
+            values.append(value)
+        if hasattr(estimator, "steps"):
+            for _, step in estimator.steps:
+                visit(step)
+        for child_attribute in ("regressor_", "model_", "final_estimator_"):
+            visit(getattr(estimator, child_attribute, None))
+        for fitted_estimator in getattr(estimator, "estimators_", ()):
+            visit(fitted_estimator)
+
+    visit(model)
+    return values
+
+
 def _model_solver(model) -> str | None:
     """Find an estimator's fitted solver through common wrapper layers.
 
@@ -640,34 +670,38 @@ def _model_solver(model) -> str | None:
     The traversal is deliberately duck-typed and model-agnostic.
     """
 
-    def find(attribute: str) -> str | None:
-        seen: set[int] = set()
+    selected = _model_attribute_values(model, "solver_")
+    configured = _model_attribute_values(model, "solver")
+    value = selected[0] if selected else (configured[0] if configured else None)
+    return None if value is None else str(value)
 
-        def visit(estimator) -> str | None:
-            if estimator is None or id(estimator) in seen:
-                return None
-            seen.add(id(estimator))
-            value = getattr(estimator, attribute, None)
-            if value is not None:
-                return str(value)
-            if hasattr(estimator, "steps"):
-                for _, step in estimator.steps:
-                    found = visit(step)
-                    if found is not None:
-                        return found
-            for child_attribute in ("regressor_", "model_", "final_estimator_"):
-                found = visit(getattr(estimator, child_attribute, None))
-                if found is not None:
-                    return found
-            for fitted_estimator in getattr(estimator, "estimators_", ()):
-                found = visit(fitted_estimator)
-                if found is not None:
-                    return found
-            return None
 
-        return visit(model)
+def _model_iterations(model) -> float:
+    """Return the largest finite observed ``n_iter_``, or NaN when absent."""
 
-    return find("solver_") or find("solver")
+    iterations: list[float] = []
+    for value in _model_attribute_values(model, "n_iter_"):
+        try:
+            array = np.asarray(value, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        finite = array[np.isfinite(array)]
+        if finite.size:
+            iterations.append(float(np.max(finite)))
+    return max(iterations) if iterations else np.nan
+
+
+def _model_alpha(model) -> float:
+    """Return the first finite fitted ``alpha_``, or NaN when absent."""
+
+    for value in _model_attribute_values(model, "alpha_"):
+        try:
+            alpha = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(alpha):
+            return alpha
+    return np.nan
 
 
 def _model_seed(seed: int, draw: int, n_samples: int, k_features: int) -> int:
@@ -1369,6 +1403,8 @@ def _fit_predict_model_cell(
         "best_rounds": _model_best_rounds(model),
         "converged": _model_converged(model),
         "solver": _model_solver(model),
+        "iterations": _model_iterations(model),
+        "alpha": _model_alpha(model),
         "peak_rss_bytes": _process_peak_rss_bytes(),
     }
 

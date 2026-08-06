@@ -204,10 +204,14 @@ def test_small_calibration_collects_fit_telemetry_from_real_fits(tmp_path):
 
     assert telemetry["status"] == "collected"
     assert telemetry["fields_with_observations"] == {
-        "converged": True, "best_rounds": True, "solver": True
+        "converged": True,
+        "best_rounds": True,
+        "solver": True,
+        "n_iter": True,
+        "alpha": True,
     }
     assert all(
-        {"converged", "best_rounds", "solver"}.issubset(row)
+        {"converged", "best_rounds", "solver", "n_iter", "alpha"}.issubset(row)
         for row in payload["raw_measurements"]
     )
 
@@ -1070,6 +1074,8 @@ def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path
             "converged": False,
             "best_rounds": False,
             "solver": False,
+            "n_iter": False,
+            "alpha": False,
         },
     }
     assert payload["fit_quality"]["models_below_r2_threshold"] == []
