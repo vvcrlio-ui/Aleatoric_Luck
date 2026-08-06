@@ -21,6 +21,7 @@ import resource
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+from aleatoric_nk_grid_measure_worker import cell_worker_target, task_cell_worker_target
 
 from .experiment import (
     SERIAL_OUTER_MODELS,
@@ -868,18 +870,6 @@ def _create_measurement_cgroup() -> Path | None:
         return None
 
 
-def _join_measurement_cgroup(cgroup_path: str | None) -> bool:
-    """Join an already-created cgroup from inside the spawned worker."""
-
-    if cgroup_path is None:
-        return False
-    try:
-        (Path(cgroup_path) / "cgroup.procs").write_text(str(os.getpid()), encoding="ascii")
-        return True
-    except OSError:
-        return False
-
-
 def _remove_measurement_cgroup(path: Path | None) -> None:
     if path is None:
         return
@@ -1061,9 +1051,9 @@ def measure_process_peak_rss(
     return int(response["process_peak_rss_bytes"])
 
 
-def _cell_worker(
-    connection: Any,
-    cgroup_path: str | None,
+def _run_cell_worker_after_join(
+    result_path: str,
+    cgroup_joined: bool,
     schema_path: str,
     outcome: str,
     seed: int,
@@ -1073,9 +1063,8 @@ def _cell_worker(
     draw: int,
     max_seconds: float,
 ) -> None:
-    """Spawn target: rebuild the session and run precisely one cell."""
+    """Heavy cell implementation, imported only after the worker joins."""
 
-    cgroup_joined = _join_measurement_cgroup(cgroup_path)
     session: CalibrationSession | None = None
     try:
         session = build_session(Path(schema_path), outcome, seed=seed)
@@ -1083,17 +1072,18 @@ def _cell_worker(
             session, model_name=model_name, n=n, k=k, seed=seed, draw=draw,
             max_seconds=max_seconds,
         )
-        connection.send(
-            {"ok": True, "measurement": _raw_to_dict(measurement),
-             "process_peak_rss_bytes": _process_peak_rss_bytes(),
-             "cgroup_joined": cgroup_joined}
-        )
+        response = {
+            "ok": True,
+            "measurement": _raw_to_dict(measurement),
+            "process_peak_rss_bytes": _process_peak_rss_bytes(),
+            "cgroup_joined": cgroup_joined,
+        }
     except BaseException as exc:
-        connection.send({"ok": False, "type": type(exc).__name__, "message": str(exc)})
+        response = {"ok": False, "type": type(exc).__name__, "message": str(exc)}
     finally:
         if session is not None:
             close_session(session)
-        connection.close()
+    Path(result_path).write_text(json.dumps(response), encoding="utf-8")
 
 
 def _raw_measurement_from_dict(row: Mapping[str, Any]) -> RawMeasurement:
@@ -1126,24 +1116,25 @@ def measure_one_cell(
     """Measure a cell in a fresh ``spawn`` process, never a forked child."""
 
     context = mp.get_context("spawn")
-    parent_connection, child_connection = context.Pipe(duplex=False)
     cgroup = _create_measurement_cgroup()
-    process = context.Process(
-        target=_cell_worker,
-        args=(child_connection, None if cgroup is None else str(cgroup),
-              str(session.schema_path), session.outcome, seed,
-              model_name, n, k, draw, max_seconds),
-    )
-    process.start()
-    child_connection.close()
-    try:
-        cell_peak = _monitor_peak(process, cgroup, interval=MEMORY_SAMPLE_INTERVAL_SECONDS)
-        if not parent_connection.poll():
-            raise RuntimeError(f"spawned cell worker exited without a result (exitcode={process.exitcode})")
-        response = parent_connection.recv()
-    finally:
-        parent_connection.close()
-        _remove_measurement_cgroup(cgroup)
+    with tempfile.TemporaryDirectory(prefix="nk-grid-cell-memory-") as temporary_dir:
+        result_path = str(Path(temporary_dir) / "result.json")
+        process = context.Process(
+            target=cell_worker_target,
+            args=(None if cgroup is None else str(cgroup), result_path,
+                  str(session.schema_path), session.outcome, seed,
+                  model_name, n, k, draw, max_seconds, None, 0),
+        )
+        process.start()
+        try:
+            cell_peak = _monitor_peak(process, cgroup, interval=MEMORY_SAMPLE_INTERVAL_SECONDS)
+            if not Path(result_path).exists():
+                raise RuntimeError(
+                    f"spawned cell worker exited without a result (exitcode={process.exitcode})"
+                )
+            response = json.loads(Path(result_path).read_text(encoding="utf-8"))
+        finally:
+            _remove_measurement_cgroup(cgroup)
     if not response["ok"]:
         if response["type"] == "MeasurementCensored":
             raise MeasurementCensored(response["message"])
@@ -1193,26 +1184,33 @@ def _monitor_processes(
 
 
 def _measure_task_peak_n_jobs_8(
-    target: Callable[..., None],
     worker_args: Sequence[tuple[Any, ...]],
     *,
     sample_interval_seconds: float = MEMORY_SAMPLE_INTERVAL_SECONDS,
+    observation_paths: Sequence[str | None] | None = None,
+    probe_only: int = 0,
 ) -> MemoryPeak:
     """Measure the memory of one complete eight-worker task.
 
-    ``target`` must be a module-level spawn-picklable worker.  The caller
-    supplies exactly eight complete cell workloads; this keeps the memory
-    measurement separate from ①-C's parallel-efficiency experiment.
+    Every worker argument is a primitive value.  The lightweight fixed target
+    joins the cgroup before importing this module and reconstructing the cell.
     """
 
     if len(worker_args) != 8:
         raise ValueError("task_cgroup_peak_n_jobs_8 requires exactly eight workers")
+    if observation_paths is None:
+        observation_paths = (None,) * 8
+    if len(observation_paths) != 8:
+        raise ValueError("task memory observation_paths must contain eight entries")
     context = mp.get_context("spawn")
     cgroup = _create_measurement_cgroup()
     cgroup_path = None if cgroup is None else str(cgroup)
     processes = [
-        context.Process(target=_task_worker, args=(cgroup_path, target, args))
-        for args in worker_args
+        context.Process(
+            target=task_cell_worker_target,
+            args=(cgroup_path, *args, observation_path, probe_only),
+        )
+        for args, observation_path in zip(worker_args, observation_paths)
     ]
     for process in processes:
         process.start()
@@ -1222,31 +1220,29 @@ def _measure_task_peak_n_jobs_8(
         _remove_measurement_cgroup(cgroup)
 
 
-def _task_worker(
-    cgroup_path: str | None, target: Callable[..., None], args: tuple[Any, ...]
+def _run_task_cell_after_join(
+    schema_path: str,
+    outcome: str,
+    model_name: str,
+    n: int,
+    k: int,
+    seed: int,
+    draw: int,
+    max_seconds: float,
 ) -> None:
-    """Join the pre-created task cgroup before starting a workload."""
-
-    _join_measurement_cgroup(cgroup_path)
-    target(*args)
-
-
-def _task_cell_worker(
-    schema_path: str, outcome: str, request: CellMeasurementRequest
-) -> None:
-    """Spawn target for a real calibration cell in the task-memory probe."""
+    """Rebuild a task cell only after its lightweight target has joined."""
 
     session: CalibrationSession | None = None
     try:
-        session = build_session(Path(schema_path), outcome, seed=request.seed)
+        session = build_session(Path(schema_path), outcome, seed=seed)
         _measure_one_cell_in_process(
             session,
-            model_name=request.model_name,
-            n=request.n,
-            k=request.k,
-            seed=request.seed,
-            draw=request.draw,
-            max_seconds=request.max_seconds,
+            model_name=model_name,
+            n=n,
+            k=k,
+            seed=seed,
+            draw=draw,
+            max_seconds=max_seconds,
         )
     finally:
         if session is not None:
@@ -1268,8 +1264,19 @@ def measure_task_cgroup_peak_n_jobs_8(
     """
 
     return _measure_task_peak_n_jobs_8(
-        _task_cell_worker,
-        [(str(session.schema_path), session.outcome, request) for request in requests],
+        [
+            (
+                str(session.schema_path),
+                session.outcome,
+                request.model_name,
+                request.n,
+                request.k,
+                request.seed,
+                request.draw,
+                request.max_seconds,
+            )
+            for request in requests
+        ],
         sample_interval_seconds=sample_interval_seconds,
     )
 

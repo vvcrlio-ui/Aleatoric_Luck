@@ -30,6 +30,7 @@ aleatoric-nk-grid-panels = "aleatoric_nk_grid.run_panels:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+py-modules = ["aleatoric_nk_grid_measure_worker"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

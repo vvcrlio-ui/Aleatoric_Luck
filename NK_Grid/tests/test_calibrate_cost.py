@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
+import multiprocessing as mp
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
+from aleatoric_nk_grid_measure_worker import cell_worker_target, task_cell_worker_target
 
 from aleatoric_nk_grid import calibrate_cost as cc
 
@@ -335,61 +336,36 @@ def test_macos_fallback_is_explicit_tree_rss_with_sampling_interval(tmp_path, mo
     assert measurement.cell_cgroup_peak_bytes > 0
 
 
-def test_cell_worker_joins_precreated_cgroup_before_building_session(tmp_path, monkeypatch):
-    cgroup = tmp_path / "cgroup"
-    cgroup.mkdir()
-    cgroup_procs = cgroup / "cgroup.procs"
-    cgroup_procs.touch()
-    observed: list[str] = []
+def test_cell_spawn_target_observes_no_numpy_or_pandas_before_join(tmp_path):
+    observation = tmp_path / "cell-import-state.txt"
+    process = mp.get_context("spawn").Process(
+        target=cell_worker_target,
+        args=(None, str(tmp_path / "unused-result.json"), "schema.yaml", "y", 0,
+              "ols", 10, 5, 0, 60.0, str(observation), 1),
+    )
+    process.start()
+    process.join()
+    assert process.exitcode == 0
+    assert observation.read_text(encoding="ascii") == "numpy=0\npandas=0\n"
 
-    class Connection:
-        message: dict[str, object] | None = None
 
-        def send(self, message):
-            self.message = message
-
-        def close(self):
-            pass
-
-    connection = Connection()
-
-    def _build_session(*args, **kwargs):
-        observed.append(cgroup_procs.read_text(encoding="ascii"))
-        return object()
-
-    monkeypatch.setattr(cc, "build_session", _build_session)
-    monkeypatch.setattr(cc, "_measure_one_cell_in_process", lambda *args, **kwargs: cc.RawMeasurement(
-        model="ols", n=10, k=5, rep=0, fit_seconds=0.0, preprocess_seconds=0.0,
-        preprocess_mode="imputed", peak_rss_bytes=0, stage="",
-    ))
-    monkeypatch.setattr(cc, "close_session", lambda session: None)
-    monkeypatch.setattr(cc, "_process_peak_rss_bytes", lambda: 123)
-
-    cc._cell_worker(connection, str(cgroup), "schema.yaml", "y", 0, "ols", 10, 5, 0, 60)
-
-    assert observed == [str(os.getpid())]
-    assert connection.message is not None
-    assert connection.message["cgroup_joined"] is True
+def test_task_spawn_target_observes_no_numpy_or_pandas_before_join(tmp_path):
+    observation = tmp_path / "task-import-state.txt"
+    process = mp.get_context("spawn").Process(
+        target=task_cell_worker_target,
+        args=(None, "schema.yaml", "y", "ols", 10, 5, 0, 0, 60.0,
+              str(observation), 1),
+    )
+    process.start()
+    process.join()
+    assert process.exitcode == 0
+    assert observation.read_text(encoding="ascii") == "numpy=0\npandas=0\n"
 
 
 def test_memory_scope_suspect_marks_only_an_underreported_tree_peak():
     assert cc._memory_scope_suspect(99, 100) is True
     assert cc._memory_scope_suspect(100, 100) is False
     assert cc._memory_scope_suspect(101, 100) is False
-
-
-def test_task_worker_joins_precreated_cgroup_before_workload(tmp_path):
-    cgroup = tmp_path / "task-cgroup"
-    cgroup.mkdir()
-    cgroup_procs = cgroup / "cgroup.procs"
-    cgroup_procs.touch()
-    observed: list[str] = []
-
-    def _workload():
-        observed.append(cgroup_procs.read_text(encoding="ascii"))
-
-    cc._task_worker(str(cgroup), _workload, ())
-    assert observed == [str(os.getpid())]
 
 
 def test_linux_tree_sampler_reads_proc_without_invoking_ps(tmp_path, monkeypatch):
@@ -403,12 +379,14 @@ def test_linux_tree_sampler_reads_proc_without_invoking_ps(tmp_path, monkeypatch
     assert cc._linux_process_tree_rss_bytes(100, proc) == (3 + 5) * 4096
 
 
-def test_task_peak_uses_eight_spawn_workers_and_returns_its_own_scope(monkeypatch):
+def test_task_peak_uses_eight_spawn_workers_and_returns_its_own_scope(tmp_path, monkeypatch):
     monkeypatch.setattr(cc, "_create_measurement_cgroup", lambda: None)
     monkeypatch.setattr(cc, "_process_tree_rss_bytes", lambda pid: 2_000_000)
+    temporary = [tmp_path / f"task-import-state-{index}" for index in range(8)]
     peak = cc._measure_task_peak_n_jobs_8(
-        _allocate_bytes_for_peak,
-        [(2 * 1024 * 1024, 0.2)] * 8,
+        [("schema.yaml", "y", "ols", 10, 5, 0, 0, 60.0)] * 8,
+        observation_paths=[str(path) for path in temporary],
+        probe_only=1,
     )
     assert peak.bytes > 0
     assert peak.method in {
@@ -421,6 +399,8 @@ def test_task_peak_uses_eight_spawn_workers_and_returns_its_own_scope(monkeypatc
     else:
         assert peak.sampling_interval_seconds is not None
         assert peak.sampling_interval_max_seconds is not None
+    for path in temporary:
+        assert path.read_text(encoding="ascii") == "numpy=0\npandas=0\n"
 
 
 def test_task_memory_cli_requires_an_explicit_eight_cell_task_shape():
