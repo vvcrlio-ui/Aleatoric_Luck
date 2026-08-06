@@ -2,9 +2,9 @@
 #SBATCH --job-name=al-nk-grid
 #SBATCH --output=logs/%x-%A_%a.out
 #SBATCH --error=logs/%x-%A_%a.err
-#SBATCH --time=4-00:00:00
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+# Resource values are supplied by the submitter from the immutable chunk
+# resource class.  Do not add defaults here: partition, time and memory are
+# Stage-B calibration/cluster inputs rather than worker-script policy.
 #SBATCH --open-mode=append
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@300

@@ -203,8 +203,7 @@ def test_xgboost_toy_panel_final_csv_is_bitwise_identical_across_five_runs(
     manifest = json.loads(
         outputs[0].with_suffix(".manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["design"]["parallelism"]["configured_outer_n_jobs"] == 8
-    assert manifest["design"]["parallelism"]["window_policy"]["n_jobs_rule"] == {
-        "all_models_native": 1,
-        "otherwise": 8,
-    }
+    assert manifest["design"]["parallelism"]["configured_outer_n_jobs"] == 1
+    assert manifest["design"]["parallelism"]["chunk_policy"]["n_jobs_rule"] == (
+        "one array worker executes its groups serially"
+    )

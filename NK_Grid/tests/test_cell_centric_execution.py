@@ -317,38 +317,13 @@ def test_cell_groups_are_deterministic_with_concurrent_outer_jobs(tmp_path):
     )
 
 
-def test_mixed_panel_runs_in_one_threads_window(tmp_path):
-    # BART was the only model that needed prefer="processes". With it removed,
-    # a mixed native/non-native panel must collapse into a single threads
-    # window rather than being split across scheduling subwindows.
+def test_mixed_panel_runs_serially_without_joblib_outer_layer(tmp_path):
     frame = _frame()
     predictors = [column for column in frame if column.startswith("X_")]
     schema = write_schema_bundle(
         tmp_path / "input", frame, predictors=predictors
     )
-    parallel_calls = []
-
-    class TrackingParallel:
-        def __init__(self, **kwargs):
-            self.settings = kwargs
-
-        def __call__(self, tasks):
-            observed_models = []
-            rows = []
-            for function, args, kwargs in tasks:
-                observed_models.append(tuple(args[4]))
-                rows.append(function(*args, **kwargs))
-            parallel_calls.append(
-                {
-                    "prefer": self.settings["prefer"],
-                    "n_jobs": self.settings["n_jobs"],
-                    "models": observed_models,
-                }
-            )
-            return rows
-
     with (
-        patch("aleatoric_nk_grid.nk_grid.Parallel", TrackingParallel),
         patch(
             "aleatoric_nk_grid.nk_grid.make_model",
             side_effect=lambda *args, **kwargs: _MeanRegressor(),
@@ -368,17 +343,10 @@ def test_mixed_panel_runs_in_one_threads_window(tmp_path):
             )
         )
 
-    assert parallel_calls == [
-        {
-            "prefer": "threads",
-            "n_jobs": 3,
-            "models": [("lightgbm", "ols")],
-        },
-    ]
     assert pd.read_csv(tmp_path / "mixed.csv")["status"].eq("ok").all()
 
 
-def test_manifest_records_actual_window_policy_without_legacy_model_policy(
+def test_manifest_records_serial_chunk_policy_without_legacy_model_policy(
     tmp_path,
 ):
     frame = _frame()
@@ -388,7 +356,6 @@ def test_manifest_records_actual_window_policy_without_legacy_model_policy(
     )
     out = tmp_path / "window-policy.csv"
     with (
-        patch("aleatoric_nk_grid.nk_grid.Parallel", _InlineParallel),
         patch(
             "aleatoric_nk_grid.nk_grid.make_model",
             side_effect=lambda *args, **kwargs: _MeanRegressor(),
@@ -414,15 +381,12 @@ def test_manifest_records_actual_window_policy_without_legacy_model_policy(
     assert "effective_outer_n_jobs_by_model" not in parallelism
     assert "joblib_prefer_by_model" not in parallelism
     assert "bart" not in json.dumps(parallelism)
-    assert parallelism["configured_outer_n_jobs"] == 3
-    assert parallelism["window_policy"] == {
+    assert parallelism["configured_outer_n_jobs"] == 1
+    assert parallelism["chunk_policy"] == {
         "parallel_unit": "cell_group",
-        "prefer": "threads",
+        "prefer": "serial",
         "contains_native": True,
-        "n_jobs_rule": {
-            "all_models_native": 1,
-            "otherwise": 3,
-        },
+        "n_jobs_rule": "one array worker executes its groups serially",
         "native_calls_serialized": True,
     }
 
