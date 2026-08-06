@@ -97,3 +97,22 @@ def test_make_model_builds_cv_pipeline_from_locked_params():
     assert inner.alpha_ in np.logspace(
         fast["alpha_log10_min"], fast["alpha_log10_max"], fast["n_alphas"]
     )
+
+
+def test_converged_large_n_predictions_are_bitwise_invariant_to_iteration_cap():
+    X, y = _toy(1000, 3)
+    params = dict(
+        FAST, hidden_layer_sizes=[4], n_alphas=2, max_cv_folds=2,
+        learning_rate_init=0.01,
+    )
+    low = AdaptiveMLPRegressor(seed=91, **dict(params, max_iter=500)).fit(X, y)
+    high = AdaptiveMLPRegressor(seed=91, **dict(params, max_iter=2000)).fit(X, y)
+    np.testing.assert_array_equal(low.predict(X), high.predict(X))
+    assert low.alpha_ == high.alpha_
+
+
+def test_small_p_over_n_mlp_no_longer_hits_2000_iteration_cap():
+    X, y = _toy(10, 80, seed=19)
+    params = dict(FAST, hidden_layer_sizes=[32], max_iter=2000, n_alphas=2)
+    model = AdaptiveMLPRegressor(seed=2, **params).fit(X, y)
+    assert model.model_.n_iter_ < params["max_iter"]

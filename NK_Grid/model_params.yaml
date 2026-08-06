@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v5-adapter-4
+algorithm_version: nk-grid-v5-adapter-5
 
 regression:
   ols:
@@ -33,7 +33,7 @@ regression:
     n_alphas: 5
     max_cv_folds: 3
     learning_rate_init: 0.001
-    max_iter: 500
+    max_iter: 2000
     early_stopping: false
   super_learner:
     cv: 5

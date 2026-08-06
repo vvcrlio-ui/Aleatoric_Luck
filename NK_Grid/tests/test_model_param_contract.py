@@ -68,7 +68,7 @@ def test_locked_cv_regression_parameters_load_with_rmse():
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
 @pytest.mark.parametrize("task", ["regression", "classification"])
 def test_model_param_contract_covers_model_space_exactly(params_path, task):
-    assert load_algorithm_version(params_path) == "nk-grid-v5-adapter-4"
+    assert load_algorithm_version(params_path) == "nk-grid-v5-adapter-5"
     document = yaml.safe_load(params_path.read_text(encoding="utf-8"))
     assert set(document[task]) == set(SUPPORTED_MODEL_NAMES)
     selected = load_model_params(
@@ -78,6 +78,15 @@ def test_model_param_contract_covers_model_space_exactly(params_path, task):
     )
     assert len(MODEL_NAMES) == 9
     assert set(selected) == set(MODEL_NAMES)
+
+
+@pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
+def test_mlp_iteration_limit_distribution_is_locked(params_path):
+    values = [
+        line.strip() for line in params_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert values.count("max_iter: 500") == 3
+    assert values.count("max_iter: 2000") == 1
 
 
 def test_removed_model_registry_covers_expected_retirements():
