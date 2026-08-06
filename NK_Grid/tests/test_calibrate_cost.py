@@ -31,12 +31,17 @@ def _test_shape(
     """Small explicit shape for tests that do not exercise schema parsing."""
 
     n_onehot = n_sources // 2 if onehot_sources is None else onehot_sources
+    sources = tuple(
+        [cc.ShapeSource("continuous", (continuous_dtype,)) for _ in range(n_sources - n_onehot)]
+        + [cc.ShapeSource("onehot_group", (onehot_dtype, onehot_dtype, onehot_dtype)) for _ in range(n_onehot)]
+    )
+    expanded_count = sum(source.width for source in sources)
     return cc.PanelShape(
         schema_path="<test-shape>",
-        sources=tuple(
-            [cc.ShapeSource("continuous", (continuous_dtype,)) for _ in range(n_sources - n_onehot)]
-            + [cc.ShapeSource("onehot_group", (onehot_dtype, onehot_dtype, onehot_dtype)) for _ in range(n_onehot)]
-        ),
+        sources=sources,
+        dtype_source="declared",
+        dtype_metadata_declared=expanded_count,
+        dtype_metadata_total=expanded_count,
     )
 
 
@@ -570,7 +575,7 @@ def test_build_session_never_opens_private_data_paths(tmp_path, monkeypatch):
 
 def _write_feature_universe_schema(
     path: Path,
-    source_specs: list[tuple[str, tuple[str, ...]]],
+    source_specs: list[tuple[str, tuple[str | None, ...]]],
 ) -> Path:
     sources = []
     for source_order, (unit_type, dtypes) in enumerate(source_specs):
@@ -580,7 +585,10 @@ def _write_feature_universe_schema(
                 "source_order": source_order,
                 "unit_type": unit_type,
                 "features": [
-                    {"feature": f"f_{source_order}_{feature_order}", "dtype": dtype}
+                    {
+                        "feature": f"f_{source_order}_{feature_order}",
+                        **({"dtype": dtype} if dtype is not None else {}),
+                    }
                     for feature_order, dtype in enumerate(dtypes)
                 ],
             }
@@ -631,6 +639,82 @@ def test_shape_from_schema_and_synthetic_bundle_preserve_parameterized_dtypes(
     } == expected_counts
 
 
+def test_shape_without_dtype_metadata_fails_closed(tmp_path):
+    schema = _write_feature_universe_schema(
+        tmp_path / "missing-dtypes.feature_universe.json",
+        [("continuous", (None,)), ("onehot_group", (None, None))],
+    )
+
+    with pytest.raises(ValueError, match="declares dtype for 0/3"):
+        cc.shape_from_schema(schema)
+
+
+def test_external_dtype_profile_drives_generated_panel_and_is_recorded(tmp_path):
+    schema = _write_feature_universe_schema(
+        tmp_path / "profiled.feature_universe.json",
+        [("continuous", (None,)), ("continuous", (None,)), ("onehot_group", (None, None, None))],
+    )
+    profile_path = tmp_path / "dtype-profile.json"
+    profile_path.write_text(json.dumps({"int64": 3, "float64": 2}), encoding="utf-8")
+    profile = cc.read_feature_dtype_profile(profile_path)
+    shape = cc.shape_from_schema(
+        schema,
+        feature_dtype_profile=profile,
+        dtype_profile_path=profile_path,
+    )
+    params = cc.SyntheticDataParams(n_train=20, shape=shape, seed=8)
+    _, stats = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    generated = pd.read_parquet(tmp_path / "bundle" / "train.parquet").drop(columns="y")
+
+    assert {str(dtype): int((generated.dtypes == dtype).sum()) for dtype in generated.dtypes.unique()} == {
+        "float64": 2,
+        "int64": 3,
+    }
+    description = stats["shape"]
+    assert description["dtype_source"] == "external_profile"
+    assert description["dtype_metadata_coverage"] == "0/5"
+    assert description["dtype_profile_path"] == str(profile_path.resolve())
+
+
+def test_json_distinguishes_declared_defaulted_and_partial_dtype_sources(tmp_path):
+    schemas = {
+        "declared": _write_feature_universe_schema(
+            tmp_path / "declared.json", [("onehot_group", ("float64", "float64"))]
+        ),
+        "defaulted_float64": _write_feature_universe_schema(
+            tmp_path / "defaulted.json", [("onehot_group", (None, None))]
+        ),
+        "declared_with_assumed_float64": _write_feature_universe_schema(
+            tmp_path / "partial.json", [("onehot_group", ("int64", None))]
+        ),
+    }
+    expected_coverage = {
+        "declared": "2/2",
+        "defaulted_float64": "0/2",
+        "declared_with_assumed_float64": "1/2",
+    }
+    for expected_source, schema in schemas.items():
+        shape = cc.shape_from_schema(
+            schema,
+            assume_feature_dtype=(None if expected_source == "declared" else "float64"),
+        )
+        payload = cc.build_calibration_payload(
+            synthetic_params=cc.SyntheticDataParams(n_train=10, shape=shape, seed=0),
+            synthetic_stats={"n_expanded_predictors": 2},
+            t0_seconds={},
+            fit_cost={},
+            preprocess_cost={},
+            peak_rss={},
+            validation=[],
+            censored=[],
+            raw_measurements=[],
+            thread_env_report={"ok": True, "values": {}},
+        )
+        recorded = payload["synthetic_data"]["panel_shape"]
+        assert recorded["dtype_source"] == expected_source
+        assert recorded["dtype_metadata_coverage"] == expected_coverage[expected_source]
+
+
 def test_k_grid_uses_each_schema_shape_maximum_and_has_interior_probes(tmp_path):
     small = cc.shape_from_schema(
         _write_feature_universe_schema(
@@ -656,9 +740,11 @@ def test_k_grid_uses_each_schema_shape_maximum_and_has_interior_probes(tmp_path)
 def test_shape_from_existing_structure_schema_is_self_consistent():
     schema = next((cc.repo_root() / "SMR" / "schema").glob("*.feature_universe.json"))
     document = json.loads(schema.read_text(encoding="utf-8"))
-    shape = cc.shape_from_schema(schema)
+    shape = cc.shape_from_schema(schema, assume_feature_dtype="float64")
 
     assert shape.n_sources == len(document["sources"])
+    assert shape.dtype_source == "defaulted_float64"
+    assert shape.dtype_metadata_coverage == f"0/{len(document['predictors'])}"
     assert sum(shape.expanded_dtype_counts.values()) == sum(
         len(source["features"]) for source in document["sources"]
     )
@@ -683,6 +769,34 @@ def test_shape_export_passes_only_its_schema_directory_to_private_data_guard(tmp
 def test_cli_requires_explicit_shape_schema():
     with pytest.raises(SystemExit):
         cc.parse_args(["--n-train", "20"])
+
+
+def test_cli_accepts_external_dtype_profile_and_rejects_conflicting_assumption(tmp_path):
+    profile = tmp_path / "profile.json"
+    args = cc.parse_args(
+        [
+            "--shape-schema",
+            "shape.json",
+            "--n-train",
+            "20",
+            "--feature-dtype-profile",
+            str(profile),
+        ]
+    )
+    assert args.feature_dtype_profile == profile
+    with pytest.raises(SystemExit):
+        cc.parse_args(
+            [
+                "--shape-schema",
+                "shape.json",
+                "--n-train",
+                "20",
+                "--feature-dtype-profile",
+                str(profile),
+                "--assume-feature-dtype",
+                "float64",
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -337,6 +337,10 @@ class PanelShape:
 
     schema_path: str
     sources: tuple[ShapeSource, ...]
+    dtype_source: str
+    dtype_metadata_declared: int
+    dtype_metadata_total: int
+    dtype_profile_path: str | None = None
 
     @property
     def n_sources(self) -> int:
@@ -362,6 +366,10 @@ class PanelShape:
                 counts[dtype] = counts.get(dtype, 0) + 1
         return dict(sorted(counts.items()))
 
+    @property
+    def dtype_metadata_coverage(self) -> str:
+        return f"{self.dtype_metadata_declared}/{self.dtype_metadata_total}"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema_path": self.schema_path,
@@ -369,17 +377,33 @@ class PanelShape:
             "onehot_source_fraction": self.onehot_source_fraction,
             "onehot_group_sizes": list(self.onehot_group_sizes),
             "expanded_dtype_counts": self.expanded_dtype_counts,
+            "dtype_source": self.dtype_source,
+            "dtype_metadata_coverage": self.dtype_metadata_coverage,
+            "dtype_metadata_declared": self.dtype_metadata_declared,
+            "dtype_metadata_total": self.dtype_metadata_total,
+            "dtype_profile_path": self.dtype_profile_path,
         }
 
 
-def shape_from_schema(schema_path: Path | str) -> PanelShape:
-    """Read an explicit feature-universe schema without opening observation data.
+def shape_from_schema(
+    schema_path: Path | str,
+    *,
+    feature_dtype_profile: Mapping[str, int] | None = None,
+    assume_feature_dtype: str | None = None,
+    dtype_profile_path: Path | str | None = None,
+) -> PanelShape:
+    """Read an explicit feature-universe schema without observation values.
 
-    ``dtype`` is optional metadata on each expanded feature.  Schemas predating
-    that metadata are unambiguously represented as float64, preserving their
-    previous synthetic-panel behaviour while allowing newer schemas to state
-    integer-heavy layouts exactly.
+    Dtype composition is a property of the expanded *data*, not of a structure
+    schema, so it can never be inferred from structure alone. It must come from
+    either per-feature ``dtype`` metadata declared by the schema, or a read-only
+    dtype probe supplied through ``feature_dtype_profile``. A caller may instead
+    make an explicit uniform assumption with ``assume_feature_dtype``; unlike the
+    old implicit float64 fallback, that choice is recorded in the shape and JSON.
     """
+
+    if feature_dtype_profile is not None and assume_feature_dtype is not None:
+        raise ValueError("feature_dtype_profile and assume_feature_dtype are mutually exclusive")
 
     resolved = Path(schema_path).resolve()
     guard_not_private_data(resolved, allowed_roots=(resolved.parent,))
@@ -391,7 +415,8 @@ def shape_from_schema(schema_path: Path | str) -> PanelShape:
     if not isinstance(raw_sources, list) or not raw_sources:
         raise ValueError(f"feature-universe schema has no sources: {resolved}")
 
-    sources: list[ShapeSource] = []
+    source_rows: list[tuple[str, list[Mapping[str, Any]]]] = []
+    declared_count = 0
     for index, raw_source in enumerate(raw_sources):
         if not isinstance(raw_source, Mapping):
             raise ValueError(f"source {index} is not an object in {resolved}")
@@ -399,16 +424,78 @@ def shape_from_schema(schema_path: Path | str) -> PanelShape:
         features = raw_source.get("features")
         if unit_type not in {"continuous", "onehot_group"} or not isinstance(features, list) or not features:
             raise ValueError(f"source {index} has invalid unit_type or features in {resolved}")
-        dtypes: list[str] = []
         for feature in features:
             if not isinstance(feature, Mapping):
                 raise ValueError(f"source {index} has a non-object feature in {resolved}")
+            declared_count += "dtype" in feature
+        source_rows.append((unit_type, features))
+
+    total_count = sum(len(features) for _, features in source_rows)
+    if feature_dtype_profile is not None:
+        profile: list[str] = []
+        for raw_dtype, raw_count in sorted(feature_dtype_profile.items()):
             try:
-                dtypes.append(np.dtype(feature.get("dtype", "float64")).name)
+                dtype = np.dtype(raw_dtype).name
+                count = int(raw_count)
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"source {index} has invalid dtype metadata in {resolved}") from exc
+                raise ValueError(f"invalid feature dtype profile entry: {raw_dtype!r}: {raw_count!r}") from exc
+            if count < 0:
+                raise ValueError("feature dtype profile counts must be non-negative")
+            profile.extend([dtype] * count)
+        if len(profile) != total_count:
+            raise ValueError(
+                "feature dtype profile count does not match expanded feature count: "
+                f"{len(profile)} != {total_count}"
+            )
+        dtype_source = "external_profile"
+        profile_iterator = iter(profile)
+    else:
+        missing_count = total_count - declared_count
+        if missing_count and assume_feature_dtype is None:
+            raise ValueError(
+                f"feature-universe schema declares dtype for {declared_count}/{total_count} "
+                "expanded features; pass feature_dtype_profile or explicitly set "
+                "assume_feature_dtype"
+            )
+        assumed_dtype = None
+        if assume_feature_dtype is not None:
+            try:
+                assumed_dtype = np.dtype(assume_feature_dtype).name
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid assumed feature dtype: {assume_feature_dtype!r}") from exc
+        if missing_count == 0:
+            dtype_source = "declared"
+        elif declared_count == 0:
+            dtype_source = f"defaulted_{assumed_dtype}"
+        else:
+            dtype_source = f"declared_with_assumed_{assumed_dtype}"
+        profile_iterator = None
+
+    sources: list[ShapeSource] = []
+    for source_index, (unit_type, features) in enumerate(source_rows):
+        dtypes: list[str] = []
+        for feature in features:
+            try:
+                if profile_iterator is not None:
+                    dtype = next(profile_iterator)
+                else:
+                    dtype = np.dtype(feature.get("dtype", assumed_dtype)).name
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"source {source_index} has invalid dtype metadata in {resolved}"
+                ) from exc
+            dtypes.append(dtype)
         sources.append(ShapeSource(unit_type=unit_type, feature_dtypes=tuple(dtypes)))
-    return PanelShape(schema_path=str(resolved), sources=tuple(sources))
+    return PanelShape(
+        schema_path=str(resolved),
+        sources=tuple(sources),
+        dtype_source=dtype_source,
+        dtype_metadata_declared=declared_count,
+        dtype_metadata_total=total_count,
+        dtype_profile_path=(
+            str(Path(dtype_profile_path).resolve()) if dtype_profile_path is not None else None
+        ),
+    )
 
 
 def k_grid_from_shape(
@@ -1851,6 +1938,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Explicit feature-universe schema used to derive the synthetic panel shape.",
     )
+    dtype_group = parser.add_mutually_exclusive_group()
+    dtype_group.add_argument(
+        "--feature-dtype-profile",
+        type=Path,
+        default=None,
+        help="JSON object mapping dtype names to expanded-feature counts from a read-only dtype probe.",
+    )
+    dtype_group.add_argument(
+        "--assume-feature-dtype",
+        type=str,
+        default=None,
+        help="Explicit uniform dtype assumption for schema features lacking dtype metadata.",
+    )
     parser.add_argument("--n-train", type=int, required=True)
     parser.add_argument(
         "--stage-a-n",
@@ -1932,13 +2032,34 @@ def parse_positive_int_grid(specification: str, *, option: str) -> tuple[int, ..
     return tuple(dict.fromkeys(values))
 
 
+def read_feature_dtype_profile(path: Path | str) -> dict[str, int]:
+    resolved = Path(path).resolve()
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid feature dtype profile JSON: {resolved}: {exc}") from exc
+    if not isinstance(payload, Mapping) or not payload:
+        raise ValueError("feature dtype profile must be a non-empty JSON object")
+    return dict(payload)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     thread_report = enforce_thread_env(strict=not args.allow_nonproduction_threads)
 
     work_dir = args.work_dir or (repo_root() / "NK_Grid" / "calibration" / "_scratch")
     out_dir = args.out_dir or (repo_root() / "NK_Grid" / "calibration")
-    shape = shape_from_schema(args.shape_schema)
+    dtype_profile = (
+        read_feature_dtype_profile(args.feature_dtype_profile)
+        if args.feature_dtype_profile is not None
+        else None
+    )
+    shape = shape_from_schema(
+        args.shape_schema,
+        feature_dtype_profile=dtype_profile,
+        assume_feature_dtype=args.assume_feature_dtype,
+        dtype_profile_path=args.feature_dtype_profile,
+    )
     stage_a_n = parse_positive_int_grid(args.stage_a_n, option="--stage-a-n")
     if max(stage_a_n) > args.n_train:
         raise ValueError("--stage-a-n values cannot exceed --n-train")

@@ -91,6 +91,9 @@ def test_preprocess_cell_scaling_and_peak_memory_benchmark(tmp_path, record_prop
                 sources=tuple(
                     cc.ShapeSource("continuous", ("float64",)) for _ in range(8053)
                 ),
+                dtype_source="declared",
+                dtype_metadata_declared=8053,
+                dtype_metadata_total=8053,
             ),
             seed=0,
         ),
