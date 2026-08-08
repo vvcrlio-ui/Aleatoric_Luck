@@ -7,7 +7,6 @@ regression:
     alpha_log10_min: -4
     alpha_log10_max: 4
     n_alphas: 50
-    max_cv_folds: 5
     scoring: neg_mean_squared_error
   lasso:
     alpha_log10_min: -4

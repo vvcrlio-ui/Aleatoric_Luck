@@ -32,8 +32,8 @@ def _fast_params(model_name: str) -> dict:
     )
     if model_name in {"ridge", "lasso"}:
         params["n_alphas"] = 5
-        params["max_cv_folds"] = 2
         if model_name != "ridge":
+            params["max_cv_folds"] = 2
             params["max_iter"] = min(int(params.get("max_iter", 100)), 100)
     elif model_name in {"random_forest", "extra_trees"}:
         params.update(n_estimators=8, min_samples_leaf=1)

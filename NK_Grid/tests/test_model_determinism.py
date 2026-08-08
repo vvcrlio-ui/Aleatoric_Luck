@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from aleatoric_nk_grid.model_registry import (
+    AdaptiveRidgeCV,
     SUPPORTED_MODEL_NAMES,
     load_model_params,
 )
@@ -30,6 +31,25 @@ MODEL_PARAMS = Path(__file__).resolve().parents[1] / "model_params.yaml"
 REPEATS = 24
 
 
+class _FiveFoldAdaptiveRidgeCV(AdaptiveRidgeCV):
+    """Pre-change ridge behavior for the isolated regression comparison."""
+
+    def fit(self, X, y):
+        from sklearn.linear_model import RidgeCV
+
+        cv = min(5, len(y))
+        if cv < 2:
+            raise ValueError("Ridge requires at least two training rows.")
+        self.model_ = RidgeCV(
+            alphas=np.logspace(
+                self.alpha_log10_min, self.alpha_log10_max, self.n_alphas
+            ),
+            cv=cv,
+            scoring=self.scoring,
+        ).fit(X, y)
+        return self
+
+
 def _fast_model_params(model_name: str, task: str) -> dict:
     """Return small test-only parameters without bypassing model code paths."""
 
@@ -40,7 +60,9 @@ def _fast_model_params(model_name: str, task: str) -> dict:
     )
     if model_name in {"ridge", "lasso"}:
         if task == "regression":
-            params.update(n_alphas=2, max_cv_folds=2)
+            params["n_alphas"] = 2
+            if model_name == "lasso":
+                params["max_cv_folds"] = 2
         if model_name == "lasso" or task == "classification":
             params["max_iter"] = 100
     elif model_name in {"random_forest", "extra_trees"}:
@@ -156,6 +178,48 @@ def test_all_registered_models_are_bitwise_deterministic(
                 result["best_rounds"] == reference_rounds
                 for result in results[1:]
             )
+
+
+def test_only_ridge_predictions_change_from_the_five_fold_baseline(monkeypatch):
+    """The fixed full-model fixture preserves every non-ridge prediction."""
+
+    import aleatoric_nk_grid.model_registry as registry
+
+    X_train, y_train, X_test = _data(20, "regression")
+
+    def results():
+        return {
+            model_name: _fit_predict_model_cell(
+                model_name=model_name,
+                model_seed=918,
+                model_n_jobs=1,
+                task="regression",
+                params=_fast_model_params(model_name, "regression"),
+                X_train=X_train,
+                y_train=y_train,
+                X_test=X_test,
+            )
+            for model_name in SUPPORTED_MODEL_NAMES
+        }
+
+    monkeypatch.setattr(registry, "AdaptiveRidgeCV", _FiveFoldAdaptiveRidgeCV)
+    before = results()
+    monkeypatch.setattr(registry, "AdaptiveRidgeCV", AdaptiveRidgeCV)
+    after = results()
+
+    for model_name in SUPPORTED_MODEL_NAMES:
+        if model_name == "ridge":
+            continue
+        np.testing.assert_array_equal(
+            after[model_name]["predictions"], before[model_name]["predictions"]
+        )
+    assert not np.array_equal(
+        after["ridge"]["predictions"], before["ridge"]["predictions"]
+    )
+    np.testing.assert_array_equal(
+        after["super_learner"]["predictions"],
+        before["super_learner"]["predictions"],
+    )
 
 
 class _SolverEstimator:

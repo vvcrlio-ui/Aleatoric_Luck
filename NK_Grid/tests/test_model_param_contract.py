@@ -55,6 +55,16 @@ def test_cv_regressor_missing_required_parameter_fails_at_load_time(tmp_path):
         load_model_params(path, task="regression", models=("xgboost",))
 
 
+@pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
+def test_ridge_rejects_removed_max_cv_folds_at_load_time(tmp_path, params_path):
+    document = yaml.safe_load(params_path.read_text(encoding="utf-8"))
+    document["regression"]["ridge"]["max_cv_folds"] = 5
+    stale = tmp_path / params_path.name
+    stale.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="max_cv_folds"):
+        load_model_params(stale, task="regression", models=("ridge",))
+
+
 def test_locked_cv_regression_parameters_load_with_rmse():
     selected = load_model_params(
         MODEL_PARAMS,

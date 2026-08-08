@@ -136,9 +136,17 @@ def test_schema_semantic_contract_normalizes_optional_defaults(tmp_path):
 
 
 def test_explicit_identity_versions_prevent_checkpoint_aliasing(tmp_path):
-    first = replace(_config(tmp_path / "schema.json", tmp_path / "one.csv"), data_version="data-v1")
-    second = replace(first, data_version="data-v2")
-    assert first.data_version != second.data_version
+    schema = write_schema_bundle(
+        tmp_path / "bundle", _frame(), predictors=["X_a", "X_b"]
+    )
+    first = replace(
+        _config(schema, tmp_path / "one.csv"),
+        model_spec_version="nkgrid-models-v1",
+    )
+    run_nk_grid(first)
+    second = replace(first, model_spec_version="nkgrid-models-v2")
+    with pytest.raises(ValueError, match=r"identity\.model_spec_version"):
+        run_nk_grid(second)
 
 
 def test_panel_rejects_schema_owned_fields_and_external_test_size(tmp_path):
