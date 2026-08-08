@@ -1,12 +1,13 @@
 #!/bin/bash
 # Submit with --job-name="$CALIBRATION_JOB_NAME" and explicitly export
 # SBATCH_ACCOUNT plus SBATCH_CONSTRAINT before calling sbatch.
-# These retained resource requests predate the reduced calibration scope and
-# must be re-measured when that scope changes.
+# Eight CPUs are used only by the retained optional task-allocation memory
+# scope; the invalidated timing grids are gone, so four hours is the reviewed
+# ceiling for the caller-selected cell list rather than a twelve-hour fit grid.
 #SBATCH --job-name=al-calibrate
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=12:00:00
+#SBATCH --mem=48G
+#SBATCH --time=04:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 set -euo pipefail
@@ -20,6 +21,7 @@ PYTHON="${PYTHON:-$VENV/bin/python}"
 : "${SBATCH_CONSTRAINT:?Set SBATCH_CONSTRAINT before submitting this calibration job}"
 : "${CALIBRATION_SHAPE_SCHEMA:?Set CALIBRATION_SHAPE_SCHEMA to a feature-universe schema}"
 : "${CALIBRATION_N_TRAIN:?Set CALIBRATION_N_TRAIN to the training-row count}"
+: "${CALIBRATION_MEMORY_CELLS:?Set CALIBRATION_MEMORY_CELLS to model:N:K probes}"
 : "${CALIBRATION_TASK_MEMORY_CELLS:?Set CALIBRATION_TASK_MEMORY_CELLS}"
 : "${CALIBRATION_OUT_DIR:?Set CALIBRATION_OUT_DIR}"
 
@@ -48,5 +50,6 @@ echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_
   --shape-schema "$CALIBRATION_SHAPE_SCHEMA" \
   "${DTYPE_ARGS[@]}" \
   --n-train "$CALIBRATION_N_TRAIN" \
+  --memory-cells "$CALIBRATION_MEMORY_CELLS" \
   --task-memory-cells "$CALIBRATION_TASK_MEMORY_CELLS" \
   --out-dir "$CALIBRATION_OUT_DIR"

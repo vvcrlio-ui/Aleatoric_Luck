@@ -51,46 +51,6 @@ def _test_shape(
 # ---------------------------------------------------------------------------
 
 
-def test_fit_power_law_recovers_known_exponents_noise_free():
-    rng = np.random.default_rng(0)
-    n = rng.integers(1, 5000, size=60).astype(float)
-    k = rng.integers(1, 5000, size=60).astype(float)
-    c, a, b = 3.5, 0.85, 0.15
-    t = c * (k**a) * (n**b)
-
-    fit = cc.fit_power_law(n, k, t)
-
-    assert abs(fit.a - a) < 1e-6
-    assert abs(fit.b - b) < 1e-6
-    assert abs(fit.log_c - np.log(c)) < 1e-6
-    assert fit.r2 > 1 - 1e-9
-
-
-def test_fit_power_law_recovers_known_exponents_with_noise():
-    rng = np.random.default_rng(1)
-    n = rng.integers(1, 5000, size=200).astype(float)
-    k = rng.integers(1, 5000, size=200).astype(float)
-    c, a, b = 1.2, 0.7, 0.4
-    t = c * (k**a) * (n**b) * (1.0 + rng.normal(0, 0.02, size=200))
-
-    fit = cc.fit_power_law(n, k, t)
-
-    assert abs(fit.a - a) < 0.05
-    assert abs(fit.b - b) < 0.05
-    assert abs(fit.log_c - np.log(c)) < 0.1
-    assert fit.r2 > 0.9
-
-
-def test_fit_power_law_rejects_too_few_points():
-    with pytest.raises(ValueError):
-        cc.fit_power_law([1.0, 2.0], [1.0, 2.0], [1.0, 2.0])
-
-
-# ---------------------------------------------------------------------------
-# 2. Synthetic data determinism
-# ---------------------------------------------------------------------------
-
-
 def test_synthetic_bundle_generation_is_deterministic(tmp_path):
     params = cc.SyntheticDataParams(n_train=120, shape=_test_shape(15), seed=42)
     schema_a, stats_a = cc.generate_synthetic_bundle(tmp_path / "a", params)
@@ -115,31 +75,6 @@ def test_synthetic_bundle_generation_differs_across_seeds(tmp_path):
     assert not frame_a.equals(frame_b)
 
 
-def test_t0_component_consistency_flags_more_than_ten_percent_gap():
-    consistent = cc.t0_component_consistency(10.0, 10.9)
-    inconsistent = cc.t0_component_consistency(10.0, 12.0)
-
-    assert consistent["exceeds_tolerance"] is False
-    assert inconsistent["exceeds_tolerance"] is True
-    assert inconsistent["relative_difference"] == pytest.approx(2.0 / 12.0)
-
-
-def test_payload_lists_every_fit_below_the_r2_explanation_threshold():
-    low = cc.PowerLawFit(0.0, 1.0, 1.0, 0.79, (0.0, 0.0), 3)
-    acceptable = cc.PowerLawFit(0.0, 1.0, 1.0, 0.80, (0.0, 0.0), 3)
-    payload = cc.build_calibration_payload(
-        synthetic_params=cc.SyntheticDataParams(n_train=10, shape=_test_shape(4), seed=0),
-        synthetic_stats={"n_expanded_predictors": 8, "observed_missingness": {}},
-        t0_seconds={}, fit_cost={"ridge": low, "ols": acceptable}, preprocess_cost={},
-        peak_rss={}, validation=[], censored=[], raw_measurements=[],
-        thread_env_report={"ok": True, "values": {}},
-    )
-
-    assert payload["fit_quality"]["models_below_r2_threshold"] == [
-        {"model": "ridge", "r2": 0.79}
-    ]
-
-
 def test_synthetic_observed_missingness_exposes_an_all_integer_zero_missing_panel(tmp_path):
     shape = _test_shape(8, onehot_sources=4, onehot_dtype="int64", continuous_dtype="int64")
     _, stats = cc.generate_synthetic_bundle(
@@ -151,57 +86,7 @@ def test_synthetic_observed_missingness_exposes_an_all_integer_zero_missing_pane
     assert observed["missing_cells_fraction"] == 0.0
 
 
-def test_small_calibration_collects_fit_telemetry_from_real_fits(tmp_path):
-    params = cc.SyntheticDataParams(n_train=100, shape=_test_shape(8), seed=11)
-    schema_path, stats = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
-    session = cc.build_session(schema_path, "y", seed=0)
-    # Test-only reduced settings retain each production estimator path while
-    # making this a small telemetry smoke test rather than a calibration run.
-    session.model_params["xgboost"].update(max_rounds=5, cv_folds=2)
-    session.model_params["shallow_neural_network"].update(
-        hidden_layer_sizes=[3], max_iter=5, n_alphas=2, max_cv_folds=2
-    )
-    measurements = []
-    try:
-        for model_name in ("lasso", "ridge", "xgboost", "shallow_neural_network"):
-            measurement = cc._measure_one_cell_in_process(
-                session, model_name=model_name, n=20, k=4, seed=0, draw=0, max_seconds=60
-            )
-            measurement.stage = "A"
-            measurements.append(measurement)
-    finally:
-        cc.close_session(session)
-
-    payload = cc.build_calibration_payload(
-        synthetic_params=params,
-        synthetic_stats=stats,
-        t0_seconds={}, fit_cost={}, preprocess_cost={}, peak_rss={}, validation=[], censored=[],
-        raw_measurements=measurements, thread_env_report={"ok": True, "values": {}},
-    )
-    telemetry = payload["telemetry"]
-
-    assert telemetry["status"] == "collected"
-    assert telemetry["fields_with_observations"] == {
-        "converged": True,
-        "best_rounds": True,
-        "solver": True,
-        "n_iter": True,
-        "alpha": True,
-    }
-    assert all(
-        {"converged", "best_rounds", "solver", "n_iter", "alpha"}.issubset(row)
-        for row in payload["raw_measurements"]
-    )
-
-
-# ---------------------------------------------------------------------------
-# 3. Censoring path
-# ---------------------------------------------------------------------------
-
-
-def test_measure_one_cell_records_censoring_and_excludes_from_regression(
-    tmp_path, monkeypatch
-):
+def test_measure_one_cell_respects_the_memory_probe_time_budget(tmp_path, monkeypatch):
     params = cc.SyntheticDataParams(n_train=100, shape=_test_shape(10), seed=0)
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
     session = cc.build_session(schema_path, "y", seed=0)
@@ -217,57 +102,14 @@ def test_measure_one_cell_records_censoring_and_excludes_from_regression(
     # The public entry point is a fresh spawn process.  Exercise the budget
     # implementation directly here; monkeypatches do not cross a spawn
     # boundary (which is exactly the isolation the calibration needs).
-    with pytest.raises(cc.MeasurementCensored):
-        cc._measure_one_cell_in_process(
-            session,
-            model_name="ols",
-            n=10,
-            k=5,
-            seed=0,
-            draw=0,
-            max_seconds=0.05,
-        )
-
-    monkeypatch.setattr(
-        cc, "measure_one_cell",
-        lambda *args, **kwargs: (_ for _ in ()).throw(cc.MeasurementCensored("test")),
-    )
-    raw, censored = cc.run_stage_a(
-        session,
-        n_grid=(10,),
-        k_grid=(5,),
-        n_reps=1,
-        max_seconds=0.05,
-        models=("ols",),
-    )
-    assert raw == []
-    assert len(censored) == 1
-    assert censored[0] == {
-        "n": 10,
-        "k": 5,
-        "model": "ols",
-        "rep": 0,
-        "max_seconds": 0.05,
-        "stage": "A",
-    }
-
-    fits = cc.fit_all_models(raw, models=("ols",))
-    assert fits["ols"] is None
-
-    payload = cc.build_calibration_payload(
-        synthetic_params=params,
-        synthetic_stats={"n_expanded_predictors": 10},
-        t0_seconds={},
-        fit_cost=fits,
-        preprocess_cost={},
-        peak_rss={},
-        validation=[],
-        censored=censored,
-        raw_measurements=raw,
-        thread_env_report={"ok": True, "values": {}},
-    )
-    assert payload["censored"] == censored
-    assert payload["raw_measurements"] == []
+    try:
+        with pytest.raises(cc.MeasurementCensored):
+            cc._measure_one_cell_in_process(
+                session, model_name="ols", n=10, k=5, seed=0, draw=0,
+                max_seconds=0.05,
+            )
+    finally:
+        cc.close_session(session)
 
 
 # ---------------------------------------------------------------------------
@@ -275,118 +117,32 @@ def test_measure_one_cell_records_censoring_and_excludes_from_regression(
 # ---------------------------------------------------------------------------
 
 
-def test_calibration_file_round_trip_recomputes_fit_cost(tmp_path):
-    rng = np.random.default_rng(7)
-    raw = []
-    true_fit = {}
-    for model_name, (c, a, b) in {
-        "ols": (1.0, 0.5, 0.5),
-        "ridge": (2.0, 0.7, 0.2),
-    }.items():
-        true_fit[model_name] = (c, a, b)
-        for n in (10, 100, 1000):
-            for k in (10, 100):
-                t = c * (k**a) * (n**b)
-                raw.append(
-                    cc.RawMeasurement(
-                        model=model_name,
-                        n=n,
-                        k=k,
-                        rep=0,
-                        fit_seconds=t,
-                        preprocess_seconds=0.01,
-                        preprocess_mode="imputed",
-                        peak_rss_bytes=1_000_000,
-                        stage="A",
-                    )
-                )
-
-    fit_cost = cc.fit_all_models(raw, models=("ols", "ridge"))
-    raw[0].memory_scope_suspect = True
-    raw[0].preprocess_vectorized = True
-    payload = cc.build_calibration_payload(
-        synthetic_params=cc.SyntheticDataParams(n_train=10, shape=_test_shape(10), seed=0),
-        synthetic_stats={
-            "n_expanded_predictors": 10,
-            "observed_missingness": {
-                "expanded_columns_with_nan_fraction": 0.0,
-                "missing_cells_fraction": 0.0,
-            },
-        },
-        t0_seconds={
-            "import": {"median": 1.18, "min": 1.156, "max": 1.234, "n_reps": 5},
-            "load": {"median": 0.1, "min": 0.09, "max": 0.11, "n_reps": 5},
-            "split": {"median": 0.01, "min": 0.009, "max": 0.011, "n_reps": 5},
-            "orders": {"median": 0.001, "min": 0.0009, "max": 0.0011, "n_reps": 5},
-            "total": {"median": 1.3, "n_reps": 5},
-        },
-        fit_cost=fit_cost,
-        preprocess_cost={},
-        peak_rss={},
-        validation=[],
-        censored=[],
-        raw_measurements=raw,
+def test_format_v6_round_trip_contains_only_memory_measurements(tmp_path):
+    params = cc.SyntheticDataParams(n_train=30, shape=_test_shape(5), seed=7)
+    _, stats = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
+    measurement = cc.RawMeasurement(
+        model="ols", n=10, k=3, rep=2, fit_seconds=1.0,
+        preprocess_seconds=0.5, preprocess_mode="imputed", peak_rss_bytes=222,
+        stage="", process_peak_rss_bytes=111, cell_cgroup_peak_bytes=222,
+        cell_memory_method=cc.MEMORY_METHOD_CGROUP_CURRENT,
+        cell_memory_sampling_interval_seconds=0.01,
+        cell_memory_sampling_interval_max_seconds=0.02,
+    )
+    payload = cc.build_memory_probe_payload(
+        synthetic_params=params, synthetic_stats=stats,
+        cell_measurements=(measurement,),
         thread_env_report={"ok": True, "values": {name: "1" for name in cc.THREAD_ENV_VARS}},
-        task_cgroup_peak_n_jobs_8=cc.MemoryPeak(
-            bytes=987_654_321,
-            method=cc.MEMORY_METHOD_CGROUP_PEAK,
-            sampling_interval_seconds=None,
-        ),
+        task_peak=cc.MemoryPeak(333, cc.MEMORY_METHOD_CGROUP_PEAK, None),
+        wall_clock_seconds=4.5,
     )
-
-    out_path = cc.write_calibration_file(payload, tmp_path, date="2026-07-31")
-    assert out_path.name == "cost_model_2026-07-31.json"
-
-    reloaded = cc.read_calibration_file(out_path)
-    assert reloaded["format_version"] == cc.FORMAT_VERSION
-
-    required_top_level = {
-        "format_version",
-        "created_at_utc",
-        "git_commit",
-        "environment",
-        "synthetic_data",
-        "t0_seconds",
-        "fit_cost",
-        "preprocess_cost",
-        "peak_rss_bytes",
-        "memory_measurement",
-        "validation",
-        "censored",
-        "raw_measurements",
-    }
-    assert required_top_level.issubset(reloaded.keys())
-    assert reloaded["t0_seconds"]["import"]["median"] == 1.18
-    assert reloaded["memory_measurement"]["cell_memory_scope_suspect_count"] == 1
-    assert reloaded["raw_measurements"][0]["memory_scope_suspect"] is True
-    assert reloaded["raw_measurements"][0]["preprocess_vectorized"] is True
-    task_peak = reloaded["memory_measurement"]["task_cgroup_peak_n_jobs_8"]
-    assert task_peak == {
-        "status": "measured",
-        "bytes": 987_654_321,
-        "method": cc.MEMORY_METHOD_CGROUP_PEAK,
-        "sampling_interval_seconds": None,
-        "sampling_interval_max_seconds": None,
-        "samples": 0,
-    }
-
-    recomputed = cc.recompute_fit_cost_from_raw(
-        reloaded["raw_measurements"], models=("ols", "ridge")
-    )
-    for model_name, (c, a, b) in true_fit.items():
-        fit = recomputed[model_name]
-        assert fit is not None
-        assert abs(fit.a - a) < 1e-6
-        assert abs(fit.b - b) < 1e-6
-        assert abs(fit.log_c - np.log(c)) < 1e-6
-        assert abs(fit.log_c - reloaded["fit_cost"][model_name]["log_c"]) < 1e-9
-        assert abs(fit.a - reloaded["fit_cost"][model_name]["a"]) < 1e-9
-        assert abs(fit.b - reloaded["fit_cost"][model_name]["b"]) < 1e-9
-
-
-# ---------------------------------------------------------------------------
-# 4A. Round-2 memory measurement: independent spawn RSS plus cgroup fallbacks
-# ---------------------------------------------------------------------------
+    path = cc.write_calibration_file(payload, tmp_path, date="2026-08-09")
+    assert path.name == "memory_probe_2026-08-09.json"
+    reloaded = cc.read_calibration_file(path)
+    assert reloaded["format_version"] == 6
+    assert reloaded["memory_measurement"]["cell_measurements"][0]["process_peak_rss_bytes"] == 111
+    assert reloaded["memory_measurement"]["cell_measurements"][0]["cell_allocation_peak_bytes"] == 222
+    assert reloaded["memory_measurement"]["task_allocation_peak"]["bytes"] == 333
+    assert not {"t0_seconds", "fit_cost", "preprocess_cost", "validation", "peak_rss_bytes"}.intersection(reloaded)
 
 
 def test_fresh_spawn_process_peak_does_not_inherit_parent_high_water():
@@ -524,11 +280,20 @@ def test_task_memory_cli_requires_an_explicit_eight_cell_task_shape():
         cc.parse_task_memory_cells("ols:10:5", max_seconds=12.5)
 
 
-@pytest.mark.parametrize("old_version", (1, 2, 3, 4))
+@pytest.mark.parametrize(
+    "specification",
+    ("", "unknown:10:5", "ols:0:5", "ols:10:0", "ols:10"),
+)
+def test_memory_cell_cli_rejects_invalid_caller_selected_points(specification):
+    with pytest.raises(ValueError):
+        cc.parse_memory_cells(specification, max_seconds=12.5)
+
+
+@pytest.mark.parametrize("old_version", (1, 2, 3, 4, 5))
 def test_calibration_reader_rejects_old_calibration_formats(tmp_path, old_version):
     old_path = tmp_path / f"old-v{old_version}.json"
     old_path.write_text(json.dumps({"format_version": old_version}), encoding="utf-8")
-    with pytest.raises(ValueError, match="expected 5"):
+    with pytest.raises(ValueError, match="versions <=5"):
         cc.read_calibration_file(old_path)
 
 
@@ -823,43 +588,15 @@ def test_json_distinguishes_declared_defaulted_and_partial_dtype_sources(tmp_pat
             schema,
             assume_feature_dtype=(None if expected_source == "declared" else "float64"),
         )
-        payload = cc.build_calibration_payload(
+        payload = cc.build_memory_probe_payload(
             synthetic_params=cc.SyntheticDataParams(n_train=10, shape=shape, seed=0),
-            synthetic_stats={"n_expanded_predictors": 2},
-            t0_seconds={},
-            fit_cost={},
-            preprocess_cost={},
-            peak_rss={},
-            validation=[],
-            censored=[],
-            raw_measurements=[],
+            synthetic_stats={"n_expanded_predictors": 2, "observed_missingness": {}},
+            cell_measurements=[],
             thread_env_report={"ok": True, "values": {}},
         )
         recorded = payload["synthetic_data"]["panel_shape"]
         assert recorded["dtype_source"] == expected_source
         assert recorded["dtype_metadata_coverage"] == expected_coverage[expected_source]
-
-
-def test_k_grid_uses_each_schema_shape_maximum_and_has_interior_probes(tmp_path):
-    small = cc.shape_from_schema(
-        _write_feature_universe_schema(
-            tmp_path / "small.feature_universe.json",
-            [("continuous", ("float64",))] * 40,
-        )
-    )
-    large = cc.shape_from_schema(
-        _write_feature_universe_schema(
-            tmp_path / "large.feature_universe.json",
-            [("continuous", ("float64",))] * 4000,
-        )
-    )
-    small_grid = cc.k_grid_from_shape(small, base_anchors=(10,), intermediate_points=2)
-    large_grid = cc.k_grid_from_shape(large, base_anchors=(10, 100, 1000), intermediate_points=2)
-
-    assert small_grid[-1] == 40
-    assert large_grid[-1] == 4000
-    assert sum(10 < point < 40 for point in small_grid) == 2
-    assert sum(1000 < point < 4000 for point in large_grid) == 2
 
 
 def test_shape_from_existing_structure_schema_is_self_consistent():
@@ -893,7 +630,7 @@ def test_shape_export_passes_only_its_schema_directory_to_private_data_guard(tmp
 
 def test_cli_requires_explicit_shape_schema():
     with pytest.raises(SystemExit):
-        cc.parse_args(["--n-train", "20"])
+        cc.parse_args(["--n-train", "20", "--memory-cells", "ols:10:2"])
 
 
 def test_cli_accepts_external_dtype_profile_and_rejects_conflicting_assumption(tmp_path):
@@ -904,6 +641,8 @@ def test_cli_accepts_external_dtype_profile_and_rejects_conflicting_assumption(t
             "shape.json",
             "--n-train",
             "20",
+            "--memory-cells",
+            "ols:10:2",
             "--feature-dtype-profile",
             str(profile),
         ]
@@ -916,6 +655,8 @@ def test_cli_accepts_external_dtype_profile_and_rejects_conflicting_assumption(t
                 "shape.json",
                 "--n-train",
                 "20",
+                "--memory-cells",
+                "ols:10:2",
                 "--feature-dtype-profile",
                 str(profile),
                 "--assume-feature-dtype",
@@ -1017,7 +758,7 @@ def test_measure_one_cell_discards_native_runner_on_failure(tmp_path, monkeypatc
     assert session.native_runner is None
 
 
-def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path):
+def test_memory_payload_records_synthetic_shape_and_fallback_order(tmp_path):
     params = cc.SyntheticDataParams(
         n_train=50,
         shape=_test_shape(6, onehot_sources=3),
@@ -1026,16 +767,8 @@ def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path
         missing_rate_group=0.15,
     )
     _, stats = cc.generate_synthetic_bundle(tmp_path / "bundle", params)
-    payload = cc.build_calibration_payload(
-        synthetic_params=params,
-        synthetic_stats=stats,
-        t0_seconds={},
-        fit_cost={},
-        preprocess_cost={},
-        peak_rss={},
-        validation=[],
-        censored=[],
-        raw_measurements=[],
+    payload = cc.build_memory_probe_payload(
+        synthetic_params=params, synthetic_stats=stats, cell_measurements=(),
         thread_env_report={"ok": True, "values": {}},
     )
     synthetic_data = payload["synthetic_data"]
@@ -1044,16 +777,9 @@ def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path
     assert synthetic_data["missing_rate_group"] == 0.15
     assert synthetic_data["outcome"] == params.outcome
     assert synthetic_data["observed_missingness"] == stats["observed_missingness"]
-    assert payload["telemetry"] == {
-        "status": "not_measured",
-        "by_model_k": [],
-        "fields_with_observations": {
-            "converged": False,
-            "best_rounds": False,
-            "solver": False,
-            "n_iter": False,
-            "alpha": False,
-        },
-    }
-    assert payload["fit_quality"]["models_below_r2_threshold"] == []
-    assert payload["wall_clock_seconds"] == {"status": "not_measured"}
+    assert payload["memory_measurement"]["fallback_order"] == [
+        cc.MEMORY_METHOD_CGROUP_PEAK,
+        cc.MEMORY_METHOD_CGROUP_CURRENT,
+        cc.MEMORY_METHOD_PROCESS_TREE,
+    ]
+    assert payload["memory_measurement"]["cell_measurements"] == []

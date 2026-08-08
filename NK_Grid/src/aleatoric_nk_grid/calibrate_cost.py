@@ -1,13 +1,9 @@
-"""Empirical cost/memory calibration harness for the N x K engine.
+"""Pure peak-memory probe for the N x K engine.
 
-Measures wall-clock startup cost (t0), per-model fit-time power laws, peak
-RSS, and preprocessing cost -- entirely on locally generated synthetic data.
-Produces ``NK_Grid/calibration/cost_model_<UTC-date>.json``.
-
-This module is purely additive: it does not change any engine execution
-logic, does not touch private observation data (example only, never a dataset-
-name guard criterion), and never inspects or reports any metric value (``r2_test``,
-``rmse``, etc). See ``plans/cost-calibration.md`` for the full specification.
+The probe recreates real cell workloads on schema-shaped synthetic data and
+records the distinct process, cell-allocation, and optional concurrent-task
+memory scopes.  It deliberately produces no duration model, startup estimate,
+power-law fit, or validation coefficient.
 """
 
 from __future__ import annotations
@@ -19,12 +15,11 @@ import multiprocessing as mp
 import os
 import resource
 import signal
-import subprocess
 import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -62,10 +57,9 @@ from .validate_input import canonical_feature_universe, validate_input
 # Constants
 # ---------------------------------------------------------------------------
 
-# Version 5 adds measured parallel efficiency, a runtime t0 import
-# measurement/end-to-end consistency check, actual synthetic missingness, and
-# calibration-run reporting. Earlier files must never be interpreted as v5.
-FORMAT_VERSION = 5
+# Version 6 is memory-only.  Versions <=5 contain invalidated duration and
+# power-law fields and must never be interpreted as memory-probe artefacts.
+FORMAT_VERSION = 6
 MEMORY_SAMPLE_INTERVAL_SECONDS = 0.01
 MEMORY_METHOD_CGROUP_PEAK = "cgroup_v2_memory_peak"
 MEMORY_METHOD_CGROUP_CURRENT = "cgroup_v2_memory_current_sampled"
@@ -99,14 +93,7 @@ THREAD_ENV_VARS: tuple[str, ...] = (
     "NUMEXPR_NUM_THREADS",
 )
 
-DEFAULT_STAGE_A_N: tuple[int, ...] = (10, 100, 1000)
-DEFAULT_STAGE_A_K_BASE: tuple[int, ...] = (10, 100, 1000)
-DEFAULT_STAGE_A_K_INTERMEDIATE_POINTS = 2
-STAGE_A_REPS = 3
-
 DEFAULT_MAX_SECONDS = 3600.0
-T0_REPS = 5
-R2_EXPLANATION_THRESHOLD = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -284,15 +271,6 @@ def time_budget(max_seconds: float | None) -> Iterator[None]:
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, previous)
-
-
-def summarize_reps(values: Sequence[float]) -> dict[str, Any]:
-    return {
-        "median": float(np.median(values)),
-        "min": float(np.min(values)),
-        "max": float(np.max(values)),
-        "n_reps": len(values),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -558,45 +536,6 @@ def shape_from_schema(
     )
 
 
-def k_grid_from_shape(
-    shape: PanelShape,
-    *,
-    base_anchors: Sequence[int] = DEFAULT_STAGE_A_K_BASE,
-    intermediate_points: int = DEFAULT_STAGE_A_K_INTERMEDIATE_POINTS,
-) -> tuple[int, ...]:
-    """Return a shape-bounded K grid with geometric interior production probes."""
-
-    if shape.n_sources < 1:
-        raise ValueError("panel shape must contain at least one source")
-    if intermediate_points < 0:
-        raise ValueError("intermediate_points must be non-negative")
-    anchors = {int(k) for k in base_anchors if 0 < int(k) < shape.n_sources}
-    anchors.add(shape.n_sources)
-    lower = max(anchors - {shape.n_sources}, default=1)
-    if lower < shape.n_sources:
-        log_lower, log_upper = math.log(lower), math.log(shape.n_sources)
-        for position in range(1, intermediate_points + 1):
-            candidate = int(round(math.exp(log_lower + (log_upper - log_lower) * position / (intermediate_points + 1))))
-            if lower < candidate < shape.n_sources:
-                anchors.add(candidate)
-    return tuple(sorted(anchors))
-
-
-def default_stage_b_points(
-    *, n_train: int, stage_a_n: Sequence[int], k_grid: Sequence[int]
-) -> tuple[tuple[int, int], ...]:
-    """Derive validation points from caller-provided N and schema-derived K."""
-
-    if n_train < 1 or not stage_a_n or not k_grid:
-        raise ValueError("n_train, stage_a_n, and k_grid must be non-empty positive values")
-    points = [(n_train, int(k_grid[-1]))]
-    if len(stage_a_n) > 1:
-        points.append((min(n_train, max(stage_a_n)), int(k_grid[-1])))
-    if len(k_grid) > 1:
-        points.append((n_train, int(k_grid[-2])))
-    return tuple(dict.fromkeys(points))
-
-
 def generate_synthetic_bundle(
     root: Path, params: SyntheticDataParams
 ) -> tuple[Path, dict[str, Any]]:
@@ -749,219 +688,18 @@ def generate_synthetic_bundle(
 
 
 # ---------------------------------------------------------------------------
-# t0 measurement (fresh-process, component split)
-# ---------------------------------------------------------------------------
-
-_T0_IMPORT_SUBPROCESS_SCRIPT = """
-from aleatoric_nk_grid.ingest import load_input
-from aleatoric_nk_grid.nk_grid import draw_orders, split_frame
-from aleatoric_nk_grid.preprocessing import source_groups
-"""
-
-_T0_COMPONENTS_SUBPROCESS_SCRIPT = """
-import json
-import sys
-import time
-
-from aleatoric_nk_grid.ingest import load_input
-from aleatoric_nk_grid.nk_grid import draw_orders, split_frame
-from aleatoric_nk_grid.preprocessing import source_groups
-
-schema_path = sys.argv[1]
-outcome = sys.argv[2]
-
-t_load_start = time.perf_counter()
-loaded = load_input(schema_path, outcome)
-t_load_end = time.perf_counter()
-
-t_split_start = time.perf_counter()
-split = split_frame(
-    loaded.train, loaded.predictors, outcome, test_size=0.2, seed=0, task="regression"
-)
-t_split_end = time.perf_counter()
-
-groups = source_groups(loaded.predictors, loaded.manifest)
-feature_units = [group.name for group in groups]
-
-t_orders_start = time.perf_counter()
-draw_orders(split.X_train.index, feature_units, seed=0, draw=0)
-t_orders_end = time.perf_counter()
-
-print(json.dumps({
-    "t_load": t_load_end - t_load_start,
-    "t_split": t_split_end - t_split_start,
-    "t_orders": t_orders_end - t_orders_start,
-}))
-"""
-
-
-def t0_component_consistency(
-    component_total_seconds: float,
-    end_to_end_seconds: float,
-    *,
-    tolerance: float = 0.10,
-) -> dict[str, Any]:
-    """Describe whether independent startup timing agrees with component sums."""
-
-    if component_total_seconds < 0 or end_to_end_seconds <= 0:
-        raise ValueError("t0 consistency requires non-negative component and positive end-to-end times")
-    if tolerance < 0:
-        raise ValueError("t0 consistency tolerance must be non-negative")
-    difference = abs(component_total_seconds - end_to_end_seconds)
-    relative_difference = difference / end_to_end_seconds
-    return {
-        "component_total_median": component_total_seconds,
-        "end_to_end_median": end_to_end_seconds,
-        "absolute_difference_seconds": difference,
-        "relative_difference": relative_difference,
-        "tolerance": tolerance,
-        "exceeds_tolerance": relative_difference > tolerance,
-    }
-
-
-def measure_t0(
-    schema_path: Path,
-    outcome: str,
-    *,
-    n_reps: int = T0_REPS,
-    python_executable: str | None = None,
-    env: Mapping[str, str] | None = None,
-    clock: Callable[[], float] = time.perf_counter,
-) -> dict[str, Any]:
-    """Measure all t0 components and an independent end-to-end startup path.
-
-    Each observation uses a fresh interpreter. ``import`` is an outer
-    wall-clock measurement of interpreter launch plus the engine imports;
-    ``load``, ``split``, and ``orders`` are measured within separate full-path
-    processes. ``end_to_end`` independently times that full path from before
-    interpreter launch through order construction, exposing unaccounted setup.
-    """
-
-    import os
-
-    executable = python_executable or sys.executable
-    run_env = dict(env if env is not None else os.environ)
-    src_root = str(Path(__file__).resolve().parents[1])
-    run_env["PYTHONPATH"] = src_root + (
-        (":" + run_env["PYTHONPATH"]) if run_env.get("PYTHONPATH") else ""
-    )
-
-    t_load: list[float] = []
-    t_split: list[float] = []
-    t_orders: list[float] = []
-    t_import: list[float] = []
-    t_end_to_end: list[float] = []
-    for _ in range(n_reps):
-        import_started = clock()
-        subprocess.run(
-            [executable, "-c", _T0_IMPORT_SUBPROCESS_SCRIPT],
-            capture_output=True,
-            text=True,
-            env=run_env,
-            check=True,
-        )
-        t_import.append(clock() - import_started)
-
-        end_to_end_started = clock()
-        result = subprocess.run(
-            [executable, "-c", _T0_COMPONENTS_SUBPROCESS_SCRIPT, str(schema_path), outcome],
-            capture_output=True,
-            text=True,
-            env=run_env,
-            check=True,
-        )
-        t_end_to_end.append(clock() - end_to_end_started)
-        payload = json.loads(result.stdout.strip().splitlines()[-1])
-        t_load.append(float(payload["t_load"]))
-        t_split.append(float(payload["t_split"]))
-        t_orders.append(float(payload["t_orders"]))
-
-    import_summary = summarize_reps(t_import)
-    import_summary["source"] = "measured_in_current_runtime_fresh_interpreter"
-    load_summary = summarize_reps(t_load)
-    split_summary = summarize_reps(t_split)
-    orders_summary = summarize_reps(t_orders)
-    component_total_median = (
-        import_summary["median"]
-        + load_summary["median"]
-        + split_summary["median"]
-        + orders_summary["median"]
-    )
-    return {
-        "import": import_summary,
-        "load": load_summary,
-        "split": split_summary,
-        "orders": orders_summary,
-        "total": {"median": component_total_median, "n_reps": n_reps},
-        "end_to_end": summarize_reps(t_end_to_end),
-        "component_vs_end_to_end": t0_component_consistency(
-            component_total_median, float(np.median(t_end_to_end))
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Power-law regression
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class PowerLawFit:
-    log_c: float
-    a: float
-    b: float
-    r2: float
-    residual_range: tuple[float, float]
-    n_points: int
-
-
-def fit_power_law(
-    n_values: Sequence[float], k_values: Sequence[float], t_values: Sequence[float]
-) -> PowerLawFit:
-    """Fit log(t) = log(c) + a*log(K) + b*log(N) via ordinary least squares."""
-
-    n_arr = np.asarray(n_values, dtype=float)
-    k_arr = np.asarray(k_values, dtype=float)
-    t_arr = np.asarray(t_values, dtype=float)
-    if len(n_arr) != len(k_arr) or len(n_arr) != len(t_arr):
-        raise ValueError("n_values, k_values, t_values must have equal length")
-    if len(n_arr) < 3:
-        raise ValueError("fit_power_law requires at least 3 points")
-    if np.any(t_arr <= 0) or np.any(n_arr <= 0) or np.any(k_arr <= 0):
-        raise ValueError("fit_power_law requires strictly positive N, K, t values")
-
-    y = np.log(t_arr)
-    design = np.column_stack([np.ones_like(y), np.log(k_arr), np.log(n_arr)])
-    coefficients, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-    log_c, a, b = (float(v) for v in coefficients)
-
-    predicted = design @ coefficients
-    residuals = y - predicted
-    ss_res = float(np.sum(residuals**2))
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
-
-    return PowerLawFit(
-        log_c=log_c,
-        a=a,
-        b=b,
-        r2=r2,
-        residual_range=(float(np.min(residuals)), float(np.max(residuals))),
-        n_points=len(y),
-    )
-
-
-def predict_power_law(fit: PowerLawFit, n: float, k: float) -> float:
-    return float(math.exp(fit.log_c) * (k**fit.a) * (n**fit.b))
-
-
-# ---------------------------------------------------------------------------
-# Measurement harness (Stage A / Stage B / peak RSS)
+# Memory measurement harness
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class RawMeasurement:
+    """Internal IPC record for one real cell workload.
+
+    Timing/estimator fields are carried only because the production fit helper
+    returns them and the spawned child needs a stable response schema.  The v6
+    artefact serializer intentionally publishes only the memory fields.
+    """
     model: str
     n: int
     k: int
@@ -971,14 +709,13 @@ class RawMeasurement:
     preprocess_mode: str
     peak_rss_bytes: int
     stage: str
-    # ``peak_rss_bytes`` remains the fitted, whole-tree cell peak for
-    # compatibility with the cost model name.  The following fields preserve
-    # the distinct measurement scopes instead of silently conflating them.
+    # Keep the distinct memory scopes instead of silently conflating them.
     process_peak_rss_bytes: int = 0
     cell_cgroup_peak_bytes: int = 0
     cell_memory_method: str = MEMORY_METHOD_PROCESS_TREE
     cell_memory_sampling_interval_seconds: float | None = MEMORY_SAMPLE_INTERVAL_SECONDS
     cell_memory_sampling_interval_max_seconds: float | None = MEMORY_SAMPLE_INTERVAL_SECONDS
+    cell_memory_samples: int = 0
     memory_scope_suspect: bool = False
     preprocess_vectorized: bool = False
     converged: bool | None = None
@@ -1018,7 +755,7 @@ class MemoryPeak:
 
 @dataclass(frozen=True)
 class CellMeasurementRequest:
-    """One complete cell workload for the n_jobs=8 memory probe."""
+    """One complete caller-selected cell workload for memory measurement."""
 
     model_name: str
     n: int
@@ -1031,8 +768,8 @@ class CellMeasurementRequest:
 @dataclass
 class CalibrationSession:
     """Loaded/validated synthetic panel plus per-seed splits, reused across
-    every (N, K, model) measurement so generation/validation cost is paid
-    once, matching how the production engine amortizes it across a run."""
+    memory measurements so panel construction is paid once, matching how the
+    production engine amortizes it across a run."""
 
     schema_path: Path
     outcome: str
@@ -1495,6 +1232,7 @@ def _raw_measurement_from_dict(row: Mapping[str, Any]) -> RawMeasurement:
         cell_memory_sampling_interval_max_seconds=row.get(
             "cell_memory_sampling_interval_max_seconds"
         ),
+        cell_memory_samples=int(row.get("cell_memory_samples", 0)),
         memory_scope_suspect=bool(row.get("memory_scope_suspect", False)),
         preprocess_vectorized=bool(row.get("preprocess_vectorized", False)),
         converged=(None if row.get("converged") is None else bool(row["converged"])),
@@ -1548,6 +1286,7 @@ def measure_one_cell(
     measurement.cell_memory_method = cell_peak.method
     measurement.cell_memory_sampling_interval_seconds = cell_peak.sampling_interval_seconds
     measurement.cell_memory_sampling_interval_max_seconds = cell_peak.sampling_interval_max_seconds
+    measurement.cell_memory_samples = cell_peak.samples
     measurement.memory_scope_suspect = _memory_scope_suspect(
         measurement.cell_cgroup_peak_bytes, measurement.process_peak_rss_bytes
     ) or (cgroup is not None and not bool(response.get("cgroup_joined")))
@@ -1683,307 +1422,6 @@ def measure_task_cgroup_peak_n_jobs_8(
     )
 
 
-def run_stage_a(
-    session: CalibrationSession,
-    *,
-    n_grid: Sequence[int] = DEFAULT_STAGE_A_N,
-    k_grid: Sequence[int] = DEFAULT_STAGE_A_K_BASE,
-    n_reps: int = STAGE_A_REPS,
-    max_seconds: float = DEFAULT_MAX_SECONDS,
-    models: Sequence[str] = MODELS,
-    progress: Callable[[str], None] | None = None,
-) -> tuple[list[RawMeasurement], list[dict[str, Any]]]:
-    """Cheap grid used to fit the per-model power laws. Returns (raw, censored)."""
-
-    raw: list[RawMeasurement] = []
-    censored: list[dict[str, Any]] = []
-    for model_name in models:
-        for n in n_grid:
-            for k in k_grid:
-                for rep in range(n_reps):
-                    if progress:
-                        progress(f"stage A: model={model_name} N={n} K={k} rep={rep}")
-                    try:
-                        measurement = measure_one_cell(
-                            session,
-                            model_name=model_name,
-                            n=n,
-                            k=k,
-                            seed=0,
-                            draw=rep,
-                            max_seconds=max_seconds,
-                        )
-                        measurement.stage = "A"
-                        raw.append(measurement)
-                    except MeasurementCensored:
-                        censored.append(
-                            {
-                                "n": n,
-                                "k": k,
-                                "model": model_name,
-                                "rep": rep,
-                                "max_seconds": max_seconds,
-                                "stage": "A",
-                            }
-                        )
-    return raw, censored
-
-
-def run_stage_b(
-    session: CalibrationSession,
-    *,
-    points: Sequence[tuple[int, int]],
-    max_seconds: float = DEFAULT_MAX_SECONDS,
-    models: Sequence[str] = MODELS,
-    progress: Callable[[str], None] | None = None,
-) -> tuple[list[RawMeasurement], list[dict[str, Any]]]:
-    """One measurement per (N, K) validation point per model. Returns (raw, censored)."""
-
-    raw: list[RawMeasurement] = []
-    censored: list[dict[str, Any]] = []
-    for n, k in points:
-        for model_name in models:
-            if progress:
-                progress(f"stage B: model={model_name} N={n} K={k}")
-            try:
-                measurement = measure_one_cell(
-                    session,
-                    model_name=model_name,
-                    n=n,
-                    k=k,
-                    seed=0,
-                    draw=0,
-                    max_seconds=max_seconds,
-                )
-                measurement.stage = "B"
-                raw.append(measurement)
-            except MeasurementCensored:
-                censored.append(
-                    {
-                        "n": n,
-                        "k": k,
-                        "model": model_name,
-                        "rep": 0,
-                        "max_seconds": max_seconds,
-                        "stage": "B",
-                    }
-                )
-    return raw, censored
-
-
-# ---------------------------------------------------------------------------
-# Fitting / assembling the calibration payload
-# ---------------------------------------------------------------------------
-
-
-def fit_all_models(raw: Sequence[RawMeasurement], models: Sequence[str] = MODELS) -> dict[str, PowerLawFit | None]:
-    fits: dict[str, PowerLawFit | None] = {}
-    for model_name in models:
-        points = [m for m in raw if m.model == model_name and m.stage == "A"]
-        if len(points) < 3:
-            fits[model_name] = None
-            continue
-        grouped: dict[tuple[int, int], list[float]] = {}
-        for point in points:
-            grouped.setdefault((point.n, point.k), []).append(point.fit_seconds)
-        ns = [pair[0] for pair in grouped]
-        ks = [pair[1] for pair in grouped]
-        medians = [float(np.median(values)) for values in grouped.values()]
-        fits[model_name] = fit_power_law(ns, ks, medians)
-    return fits
-
-
-def fit_preprocess_by_mode(raw: Sequence[RawMeasurement]) -> dict[str, PowerLawFit | None]:
-    fits: dict[str, PowerLawFit | None] = {}
-    modes = sorted({m.preprocess_mode for m in raw if m.stage == "A"})
-    for mode in modes:
-        points = [m for m in raw if m.stage == "A" and m.preprocess_mode == mode]
-        grouped: dict[tuple[int, int], list[float]] = {}
-        for point in points:
-            grouped.setdefault((point.n, point.k), []).append(point.preprocess_seconds)
-        ns = [pair[0] for pair in grouped]
-        ks = [pair[1] for pair in grouped]
-        medians = [float(np.median(values)) for values in grouped.values()]
-        positive = [v > 0 for v in medians]
-        if len(medians) < 3 or not all(positive):
-            fits[mode] = None
-            continue
-        fits[mode] = fit_power_law(ns, ks, medians)
-    return fits
-
-
-def fit_peak_rss(raw: Sequence[RawMeasurement], models: Sequence[str] = MODELS) -> dict[str, PowerLawFit | None]:
-    fits: dict[str, PowerLawFit | None] = {}
-    for model_name in models:
-        points = [m for m in raw if m.model == model_name and m.stage == "A"]
-        grouped: dict[tuple[int, int], list[float]] = {}
-        for point in points:
-            grouped.setdefault((point.n, point.k), []).append(float(point.peak_rss_bytes))
-        ns = [pair[0] for pair in grouped]
-        ks = [pair[1] for pair in grouped]
-        medians = [float(np.median(values)) for values in grouped.values()]
-        if len(medians) < 3 or any(v <= 0 for v in medians):
-            fits[model_name] = None
-            continue
-        fits[model_name] = fit_power_law(ns, ks, medians)
-    return fits
-
-
-def build_validation_rows(
-    raw_b: Sequence[RawMeasurement],
-    censored_b: Sequence[Mapping[str, Any]],
-    fits: Mapping[str, PowerLawFit | None],
-    points: Sequence[tuple[int, int]],
-    models: Sequence[str],
-    *,
-    not_measured_points: Sequence[tuple[int, int]] = (),
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    censored_keys = {(c["n"], c["k"], c["model"]) for c in censored_b}
-    measured_by_key = {(m.n, m.k, m.model): m for m in raw_b}
-    for n, k in points:
-        for model_name in models:
-            if (n, k) in not_measured_points:
-                rows.append(
-                    {
-                        "n": n,
-                        "k": k,
-                        "model": model_name,
-                        "predicted": None,
-                        "actual": None,
-                        "ratio": None,
-                        "status": "not_measured",
-                    }
-                )
-                continue
-            key = (n, k, model_name)
-            if key in censored_keys:
-                rows.append(
-                    {
-                        "n": n,
-                        "k": k,
-                        "model": model_name,
-                        "predicted": None,
-                        "actual": None,
-                        "ratio": None,
-                        "status": "censored",
-                    }
-                )
-                continue
-            measurement = measured_by_key.get(key)
-            fit = fits.get(model_name)
-            if measurement is None or fit is None:
-                rows.append(
-                    {
-                        "n": n,
-                        "k": k,
-                        "model": model_name,
-                        "predicted": None,
-                        "actual": None,
-                        "ratio": None,
-                        "status": "missing",
-                    }
-                )
-                continue
-            predicted = predict_power_law(fit, n, k)
-            actual = measurement.fit_seconds
-            rows.append(
-                {
-                    "n": n,
-                    "k": k,
-                    "model": model_name,
-                    "predicted": predicted,
-                    "actual": actual,
-                    "ratio": predicted / actual if actual else None,
-                    "status": "measured",
-                }
-            )
-    return rows
-
-
-def _fit_to_dict(fit: PowerLawFit | None) -> dict[str, Any] | None:
-    if fit is None:
-        return None
-    return {
-        "log_c": fit.log_c,
-        "a": fit.a,
-        "b": fit.b,
-        "r2": fit.r2,
-        "residual_range": list(fit.residual_range),
-        "n_points": fit.n_points,
-    }
-
-
-def summarize_fit_telemetry(raw_measurements: Sequence[RawMeasurement]) -> dict[str, Any]:
-    """Summarize fitted-state telemetry by model and feature-unit count.
-
-    Raw rows remain the complete audit trail. This compact view makes a
-    K-dependent regime change visible without tying the harness to any model
-    implementation or dataset shape.
-    """
-
-    grouped: dict[tuple[str, int], list[RawMeasurement]] = {}
-    for measurement in raw_measurements:
-        grouped.setdefault((measurement.model, measurement.k), []).append(measurement)
-
-    def numeric_distribution(values: Sequence[float | None]) -> dict[str, Any]:
-        observed = sorted(value for value in values if value is not None)
-        return {
-            "observed": len(observed),
-            "values": observed,
-            "min": None if not observed else min(observed),
-            "median": None if not observed else float(np.median(observed)),
-            "max": None if not observed else max(observed),
-        }
-
-    by_model_k: list[dict[str, Any]] = []
-    for (model, k), measurements in sorted(grouped.items()):
-        converged = [m.converged for m in measurements if m.converged is not None]
-        solver_counts: dict[str, int] = {}
-        for solver in (m.solver for m in measurements):
-            if solver is not None:
-                solver_counts[solver] = solver_counts.get(solver, 0) + 1
-        by_model_k.append(
-            {
-                "model": model,
-                "k": k,
-                "n_measurements": len(measurements),
-                "converged": {
-                    "observed": len(converged),
-                    "true": sum(value is True for value in converged),
-                    "false": sum(value is False for value in converged),
-                    "true_fraction": (
-                        None if not converged else sum(value is True for value in converged) / len(converged)
-                    ),
-                },
-                "best_rounds": numeric_distribution([m.best_rounds for m in measurements]),
-                "n_iter": numeric_distribution([m.n_iter for m in measurements]),
-                "alpha": numeric_distribution([m.alpha for m in measurements]),
-                "solver": {
-                    "observed": sum(solver_counts.values()),
-                    "counts": dict(sorted(solver_counts.items())),
-                },
-            }
-        )
-
-    has_converged = any(row["converged"]["observed"] for row in by_model_k)
-    has_best_rounds = any(row["best_rounds"]["observed"] for row in by_model_k)
-    has_solver = any(row["solver"]["observed"] for row in by_model_k)
-    has_n_iter = any(row["n_iter"]["observed"] for row in by_model_k)
-    has_alpha = any(row["alpha"]["observed"] for row in by_model_k)
-    return {
-        "status": "collected" if by_model_k else "not_measured",
-        "by_model_k": by_model_k,
-        "fields_with_observations": {
-            "converged": has_converged,
-            "best_rounds": has_best_rounds,
-            "solver": has_solver,
-            "n_iter": has_n_iter,
-            "alpha": has_alpha,
-        },
-    }
-
-
 def _raw_to_dict(measurement: RawMeasurement) -> dict[str, Any]:
     return {
         "model": measurement.model,
@@ -1999,6 +1437,7 @@ def _raw_to_dict(measurement: RawMeasurement) -> dict[str, Any]:
         "cell_memory_method": measurement.cell_memory_method,
         "cell_memory_sampling_interval_seconds": measurement.cell_memory_sampling_interval_seconds,
         "cell_memory_sampling_interval_max_seconds": measurement.cell_memory_sampling_interval_max_seconds,
+        "cell_memory_samples": measurement.cell_memory_samples,
         "memory_scope_suspect": measurement.memory_scope_suspect,
         "preprocess_vectorized": measurement.preprocess_vectorized,
         "converged": measurement.converged,
@@ -2010,110 +1449,87 @@ def _raw_to_dict(measurement: RawMeasurement) -> dict[str, Any]:
     }
 
 
-def recompute_fit_cost_from_raw(
-    raw_measurements: Sequence[Mapping[str, Any]], models: Sequence[str] = MODELS
-) -> dict[str, PowerLawFit | None]:
-    """Recompute fit_cost coefficients from raw_measurements alone (round-trip check)."""
+def _cell_memory_to_dict(measurement: RawMeasurement) -> dict[str, Any]:
+    """Serialize only measured memory facts, never invalidated timing fields."""
 
-    reconstructed = [_raw_measurement_from_dict(row) for row in raw_measurements]
-    return fit_all_models(reconstructed, models)
+    return {
+        "model": measurement.model,
+        "n": measurement.n,
+        "k": measurement.k,
+        "seed": 0,
+        "draw": measurement.rep,
+        "process_peak_rss_bytes": measurement.process_peak_rss_bytes,
+        "cell_allocation_peak_bytes": measurement.cell_cgroup_peak_bytes,
+        "cell_allocation_method": measurement.cell_memory_method,
+        "sampling_interval_seconds": measurement.cell_memory_sampling_interval_seconds,
+        "sampling_interval_max_seconds": measurement.cell_memory_sampling_interval_max_seconds,
+        "samples": measurement.cell_memory_samples,
+        "memory_scope_suspect": measurement.memory_scope_suspect,
+    }
 
 
-def build_calibration_payload(
+def _memory_peak_to_dict(peak: MemoryPeak | None) -> dict[str, Any]:
+    if peak is None:
+        return {
+            "status": "not_measured", "bytes": None, "method": None,
+            "sampling_interval_seconds": None,
+            "sampling_interval_max_seconds": None, "samples": 0,
+        }
+    return {
+        "status": "measured", "bytes": peak.bytes, "method": peak.method,
+        "sampling_interval_seconds": peak.sampling_interval_seconds,
+        "sampling_interval_max_seconds": peak.sampling_interval_max_seconds,
+        "samples": peak.samples,
+    }
+
+
+def build_memory_probe_payload(
     *,
     synthetic_params: SyntheticDataParams,
     synthetic_stats: Mapping[str, Any],
-    t0_seconds: Mapping[str, Any],
-    fit_cost: Mapping[str, PowerLawFit | None],
-    preprocess_cost: Mapping[str, PowerLawFit | None],
-    peak_rss: Mapping[str, PowerLawFit | None],
-    validation: Sequence[Mapping[str, Any]],
-    censored: Sequence[Mapping[str, Any]],
-    raw_measurements: Sequence[RawMeasurement],
+    cell_measurements: Sequence[RawMeasurement],
     thread_env_report: Mapping[str, Any],
-    scope_reduction: Mapping[str, Any] | None = None,
-    task_cgroup_peak_n_jobs_8: MemoryPeak | None = None,
-    stage_a_k_grid: Sequence[int] | None = None,
-    wall_clock_seconds: Mapping[str, Any] | None = None,
+    task_peak: MemoryPeak | None = None,
+    wall_clock_seconds: float | None = None,
 ) -> dict[str, Any]:
+    """Build the format-v6 memory-only artefact."""
+
     environment = core_environment()
     environment["platform"] = _platform_string()
     environment["thread_env"] = thread_env_report["values"]
-    payload: dict[str, Any] = {
+    return {
         "format_version": FORMAT_VERSION,
+        "artifact": "nk_grid_memory_probe",
         "created_at_utc": utc_now(),
         "git_commit": git_state(repo_root()).get("commit"),
         "environment": environment,
         "synthetic_data": {
-            # Every SyntheticDataParams field, written explicitly (not just
-            # via the **synthetic_stats spread below) so a reader months from
-            # now can see exactly what assumptions the fitted coefficients
-            # rest on without cross-referencing the generator's source code
-            # (round 1 review F3).
             "n_train": synthetic_params.n_train,
             "n_feature_units": synthetic_params.shape.n_sources,
-            "p_onehot": synthetic_stats["n_expanded_predictors"],
+            "n_expanded_predictors": synthetic_stats["n_expanded_predictors"],
             "seed": synthetic_params.seed,
             "panel_shape": synthetic_params.shape.as_dict(),
-            "stage_a_k_grid": list(
-                stage_a_k_grid if stage_a_k_grid is not None else k_grid_from_shape(synthetic_params.shape)
-            ),
             "missing_rate_continuous": synthetic_params.missing_rate_continuous,
             "missing_rate_group": synthetic_params.missing_rate_group,
+            "observed_missingness": synthetic_stats["observed_missingness"],
             "outcome": synthetic_params.outcome,
-            **synthetic_stats,
         },
-        "t0_seconds": t0_seconds,
-        "fit_cost": {name: _fit_to_dict(fit) for name, fit in fit_cost.items()},
-        "preprocess_cost": {name: _fit_to_dict(fit) for name, fit in preprocess_cost.items()},
-        "peak_rss_bytes": {name: _fit_to_dict(fit) for name, fit in peak_rss.items()},
         "memory_measurement": {
-            "process_peak_rss": "fresh_spawn_worker_RUSAGE_SELF",
-            "cell_cgroup_peak": "per-raw-measurement fields",
-            "cell_memory_scope_suspect_count": sum(
-                measurement.memory_scope_suspect for measurement in raw_measurements
-            ),
-            "task_cgroup_peak_n_jobs_8": (
-                {
-                    "status": "not_measured",
-                    "bytes": None,
-                    "method": None,
-                    "sampling_interval_seconds": None,
-                    "sampling_interval_max_seconds": None,
-                    "samples": 0,
-                }
-                if task_cgroup_peak_n_jobs_8 is None
-                else {
-                    "status": "measured",
-                    "bytes": task_cgroup_peak_n_jobs_8.bytes,
-                    "method": task_cgroup_peak_n_jobs_8.method,
-                    "sampling_interval_seconds": task_cgroup_peak_n_jobs_8.sampling_interval_seconds,
-                    "sampling_interval_max_seconds": task_cgroup_peak_n_jobs_8.sampling_interval_max_seconds,
-                    "samples": task_cgroup_peak_n_jobs_8.samples,
-                }
-            ),
-        },
-        "telemetry": summarize_fit_telemetry(raw_measurements),
-        "fit_quality": {
-            "r2_threshold": R2_EXPLANATION_THRESHOLD,
-            "models_below_r2_threshold": [
-                {"model": name, "r2": fit.r2}
-                for name, fit in sorted(fit_cost.items())
-                if fit is not None and fit.r2 < R2_EXPLANATION_THRESHOLD
+            "fallback_order": [
+                MEMORY_METHOD_CGROUP_PEAK,
+                MEMORY_METHOD_CGROUP_CURRENT,
+                MEMORY_METHOD_PROCESS_TREE,
             ],
+            "cell_measurements": [
+                _cell_memory_to_dict(measurement) for measurement in cell_measurements
+            ],
+            "task_allocation_peak": _memory_peak_to_dict(task_peak),
+            "scope_suspect_count": sum(
+                measurement.memory_scope_suspect for measurement in cell_measurements
+            ),
         },
-        "wall_clock_seconds": (
-            {"status": "not_measured"}
-            if wall_clock_seconds is None
-            else {"status": "measured", **dict(wall_clock_seconds)}
-        ),
-        "validation": list(validation),
-        "censored": list(censored),
-        "raw_measurements": [_raw_to_dict(m) for m in raw_measurements],
+        "wall_clock_seconds": wall_clock_seconds,
     }
-    if scope_reduction is not None:
-        payload["scope_reduction"] = dict(scope_reduction)
-    return payload
 
 
 def _platform_string() -> str:
@@ -2122,157 +1538,83 @@ def _platform_string() -> str:
     return platform.platform()
 
 
-def write_calibration_file(payload: Mapping[str, Any], out_dir: Path, *, date: str | None = None) -> Path:
+def write_calibration_file(
+    payload: Mapping[str, Any], out_dir: Path, *, date: str | None = None,
+) -> Path:
     from datetime import datetime, timezone
 
     utc_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"cost_model_{utc_date}.json"
+    out_path = out_dir / f"memory_probe_{utc_date}.json"
     write_json_atomic(out_path, dict(payload))
     return out_path
 
 
 def read_calibration_file(path: Path) -> dict[str, Any]:
-    """Load only the current calibration schema; older RSS files are invalid."""
+    """Load only format-v6 memory probes; reject cost-model formats explicitly."""
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("format_version") != FORMAT_VERSION:
+    version = payload.get("format_version")
+    if version != FORMAT_VERSION:
+        if isinstance(version, int) and version <= 5:
+            raise ValueError(
+                f"unsupported calibration format_version={version}; versions <=5 "
+                "contain invalidated duration/power-law fields; rerun the v6 memory probe"
+            )
         raise ValueError(
-            f"unsupported calibration format_version={payload.get('format_version')!r}; "
-            f"expected {FORMAT_VERSION}. Earlier peak_rss_bytes formats are invalid."
+            f"unsupported calibration format_version={version!r}; expected {FORMAT_VERSION}"
         )
-    required = {
-        "memory_measurement", "raw_measurements", "peak_rss_bytes", "synthetic_data",
-        "telemetry", "fit_quality", "wall_clock_seconds",
-    }
+    required = {"artifact", "synthetic_data", "memory_measurement"}
     missing = required.difference(payload)
     if missing:
-        raise ValueError(f"calibration file is missing required fields: {sorted(missing)}")
-    shape_fields = {"panel_shape", "stage_a_k_grid"}
-    missing_shape = shape_fields.difference(payload["synthetic_data"])
-    if missing_shape:
-        raise ValueError(f"calibration file is missing schema-derived shape fields: {sorted(missing_shape)}")
-    missing_missingness = {"observed_missingness"}.difference(payload["synthetic_data"])
-    if missing_missingness:
-        raise ValueError(
-            "calibration file is missing observed synthetic missingness fields: "
-            f"{sorted(missing_missingness)}"
-        )
+        raise ValueError(f"memory probe is missing required fields: {sorted(missing)}")
+    if payload["artifact"] != "nk_grid_memory_probe":
+        raise ValueError("format-v6 artifact is not an NK-grid memory probe")
+    memory = payload["memory_measurement"]
+    if not isinstance(memory, Mapping) or not isinstance(memory.get("cell_measurements"), list):
+        raise ValueError("memory probe lacks cell_measurements")
     return payload
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Measure NK-Grid startup cost, per-model fit-time power laws, "
-        "and peak RSS on synthetic data; never reads private data or model metrics."
-    )
-    parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS)
-    parser.add_argument(
-        "--shape-schema",
-        type=Path,
-        required=True,
-        help="Explicit feature-universe schema used to derive the synthetic panel shape.",
-    )
-    dtype_group = parser.add_mutually_exclusive_group()
-    dtype_group.add_argument(
-        "--feature-dtype-profile",
-        type=Path,
-        default=None,
-        help="JSON object mapping dtype names to expanded-feature counts from a read-only dtype probe.",
-    )
-    dtype_group.add_argument(
-        "--assume-feature-dtype",
-        type=str,
-        default=None,
-        help="Explicit uniform dtype assumption for schema features lacking dtype metadata.",
-    )
-    parser.add_argument("--n-train", type=int, required=True)
-    parser.add_argument(
-        "--stage-a-n",
-        type=str,
-        default=",".join(str(value) for value in DEFAULT_STAGE_A_N),
-        help="Comma-separated N values for the stage-A fit grid.",
-    )
-    parser.add_argument(
-        "--stage-a-k-base",
-        type=str,
-        default=",".join(str(value) for value in DEFAULT_STAGE_A_K_BASE),
-        help="Lower K anchors; the schema-derived source maximum is always included.",
-    )
-    parser.add_argument(
-        "--stage-a-k-intermediate-points",
-        type=int,
-        default=DEFAULT_STAGE_A_K_INTERMEDIATE_POINTS,
-        help="Number of geometric K probes between the largest lower anchor and schema maximum.",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out-dir", type=Path, default=None)
-    parser.add_argument("--work-dir", type=Path, default=None)
-    parser.add_argument(
-        "--allow-nonproduction-threads",
-        action="store_true",
-        help="Warn instead of refusing to start when thread env vars != 1.",
-    )
-    parser.add_argument(
-        "--stage-b-points",
-        type=str,
-        default=None,
-        help="Comma-separated N:K pairs to actually measure in stage B. "
-        "Default is derived from --n-train and the schema-derived K grid.",
-    )
-    parser.add_argument("--generation-time-budget-seconds", type=float, default=300.0)
-    parser.add_argument("--generation-rss-budget-bytes", type=int, default=6 * 1024**3)
-    parser.add_argument(
-        "--task-memory-cells",
-        type=str,
-        default=None,
-        help=(
-            "Exactly eight model:N:K cell workloads that will overlap in one "
-            "n_jobs=8 production task, comma-separated. Measures and records "
-            "task_cgroup_peak_n_jobs_8; omit only when no task composition is known."
-        ),
-    )
-    return parser.parse_args(argv)
-
-
-def parse_task_memory_cells(specification: str, *, max_seconds: float) -> tuple[CellMeasurementRequest, ...]:
-    """Parse the explicit eight-cell task shape used for the --mem probe."""
+def parse_memory_cells(
+    specification: str, *, max_seconds: float, option: str = "--memory-cells",
+) -> tuple[CellMeasurementRequest, ...]:
+    """Parse caller-selected real cell workloads without inventing grid points."""
 
     requests: list[CellMeasurementRequest] = []
     for token in specification.split(","):
         try:
             model_name, n_text, k_text = token.split(":")
             request = CellMeasurementRequest(
-                model_name=model_name, n=int(n_text), k=int(k_text), max_seconds=max_seconds
+                model_name=model_name, n=int(n_text), k=int(k_text),
+                max_seconds=max_seconds,
             )
         except ValueError as exc:
             raise ValueError(
-                "--task-memory-cells must be eight comma-separated model:N:K entries"
+                f"{option} must be comma-separated model:N:K entries"
             ) from exc
         if request.model_name not in MODELS or request.n < 1 or request.k < 1:
-            raise ValueError(f"invalid task-memory cell {token!r}")
+            raise ValueError(f"invalid memory cell {token!r}")
         requests.append(request)
-    if len(requests) != 8:
-        raise ValueError("--task-memory-cells must describe exactly eight n_jobs=8 workers")
+    if not requests:
+        raise ValueError(f"{option} must contain at least one cell")
     return tuple(requests)
 
 
-def parse_positive_int_grid(specification: str, *, option: str) -> tuple[int, ...]:
-    try:
-        values = tuple(int(value) for value in specification.split(","))
-    except ValueError as exc:
-        raise ValueError(f"{option} must be comma-separated positive integers") from exc
-    if not values or any(value < 1 for value in values):
-        raise ValueError(f"{option} must be comma-separated positive integers")
-    return tuple(dict.fromkeys(values))
+def parse_task_memory_cells(
+    specification: str, *, max_seconds: float,
+) -> tuple[CellMeasurementRequest, ...]:
+    """Parse the retained eight-workload task-allocation memory scope."""
+
+    requests = parse_memory_cells(
+        specification, max_seconds=max_seconds, option="--task-memory-cells",
+    )
+    if len(requests) != 8:
+        raise ValueError("--task-memory-cells must describe exactly eight workers")
+    return requests
 
 
-def read_feature_dtype_profile(path: Path | str) -> dict[str, int]:
+def read_feature_dtype_profile(path: Path | str) -> dict[str, Any]:
     resolved = Path(path).resolve()
     try:
         payload = json.loads(resolved.read_text(encoding="utf-8"))
@@ -2283,141 +1625,101 @@ def read_feature_dtype_profile(path: Path | str) -> dict[str, int]:
     return dict(payload)
 
 
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Measure NK-grid peak memory on schema-shaped synthetic data",
+    )
+    parser.add_argument("--shape-schema", type=Path, required=True)
+    dtype_group = parser.add_mutually_exclusive_group()
+    dtype_group.add_argument("--feature-dtype-profile", type=Path)
+    dtype_group.add_argument("--assume-feature-dtype", type=str)
+    parser.add_argument("--n-train", type=int, required=True)
+    parser.add_argument(
+        "--memory-cells", required=True,
+        help="Comma-separated model:N:K cell workloads to measure independently.",
+    )
+    parser.add_argument(
+        "--task-memory-cells",
+        help="Optional eight model:N:K workloads for the retained task-allocation scope.",
+    )
+    parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--work-dir", type=Path)
+    parser.add_argument("--generation-time-budget-seconds", type=float, default=300.0)
+    parser.add_argument("--generation-rss-budget-bytes", type=int, default=6 * 1024**3)
+    parser.add_argument("--allow-nonproduction-threads", action="store_true")
+    return parser.parse_args(argv)
+
+
+def _validate_requests_fit_session(
+    session: CalibrationSession, requests: Sequence[CellMeasurementRequest],
+) -> None:
+    available_n = len(session.split.X_train)
+    available_k = len(session.feature_units)
+    for request in requests:
+        if request.n > available_n or request.k > available_k:
+            raise ValueError(
+                f"memory cell {request.model_name}:{request.n}:{request.k} exceeds "
+                f"synthetic training shape N={available_n}, K={available_k}"
+            )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
-    calibration_started = time.perf_counter()
+    started = time.perf_counter()
     args = parse_args(argv)
     thread_report = enforce_thread_env(strict=not args.allow_nonproduction_threads)
-    phase_seconds: dict[str, float] = {}
-
-    work_dir = args.work_dir or (repo_root() / "NK_Grid" / "calibration" / "_scratch")
-    out_dir = args.out_dir or (repo_root() / "NK_Grid" / "calibration")
+    requests = parse_memory_cells(args.memory_cells, max_seconds=args.max_seconds)
+    task_requests = (
+        () if args.task_memory_cells is None
+        else parse_task_memory_cells(args.task_memory_cells, max_seconds=args.max_seconds)
+    )
     dtype_profile = (
-        read_feature_dtype_profile(args.feature_dtype_profile)
-        if args.feature_dtype_profile is not None
-        else None
+        None if args.feature_dtype_profile is None
+        else read_feature_dtype_profile(args.feature_dtype_profile)
     )
     shape = shape_from_schema(
-        args.shape_schema,
-        feature_dtype_profile=dtype_profile,
+        args.shape_schema, feature_dtype_profile=dtype_profile,
         assume_feature_dtype=args.assume_feature_dtype,
         dtype_profile_path=args.feature_dtype_profile,
     )
-    stage_a_n = parse_positive_int_grid(args.stage_a_n, option="--stage-a-n")
-    if max(stage_a_n) > args.n_train:
-        raise ValueError("--stage-a-n values cannot exceed --n-train")
-    stage_a_k = k_grid_from_shape(
-        shape,
-        base_anchors=parse_positive_int_grid(args.stage_a_k_base, option="--stage-a-k-base"),
-        intermediate_points=args.stage_a_k_intermediate_points,
-    )
     params = SyntheticDataParams(n_train=args.n_train, shape=shape, seed=args.seed)
-
-    generation_start = time.perf_counter()
-    peak_rss_before = _process_peak_rss_bytes()
-    bundle_root = work_dir / "full"
-    schema_path, stats = generate_synthetic_bundle(bundle_root, params)
-    generation_seconds = time.perf_counter() - generation_start
-    phase_seconds["synthetic_generation"] = generation_seconds
-    peak_rss_after = _process_peak_rss_bytes()
-
-    scope_reduction: dict[str, Any] = {
-        "max_seconds": args.max_seconds,
-        "generation_seconds": generation_seconds,
-        "generation_peak_rss_bytes": peak_rss_after,
-    }
-
+    work_dir = args.work_dir or (repo_root() / "NK_Grid" / "calibration" / "_scratch")
+    out_dir = args.out_dir or (repo_root() / "NK_Grid" / "calibration")
+    generation_started = time.perf_counter()
+    schema_path, stats = generate_synthetic_bundle(work_dir / "memory-probe", params)
+    generation_seconds = time.perf_counter() - generation_started
+    generation_peak = _process_peak_rss_bytes()
     if (
         generation_seconds > args.generation_time_budget_seconds
-        or peak_rss_after > args.generation_rss_budget_bytes
+        or generation_peak > args.generation_rss_budget_bytes
     ):
         raise RuntimeError(
-            "synthetic panel generation exceeded its feasibility budget; "
-            "choose an explicitly smaller shape schema instead of silently changing dimensions"
+            "synthetic panel generation exceeded its feasibility budget; choose an "
+            "explicitly smaller caller-supplied shape"
         )
 
     session = build_session(schema_path, params.outcome, seed=args.seed)
     try:
-        phase_started = time.perf_counter()
-        t0 = measure_t0(schema_path, params.outcome)
-        phase_seconds["t0"] = time.perf_counter() - phase_started
-        phase_started = time.perf_counter()
+        _validate_requests_fit_session(session, (*requests, *task_requests))
+        measurements = [
+            measure_one_cell(
+                session, model_name=request.model_name, n=request.n, k=request.k,
+                seed=request.seed, draw=request.draw, max_seconds=request.max_seconds,
+            )
+            for request in requests
+        ]
         task_peak = (
-            None
-            if args.task_memory_cells is None
-            else measure_task_cgroup_peak_n_jobs_8(
-                session,
-                parse_task_memory_cells(
-                    args.task_memory_cells, max_seconds=args.max_seconds
-                ),
-            )
-        )
-        phase_seconds["task_memory"] = time.perf_counter() - phase_started
-
-        def _progress(message: str) -> None:
-            print(message, file=sys.stderr)
-
-        phase_started = time.perf_counter()
-        raw_a, censored_a = run_stage_a(
-            session,
-            n_grid=stage_a_n,
-            k_grid=stage_a_k,
-            max_seconds=args.max_seconds,
-            progress=_progress,
-        )
-        phase_seconds["stage_a"] = time.perf_counter() - phase_started
-
-        if args.stage_b_points:
-            points_to_measure = tuple(
-                tuple(int(v) for v in pair.split(":"))
-                for pair in args.stage_b_points.split(",")
-            )
-        else:
-            points_to_measure = default_stage_b_points(
-                n_train=args.n_train, stage_a_n=stage_a_n, k_grid=stage_a_k
-            )
-        validation_points = default_stage_b_points(
-            n_train=args.n_train, stage_a_n=stage_a_n, k_grid=stage_a_k
-        )
-        not_measured = tuple(p for p in validation_points if p not in points_to_measure)
-
-        phase_started = time.perf_counter()
-        raw_b, censored_b = run_stage_b(
-            session, points=points_to_measure, max_seconds=args.max_seconds, progress=_progress
-        )
-        phase_seconds["stage_b"] = time.perf_counter() - phase_started
-
-        phase_started = time.perf_counter()
-        fit_cost = fit_all_models(raw_a)
-        preprocess_cost = fit_preprocess_by_mode(raw_a)
-        peak_rss_fits = fit_peak_rss(raw_a)
-        validation = build_validation_rows(
-            raw_b, censored_b, fit_cost, validation_points, MODELS, not_measured_points=not_measured
-        )
-        phase_seconds["fit_and_validation"] = time.perf_counter() - phase_started
-
-        wall_clock_seconds = {
-            "phases": phase_seconds,
-            "total": time.perf_counter() - calibration_started,
-        }
-
-        payload = build_calibration_payload(
-            synthetic_params=params,
-            synthetic_stats=stats,
-            t0_seconds=t0,
-            fit_cost=fit_cost,
-            preprocess_cost=preprocess_cost,
-            peak_rss=peak_rss_fits,
-            validation=validation,
-            censored=[*censored_a, *censored_b],
-            raw_measurements=[*raw_a, *raw_b],
-            thread_env_report=thread_report,
-            scope_reduction=scope_reduction,
-            task_cgroup_peak_n_jobs_8=task_peak,
-            stage_a_k_grid=stage_a_k,
-            wall_clock_seconds=wall_clock_seconds,
+            None if not task_requests
+            else measure_task_cgroup_peak_n_jobs_8(session, task_requests)
         )
     finally:
         close_session(session)
+    payload = build_memory_probe_payload(
+        synthetic_params=params, synthetic_stats=stats,
+        cell_measurements=measurements, thread_env_report=thread_report,
+        task_peak=task_peak, wall_clock_seconds=time.perf_counter() - started,
+    )
     out_path = write_calibration_file(payload, out_dir)
     print(f"wrote {out_path}")
 

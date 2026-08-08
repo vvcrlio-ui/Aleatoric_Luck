@@ -98,15 +98,18 @@ def test_prepare_round_assigns_every_todo_row_by_index_modulo(tmp_path, workers,
 
 
 def test_attempt_classification_keeps_crash_and_too_long_separate():
-    crashed, too_long = classify_attempts([
+    ordered = [
         {"round": 1, "worker_index": 0, "sequence": 0, "row_id": "crashed"},
         {"round": 1, "worker_index": 0, "sequence": 1, "row_id": "later"},
         {"round": 1, "worker_index": 1, "sequence": 0, "row_id": "long"},
         {"round": 2, "worker_index": 1, "sequence": 0, "row_id": "long"},
         {"round": 3, "worker_index": 1, "sequence": 0, "row_id": "long"},
-    ])
+    ]
+    crashed, too_long = classify_attempts(ordered)
     assert crashed == {"crashed"}
     assert too_long == {"long"}
+    shuffled = [ordered[index] for index in (4, 1, 3, 0, 2)]
+    assert classify_attempts(shuffled) == (crashed, too_long)
 
 
 @pytest.mark.parametrize("workers,row_count", [(workers, rows) for workers in range(1, 11) for rows in (0, 1, 2, 7, 19)])

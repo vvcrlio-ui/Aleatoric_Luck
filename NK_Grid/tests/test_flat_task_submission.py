@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -74,6 +75,36 @@ def test_dynamic_submitter_rejects_non_single_core_plan_before_sbatch(tmp_path):
     assert not Path(environment["FAKE_SBATCH_LOG"]).exists()
 
 
+def test_dynamic_submitter_rejects_missing_plan_fields_before_submission(tmp_path):
+    required_paths = (
+        ("snapshot",),
+        ("workers",),
+        ("rounds",),
+        ("submission", "array"),
+        ("submission", "sbatch_args"),
+        ("submission", "account"),
+        ("submission", "constraint"),
+    )
+    for field_path in required_paths:
+        case_dir = tmp_path.joinpath(*field_path)
+        case_dir.mkdir(parents=True)
+        plan = _plan(case_dir / "plan.json")
+        payload = json.loads(plan.read_text(encoding="utf-8"))
+        owner = payload
+        for field in field_path[:-1]:
+            owner = owner[field]
+        del owner[field_path[-1]]
+        plan.write_text(json.dumps(payload), encoding="utf-8")
+        environment = _environment(case_dir)
+        completed = subprocess.run(
+            ["bash", str(SUBMITTER), str(plan)], env=environment,
+            check=False, capture_output=True, text=True,
+        )
+        assert completed.returncode != 0
+        assert "invalid dynamic plan JSON" in completed.stderr
+        assert not Path(environment["FAKE_SBATCH_LOG"]).exists()
+
+
 def _worker_environment(tmp_path: Path, python: Path) -> dict[str, str]:
     return {**os.environ, "ENGINE_DIR": str(ENGINE_DIR), "PYTHON": str(python), "VENV": str(tmp_path / "venv"), "SLURM_ARRAY_TASK_ID": "7"}
 
@@ -98,9 +129,38 @@ def test_dynamic_worker_reports_architecture_without_mislabeling_install(tmp_pat
     assert "not installed" not in completed.stderr
 
 
-def test_worker_module_block_is_local_development_safe_and_illegal_instruction_grep_is_absent():
-    text = WORKER.read_text(encoding="utf-8")
-    assert 'if [ -n "${PYTHON_MODULE:-}" ]; then' in text
-    assert 'PYTHON_MODULE is set but the module command is unavailable' in text
-    assert 'grep -qi "Illegal instruction"' not in text
-    assert "python=$PYTHON" in text
+def test_all_compute_scripts_share_the_module_and_architecture_guards():
+    module_block = '''if [ -n "${PYTHON_MODULE:-}" ]; then
+  command -v module >/dev/null 2>&1 || {
+    echo "PYTHON_MODULE is set but the module command is unavailable" >&2
+    exit 1
+  }
+  module purge
+  module load "$PYTHON_MODULE"
+fi'''
+    block_md5s = set()
+    for script in (WORKER, PREP, VERIFY):
+        text = script.read_text(encoding="utf-8")
+        assert text.count(module_block) == 1
+        start = text.index(module_block)
+        actual_block = text[start:start + len(module_block)]
+        block_md5s.add(hashlib.md5(actual_block.encode("utf-8")).hexdigest())
+        assert 'venv is incompatible with this node CPU architecture' in text
+        assert 'BMRC_GCC_ARCH_NATIVE=${BMRC_GCC_ARCH_NATIVE:-?}' in text
+        assert 'grep -qi "Illegal instruction"' not in text
+        assert "python=$PYTHON" in text
+    assert len(block_md5s) == 1
+
+
+def test_calibrate_script_is_generic_and_uses_the_shared_module_block():
+    calibrate = (ENGINE_DIR / "slurm" / "calibrate.sbatch").read_text(encoding="utf-8")
+    worker = WORKER.read_text(encoding="utf-8")
+    start = worker.index('if [ -n "${PYTHON_MODULE:-}" ]; then')
+    end = worker.index("\nfi", start) + len("\nfi")
+    assert worker[start:end] in calibrate
+    assert not any(token in calibrate.lower() for token in ("smr", "5970", "497"))
+    assert "#SBATCH --cpus-per-task=8" in calibrate
+    assert "#SBATCH --mem=48G" in calibrate
+    assert "#SBATCH --time=04:00:00" in calibrate
+    assert '--memory-cells "$CALIBRATION_MEMORY_CELLS"' in calibrate
+    assert not any(token in calibrate for token in ("--stage-a", "--stage-b"))

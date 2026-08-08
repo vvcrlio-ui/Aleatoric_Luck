@@ -388,7 +388,10 @@ def classify_attempts(
     records: Iterable[Mapping[str, int | str]], *, completed_row_ids: Iterable[str] = (),
 ) -> tuple[set[str], set[str]]:
     """Return (crashed, too_long) using the two intentionally distinct rules."""
-    attempts = [dict(record) for record in records]
+    attempts = sorted(
+        (dict(record) for record in records),
+        key=lambda record: (int(record["round"]), int(record["worker_index"]), int(record["sequence"])),
+    )
     crashed: set[str] = set()
     finals: dict[tuple[int, int], tuple[int, str]] = {}
     for record in attempts:
