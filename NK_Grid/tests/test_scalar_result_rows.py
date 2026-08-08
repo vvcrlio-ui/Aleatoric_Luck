@@ -117,7 +117,7 @@ def _config(schema: Path, out: Path, *, n_draws: int, batch_size: int) -> NKGrid
         n_sizes_k=1,
         min_n=10,
         max_n=0,
-        max_k=0,
+        max_k=1,
         batch_size=batch_size,
         n_jobs=1,
         model_params=MODEL_PARAMS,

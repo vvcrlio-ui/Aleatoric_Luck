@@ -85,10 +85,12 @@ def test_draw_orders_is_deterministic_and_only_cached_payload_is_frozen():
 
 
 def test_thread_and_serial_groups_reuse_one_order_per_seed_draw(tmp_path):
+    frame = _frame()
+    frame["X_c"] = np.arange(len(frame), dtype=float) % 5
     schema = write_schema_bundle(
         tmp_path / "input",
-        _frame(),
-        predictors=["X_a", "X_b"],
+        frame,
+        predictors=["X_a", "X_b", "X_c"],
     )
     config = NKGridConfig(
         schema=schema,
@@ -103,7 +105,7 @@ def test_thread_and_serial_groups_reuse_one_order_per_seed_draw(tmp_path):
         n_sizes_k=2,
         min_n=10,
         max_n=0,
-        max_k=0,
+        max_k=2,
         batch_size=3,
         n_jobs=2,
         model_params=MODEL_PARAMS,

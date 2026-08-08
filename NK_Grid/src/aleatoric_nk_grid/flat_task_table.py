@@ -26,6 +26,7 @@ from .experiment import manifest_path, write_json_atomic
 from .nk_grid import (
     NKGridConfig,
     _process_peak_rss_bytes,
+    pairs_for_point,
     resolve_repeat_pairs,
     run_nk_grid,
 )
@@ -63,14 +64,22 @@ def pairs_for(
     n_samples: int,
     k_features: int,
     repeat_pairs: Sequence[tuple[int, int]],
+    *,
+    n_train_total: int,
+    n_feature_units: int,
 ) -> tuple[tuple[int, int], ...]:
     """Return the repeat pairs for one grid point.
 
-    Keeping N/K in the API is intentional: a later design can append repeats
-    for selected points without renumbering any existing task.
+    This delegates the draw-collapse policy to the direct engine path so the
+    table and direct designs cannot drift.
     """
-    del n_samples, k_features
-    return tuple((int(seed), int(draw)) for seed, draw in repeat_pairs)
+    return pairs_for_point(
+        repeat_pairs,
+        n_samples,
+        k_features,
+        n_train_total=n_train_total,
+        n_feature_units=n_feature_units,
+    )
 
 
 def execution_groups(
@@ -137,12 +146,22 @@ def build_rows(
     *,
     n_grid: Sequence[int],
     k_grid: Sequence[int],
+    n_train_total: int,
+    n_feature_units: int,
     split_super_learner_min_k: int | None = None,
     pairs_provider: Callable[[int, int], Sequence[tuple[int, int]]] | None = None,
 ) -> tuple[TaskRow, ...]:
     """Build the complete, deterministic cell-group design in memory."""
     repeat_pairs = resolve_repeat_pairs(config)
-    provider = pairs_provider or (lambda n, k: pairs_for(n, k, repeat_pairs))
+    provider = pairs_provider or (
+        lambda n, k: pairs_for(
+            n,
+            k,
+            repeat_pairs,
+            n_train_total=n_train_total,
+            n_feature_units=n_feature_units,
+        )
+    )
     rows: list[TaskRow] = []
     for k_features in sorted({int(value) for value in k_grid}):
         for n_samples in sorted({int(value) for value in n_grid}):
