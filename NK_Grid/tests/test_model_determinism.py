@@ -216,6 +216,9 @@ def test_only_ridge_predictions_change_from_the_five_fold_baseline(monkeypatch):
     assert not np.array_equal(
         after["ridge"]["predictions"], before["ridge"]["predictions"]
     )
+    # Structural fact only: AdaptiveStackingRegressor constructs bare RidgeCV,
+    # so this AdaptiveRidgeCV monkeypatch cannot reach it. This records that
+    # architecture; it is not an independent regression defense.
     np.testing.assert_array_equal(
         after["super_learner"]["predictions"],
         before["super_learner"]["predictions"],
