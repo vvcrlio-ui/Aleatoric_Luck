@@ -21,7 +21,6 @@ PYTHON="${PYTHON:-$VENV/bin/python}"
 : "${CALIBRATION_SHAPE_SCHEMA:?Set CALIBRATION_SHAPE_SCHEMA to a feature-universe schema}"
 : "${CALIBRATION_N_TRAIN:?Set CALIBRATION_N_TRAIN to the training-row count}"
 : "${CALIBRATION_TASK_MEMORY_CELLS:?Set CALIBRATION_TASK_MEMORY_CELLS}"
-: "${CALIBRATION_PARALLEL_EFFICIENCY_CELLS:?Set CALIBRATION_PARALLEL_EFFICIENCY_CELLS}"
 : "${CALIBRATION_OUT_DIR:?Set CALIBRATION_OUT_DIR}"
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
@@ -44,11 +43,10 @@ else
 fi
 
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$(command -v python3) venv=$VENV calibration_job=$CALIBRATION_JOB_NAME"
+echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV calibration_job=$CALIBRATION_JOB_NAME"
 "$PYTHON" -m aleatoric_nk_grid.calibrate_cost \
   --shape-schema "$CALIBRATION_SHAPE_SCHEMA" \
   "${DTYPE_ARGS[@]}" \
   --n-train "$CALIBRATION_N_TRAIN" \
   --task-memory-cells "$CALIBRATION_TASK_MEMORY_CELLS" \
-  --parallel-efficiency-cells "$CALIBRATION_PARALLEL_EFFICIENCY_CELLS" \
   --out-dir "$CALIBRATION_OUT_DIR"

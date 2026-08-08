@@ -32,7 +32,6 @@ import numpy as np
 import pandas as pd
 from aleatoric_nk_grid_measure_worker import (
     cell_worker_target,
-    parallel_efficiency_cell_worker_target,
     task_cell_worker_target,
 )
 
@@ -107,7 +106,6 @@ STAGE_A_REPS = 3
 
 DEFAULT_MAX_SECONDS = 3600.0
 T0_REPS = 5
-PARALLEL_EFFICIENCY_REPS = 3
 R2_EXPLANATION_THRESHOLD = 0.8
 
 
@@ -1685,116 +1683,6 @@ def measure_task_cgroup_peak_n_jobs_8(
     )
 
 
-# ---------------------------------------------------------------------------
-# Parallel-efficiency measurement (independent from memory probes)
-# ---------------------------------------------------------------------------
-
-
-def parallel_efficiency(
-    t1_seconds: float, t8_seconds: float, *, n_jobs: int = 8
-) -> float:
-    """Return eta = T1 / (n_jobs * Tn), with no machine-dependent defaults."""
-
-    if n_jobs < 2:
-        raise ValueError("parallel efficiency requires at least two jobs")
-    if t1_seconds <= 0 or t8_seconds <= 0:
-        raise ValueError("parallel efficiency requires positive wall-clock measurements")
-    return float(t1_seconds / (n_jobs * t8_seconds))
-
-
-def _parallel_efficiency_worker_args(
-    session: CalibrationSession, requests: Sequence[CellMeasurementRequest]
-) -> list[tuple[Any, ...]]:
-    if len(requests) != 8:
-        raise ValueError("parallel efficiency requires exactly eight fixed cell workloads")
-    return [
-        (
-            str(session.schema_path),
-            session.outcome,
-            request.model_name,
-            request.n,
-            request.k,
-            request.seed,
-            request.draw,
-            request.max_seconds,
-        )
-        for request in requests
-    ]
-
-
-def _run_parallel_efficiency_cells(
-    worker_args: Sequence[tuple[Any, ...]], *, n_jobs: int
-) -> None:
-    """Run fixed cell workloads via spawn without cgroups or memory sampling."""
-
-    if n_jobs < 1:
-        raise ValueError("n_jobs must be positive")
-    context = mp.get_context("spawn")
-    pending = iter(worker_args)
-    while True:
-        batch = list()
-        for _ in range(n_jobs):
-            try:
-                args = next(pending)
-            except StopIteration:
-                break
-            process = context.Process(target=parallel_efficiency_cell_worker_target, args=args)
-            process.start()
-            batch.append(process)
-        if not batch:
-            return
-        for process in batch:
-            process.join()
-            if process.exitcode != 0:
-                raise RuntimeError(
-                    "parallel-efficiency spawn worker failed "
-                    f"(pid={process.pid}, exitcode={process.exitcode})"
-                )
-
-
-def measure_parallel_efficiency(
-    session: CalibrationSession,
-    requests: Sequence[CellMeasurementRequest],
-    *,
-    n_reps: int = PARALLEL_EFFICIENCY_REPS,
-    clock: Callable[[], float] = time.perf_counter,
-) -> dict[str, Any]:
-    """Measure serial and n_jobs=8 wall clocks for the same fixed eight cells.
-
-    This deliberately shares neither a cgroup nor a memory sampler with the
-    item-1 task-memory probe.  It exists solely to estimate the time-model
-    denominator used by Stage B's multi-CPU split decision.
-    """
-
-    if n_reps < 1:
-        raise ValueError("parallel efficiency n_reps must be positive")
-    worker_args = _parallel_efficiency_worker_args(session, requests)
-    t1_values: list[float] = []
-    t8_values: list[float] = []
-    for _ in range(n_reps):
-        started = clock()
-        _run_parallel_efficiency_cells(worker_args, n_jobs=1)
-        t1_values.append(clock() - started)
-        started = clock()
-        _run_parallel_efficiency_cells(worker_args, n_jobs=8)
-        t8_values.append(clock() - started)
-    t1_summary = summarize_reps(t1_values)
-    t8_summary = summarize_reps(t8_values)
-    return {
-        "worker_start_method": "spawn",
-        "n_jobs": 8,
-        "n_reps": n_reps,
-        "cell_workloads": [
-            {"model": request.model_name, "n": request.n, "k": request.k,
-             "seed": request.seed, "draw": request.draw}
-            for request in requests
-        ],
-        "t1_seconds": t1_summary,
-        "t8_seconds": t8_summary,
-        "eta": parallel_efficiency(t1_summary["median"], t8_summary["median"]),
-    }
-
-
 def run_stage_a(
     session: CalibrationSession,
     *,
@@ -2146,7 +2034,6 @@ def build_calibration_payload(
     scope_reduction: Mapping[str, Any] | None = None,
     task_cgroup_peak_n_jobs_8: MemoryPeak | None = None,
     stage_a_k_grid: Sequence[int] | None = None,
-    parallel_efficiency_measurement: Mapping[str, Any] | None = None,
     wall_clock_seconds: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     environment = core_environment()
@@ -2206,11 +2093,6 @@ def build_calibration_payload(
                 }
             ),
         },
-        "parallel_efficiency": (
-            {"status": "not_measured"}
-            if parallel_efficiency_measurement is None
-            else {"status": "measured", **dict(parallel_efficiency_measurement)}
-        ),
         "telemetry": summarize_fit_telemetry(raw_measurements),
         "fit_quality": {
             "r2_threshold": R2_EXPLANATION_THRESHOLD,
@@ -2261,7 +2143,7 @@ def read_calibration_file(path: Path) -> dict[str, Any]:
         )
     required = {
         "memory_measurement", "raw_measurements", "peak_rss_bytes", "synthetic_data",
-        "parallel_efficiency", "telemetry", "fit_quality", "wall_clock_seconds",
+        "telemetry", "fit_quality", "wall_clock_seconds",
     }
     missing = required.difference(payload)
     if missing:
@@ -2355,21 +2237,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "task_cgroup_peak_n_jobs_8; omit only when no task composition is known."
         ),
     )
-    parser.add_argument(
-        "--parallel-efficiency-cells",
-        type=str,
-        default=None,
-        help=(
-            "Exactly eight fixed model:N:K cell workloads used for both the serial "
-            "and n_jobs=8 spawn-only eta measurement; independent from --task-memory-cells."
-        ),
-    )
-    parser.add_argument(
-        "--parallel-efficiency-reps",
-        type=int,
-        default=PARALLEL_EFFICIENCY_REPS,
-        help="Repeated serial/concurrent wall-clock pairs for eta.",
-    )
     return parser.parse_args(argv)
 
 
@@ -2419,8 +2286,6 @@ def read_feature_dtype_profile(path: Path | str) -> dict[str, int]:
 def main(argv: Sequence[str] | None = None) -> None:
     calibration_started = time.perf_counter()
     args = parse_args(argv)
-    if args.parallel_efficiency_cells is None:
-        raise ValueError("--parallel-efficiency-cells is required for format-v5 calibration")
     thread_report = enforce_thread_env(strict=not args.allow_nonproduction_threads)
     phase_seconds: dict[str, float] = {}
 
@@ -2475,15 +2340,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         phase_started = time.perf_counter()
         t0 = measure_t0(schema_path, params.outcome)
         phase_seconds["t0"] = time.perf_counter() - phase_started
-        phase_started = time.perf_counter()
-        eta_measurement = measure_parallel_efficiency(
-            session,
-            parse_task_memory_cells(
-                args.parallel_efficiency_cells, max_seconds=args.max_seconds
-            ),
-            n_reps=args.parallel_efficiency_reps,
-        )
-        phase_seconds["parallel_efficiency"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         task_peak = (
             None
@@ -2558,7 +2414,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             scope_reduction=scope_reduction,
             task_cgroup_peak_n_jobs_8=task_peak,
             stage_a_k_grid=stage_a_k,
-            parallel_efficiency_measurement=eta_measurement,
             wall_clock_seconds=wall_clock_seconds,
         )
     finally:

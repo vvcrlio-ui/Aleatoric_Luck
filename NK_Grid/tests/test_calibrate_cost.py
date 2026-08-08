@@ -140,28 +140,6 @@ def test_payload_lists_every_fit_below_the_r2_explanation_threshold():
     ]
 
 
-def test_parallel_efficiency_measurement_uses_injected_clock_without_real_workers(monkeypatch):
-    session = SimpleNamespace(schema_path=Path("synthetic-schema.json"), outcome="y")
-    requests = tuple(cc.CellMeasurementRequest("ols", 10, 5) for _ in range(8))
-    observed_jobs: list[int] = []
-    clock_values = iter((0.0, 16.0, 20.0, 24.0))
-
-    def _fake_run(worker_args, *, n_jobs):
-        assert len(worker_args) == 8
-        observed_jobs.append(n_jobs)
-
-    monkeypatch.setattr(cc, "_run_parallel_efficiency_cells", _fake_run)
-    measurement = cc.measure_parallel_efficiency(
-        session, requests, n_reps=1, clock=lambda: next(clock_values)
-    )
-
-    assert observed_jobs == [1, 8]
-    assert measurement["t1_seconds"]["median"] == 16.0
-    assert measurement["t8_seconds"]["median"] == 4.0
-    assert measurement["eta"] == pytest.approx(0.5)
-    assert measurement["worker_start_method"] == "spawn"
-
-
 def test_synthetic_observed_missingness_exposes_an_all_integer_zero_missing_panel(tmp_path):
     shape = _test_shape(8, onehot_sources=4, onehot_dtype="int64", continuous_dtype="int64")
     _, stats = cc.generate_synthetic_bundle(
@@ -1066,7 +1044,6 @@ def test_synthetic_data_section_records_all_params_and_placeholder_flag(tmp_path
     assert synthetic_data["missing_rate_group"] == 0.15
     assert synthetic_data["outcome"] == params.outcome
     assert synthetic_data["observed_missingness"] == stats["observed_missingness"]
-    assert payload["parallel_efficiency"] == {"status": "not_measured"}
     assert payload["telemetry"] == {
         "status": "not_measured",
         "by_model_k": [],

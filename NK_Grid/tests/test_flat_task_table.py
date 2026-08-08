@@ -1,262 +1,172 @@
 from __future__ import annotations
 
 import csv
-import inspect
+import json
 import stat
 from pathlib import Path
-from unittest.mock import patch
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
-import aleatoric_nk_grid.flat_task_table as flat_task_table
-import aleatoric_nk_grid.nk_grid as nk_grid
-import yaml
 
+import aleatoric_nk_grid.flat_task_table as ft
 from aleatoric_nk_grid.flat_task_table import (
     ResourceRequest,
     TaskRow,
+    assign_rows_modulo,
     build_rows,
-    execution_groups,
+    classify_attempts,
     expected_model_keys,
-    finalize_chunk_shards,
-    pack_lpt,
-    pending_rows,
-    read_chunk,
-    resource_class_for_rows,
-    resource_request,
-    measure_chunk_read_rss,
-    run_chunk,
+    finalize_slice_shards,
+    prepare_round,
+    read_row_group,
+    read_task_table,
+    run_slice,
     sbatch_resource_args,
-    run_snapshot_chunk,
-    write_chunk_snapshot,
+    verify_rounds,
     write_task_table,
-    write_synthetic_task_table,
+    write_work_snapshot,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
-from aleatoric_nk_grid.seed_shards import (
-    build_chunk_finalizer_map,
-    finalize_chunk_shards as finalize_chunk_shards_via_seed_shards,
-)
-from conftest import write_schema_bundle
-import numpy as np
-import pandas as pd
 
 
-def _config(tmp_path: Path) -> NKGridConfig:
+def _config(tmp_path: Path, *, models: tuple[str, ...] = ("ols",)) -> NKGridConfig:
     return NKGridConfig(
-        schema=tmp_path / "schema.json", out=tmp_path / "result.csv", outcome="y",
-        models=("ols", "ridge", "lightgbm", "super_learner"), seed=11,
-        test_size=0.3, n_seeds=2, n_draws=2, n_sizes_n=1, n_sizes_k=1,
-        max_n=20, max_k=2, batch_size=4, n_jobs=1,
+        schema=tmp_path / "schema.json", out=tmp_path / "unused.csv", outcome="y", models=models,
+        seed=11, test_size=0.3, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=20, max_k=2, batch_size=4, n_jobs=8, repeat_plan=((11, 0),),
     )
 
 
-def _fast_model_params(tmp_path: Path) -> Path:
-    source = Path(__file__).resolve().parents[1] / "model_params.yaml"
-    payload = yaml.safe_load(source.read_text(encoding="utf-8"))
-    regression = payload["regression"]
-    regression["lightgbm"].update({"max_rounds": 2, "cv_folds": 2})
-    regression["xgboost"].update({"max_rounds": 2, "cv_folds": 2})
-    regression["super_learner"].update({
-        "cv": 2, "n_estimators": 1, "max_iter": 2, "lgbm_n_estimators": 1,
-    })
-    path = tmp_path / "fast-model-params.yaml"
-    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
-    return path
+def _fake_run(config: NKGridConfig, **_: object) -> None:
+    config.out.parent.mkdir(parents=True, exist_ok=True)
+    with config.out.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["model", "seed", "draw", "N", "K", "status", "metric"])
+        writer.writeheader()
+        for model in config.models:
+            writer.writerow({"model": model, "seed": config.repeat_plan[0][0], "draw": config.repeat_plan[0][1], "N": config.n_grid[0], "K": config.k_grid[0], "status": "ok", "metric": f"{config.n_grid[0]}:{config.k_grid[0]}"})
 
 
-def test_task_table_is_reproducible_and_has_one_row_group_per_chunk(tmp_path):
-    rows = build_rows(_config(tmp_path), n_grid=(10, 20), k_grid=(1, 2))
-    first = pack_lpt(rows, budget=2)
-    second = pack_lpt(build_rows(_config(tmp_path), n_grid=(10, 20), k_grid=(1, 2)), budget=2)
-    assert first == second
-    path = write_task_table(tmp_path / "tasks.parquet", first)
-    loaded = tuple(row for chunk in range(max(row.chunk_id for row in first) + 1) for row in read_chunk(path, chunk))
-    assert loaded == first
-    assert all(len(row.models) >= 1 for row in loaded)
-    assert all("ols" not in row.models or "ridge" in row.models for row in loaded if row.group == "imputed_core")
-    assert not path.stat().st_mode & stat.S_IWUSR
-    assert "sqlite" not in inspect.getsource(flat_task_table).lower()
+def _snapshot(tmp_path: Path, *, workers: int = 2, n_grid: tuple[int, ...] = (10, 12), k_grid: tuple[int, ...] = (1, 2)) -> tuple[Path, tuple[TaskRow, ...]]:
+    config = _config(tmp_path)
+    rows = build_rows(config, n_grid=n_grid, k_grid=k_grid)
+    table = write_task_table(tmp_path / "tasks.parquet", rows, rows_per_group=2)
+    snapshot = write_work_snapshot(tmp_path / "snapshot.json", table_path=table, panel="test", config=config, output_dir=tmp_path / "outputs", workers=workers)
+    return snapshot, rows
 
 
-def test_rss_harness_streams_synthetic_design_and_reads_one_chunk(tmp_path):
-    path = write_synthetic_task_table(
-        tmp_path / "synthetic.parquet", row_count=5_000, rows_per_chunk=1_000,
-    )
-    measured = measure_chunk_read_rss(path, chunk_id=2)
-    assert measured["rows"] == 1_000
-    assert measured["rss_delta_bytes"] >= 0
+def test_v2_table_is_immutable_cost_free_and_streamed(tmp_path):
+    snapshot, rows = _snapshot(tmp_path, workers=3)
+    table = Path(json.loads(snapshot.read_text())["task_table"])
+    source = pq.ParquetFile(table)
+    assert source.schema.names == ["row_id", "seed", "draw", "N", "K", "group", "element"] or source.schema.names == ["row_id", "seed", "draw", "N", "K", "group", "models"]
+    assert all(column not in source.schema.names for column in ("est_cost", "chunk_id"))
+    assert read_task_table(table) == tuple(sorted(rows, key=lambda row: (row.k_features, row.n_samples, row.seed, row.draw, row.group, row.row_id)))
+    assert not table.stat().st_mode & stat.S_IWUSR
 
 
-def test_chunk_read_rss_uses_the_engine_peak_rss_conversion():
-    assert flat_task_table._process_peak_rss_bytes is nk_grid._process_peak_rss_bytes
+def test_v1_table_is_rejected_fail_closed(tmp_path):
+    path = tmp_path / "old.parquet"
+    pq.write_table(pa.table({"row_id": ["a"], "seed": [1], "draw": [0], "N": [10], "K": [1], "group": ["imputed_core"], "models": [["ols"]], "est_cost": [1.0], "chunk_id": [0]}), path)
+    with pytest.raises(ValueError, match="v1"):
+        read_task_table(path)
 
 
-def test_lpt_obeys_budget_except_single_over_budget_rows():
-    rows = tuple(TaskRow(str(index), 1, 0, 10, index + 1, "imputed_core", ("ols",)) for index in range(4))
-    costs = {"0": 6.0, "1": 4.0, "2": 3.0, "3": 2.0}
-    packed = pack_lpt(rows, budget=5, cost_function=lambda row: costs[row.row_id])
-    totals: dict[int, float] = {}
-    counts: dict[int, int] = {}
-    for row in packed:
-        totals[row.chunk_id] = totals.get(row.chunk_id, 0.0) + row.est_cost
-        counts[row.chunk_id] = counts.get(row.chunk_id, 0) + 1
-    assert all(total <= 5 or counts[chunk] == 1 for chunk, total in totals.items())
-
-
-def test_super_learner_split_is_threshold_controlled_without_default():
-    models = ("ols", "super_learner", "lightgbm")
-    assert execution_groups(models, k_features=100) == (
-        ("imputed_core", ("ols", "super_learner")), ("passthrough", ("lightgbm",)),
-    )
-    assert execution_groups(models, k_features=100, split_super_learner_min_k=100) == (
-        ("imputed_core", ("ols",)), ("super_learner", ("super_learner",)),
-        ("passthrough", ("lightgbm",)),
-    )
-
-
-def test_resume_is_key_set_difference_not_table_position():
-    rows = (
-        TaskRow("a", 1, 0, 10, 1, "imputed_core", ("ols", "ridge")),
-        TaskRow("b", 2, 0, 10, 1, "imputed_core", ("ols",)),
-    )
-    assert pending_rows(rows, {("ols", 1, 0, 10, 1), ("ridge", 1, 0, 10, 1)}) == (rows[1],)
-
-
-def test_finalizer_rejects_out_of_design_and_duplicate_keys(tmp_path):
-    rows = pack_lpt((
-        TaskRow("a", 1, 0, 10, 1, "imputed_core", ("ols",)),
-        TaskRow("b", 2, 0, 10, 1, "imputed_core", ("ols",)),
-    ), budget=1)
-    table = write_task_table(tmp_path / "tasks.parquet", rows)
-    chunks: dict[int, Path] = {}
-    for chunk_id in (0, 1):
-        path = tmp_path / f"chunk-{chunk_id}.csv"
-        with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["model", "seed", "draw", "N", "K", "status"])
-            writer.writeheader()
-            row = read_chunk(table, chunk_id)[0]
-            writer.writerow({"model": "ols", "seed": row.seed, "draw": row.draw, "N": row.n_samples, "K": row.k_features, "status": "ok"})
-        chunks[chunk_id] = path
-    output = finalize_chunk_shards(table, chunks, tmp_path / "merged.csv")
-    assert len(list(csv.DictReader(output.open(encoding="utf-8")))) == len(expected_model_keys(rows))
-    with chunks[0].open("a", encoding="utf-8") as handle:
-        handle.write("not-a-model,1,0,10,1,ok\n")
-    with pytest.raises(ValueError, match="out-of-design"):
-        finalize_chunk_shards(table, chunks, tmp_path / "bad.csv")
-
-
-def test_resource_framework_requires_stage_b_values():
-    serial = (TaskRow("a", 1, 0, 10, 1, "imputed_core", ("ols",)),)
-    super_rows = (TaskRow("b", 1, 0, 10, 1, "super_learner", ("super_learner",)),)
-    assert resource_class_for_rows(serial) == "serial"
-    assert resource_class_for_rows(super_rows) == "super_learner"
-    with pytest.raises(ValueError, match="No Stage-B"):
-        resource_request(serial, {})
-    values = {
-        "serial": ResourceRequest("serial", 1, "long", "8G", "00:30:00"),
-        "super_learner": ResourceRequest("super_learner", 2, "long", "16G", "00:30:00"),
-    }
-    assert resource_request(serial, values).cpus_per_task == 1
-    assert sbatch_resource_args(serial, values) == (
-        "--partition=long", "--cpus-per-task=1", "--mem=8G", "--time=00:30:00",
-    )
-    assert resource_request(super_rows, values).cpus_per_task == 2
-    assert "--cpus-per-task=2" in sbatch_resource_args(super_rows, values)
-
-
-@pytest.mark.parametrize(
-    ("models", "expected_group", "n_jobs"),
-    [
-        (("ols", "ridge"), "imputed_core", 1),
-        (("lightgbm", "xgboost"), "passthrough", 1),
-        (("super_learner",), "imputed_core", 2),
-    ],
-    ids=("imputed", "passthrough", "super-learner-isolated"),
-)
-def test_chunk_execution_matches_direct_cell_group_metrics(
-    tmp_path, models, expected_group, n_jobs,
-):
-    values = np.arange(72, dtype=float)
-    frame = pd.DataFrame({
-        "y": values * 2 + values % 5,
-        "x1": values,
-        "x2": values % 3,
-        "x3": values % 7,
-    })
-    schema = write_schema_bundle(
-        tmp_path / "input", frame, predictors=["x1", "x2", "x3"],
-        imputation={
-            "continuous": "median", "ordinal": "most_frequent",
-            "onehot_group": "atomic_mode",
-            "model_overrides": {"lightgbm": "passthrough", "xgboost": "passthrough"},
-        },
-    )
-    config = NKGridConfig(
-        schema=schema, out=tmp_path / "direct.csv", outcome="y", models=models,
-        seed=17, test_size=0.25, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
-        max_n=12, max_k=1, min_n=10, batch_size=2, n_jobs=n_jobs,
-        repeat_plan=((17, 0),), n_grid=(10, 12), k_grid=(1,), rerun_completed=False,
-        model_params=_fast_model_params(tmp_path),
-    )
-    rows = pack_lpt(build_rows(config, n_grid=(10, 12), k_grid=(1,)), budget=1)
-    assert {row.group for row in rows} == {expected_group}
-    assert len({row.chunk_id for row in rows}) >= 2
-    table = write_task_table(tmp_path / "tasks.parquet", rows)
-    chunk_outputs = {
-        chunk_id: run_chunk(table, chunk_id, config, output=tmp_path / f"chunk-{chunk_id}.csv")
-        for chunk_id in range(2)
-    }
-    chunk_output = finalize_chunk_shards(table, chunk_outputs, tmp_path / "chunk-final.csv")
-    from aleatoric_nk_grid.nk_grid import METRIC_COLUMNS, run_nk_grid
-    if models == ("super_learner",):
-        native_calls: list[dict] = []
-        from aleatoric_nk_grid import nk_grid
-        original = nk_grid._run_native_model_cell_locked
-
-        def observe(*args, **kwargs):
-            native_calls.append(dict(kwargs["fit_arguments"]))
-            return original(*args, **kwargs)
-
-        with patch("aleatoric_nk_grid.nk_grid._run_native_model_cell_locked", side_effect=observe):
-            run_nk_grid(config)
-        assert native_calls
-        assert {call["model_n_jobs"] for call in native_calls} == {2}
+@pytest.mark.parametrize("workers,row_count", [(1, 5), (2, 5), (7, 5), (4, 0)])
+def test_prepare_round_assigns_every_todo_row_by_index_modulo(tmp_path, workers, row_count):
+    snapshot, rows = _snapshot(tmp_path, workers=workers, n_grid=(10, 12, 14, 16, 18), k_grid=(1,))
+    if row_count:
+        rows = rows[:row_count]
+        table = write_task_table(tmp_path / "short.parquet", rows)
+        payload = json.loads(snapshot.read_text()); payload["task_table"] = str(table); Path(snapshot).chmod(0o644); Path(snapshot).write_text(json.dumps(payload)); Path(snapshot).chmod(0o444)
     else:
-        run_nk_grid(config)
-    sort_columns = ["model", "seed", "draw", "N", "K"]
-    left = pd.read_csv(chunk_output).sort_values(sort_columns).reset_index(drop=True)
-    right = pd.read_csv(config.out).sort_values(sort_columns).reset_index(drop=True)
-    pd.testing.assert_frame_equal(left.loc[:, [*sort_columns, *METRIC_COLUMNS]], right.loc[:, [*sort_columns, *METRIC_COLUMNS]], check_exact=True)
+        # Mark the only model key of every row complete without manufacturing a
+        # special empty main table, which production deliberately forbids.
+        output = tmp_path / "outputs" / "round-0"; output.mkdir(parents=True)
+        with (output / "worker-0.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["model", "seed", "draw", "N", "K", "status"]); writer.writeheader()
+            for row in rows: writer.writerow({"model": "ols", "seed": row.seed, "draw": row.draw, "N": row.n_samples, "K": row.k_features, "status": "ok"})
+    stats = prepare_round(snapshot, round_index=1)
+    assignment = Path(stats["assignment"])
+    groups = [read_row_group(assignment, index) for index in range(workers)]
+    assigned = [row for group in groups for row in group]
+    assert len(assigned) == len({row.row_id for row in assigned})
+    expected = [] if row_count == 0 else list(rows)
+    assert {row.row_id for row in assigned} == {row.row_id for row in expected}
+    assert all(tuple(row.row_id for row in group) == tuple(row.row_id for row in expected[index::workers]) for index, group in enumerate(groups))
 
 
-def test_snapshot_freezes_chunk_array_mapping(tmp_path):
-    config = _config(tmp_path)
-    table = write_task_table(tmp_path / "tasks.parquet", pack_lpt(
-        build_rows(config, n_grid=(10,), k_grid=(1,)), budget=1
-    ))
-    snapshot = write_chunk_snapshot(
-        tmp_path / "snapshot.json", table_path=table, panel="panel", config=config,
-        output_dir=tmp_path / "chunks",
-    )
-    import json
-    payload = json.loads(snapshot.read_text(encoding="utf-8"))
-    assert payload["chunk_count"] == 8
-    assert payload["task_table"] == str(table.resolve())
-    with pytest.raises(IndexError, match="outside"):
-        run_snapshot_chunk(snapshot, 8)
+def test_attempt_classification_keeps_crash_and_too_long_separate():
+    crashed, too_long = classify_attempts([
+        {"round": 1, "worker_index": 0, "sequence": 0, "row_id": "crashed"},
+        {"round": 1, "worker_index": 0, "sequence": 1, "row_id": "later"},
+        {"round": 1, "worker_index": 1, "sequence": 0, "row_id": "long"},
+        {"round": 2, "worker_index": 1, "sequence": 0, "row_id": "long"},
+        {"round": 3, "worker_index": 1, "sequence": 0, "row_id": "long"},
+    ])
+    assert crashed == {"crashed"}
+    assert too_long == {"long"}
 
 
-def test_seed_shard_finalizer_map_uses_chunk_id_targets(tmp_path):
-    config = _config(tmp_path)
-    table = write_task_table(tmp_path / "tasks.parquet", pack_lpt(
-        build_rows(config, n_grid=(10,), k_grid=(1,)), budget=1
-    ))
-    snapshot = write_chunk_snapshot(
-        tmp_path / "snapshot.json", table_path=table, panel="panel", config=config,
-        output_dir=tmp_path / "chunks",
-    )
-    finalizer_map = build_chunk_finalizer_map(snapshot)
-    import json
-    payload = json.loads(finalizer_map.read_text(encoding="utf-8"))
-    assert payload["kind"] == "chunk-finalizer"
-    assert payload["targets"][0]["chunk_count"] == 8
+@pytest.mark.parametrize("workers,row_count", [(workers, rows) for workers in range(1, 11) for rows in (0, 1, 2, 7, 19)])
+def test_modulo_assignment_is_complete_balanced_and_not_contiguous(workers, row_count):
+    rows = tuple(TaskRow(str(index), 1, 0, 10, index + 1, "imputed_core", ("ols",)) for index in range(row_count))
+    groups = assign_rows_modulo(rows, workers)
+    assert len(groups) == workers
+    assert {row.row_id for group in groups for row in group} == {row.row_id for row in rows}
+    assert max((len(group) for group in groups), default=0) - min((len(group) for group in groups), default=0) <= 1
+    assert all(tuple(row.row_id for row in group) == tuple(str(index) for index in range(worker, row_count, workers)) for worker, group in enumerate(groups))
+
+
+def test_each_successful_cell_is_atomically_persisted_before_interruption(tmp_path, monkeypatch):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10, 12, 14), k_grid=(1,))
+    prepare_round(snapshot, round_index=1)
+    calls = 0
+
+    def interrupted(config, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("simulated SIGKILL boundary")
+        _fake_run(config, **kwargs)
+
+    monkeypatch.setattr(ft, "run_nk_grid", interrupted)
+    with pytest.raises(RuntimeError, match="SIGKILL"):
+        run_slice(snapshot, round_index=1, worker_index=0)
+    shard = tmp_path / "outputs" / "round-1" / "worker-0.csv"
+    persisted = list(csv.DictReader(shard.open(encoding="utf-8")))
+    assert len(persisted) == 2
+    assert json.loads(ft.manifest_path(shard).read_text())["completion"]["materialized_rows"] == 2
+    assert all(not path.name.endswith(".tmp") for path in shard.parent.iterdir())
+    monkeypatch.setattr(ft, "run_nk_grid", _fake_run)
+    run_slice(snapshot, round_index=1, worker_index=0)
+    assert len(list(csv.DictReader(shard.open(encoding="utf-8")))) == len(expected_model_keys(rows))
+
+
+def test_real_two_round_recovery_converges_to_one_shot_output(tmp_path, monkeypatch):
+    snapshot, rows = _snapshot(tmp_path, workers=2)
+    monkeypatch.setattr(ft, "run_nk_grid", _fake_run)
+    first = prepare_round(snapshot, round_index=1)
+    assert first["todo_rows"] == len(rows)
+    run_slice(snapshot, round_index=1, worker_index=0)
+    second = prepare_round(snapshot, round_index=2)
+    assert second["todo_rows"] == len(rows) - len(read_row_group(Path(first["assignment"]), 0))
+    run_slice(snapshot, round_index=2, worker_index=0)
+    run_slice(snapshot, round_index=2, worker_index=1)
+    result = verify_rounds(snapshot)
+    assert result["missing_model_keys"] == 0
+    merged = finalize_slice_shards(Path(json.loads(snapshot.read_text())["task_table"]), (tmp_path / "outputs" / "round-1" / "worker-0.csv", tmp_path / "outputs" / "round-2" / "worker-0.csv", tmp_path / "outputs" / "round-2" / "worker-1.csv"), tmp_path / "merged.csv")
+    one_shot = tmp_path / "one-shot.csv"
+    with one_shot.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["model", "seed", "draw", "N", "K", "status", "metric"]); writer.writeheader()
+        for row in sorted(rows, key=lambda row: (row.n_samples, row.k_features)):
+            writer.writerow({"model": "ols", "seed": row.seed, "draw": row.draw, "N": row.n_samples, "K": row.k_features, "status": "ok", "metric": f"{row.n_samples}:{row.k_features}"})
+    pd.testing.assert_frame_equal(pd.read_csv(merged).sort_values(["N", "K"]).reset_index(drop=True), pd.read_csv(one_shot).sort_values(["N", "K"]).reset_index(drop=True), check_exact=True)
+
+
+def test_resource_request_is_single_core_and_records_account_constraint():
+    request = ResourceRequest(1, "long", "8G", "12:00:00", "proj", "cpu-a")
+    assert sbatch_resource_args(request) == ("--partition=long", "--cpus-per-task=1", "--mem=8G", "--time=12:00:00", "--account=proj", "--constraint=cpu-a")
+    with pytest.raises(ValueError, match="one CPU"):
+        sbatch_resource_args(ResourceRequest(2, "long", "8G", "12:00:00", "proj", "none"))
