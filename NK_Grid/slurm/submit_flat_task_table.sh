@@ -46,6 +46,8 @@ if [ "$SUBMIT" = "1" ] && [ -z "$MAX_ARRAY_SIZE" ]; then
   echo "--submit requires --max-array-size from the target cluster" >&2
   exit 2
 fi
+: "${SBATCH_ACCOUNT:?Set SBATCH_ACCOUNT to the Slurm project account (e.g. -A <proj>)}"
+: "${SBATCH_CONSTRAINT:?Set SBATCH_CONSTRAINT to a CPU-architecture feature, or 'none' to opt out}"
 
 [ -x "$PYTHON" ] || { echo "Python not found: $PYTHON" >&2; exit 1; }
 [ -f "$PLAN" ] || { echo "Plan JSON not found: $PLAN" >&2; exit 1; }
@@ -103,6 +105,8 @@ for index, submission in enumerate(submissions):
 
 WORKER="$ENGINE_DIR/slurm/run_flat_task_table.sbatch"
 [ -f "$WORKER" ] || { echo "Flat-task worker not found: $WORKER" >&2; exit 1; }
+# Slurm opens #SBATCH --output/--error before the worker script starts.
+mkdir -p logs
 
 RECEIPT_LINES=""
 while IFS= read -r SUBMISSION; do
@@ -126,7 +130,11 @@ for arg in entry["sbatch_args"]:
   while IFS= read -r ARGUMENT || [ -n "$ARGUMENT" ]; do
     SBATCH_ARGS+=("$ARGUMENT")
   done <<< "$FIELDS"
-  COMMAND=(sbatch "${SBATCH_ARGS[@]}" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT")
+  COMMAND=(sbatch "${SBATCH_ARGS[@]}" "--account=$SBATCH_ACCOUNT")
+  if [ "$SBATCH_CONSTRAINT" != "none" ]; then
+    COMMAND+=( "--constraint=$SBATCH_CONSTRAINT" )
+  fi
+  COMMAND+=( "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" )
 
   if [ "$SUBMIT" = "0" ]; then
     printf 'DRY RUN:'
@@ -144,8 +152,10 @@ import json
 import sys
 entry = json.loads(sys.argv[1])
 entry["slurm_job_id"] = sys.argv[2]
+entry["sbatch_account"] = sys.argv[3]
+entry["sbatch_constraint"] = sys.argv[4]
 print(json.dumps(entry, separators=(",", ":")))
-' "$SUBMISSION" "$JOB_ID")$'\n'
+' "$SUBMISSION" "$JOB_ID" "$SBATCH_ACCOUNT" "$SBATCH_CONSTRAINT")$'\n'
 done <<< "$SUBMISSIONS"
 
 if [ "$SUBMIT" = "1" ]; then
