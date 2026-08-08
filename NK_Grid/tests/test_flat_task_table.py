@@ -65,15 +65,9 @@ def _fast_model_params(tmp_path: Path) -> Path:
 
 
 def test_task_table_is_reproducible_and_has_one_row_group_per_chunk(tmp_path):
-    rows = build_rows(
-        _config(tmp_path), n_grid=(10, 20), k_grid=(1, 2),
-        n_train_total=100, n_feature_units=100,
-    )
+    rows = build_rows(_config(tmp_path), n_grid=(10, 20), k_grid=(1, 2))
     first = pack_lpt(rows, budget=2)
-    second = pack_lpt(build_rows(
-        _config(tmp_path), n_grid=(10, 20), k_grid=(1, 2),
-        n_train_total=100, n_feature_units=100,
-    ), budget=2)
+    second = pack_lpt(build_rows(_config(tmp_path), n_grid=(10, 20), k_grid=(1, 2)), budget=2)
     assert first == second
     path = write_task_table(tmp_path / "tasks.parquet", first)
     loaded = tuple(row for chunk in range(max(row.chunk_id for row in first) + 1) for row in read_chunk(path, chunk))
@@ -204,10 +198,7 @@ def test_chunk_execution_matches_direct_cell_group_metrics(
         repeat_plan=((17, 0),), n_grid=(10, 12), k_grid=(1,), rerun_completed=False,
         model_params=_fast_model_params(tmp_path),
     )
-    rows = pack_lpt(build_rows(
-        config, n_grid=(10, 12), k_grid=(1,),
-        n_train_total=100, n_feature_units=100,
-    ), budget=1)
+    rows = pack_lpt(build_rows(config, n_grid=(10, 12), k_grid=(1,)), budget=1)
     assert {row.group for row in rows} == {expected_group}
     assert len({row.chunk_id for row in rows}) >= 2
     table = write_task_table(tmp_path / "tasks.parquet", rows)
@@ -241,10 +232,7 @@ def test_chunk_execution_matches_direct_cell_group_metrics(
 def test_snapshot_freezes_chunk_array_mapping(tmp_path):
     config = _config(tmp_path)
     table = write_task_table(tmp_path / "tasks.parquet", pack_lpt(
-        build_rows(
-            config, n_grid=(10,), k_grid=(1,),
-            n_train_total=100, n_feature_units=100,
-        ), budget=1
+        build_rows(config, n_grid=(10,), k_grid=(1,)), budget=1
     ))
     snapshot = write_chunk_snapshot(
         tmp_path / "snapshot.json", table_path=table, panel="panel", config=config,
@@ -261,10 +249,7 @@ def test_snapshot_freezes_chunk_array_mapping(tmp_path):
 def test_seed_shard_finalizer_map_uses_chunk_id_targets(tmp_path):
     config = _config(tmp_path)
     table = write_task_table(tmp_path / "tasks.parquet", pack_lpt(
-        build_rows(
-            config, n_grid=(10,), k_grid=(1,),
-            n_train_total=100, n_feature_units=100,
-        ), budget=1
+        build_rows(config, n_grid=(10,), k_grid=(1,)), budget=1
     ))
     snapshot = write_chunk_snapshot(
         tmp_path / "snapshot.json", table_path=table, panel="panel", config=config,

@@ -472,7 +472,7 @@ def test_preprocess_telemetry_counts_only_mode_misses_and_matches_manifest(
         )
 
 
-def test_near_max_k_cell_groups_do_not_show_strictly_increasing_rss(tmp_path):
+def test_max_k_cell_groups_do_not_show_strictly_increasing_rss(tmp_path):
     frame = _frame(rows=64, features=64)
     predictors = [column for column in frame if column.startswith("X_")]
     schema = write_schema_bundle(
@@ -539,9 +539,7 @@ def test_near_max_k_cell_groups_do_not_show_strictly_increasing_rss(tmp_path):
                 tmp_path / "rss.csv",
                 models=("ols", "ridge"),
                 n_draws=6,
-                # Keep K one short of the true feature-unit total so every
-                # draw remains meaningful for this memory-sampling test.
-                max_k=63,
+                max_k=0,
                 batch_size=2,
             )
         )
@@ -566,7 +564,6 @@ def test_max_jobs_batch_boundaries_and_resume_match_uninterrupted_output(
         models=("ols", "ridge"),
         n_draws=3,
         batch_size=3,
-        max_k=3,
     )
     resumed = _config(
         schema,
@@ -574,7 +571,6 @@ def test_max_jobs_batch_boundaries_and_resume_match_uninterrupted_output(
         models=("ols", "ridge"),
         n_draws=3,
         batch_size=3,
-        max_k=3,
     )
 
     run_nk_grid(complete)

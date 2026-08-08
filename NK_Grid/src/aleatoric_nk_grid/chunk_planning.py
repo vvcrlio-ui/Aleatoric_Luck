@@ -431,8 +431,6 @@ def build_calibrated_plan(
     calibration_path: Path | str,
     n_grid: Sequence[int],
     k_grid: Sequence[int],
-    n_train_total: int,
-    n_feature_units: int,
     cluster: ClusterPolicy,
     table_path: Path | str,
     snapshot_path: Path | str,
@@ -457,8 +455,6 @@ def build_calibrated_plan(
         config,
         n_grid=n_grid,
         k_grid=k_grid,
-        n_train_total=n_train_total,
-        n_feature_units=n_feature_units,
         split_super_learner_min_k=split_super_learner_min_k,
     )
     packed, ranges = pack_by_resource_class(
@@ -595,8 +591,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         calibration_path=payload["calibration"],
         n_grid=[int(value) for value in payload["n_grid"]],
         k_grid=[int(value) for value in payload["k_grid"]],
-        n_train_total=int(payload["n_train_total"]),
-        n_feature_units=int(payload["n_feature_units"]),
         cluster=_cluster_from_payload(payload["cluster"]),
         table_path=payload["task_table"],
         snapshot_path=payload["snapshot"],

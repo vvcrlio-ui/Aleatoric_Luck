@@ -273,129 +273,6 @@ def group_repeat_pairs_by_seed(
     return {seed: tuple(sorted(draws)) for seed, draws in sorted(grouped.items())}
 
 
-def draws_are_degenerate(
-    n_samples: int,
-    k_features: int,
-    *,
-    n_train_total: int,
-    n_feature_units: int,
-) -> bool:
-    """Whether a point consumes every train row and feature unit.
-
-    ``draw_orders`` permutes rows and feature units from the same ``(seed,
-    draw)`` pair.  Drawn sets stop varying only when both prefixes consume
-    their complete populations; saturating one dimension alone leaves the
-    other draw-dependent.
-    """
-
-    return n_samples >= n_train_total and k_features >= n_feature_units
-
-
-def pairs_for_point(
-    repeat_pairs: Sequence[tuple[int, int]],
-    n_samples: int,
-    k_features: int,
-    *,
-    n_train_total: int,
-    n_feature_units: int,
-) -> tuple[tuple[int, int], ...]:
-    """Return all pairs, or the smallest draw for each seed when saturated."""
-
-    pairs = tuple((int(seed), int(draw)) for seed, draw in repeat_pairs)
-    if not draws_are_degenerate(
-        n_samples,
-        k_features,
-        n_train_total=n_train_total,
-        n_feature_units=n_feature_units,
-    ):
-        return pairs
-    grouped = group_repeat_pairs_by_seed(pairs)
-    return tuple((seed, draws[0]) for seed, draws in grouped.items())
-
-
-def enumerate_jobs(
-    models: Sequence[str],
-    repeat_pairs: Sequence[tuple[int, int]],
-    n_grid: Sequence[int],
-    k_grid: Sequence[int],
-    *,
-    n_train_total: int,
-    n_feature_units: int,
-) -> list[tuple[str, int, int, int, int]]:
-    """Enumerate the collapsed design without reordering surviving jobs."""
-
-    point_pairs = {
-        (int(n_samples), int(k_features)): frozenset(
-            pairs_for_point(
-                repeat_pairs,
-                int(n_samples),
-                int(k_features),
-                n_train_total=n_train_total,
-                n_feature_units=n_feature_units,
-            )
-        )
-        for k_features in k_grid
-        for n_samples in n_grid
-    }
-    jobs: list[tuple[str, int, int, int, int]] = []
-    # Keep the pre-collapse loop order.  Batch boundaries, checkpoint timing,
-    # and the final materialization path all consume this sequence downstream.
-    for seed, draw in repeat_pairs:
-        for k_features in k_grid:
-            for n_samples in n_grid:
-                point = (int(n_samples), int(k_features))
-                if (int(seed), int(draw)) not in point_pairs[point]:
-                    continue
-                jobs.extend(
-                    (str(model_name), int(seed), int(draw), *point)
-                    for model_name in models
-                )
-    return jobs
-
-
-def draw_collapse_payload(
-    repeat_pairs: Sequence[tuple[int, int]],
-    n_grid: Sequence[int],
-    k_grid: Sequence[int],
-    *,
-    n_train_total: int,
-    n_feature_units: int,
-    n_models: int,
-) -> dict[str, object]:
-    """Describe draw-axis collapse, including the explicit no-collapse case."""
-
-    pairs_before = len(repeat_pairs)
-    collapsed_points: list[dict[str, int]] = []
-    rows_dropped = 0
-    for k_features in k_grid:
-        for n_samples in n_grid:
-            pairs_after = len(
-                pairs_for_point(
-                    repeat_pairs,
-                    int(n_samples),
-                    int(k_features),
-                    n_train_total=n_train_total,
-                    n_feature_units=n_feature_units,
-                )
-            )
-            if pairs_after < pairs_before:
-                collapsed_points.append(
-                    {
-                        "n": int(n_samples),
-                        "k": int(k_features),
-                        "pairs_before": pairs_before,
-                        "pairs_after": pairs_after,
-                    }
-                )
-                rows_dropped += (pairs_before - pairs_after) * int(n_models)
-    return {
-        "n_train_total": int(n_train_total),
-        "n_feature_units": int(n_feature_units),
-        "collapsed_points": collapsed_points,
-        "rows_dropped": rows_dropped,
-    }
-
-
 def log2_size_grid(
     total: int,
     n_sizes: int,
@@ -1001,41 +878,16 @@ def _select_output_path(
     return _timestamped_out_path(directory, stem, segment, suffix)
 
 
-def estimate_run_size(
-    config: NKGridConfig,
-    *,
-    n_grid: Sequence[int] | None = None,
-    k_grid: Sequence[int] | None = None,
-    n_train_total: int | None = None,
-    n_feature_units: int | None = None,
-) -> dict[str, int | str]:
+def estimate_run_size(config: NKGridConfig) -> dict[str, int | str]:
     """Return a conservative pre-data estimate for panel dry-runs."""
 
     _validate_config(config)
-    n_values = tuple(int(value) for value in (
-        n_grid if n_grid is not None else config.n_grid or tuple(range(config.n_sizes_n))
-    ))
-    k_values = tuple(int(value) for value in (
-        k_grid if k_grid is not None else config.k_grid or tuple(range(config.n_sizes_k))
-    ))
-    repeat_pairs = resolve_repeat_pairs(config)
-    if n_train_total is None or n_feature_units is None:
-        point_pair_count = len(repeat_pairs) * len(n_values) * len(k_values)
-    else:
-        point_pair_count = sum(
-            len(
-                pairs_for_point(
-                    repeat_pairs,
-                    n_samples,
-                    k_features,
-                    n_train_total=n_train_total,
-                    n_feature_units=n_feature_units,
-                )
-            )
-            for k_features in k_values
-            for n_samples in n_values
-        )
-    top_level = len(config.models) * point_pair_count
+    top_level = (
+        len(config.models)
+        * len(resolve_repeat_pairs(config))
+        * len(config.n_grid or tuple(range(config.n_sizes_n)))
+        * len(config.k_grid or tuple(range(config.n_sizes_k)))
+    )
     super_cells = (
         top_level // len(config.models)
         if "super_learner" in config.models
@@ -1163,7 +1015,6 @@ def _manifest_payload(
     splits: dict[int, SplitData],
     n_grid: np.ndarray,
     k_grid: np.ndarray,
-    draw_collapse: Mapping[str, object],
     expected_rows: int,
     results: pd.DataFrame | None,
     result_summary: CheckpointSummary | None = None,
@@ -1223,7 +1074,6 @@ def _manifest_payload(
             "train_rows": int(len(next(iter(splits.values())).X_train)),
             "test_rows": int(len(next(iter(splits.values())).X_test)),
         },
-        "draw_collapse": dict(draw_collapse),
         "design": {
             "preset": config.preset,
             "test_size": float(config.test_size),
@@ -1644,6 +1494,19 @@ def _run_nk_grid_locked(
             "exact_output_path is reserved for explicit single-seed "
             "shard execution"
         )
+    declared_size = estimate_run_size(config)
+    if dry_run:
+        print(json.dumps(declared_size, indent=2, sort_keys=True))
+        return declared_size
+    if (
+        declared_size["top_level_model_cells"] > LARGE_RUN_THRESHOLD
+        and not allow_large_run
+    ):
+        raise ValueError(
+            "Large run requires --allow-large-run: declared grid contains "
+            f"{declared_size['top_level_model_cells']:,} top-level model cells, "
+            f"above the {LARGE_RUN_THRESHOLD:,} safety threshold."
+        )
     model_params_path = Path(config.model_params)
     raw_loaded = load_input(config.schema, config.outcome)
     if (
@@ -1753,49 +1616,19 @@ def _run_nk_grid_locked(
         min_size=config.min_n,
     )
     k_grid = np.asarray(config.k_grid, dtype=int) if config.k_grid else log2_size_grid(len(feature_units), config.n_sizes_k, config.max_k)
-    n_train_total = len(next(iter(splits.values())).X_train)
-    n_feature_units = len(feature_units)
-    declared_size = estimate_run_size(
-        config,
-        n_grid=n_grid,
-        k_grid=k_grid,
-        n_train_total=n_train_total,
-        n_feature_units=n_feature_units,
-    )
-    if dry_run:
-        print(json.dumps(declared_size, indent=2, sort_keys=True))
-        return declared_size
-    if (
-        declared_size["top_level_model_cells"] > LARGE_RUN_THRESHOLD
-        and not allow_large_run
-    ):
-        raise ValueError(
-            "Large run requires --allow-large-run: declared grid contains "
-            f"{declared_size['top_level_model_cells']:,} top-level model cells, "
-            f"above the {LARGE_RUN_THRESHOLD:,} safety threshold."
-        )
     log_progress(
         "grid "
         f"N={n_grid.tolist()} K={k_grid.tolist()} "
         f"seeds={split_seeds} repeat_pairs={list(execution_pairs)} models={list(config.models)}"
     )
 
-    jobs = enumerate_jobs(
-        config.models,
-        execution_pairs,
-        n_grid,
-        k_grid,
-        n_train_total=n_train_total,
-        n_feature_units=n_feature_units,
-    )
-    draw_collapse = draw_collapse_payload(
-        execution_pairs,
-        n_grid,
-        k_grid,
-        n_train_total=n_train_total,
-        n_feature_units=n_feature_units,
-        n_models=len(config.models),
-    )
+    jobs = [
+        (model_name, seed, draw, int(n_samples), int(k_features))
+        for seed, draw in execution_pairs
+        for k_features in k_grid
+        for n_samples in n_grid
+        for model_name in config.models
+    ]
     expected_rows = len(jobs)
     if expected_rows > LARGE_RUN_THRESHOLD and not allow_large_run:
         raise ValueError(
@@ -1901,7 +1734,6 @@ def _run_nk_grid_locked(
         splits=splits,
         n_grid=n_grid,
         k_grid=k_grid,
-        draw_collapse=draw_collapse,
         expected_rows=expected_rows,
         results=existing,
         started_at=started_at,
@@ -2415,7 +2247,6 @@ def _run_nk_grid_locked(
         splits=splits,
         n_grid=n_grid,
         k_grid=k_grid,
-        draw_collapse=draw_collapse,
         expected_rows=expected_rows,
         results=results,
         result_summary=result_summary,

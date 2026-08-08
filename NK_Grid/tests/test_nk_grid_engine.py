@@ -375,7 +375,7 @@ def test_staged_draw_expansion_matches_one_shot_and_fits_only_new_cells(tmp_path
     run_nk_grid(
         _config(
             schema, staged_declared, preset="pilot", n_draws=3,
-            rerun_completed=False, max_k=1,
+            rerun_completed=False,
         )
     )
     import aleatoric_nk_grid.nk_grid as nk_grid
@@ -384,13 +384,13 @@ def test_staged_draw_expansion_matches_one_shot_and_fits_only_new_cells(tmp_path
         staged = run_nk_grid(
             _config(
                 schema, staged_declared, preset="medium", n_draws=9,
-                rerun_completed=False, max_k=1,
+                rerun_completed=False,
             )
         )
     assert make_model.call_count == 6
 
     one_shot = tmp_path / "one-shot.csv"
-    run_nk_grid(_config(schema, one_shot, n_draws=9, rerun_completed=False, max_k=1))
+    run_nk_grid(_config(schema, one_shot, n_draws=9, rerun_completed=False))
     assert staged.read_bytes() == one_shot.read_bytes()
 
 
@@ -942,7 +942,6 @@ def test_checkpoint_boundary_stop_is_resumable(tmp_path):
         n_draws=3,
         batch_size=1,
         rerun_completed=False,
-        max_k=1,
     )
 
     first = run_nk_grid(config, stop_after_batch=lambda: True)
@@ -985,7 +984,6 @@ def test_resume_migrates_main_csv_when_parts_directory_is_empty(tmp_path):
         n_draws=3,
         batch_size=1,
         rerun_completed=False,
-        max_k=1,
     )
     run_nk_grid(config, stop_after_batch=lambda: True)
     assert len(pd.read_csv(out)) == 1
@@ -1013,7 +1011,6 @@ def test_legacy_statusless_main_csv_can_mix_with_new_retry_shards(tmp_path):
         n_draws=3,
         batch_size=1,
         rerun_completed=False,
-        max_k=1,
     )
     run_nk_grid(config, stop_after_batch=lambda: True)
     legacy = pd.read_csv(out).drop(columns=["status"])
@@ -1071,7 +1068,6 @@ def test_scheduler_stop_defers_full_csv_materialization_until_resume(tmp_path):
         n_draws=3,
         batch_size=1,
         rerun_completed=False,
-        max_k=1,
     )
 
     with patch(
