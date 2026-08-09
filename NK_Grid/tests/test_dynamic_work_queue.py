@@ -58,6 +58,10 @@ def test_plan_requires_account_and_never_splits_super_learner(tmp_path):
     plan = build_dynamic_plan(
         _config(tmp_path), n_grid=(10, 20), k_grid=(1, 2),
         cluster=_cluster(
+            preparation_memory="3G", preparation_time_limit="01:00:00",
+            preparation_tmp_dir=str(tmp_path / "prep-scratch"),
+            verification_memory="3G", verification_time_limit="01:00:00",
+            verification_tmp_dir=str(tmp_path / "verify-scratch"),
             finalization_memory="4G", finalization_time_limit="02:00:00",
             finalization_tmp_dir=str(tmp_path / "scratch"),
         ),
@@ -69,9 +73,17 @@ def test_plan_requires_account_and_never_splits_super_learner(tmp_path):
     assert "--cpus-per-task=1" in plan["submission"]["sbatch_args"]
     assert "--account=project" in plan["submission"]["sbatch_args"]
     assert "--constraint=arch" in plan["submission"]["sbatch_args"]
+    assert "--mem=3G" in plan["preparation"]["sbatch_args"]
+    assert "--time=01:00:00" in plan["preparation"]["sbatch_args"]
+    assert plan["preparation"]["tmp_dir"] == str(tmp_path / "prep-scratch")
+    assert "--mem=3G" in plan["verification"]["sbatch_args"]
+    assert "--time=01:00:00" in plan["verification"]["sbatch_args"]
+    assert plan["verification"]["tmp_dir"] == str(tmp_path / "verify-scratch")
     assert "--mem=4G" in plan["finalization"]["sbatch_args"]
     assert "--time=02:00:00" in plan["finalization"]["sbatch_args"]
     assert plan["finalization"]["tmp_dir"] == str(tmp_path / "scratch")
     snapshot = json.loads((tmp_path / "snapshot.json").read_text())
+    assert snapshot["preparation"]["tmp_dir"] == str((tmp_path / "prep-scratch").resolve())
+    assert snapshot["verification"]["tmp_dir"] == str((tmp_path / "verify-scratch").resolve())
     assert snapshot["finalization"]["tmp_dir"] == str((tmp_path / "scratch").resolve())
     assert plan["memory"]["frame_copies"] == 12

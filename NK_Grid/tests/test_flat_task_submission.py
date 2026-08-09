@@ -30,6 +30,14 @@ def _plan(path: Path) -> Path:
             "--partition=long", "--cpus-per-task=1", "--mem=8G", "--time=12:00:00",
             "--account=test-account", "--constraint=test-arch",
         ], "account": "test-account", "constraint": "test-arch"},
+        "preparation": {"sbatch_args": [
+            "--partition=long", "--cpus-per-task=1", "--mem=3G", "--time=01:00:00",
+            "--account=test-account", "--constraint=test-arch",
+        ], "tmp_dir": "/local/prep"},
+        "verification": {"sbatch_args": [
+            "--partition=long", "--cpus-per-task=1", "--mem=3G", "--time=01:00:00",
+            "--account=test-account", "--constraint=test-arch",
+        ], "tmp_dir": "/local/verify"},
         "finalization": {"sbatch_args": [
             "--partition=long", "--cpus-per-task=1", "--mem=4G", "--time=02:00:00",
             "--account=test-account", "--constraint=test-arch",
@@ -54,6 +62,8 @@ def test_dynamic_submitter_prints_the_entire_afterany_chain(tmp_path):
     assert "--dependency=afterany:dry-work-1" in lines[2]
     assert "--dependency=afterany:dry-work-2" in lines[-2]
     assert "--dependency=afterok:dry-verify" in lines[-1]
+    assert "/local/prep" in lines[0]
+    assert "/local/verify" in lines[-2]
     assert "/local/finalizer" in lines[-1]
     assert "--mem=4G" in lines[-1]
     assert "afterany" not in lines[-1]
@@ -77,6 +87,9 @@ def test_dynamic_submitter_submits_every_link_and_writes_receipt(tmp_path):
     assert receipt_payload["jobs"][-1]["dependency"] == "afterok:12345"
     assert receipt_payload["sbatch_account"] == "test-account"
     assert receipt_payload["sbatch_constraint"] == "test-arch"
+    assert receipt_payload["resources"]["preparation"]["tmp_dir"] == "/local/prep"
+    assert receipt_payload["resources"]["verification"]["tmp_dir"] == "/local/verify"
+    assert "--mem=3G" in receipt_payload["resources"]["verification"]["sbatch_args"]
 
 
 def test_dynamic_submitter_rejects_non_single_core_plan_before_sbatch(tmp_path):
@@ -98,6 +111,8 @@ def test_dynamic_submitter_rejects_missing_plan_fields_before_submission(tmp_pat
         ("submission", "sbatch_args"),
         ("submission", "account"),
         ("submission", "constraint"),
+        ("preparation", "sbatch_args"),
+        ("verification", "sbatch_args"),
         ("finalization", "sbatch_args"),
     )
     for field_path in required_paths:

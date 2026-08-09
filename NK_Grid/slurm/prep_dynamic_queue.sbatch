@@ -9,6 +9,7 @@ VENV="${VENV:-$(cd "$ENGINE_DIR/.." && pwd)/.venv}"
 PYTHON="${PYTHON:-$VENV/bin/python}"
 SNAPSHOT="${1:?Pass a frozen dynamic-work-queue snapshot}"
 ROUND="${2:?Pass the dynamic-work-queue round}"
+PREPARATION_TMP_DIR="${3:-}"
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
   command -v module >/dev/null 2>&1 || {
@@ -41,4 +42,8 @@ else
   fi
 fi
 echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND phase=prep"
-"$PYTHON" -m aleatoric_nk_grid.flat_task_table prep --snapshot "$SNAPSHOT" --round "$ROUND"
+PREP_ARGS=(prep --snapshot "$SNAPSHOT" --round "$ROUND")
+if [ -n "$PREPARATION_TMP_DIR" ]; then
+  PREP_ARGS+=(--tmp-dir "$PREPARATION_TMP_DIR")
+fi
+"$PYTHON" -m aleatoric_nk_grid.flat_task_table "${PREP_ARGS[@]}"

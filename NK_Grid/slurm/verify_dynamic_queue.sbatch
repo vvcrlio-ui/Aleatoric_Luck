@@ -8,6 +8,7 @@ ENGINE_DIR="${ENGINE_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
 VENV="${VENV:-$(cd "$ENGINE_DIR/.." && pwd)/.venv}"
 PYTHON="${PYTHON:-$VENV/bin/python}"
 SNAPSHOT="${1:?Pass a frozen dynamic-work-queue snapshot}"
+VERIFICATION_TMP_DIR="${2:-}"
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
   command -v module >/dev/null 2>&1 || {
@@ -40,4 +41,8 @@ else
   fi
 fi
 echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV phase=verify"
-"$PYTHON" -m aleatoric_nk_grid.flat_task_table verify --snapshot "$SNAPSHOT"
+VERIFY_ARGS=(verify --snapshot "$SNAPSHOT")
+if [ -n "$VERIFICATION_TMP_DIR" ]; then
+  VERIFY_ARGS+=(--tmp-dir "$VERIFICATION_TMP_DIR")
+fi
+"$PYTHON" -m aleatoric_nk_grid.flat_task_table "${VERIFY_ARGS[@]}"

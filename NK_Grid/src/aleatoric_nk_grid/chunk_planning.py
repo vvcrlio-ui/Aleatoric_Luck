@@ -95,6 +95,12 @@ class ClusterPolicy:
     account: str
     constraint: str
     memory_override: str | None = None
+    preparation_memory: str | None = None
+    preparation_time_limit: str | None = None
+    preparation_tmp_dir: str | None = None
+    verification_memory: str | None = None
+    verification_time_limit: str | None = None
+    verification_tmp_dir: str | None = None
     finalization_memory: str | None = None
     finalization_time_limit: str | None = None
     finalization_tmp_dir: str | None = None
@@ -107,12 +113,13 @@ class ClusterPolicy:
             raise ValueError("ClusterPolicy.account is required; refusing to emit a submission plan")
         if not self.partition or not self.time_limit or not self.constraint:
             raise ValueError("ClusterPolicy.partition, time_limit, and constraint are required")
-        if self.finalization_memory is not None and not self.finalization_memory:
-            raise ValueError("ClusterPolicy.finalization_memory must be non-empty when set")
-        if self.finalization_time_limit is not None and not self.finalization_time_limit:
-            raise ValueError("ClusterPolicy.finalization_time_limit must be non-empty when set")
-        if self.finalization_tmp_dir is not None and not self.finalization_tmp_dir:
-            raise ValueError("ClusterPolicy.finalization_tmp_dir must be non-empty when set")
+        for field in (
+            "preparation_memory", "preparation_time_limit", "preparation_tmp_dir",
+            "verification_memory", "verification_time_limit", "verification_tmp_dir",
+            "finalization_memory", "finalization_time_limit", "finalization_tmp_dir",
+        ):
+            if getattr(self, field) is not None and not getattr(self, field):
+                raise ValueError(f"ClusterPolicy.{field} must be non-empty when set")
 
 
 def build_dynamic_plan(
@@ -139,6 +146,22 @@ def build_dynamic_plan(
         memory=cluster.memory_override or format_slurm_memory(formula_bytes),
         time_limit=cluster.time_limit, account=cluster.account, constraint=cluster.constraint,
     )
+    preparation_request = ResourceRequest(
+        cpus_per_task=1,
+        partition=cluster.partition,
+        memory=cluster.preparation_memory or request.memory,
+        time_limit=cluster.preparation_time_limit or cluster.time_limit,
+        account=cluster.account,
+        constraint=cluster.constraint,
+    )
+    verification_request = ResourceRequest(
+        cpus_per_task=1,
+        partition=cluster.partition,
+        memory=cluster.verification_memory or request.memory,
+        time_limit=cluster.verification_time_limit or cluster.time_limit,
+        account=cluster.account,
+        constraint=cluster.constraint,
+    )
     finalization_request = ResourceRequest(
         cpus_per_task=1,
         partition=cluster.partition,
@@ -147,14 +170,17 @@ def build_dynamic_plan(
         account=cluster.account,
         constraint=cluster.constraint,
     )
-    finalization_tmp_dir = (
-        None
-        if cluster.finalization_tmp_dir is None
-        else str(Path(cluster.finalization_tmp_dir).expanduser().resolve())
-    )
+    def resolve_tmp_dir(value: str | None) -> str | None:
+        return None if value is None else str(Path(value).expanduser().resolve())
+
+    preparation_tmp_dir = resolve_tmp_dir(cluster.preparation_tmp_dir)
+    verification_tmp_dir = resolve_tmp_dir(cluster.verification_tmp_dir)
+    finalization_tmp_dir = resolve_tmp_dir(cluster.finalization_tmp_dir)
     snapshot = write_work_snapshot(
         Path(snapshot_path), table_path=table, panel=panel, config=config,
         output_dir=Path(output_dir), workers=cluster.workers,
+        preparation_tmp_dir=preparation_tmp_dir,
+        verification_tmp_dir=verification_tmp_dir,
         finalization_tmp_dir=finalization_tmp_dir,
     )
     return {
@@ -173,6 +199,14 @@ def build_dynamic_plan(
             "account": request.account,
             "constraint": request.constraint,
         },
+        "preparation": {
+            "sbatch_args": list(sbatch_resource_args(preparation_request)),
+            "tmp_dir": preparation_tmp_dir,
+        },
+        "verification": {
+            "sbatch_args": list(sbatch_resource_args(verification_request)),
+            "tmp_dir": verification_tmp_dir,
+        },
         "finalization": {
             "sbatch_args": list(sbatch_resource_args(finalization_request)),
             "tmp_dir": finalization_tmp_dir,
@@ -188,6 +222,12 @@ def _cluster_from_payload(payload: Mapping[str, object]) -> ClusterPolicy:
             account=str(payload["account"]),
             constraint=str(payload["constraint"]),
             memory_override=None if payload.get("memory_override") is None else str(payload.get("memory_override")),
+            preparation_memory=None if payload.get("preparation_memory") is None else str(payload.get("preparation_memory")),
+            preparation_time_limit=None if payload.get("preparation_time_limit") is None else str(payload.get("preparation_time_limit")),
+            preparation_tmp_dir=None if payload.get("preparation_tmp_dir") is None else str(payload.get("preparation_tmp_dir")),
+            verification_memory=None if payload.get("verification_memory") is None else str(payload.get("verification_memory")),
+            verification_time_limit=None if payload.get("verification_time_limit") is None else str(payload.get("verification_time_limit")),
+            verification_tmp_dir=None if payload.get("verification_tmp_dir") is None else str(payload.get("verification_tmp_dir")),
             finalization_memory=None if payload.get("finalization_memory") is None else str(payload.get("finalization_memory")),
             finalization_time_limit=None if payload.get("finalization_time_limit") is None else str(payload.get("finalization_time_limit")),
             finalization_tmp_dir=None if payload.get("finalization_tmp_dir") is None else str(payload.get("finalization_tmp_dir")),

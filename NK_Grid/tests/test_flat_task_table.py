@@ -145,6 +145,12 @@ def test_attempt_classification_keeps_crash_and_too_long_separate():
     assert classify_attempts(shuffled) == (crashed, too_long)
 
 
+def test_worker_refuses_an_unready_assignment_after_failed_prep(tmp_path):
+    snapshot, _ = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    with pytest.raises(RuntimeError, match="assignment is not ready.*prep may have failed"):
+        run_slice(snapshot, round_index=1, worker_index=0)
+
+
 def test_verify_cli_writes_complete_json_and_exits_zero(tmp_path, capsys):
     snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
     _write_all_terminal(snapshot, rows)

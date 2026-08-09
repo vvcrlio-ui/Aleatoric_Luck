@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -38,6 +39,8 @@ VERIFY_INCOMPLETE_EXIT_CODE = 3
 FINALIZATION_FORMAT_VERSION = 1
 FINALIZATION_BATCH_ROWS = 4_096
 FINALIZATION_MIN_TEMP_BYTES = 64 * 1024**2
+QUEUE_INDEX_BATCH_ROWS = 4_096
+QUEUE_INDEX_QUERY_ROWS = 512
 TERMINAL_STATUSES = frozenset({"ok", "skipped"})
 VALID_RESULT_STATUSES = frozenset({"ok", "skipped", "failed"})
 
@@ -320,7 +323,7 @@ def run_slice(snapshot_path: Path, *, round_index: int, worker_index: int) -> Pa
     workers = int(payload["workers"])
     if not 0 <= worker_index < workers:
         raise IndexError("worker_index is outside the frozen worker count")
-    assignment = _round_directory(payload, round_index) / "assignment.parquet"
+    assignment = _require_ready_assignment(payload, round_index=round_index, workers=workers)
     rows = read_row_group(assignment, worker_index)
     output = _round_directory(payload, round_index) / f"worker-{worker_index}.csv"
     _sweep_slice_temporaries(output, round_index=round_index, worker_index=worker_index)
@@ -435,40 +438,462 @@ def assign_rows_modulo(rows: Sequence[TaskRow], workers: int) -> tuple[tuple[Tas
     return tuple(tuple(rows[index] for index in range(worker, len(rows), workers)) for worker in range(workers))
 
 
-def prepare_round(snapshot_path: Path, *, round_index: int) -> dict[str, object]:
-    """Build exactly one row group per worker from durable results and attempts."""
+_QUEUE_KEY_COLUMNS = ("model", "seed", "draw", "N", "K")
+_QUEUE_KEY_SQL = ', '.join(f'"{column}"' for column in _QUEUE_KEY_COLUMNS)
+
+
+def _queue_key_join(left: str, right: str) -> str:
+    return " AND ".join(
+        f'{left}."{column}"={right}."{column}"' for column in _QUEUE_KEY_COLUMNS
+    )
+
+
+def _result_shards(output_dir: Path) -> tuple[Path, ...]:
+    return tuple(sorted(Path(output_dir).glob("round-*/worker-*.csv")))
+
+
+def _attempt_logs(output_dir: Path) -> tuple[Path, ...]:
+    return tuple(sorted(Path(output_dir).glob("round-*/attempts/worker-*.jsonl")))
+
+
+def _resolve_queue_index_tmp_base(
+    snapshot: Mapping[str, object], explicit: Path | None, *, phase: str,
+) -> Path:
+    configured: object | None = None
+    phase_config = snapshot.get(phase)
+    if isinstance(phase_config, Mapping):
+        configured = phase_config.get("tmp_dir")
+    candidate = (
+        explicit
+        if explicit is not None
+        else configured
+        or os.environ.get("NK_GRID_TMPDIR")
+        or os.environ.get("TMPDIR")
+        or tempfile.gettempdir()
+    )
+    base = Path(str(candidate)).expanduser().resolve()
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"cannot create {phase} temporary directory {base}: {exc}") from exc
+    if not base.is_dir():
+        raise RuntimeError(f"{phase} temporary path is not a directory: {base}")
+    return base
+
+
+def _queue_index_temp_estimate(table_path: Path, inputs: Sequence[Path]) -> int:
+    try:
+        task_bytes = Path(table_path).stat().st_size
+        input_bytes = sum(path.stat().st_size for path in inputs)
+    except OSError as exc:
+        raise RuntimeError(f"cannot size queue-index inputs: {exc}") from exc
+    return max(
+        FINALIZATION_MIN_TEMP_BYTES,
+        FINALIZATION_MIN_TEMP_BYTES + 12 * task_bytes + 3 * input_bytes,
+    )
+
+
+def _preflight_queue_index_space(
+    tmp_base: Path, table_path: Path, inputs: Sequence[Path], *, phase: str,
+) -> tuple[int, int]:
+    estimated = _queue_index_temp_estimate(table_path, inputs)
+    try:
+        available = int(shutil.disk_usage(tmp_base).free)
+    except OSError as exc:
+        raise RuntimeError(f"cannot measure {phase} temporary directory {tmp_base}: {exc}") from exc
+    if available < estimated:
+        raise RuntimeError(
+            f"insufficient {phase} temporary space: temporary_directory={tmp_base} "
+            f"available_bytes={available} estimated_required_bytes={estimated}"
+        )
+    return available, estimated
+
+
+def _create_queue_index_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(f"""
+        CREATE TABLE expected (
+            row_id TEXT NOT NULL,
+            {_QUEUE_KEY_SQL},
+            PRIMARY KEY ({_QUEUE_KEY_SQL})
+        ) WITHOUT ROWID;
+        CREATE INDEX expected_row_id ON expected (row_id);
+        CREATE TABLE completed (
+            {_QUEUE_KEY_SQL},
+            PRIMARY KEY ({_QUEUE_KEY_SQL})
+        ) WITHOUT ROWID;
+        CREATE TABLE attempts (
+            ingest_order INTEGER PRIMARY KEY,
+            round_index INTEGER NOT NULL,
+            worker_index INTEGER NOT NULL,
+            sequence INTEGER NOT NULL,
+            row_id TEXT NOT NULL
+        );
+        CREATE INDEX attempts_order ON attempts (round_index, worker_index, sequence, ingest_order);
+        CREATE TABLE completed_rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID;
+        CREATE TABLE crashed_rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID;
+        CREATE TABLE too_long_rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID;
+    """)
+
+
+@contextmanager
+def _queue_index(
+    snapshot: Mapping[str, object], *, explicit_tmp_dir: Path | None, phase: str,
+):
+    """Yield a one-run SQLite index under configured local scratch.
+
+    The index owns every collection whose cardinality grows with the design or
+    with accumulated worker output.  Its run directory is deliberately unique
+    so a preempted invocation cannot contaminate a subsequent round.
+    """
+
+    output_dir = Path(str(snapshot["output_dir"]))
+    table_path = Path(str(snapshot["task_table"]))
+    inputs = (*_result_shards(output_dir), *_attempt_logs(output_dir))
+    tmp_base = _resolve_queue_index_tmp_base(snapshot, explicit_tmp_dir, phase=phase)
+    _preflight_queue_index_space(tmp_base, table_path, inputs, phase=phase)
+    run_dir = Path(tempfile.mkdtemp(prefix=f"nk-grid-{phase}-", dir=tmp_base))
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(run_dir / "index.sqlite")
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA cache_size=-16384")
+        _create_queue_index_tables(connection)
+        yield connection
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"SQLite {phase} index failed in {run_dir}: {exc}") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _index_queue_expected_design(connection: sqlite3.Connection, table_path: Path) -> int:
+    statement = f"INSERT INTO expected (row_id, {_QUEUE_KEY_SQL}) VALUES (?, ?, ?, ?, ?, ?)"
+    expected_count = 0
+    try:
+        for rows in _iter_task_row_batches(table_path, batch_rows=QUEUE_INDEX_BATCH_ROWS):
+            values = tuple(
+                (row.row_id, model, row.seed, row.draw, row.n_samples, row.k_features)
+                for row in rows for model in row.models
+            )
+            connection.executemany(statement, values)
+            expected_count += len(values)
+            connection.commit()
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("task table contains duplicate expected model keys") from exc
+    except (OSError, ValueError, pa.ArrowInvalid) as exc:
+        raise ValueError(f"cannot stream task table {table_path}: {exc}") from exc
+    return expected_count
+
+
+def _index_queue_completed_shards(connection: sqlite3.Connection, output_dir: Path) -> int:
+    statement = f"INSERT OR IGNORE INTO completed ({_QUEUE_KEY_SQL}) VALUES (?, ?, ?, ?, ?)"
+    for path in _result_shards(output_dir):
+        try:
+            with path.open(newline="", encoding="utf-8") as source:
+                reader = csv.DictReader(source)
+                for row in reader:
+                    if row.get("status") not in TERMINAL_STATUSES:
+                        continue
+                    connection.execute(statement, _csv_key(row))
+        except (OSError, UnicodeError, csv.Error, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"cannot read completed worker CSV {path}: {exc}") from exc
+        connection.commit()
+    return int(connection.execute("SELECT COUNT(*) FROM completed").fetchone()[0])
+
+
+def _index_queue_attempts(connection: sqlite3.Connection, output_dir: Path) -> None:
+    statement = (
+        "INSERT INTO attempts (round_index, worker_index, sequence, row_id) "
+        "VALUES (?, ?, ?, ?)"
+    )
+    for path in _attempt_logs(output_dir):
+        try:
+            with path.open(encoding="utf-8") as source:
+                for line in source:
+                    try:
+                        item = json.loads(line)
+                        connection.execute(statement, (
+                            int(item["round"]), int(item["worker_index"]),
+                            int(item["sequence"]), str(item["row_id"]),
+                        ))
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        # A Slurm SIGKILL can leave only the final JSON line malformed.
+                        continue
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"cannot read attempt log {path}: {exc}") from exc
+        connection.commit()
+
+
+def _index_completed_rows(connection: sqlite3.Connection) -> None:
+    connection.execute(f"""
+        INSERT INTO completed_rows (row_id)
+        SELECT DISTINCT e.row_id FROM expected e
+        WHERE NOT EXISTS (
+            SELECT 1 FROM expected p
+            WHERE p.row_id=e.row_id
+              AND NOT EXISTS (
+                SELECT 1 FROM completed c WHERE {_queue_key_join('p', 'c')}
+              )
+        )
+    """)
+    connection.commit()
+
+
+def _classify_queue_attempts(connection: sqlite3.Connection) -> None:
+    """Classify attempts using SQL order but the exact existing two-rule logic."""
+
+    connection.execute("CREATE TABLE final_attempts (round_index INTEGER, worker_index INTEGER, row_id TEXT, PRIMARY KEY (round_index, worker_index)) WITHOUT ROWID")
+    prior_group: tuple[int, int] | None = None
+    final_sequence: int | None = None
+    final_row_id: str | None = None
+    cursor = connection.execute(
+        "SELECT round_index, worker_index, sequence, row_id FROM attempts "
+        "ORDER BY round_index, worker_index, sequence, ingest_order"
+    )
+    for round_index, worker_index, sequence, row_id in cursor:
+        group = (int(round_index), int(worker_index))
+        if group != prior_group:
+            if prior_group is not None and final_row_id is not None:
+                connection.execute(
+                    "INSERT INTO final_attempts VALUES (?, ?, ?)",
+                    (*prior_group, final_row_id),
+                )
+            prior_group = group
+            final_sequence = None
+            final_row_id = None
+        if final_row_id is not None:
+            connection.execute("INSERT OR IGNORE INTO crashed_rows VALUES (?)", (final_row_id,))
+        if final_sequence is None or int(sequence) > final_sequence:
+            final_sequence = int(sequence)
+            final_row_id = str(row_id)
+    if prior_group is not None and final_row_id is not None:
+        connection.execute("INSERT INTO final_attempts VALUES (?, ?, ?)", (*prior_group, final_row_id))
+    connection.execute("CREATE TABLE final_rounds (row_id TEXT, round_index INTEGER, PRIMARY KEY (row_id, round_index)) WITHOUT ROWID")
+    connection.execute("INSERT INTO final_rounds SELECT DISTINCT row_id, round_index FROM final_attempts")
+    connection.execute("""
+        INSERT INTO too_long_rows (row_id)
+        SELECT DISTINCT first.row_id FROM final_rounds first
+        JOIN final_rounds second
+          ON second.row_id=first.row_id AND second.round_index=first.round_index + 1
+        JOIN final_rounds third
+          ON third.row_id=first.row_id AND third.round_index=first.round_index + 2
+    """)
+    connection.execute("DELETE FROM crashed_rows WHERE row_id IN (SELECT row_id FROM completed_rows)")
+    connection.execute("DELETE FROM too_long_rows WHERE row_id IN (SELECT row_id FROM completed_rows)")
+    connection.commit()
+
+
+def _queue_row_ids(connection: sqlite3.Connection, table: str) -> list[str]:
+    return [str(row_id) for (row_id,) in connection.execute(f"SELECT row_id FROM {table} ORDER BY row_id")]
+
+
+def _queue_missing_model_keys(connection: sqlite3.Connection) -> int:
+    return int(connection.execute(f"""
+        SELECT COUNT(*) FROM expected e
+        WHERE NOT EXISTS (SELECT 1 FROM completed c WHERE {_queue_key_join('e', 'c')})
+    """).fetchone()[0])
+
+
+def _queue_incomplete_rows(connection: sqlite3.Connection) -> None:
+    connection.execute("CREATE TABLE incomplete_rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID")
+    connection.execute(f"""
+        INSERT INTO incomplete_rows (row_id)
+        SELECT DISTINCT e.row_id FROM expected e
+        WHERE NOT EXISTS (SELECT 1 FROM completed c WHERE {_queue_key_join('e', 'c')})
+    """)
+    connection.commit()
+
+
+def _stage_queue_todo(
+    connection: sqlite3.Connection, table_path: Path, *, workers: int,
+) -> int:
+    connection.executescript("""
+        CREATE TABLE todo (
+            todo_index INTEGER PRIMARY KEY,
+            worker_index INTEGER NOT NULL,
+            row_id TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            draw INTEGER NOT NULL,
+            N INTEGER NOT NULL,
+            K INTEGER NOT NULL,
+            group_name TEXT NOT NULL,
+            models_json TEXT NOT NULL
+        );
+        CREATE INDEX todo_worker_order ON todo (worker_index, todo_index);
+    """)
+    todo_index = 0
+    eligible_statement = (
+        "SELECT row_id FROM incomplete_rows WHERE row_id IN ({}) "
+        "AND row_id NOT IN (SELECT row_id FROM too_long_rows)"
+    )
+    insert = (
+        "INSERT INTO todo (todo_index, worker_index, row_id, seed, draw, N, K, group_name, models_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    try:
+        for rows in _iter_task_row_batches(table_path, batch_rows=QUEUE_INDEX_BATCH_ROWS):
+            for start in range(0, len(rows), QUEUE_INDEX_QUERY_ROWS):
+                batch = rows[start:start + QUEUE_INDEX_QUERY_ROWS]
+                placeholders = ", ".join("?" for _ in batch)
+                eligible = {
+                    str(row_id) for (row_id,) in connection.execute(
+                        eligible_statement.format(placeholders),
+                        tuple(row.row_id for row in batch),
+                    )
+                }
+                staged: list[tuple[object, ...]] = []
+                for row in batch:
+                    if row.row_id not in eligible:
+                        continue
+                    staged.append((
+                        todo_index, todo_index % workers, row.row_id, row.seed, row.draw,
+                        row.n_samples, row.k_features, row.group,
+                        json.dumps(list(row.models), separators=(",", ":")),
+                    ))
+                    todo_index += 1
+                connection.executemany(insert, staged)
+            connection.commit()
+    except (OSError, ValueError, pa.ArrowInvalid) as exc:
+        raise ValueError(f"cannot stream task table {table_path}: {exc}") from exc
+    return todo_index
+
+
+def _write_assignment_from_queue_index(
+    path: Path, connection: sqlite3.Connection, *, workers: int,
+) -> tuple[Path, list[int]]:
+    """Publish exactly one modulo-ordered Parquet row group for every worker."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    writer = pq.ParquetWriter(temporary, _empty_arrow_table().schema, compression="zstd")
+    assigned_rows: list[int] = []
+    try:
+        for worker_index in range(workers):
+            records = connection.execute(
+                "SELECT row_id, seed, draw, N, K, group_name, models_json FROM todo "
+                "WHERE worker_index=? ORDER BY todo_index",
+                (worker_index,),
+            ).fetchall()
+            rows = tuple(TaskRow(
+                row_id=str(row_id), seed=int(seed), draw=int(draw),
+                n_samples=int(n_samples), k_features=int(k_features), group=str(group),
+                models=tuple(str(model) for model in json.loads(models_json)),
+            ) for row_id, seed, draw, n_samples, k_features, group, models_json in records)
+            assigned_rows.append(len(rows))
+            writer.write_table(_arrow_table(rows) if rows else _empty_arrow_table())
+    finally:
+        writer.close()
+    os.replace(temporary, path)
+    os.chmod(path, 0o444)
+    return path, assigned_rows
+
+
+def _assignment_ready_path(round_dir: Path) -> Path:
+    return Path(round_dir) / "assignment.ready.json"
+
+
+def _require_ready_assignment(
+    snapshot: Mapping[str, object], *, round_index: int, workers: int,
+) -> Path:
+    round_dir = _round_directory(snapshot, round_index)
+    assignment = round_dir / "assignment.parquet"
+    ready = _assignment_ready_path(round_dir)
+    try:
+        payload = json.loads(ready.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"assignment is not ready for round {round_index}; prep may have failed: {ready}"
+        ) from exc
+    if (
+        payload.get("format_version") != TABLE_FORMAT_VERSION
+        or int(payload.get("round", -1)) != round_index
+        or int(payload.get("workers", -1)) != workers
+        or payload.get("assignment") != str(assignment.resolve())
+    ):
+        raise RuntimeError(
+            f"assignment readiness record is invalid for round {round_index}; prep may have failed: {ready}"
+        )
+    if not assignment.is_file():
+        raise RuntimeError(
+            f"assignment is not ready for round {round_index}; prep may have failed: {assignment}"
+        )
+    return assignment
+
+
+def prepare_round(
+    snapshot_path: Path, *, round_index: int, tmp_dir: Path | None = None,
+) -> dict[str, object]:
+    """Stream durable state into one modulo row group per worker.
+
+    The task design and all prior durable artefacts are indexed on disk.  The
+    only per-worker materialisation is the one row group that must be written
+    as that worker's assignment, preserving the frozen W-row-group contract.
+    """
+
     payload = _load_snapshot(snapshot_path)
     output_dir = Path(str(payload["output_dir"])); workers = int(payload["workers"])
-    all_rows = read_task_table(Path(str(payload["task_table"])))
-    completed_keys = _completed_keys(output_dir)
-    completed_row_ids = {
-        row.row_id for row in all_rows
-        if expected_model_keys((row,)).issubset(completed_keys)
-    }
-    records = _attempt_records(output_dir)
-    crashed, too_long = classify_attempts(records, completed_row_ids=completed_row_ids)
-    # Crashed rows stay eligible.  Only the three-consecutive-round diagnosis
-    # is excluded so it can be submitted separately with a longer limit.
-    todo = [row for row in pending_rows(all_rows, completed_keys) if row.row_id not in too_long]
-    groups = assign_rows_modulo(todo, workers)
+    table_path = Path(str(payload["task_table"]))
     round_dir = _round_directory(payload, round_index); round_dir.mkdir(parents=True, exist_ok=True)
-    assignment = _write_table_groups(round_dir / "assignment.parquet", groups)
-    write_json_atomic(round_dir / "crashed.json", {"round": round_index, "row_ids": sorted(crashed)})
-    write_json_atomic(round_dir / "too-long.json", {"round": round_index, "row_ids": sorted(too_long)})
-    stats = {"round": round_index, "workers": workers, "todo_rows": len(todo), "assigned_rows": [len(group) for group in groups], "completed_model_keys": len(completed_keys), "crashed_row_ids": sorted(crashed), "too_long_row_ids": sorted(too_long), "assignment": str(assignment)}
+    ready = _assignment_ready_path(round_dir)
+    ready.unlink(missing_ok=True)
+    with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="preparation") as connection:
+        _index_queue_expected_design(connection, table_path)
+        completed_model_keys = _index_queue_completed_shards(connection, output_dir)
+        _index_queue_attempts(connection, output_dir)
+        _index_completed_rows(connection)
+        _classify_queue_attempts(connection)
+        _queue_incomplete_rows(connection)
+        todo_rows = _stage_queue_todo(connection, table_path, workers=workers)
+        assignment, assigned_rows = _write_assignment_from_queue_index(
+            round_dir / "assignment.parquet", connection, workers=workers,
+        )
+        crashed = _queue_row_ids(connection, "crashed_rows")
+        too_long = _queue_row_ids(connection, "too_long_rows")
+    # These diagnostics and prep receipt are durable before the worker-facing
+    # readiness marker.  A failed prep therefore cannot look like an idle run.
+    write_json_atomic(round_dir / "crashed.json", {"round": round_index, "row_ids": crashed})
+    write_json_atomic(round_dir / "too-long.json", {"round": round_index, "row_ids": too_long})
+    stats: dict[str, object] = {
+        "round": round_index, "workers": workers, "todo_rows": todo_rows,
+        "assigned_rows": assigned_rows, "completed_model_keys": completed_model_keys,
+        "crashed_row_ids": crashed, "too_long_row_ids": too_long,
+        "assignment": str(assignment),
+    }
     write_json_atomic(round_dir / "prep.json", stats)
+    write_json_atomic(ready, {
+        "format_version": TABLE_FORMAT_VERSION, "round": round_index,
+        "workers": workers, "assignment": str(assignment.resolve()),
+    })
     return stats
 
 
-def verify_rounds(snapshot_path: Path) -> dict[str, object]:
+def verify_rounds(snapshot_path: Path, *, tmp_dir: Path | None = None) -> dict[str, object]:
+    """Stream all durable state into a complete-design verification receipt."""
+
     payload = _load_snapshot(snapshot_path)
-    rows = read_task_table(Path(str(payload["task_table"])))
-    completed = _completed_keys(Path(str(payload["output_dir"])))
-    completed_row_ids = {row.row_id for row in rows if expected_model_keys((row,)).issubset(completed)}
-    crashed, too_long = classify_attempts(_attempt_records(Path(str(payload["output_dir"]))), completed_row_ids=completed_row_ids)
-    expected = expected_model_keys(rows)
-    result = {"expected_model_keys": len(expected), "completed_model_keys": len(completed), "missing_model_keys": len(expected - completed), "crashed_row_ids": sorted(crashed), "too_long_row_ids": sorted(too_long)}
-    write_json_atomic(Path(str(payload["output_dir"])) / "verification.json", result)
+    output_dir = Path(str(payload["output_dir"]))
+    table_path = Path(str(payload["task_table"]))
+    with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="verification") as connection:
+        expected_model_keys = _index_queue_expected_design(connection, table_path)
+        completed_model_keys = _index_queue_completed_shards(connection, output_dir)
+        _index_queue_attempts(connection, output_dir)
+        _index_completed_rows(connection)
+        _classify_queue_attempts(connection)
+        result: dict[str, object] = {
+            "expected_model_keys": expected_model_keys,
+            "completed_model_keys": completed_model_keys,
+            "missing_model_keys": _queue_missing_model_keys(connection),
+            "crashed_row_ids": _queue_row_ids(connection, "crashed_rows"),
+            "too_long_row_ids": _queue_row_ids(connection, "too_long_rows"),
+        }
+    # Completeness failures are data results, not index construction errors:
+    # publish them atomically before the CLI converts them to exit code 3.
+    write_json_atomic(output_dir / "verification.json", result)
     return result
 
 
@@ -936,13 +1361,20 @@ def write_work_snapshot(
     config: NKGridConfig,
     output_dir: Path,
     workers: int,
+    preparation_tmp_dir: Path | str | None = None,
+    verification_tmp_dir: Path | str | None = None,
     finalization_tmp_dir: Path | str | None = None,
 ) -> Path:
     if workers < 1:
         raise ValueError("workers must be positive")
     table = Path(table_path).resolve()
-    if not read_task_table(table):
-        raise ValueError("task table must contain at least one row")
+    try:
+        if pq.ParquetFile(table, memory_map=True).metadata.num_rows < 1:
+            raise ValueError("task table must contain at least one row")
+    except ValueError:
+        raise
+    except (OSError, pa.ArrowInvalid) as exc:
+        raise ValueError(f"cannot read task table metadata {table}: {exc}") from exc
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, object] = {
         "format_version": TABLE_FORMAT_VERSION,
@@ -952,10 +1384,15 @@ def write_work_snapshot(
         "output_dir": str(Path(output_dir).resolve()),
         "workers": int(workers),
     }
-    if finalization_tmp_dir is not None:
-        payload["finalization"] = {
-            "tmp_dir": str(Path(finalization_tmp_dir).expanduser().resolve()),
-        }
+    for phase, temporary_directory in (
+        ("preparation", preparation_tmp_dir),
+        ("verification", verification_tmp_dir),
+        ("finalization", finalization_tmp_dir),
+    ):
+        if temporary_directory is not None:
+            payload[phase] = {
+                "tmp_dir": str(Path(temporary_directory).expanduser().resolve()),
+            }
     write_json_atomic(path, payload)
     os.chmod(path, 0o444)
     return path
@@ -971,12 +1408,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == "prep":
         if args.round is None: parser.error("prep requires --round")
-        print(json.dumps(prepare_round(args.snapshot, round_index=args.round), sort_keys=True))
+        print(json.dumps(prepare_round(args.snapshot, round_index=args.round, tmp_dir=args.tmp_dir), sort_keys=True))
     elif args.command == "run":
         if args.round is None or args.worker_index is None: parser.error("run requires --round and --worker-index")
         print(run_slice(args.snapshot, round_index=args.round, worker_index=args.worker_index))
     elif args.command == "verify":
-        result = verify_rounds(args.snapshot)
+        result = verify_rounds(args.snapshot, tmp_dir=args.tmp_dir)
         print(json.dumps(result, sort_keys=True), flush=True)
         failures = _verification_failure_counts(result)
         if any(failures.values()):
