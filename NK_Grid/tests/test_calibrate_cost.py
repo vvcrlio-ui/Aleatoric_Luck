@@ -157,6 +157,43 @@ def test_fresh_spawn_process_peak_does_not_inherit_parent_high_water():
     assert small < large * 0.85
 
 
+def test_process_tree_fallback_sums_ps_process_tree(monkeypatch):
+    class NoProcPath:
+        def __init__(self, value):
+            assert value == "/proc"
+
+        def exists(self):
+            return False
+
+    monkeypatch.setattr(cc, "Path", NoProcPath)
+    monkeypatch.setattr(
+        cc.subprocess,
+        "run",
+        lambda *args, **kwargs: cc.subprocess.CompletedProcess(
+            args[0], 0,
+            stdout="100 1 10\n101 100 20\n102 101 30\n200 1 40\ninvalid row\n",
+        ),
+    )
+    assert cc._process_tree_rss_bytes(100) == (10 + 20 + 30) * 1024
+
+
+def test_process_tree_fallback_returns_zero_when_ps_fails(monkeypatch):
+    class NoProcPath:
+        def __init__(self, value):
+            assert value == "/proc"
+
+        def exists(self):
+            return False
+
+    monkeypatch.setattr(cc, "Path", NoProcPath)
+
+    def fail(*args, **kwargs):
+        raise cc.subprocess.CalledProcessError(1, args[0])
+
+    monkeypatch.setattr(cc.subprocess, "run", fail)
+    assert cc._process_tree_rss_bytes(100) == 0
+
+
 def test_cell_measurement_records_distinct_spawn_and_whole_tree_numbers(tmp_path, monkeypatch):
     params = cc.SyntheticDataParams(n_train=80, shape=_test_shape(8), seed=0)
     schema_path, _ = cc.generate_synthetic_bundle(tmp_path / "bundle", params)

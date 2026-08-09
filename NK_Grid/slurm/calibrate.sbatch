@@ -1,9 +1,11 @@
 #!/bin/bash
 # Submit with --job-name="$CALIBRATION_JOB_NAME" and explicitly export
 # SBATCH_ACCOUNT plus SBATCH_CONSTRAINT before calling sbatch.
-# Eight CPUs are used only by the retained optional task-allocation memory
-# scope; the invalidated timing grids are gone, so four hours is the reviewed
-# ceiling for the caller-selected cell list rather than a twelve-hour fit grid.
+# This single sbatch uses eight CPUs as the upper bound needed by the optional
+# task-allocation memory scope.  Single-cell-only probes intentionally retain
+# that fixed allocation; selecting resources dynamically would require a
+# separate submission mode.  Four hours is the reviewed ceiling for the
+# caller-selected memory probes rather than a twelve-hour timing-fit grid.
 #SBATCH --job-name=al-calibrate
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
@@ -22,7 +24,6 @@ PYTHON="${PYTHON:-$VENV/bin/python}"
 : "${CALIBRATION_SHAPE_SCHEMA:?Set CALIBRATION_SHAPE_SCHEMA to a feature-universe schema}"
 : "${CALIBRATION_N_TRAIN:?Set CALIBRATION_N_TRAIN to the training-row count}"
 : "${CALIBRATION_MEMORY_CELLS:?Set CALIBRATION_MEMORY_CELLS to model:N:K probes}"
-: "${CALIBRATION_TASK_MEMORY_CELLS:?Set CALIBRATION_TASK_MEMORY_CELLS}"
 : "${CALIBRATION_OUT_DIR:?Set CALIBRATION_OUT_DIR}"
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
@@ -44,12 +45,17 @@ else
   exit 1
 fi
 
+CALIBRATION_ARGS=(
+  --shape-schema "$CALIBRATION_SHAPE_SCHEMA"
+  "${DTYPE_ARGS[@]}"
+  --n-train "$CALIBRATION_N_TRAIN"
+  --memory-cells "$CALIBRATION_MEMORY_CELLS"
+)
+if [ -n "${CALIBRATION_TASK_MEMORY_CELLS:-}" ]; then
+  CALIBRATION_ARGS+=(--task-memory-cells "$CALIBRATION_TASK_MEMORY_CELLS")
+fi
+CALIBRATION_ARGS+=(--out-dir "$CALIBRATION_OUT_DIR")
+
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV calibration_job=$CALIBRATION_JOB_NAME"
-"$PYTHON" -m aleatoric_nk_grid.calibrate_cost \
-  --shape-schema "$CALIBRATION_SHAPE_SCHEMA" \
-  "${DTYPE_ARGS[@]}" \
-  --n-train "$CALIBRATION_N_TRAIN" \
-  --memory-cells "$CALIBRATION_MEMORY_CELLS" \
-  --task-memory-cells "$CALIBRATION_TASK_MEMORY_CELLS" \
-  --out-dir "$CALIBRATION_OUT_DIR"
+"$PYTHON" -m aleatoric_nk_grid.calibrate_cost "${CALIBRATION_ARGS[@]}"

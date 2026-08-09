@@ -14,6 +14,7 @@ SUBMITTER = ENGINE_DIR / "slurm" / "submit_flat_task_table.sh"
 WORKER = ENGINE_DIR / "slurm" / "run_flat_task_table.sbatch"
 PREP = ENGINE_DIR / "slurm" / "prep_dynamic_queue.sbatch"
 VERIFY = ENGINE_DIR / "slurm" / "verify_dynamic_queue.sbatch"
+CALIBRATE = ENGINE_DIR / "slurm" / "calibrate.sbatch"
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -153,7 +154,7 @@ fi'''
 
 
 def test_calibrate_script_is_generic_and_uses_the_shared_module_block():
-    calibrate = (ENGINE_DIR / "slurm" / "calibrate.sbatch").read_text(encoding="utf-8")
+    calibrate = CALIBRATE.read_text(encoding="utf-8")
     worker = WORKER.read_text(encoding="utf-8")
     start = worker.index('if [ -n "${PYTHON_MODULE:-}" ]; then')
     end = worker.index("\nfi", start) + len("\nfi")
@@ -164,3 +165,51 @@ def test_calibrate_script_is_generic_and_uses_the_shared_module_block():
     assert "#SBATCH --time=04:00:00" in calibrate
     assert '--memory-cells "$CALIBRATION_MEMORY_CELLS"' in calibrate
     assert not any(token in calibrate for token in ("--stage-a", "--stage-b"))
+
+
+def _calibrate_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    fake_python = tmp_path / "python"
+    args_path = tmp_path / "calibrate-args.txt"
+    _write_executable(fake_python, '#!/bin/bash\nprintf \'%s\\n\' "$@" > "$CALIBRATE_ARGS"\n')
+    environment = {
+        **os.environ,
+        "ENGINE_DIR": str(ENGINE_DIR),
+        "PYTHON": str(fake_python),
+        "VENV": str(tmp_path / "venv"),
+        "CALIBRATION_JOB_NAME": "test-calibration",
+        "SBATCH_ACCOUNT": "test-account",
+        "SBATCH_CONSTRAINT": "none",
+        "CALIBRATION_SHAPE_SCHEMA": str(tmp_path / "schema.yaml"),
+        "CALIBRATION_N_TRAIN": "100",
+        "CALIBRATION_MEMORY_CELLS": "ols:10:5",
+        "CALIBRATION_OUT_DIR": str(tmp_path / "output"),
+        "CALIBRATION_ASSUME_FEATURE_DTYPE": "float64",
+        "CALIBRATE_ARGS": str(args_path),
+    }
+    environment.pop("PYTHON_MODULE", None)
+    environment.pop("CALIBRATION_TASK_MEMORY_CELLS", None)
+    return environment, args_path
+
+
+def test_calibrate_script_omits_optional_task_memory_cells_when_unset(tmp_path):
+    environment, args_path = _calibrate_environment(tmp_path)
+    completed = subprocess.run(
+        ["bash", str(CALIBRATE)], env=environment,
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--task-memory-cells" not in args_path.read_text(encoding="utf-8").splitlines()
+
+
+def test_calibrate_script_passes_optional_task_memory_cells_unchanged(tmp_path):
+    environment, args_path = _calibrate_environment(tmp_path)
+    task_cells = ",".join(f"ols:{n}:5" for n in range(10, 18))
+    environment["CALIBRATION_TASK_MEMORY_CELLS"] = task_cells
+    completed = subprocess.run(
+        ["bash", str(CALIBRATE)], env=environment,
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    args = args_path.read_text(encoding="utf-8").splitlines()
+    option_index = args.index("--task-memory-cells")
+    assert args[option_index + 1] == task_cells
