@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Submit every dynamic-work-queue round at once.  afterany is deliberate:
-# Slurm time limits are normal round termination, not a reason to stop the
-# recovery chain.
+# Submit every dynamic-work-queue round at once.  prep/work/verify use
+# afterany because Slurm time limits are normal round termination.  Finalize
+# alone uses afterok so incomplete verification can never publish a result.
 set -euo pipefail
 
 ENGINE_DIR="${ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -35,6 +35,8 @@ try:
     snapshot = p["snapshot"]; workers = int(p["workers"]); rounds = int(p["rounds"])
     submission = p["submission"]; array = submission["array"]; args = submission["sbatch_args"]
     account = submission["account"]; constraint = submission["constraint"]
+    finalization = p["finalization"]; final_args = finalization["sbatch_args"]
+    final_tmp_dir = finalization.get("tmp_dir")
 except (KeyError, TypeError, ValueError) as exc:
     raise SystemExit(f"invalid dynamic plan JSON: {exc}")
 if not isinstance(snapshot, str) or not snapshot or workers < 1 or rounds < 1:
@@ -45,8 +47,27 @@ if not isinstance(account, str) or not account or not isinstance(constraint, str
     raise SystemExit("invalid dynamic plan JSON: submission account and constraint are required")
 if "--cpus-per-task=1" not in args:
     raise SystemExit("invalid dynamic plan JSON: dynamic workers must request one CPU")
+if not isinstance(final_args, list) or not final_args or not all(isinstance(a, str) and a for a in final_args):
+    raise SystemExit("invalid dynamic plan JSON: finalization.sbatch_args are required")
+if "--cpus-per-task=1" not in final_args:
+    raise SystemExit("invalid dynamic plan JSON: finalizer must request one CPU")
+if f"--account={account}" not in final_args:
+    raise SystemExit("invalid dynamic plan JSON: finalizer account must match submission account")
+if constraint != "none" and f"--constraint={constraint}" not in final_args:
+    raise SystemExit("invalid dynamic plan JSON: finalizer constraint must match submission constraint")
+if final_tmp_dir is not None and (not isinstance(final_tmp_dir, str) or not final_tmp_dir):
+    raise SystemExit("invalid dynamic plan JSON: finalization.tmp_dir must be null or a non-empty string")
+values = [snapshot, str(workers), str(rounds), array, account, constraint, *args, *final_args]
+if final_tmp_dir is not None:
+    values.append(final_tmp_dir)
+if any("\n" in value or "\r" in value for value in values):
+    raise SystemExit("invalid dynamic plan JSON: submission fields must be single-line strings")
 print(snapshot); print(workers); print(rounds); print(array); print(account); print(constraint)
+print(len(args))
 for arg in args: print(arg)
+print(len(final_args))
+for arg in final_args: print(arg)
+print("__NK_GRID_NONE__" if final_tmp_dir is None else final_tmp_dir)
 ' "$PLAN")
 FIELD_LINES=()
 while IFS= read -r line || [ -n "$line" ]; do
@@ -54,12 +75,18 @@ while IFS= read -r line || [ -n "$line" ]; do
 done <<< "$FIELDS"
 SNAPSHOT="${FIELD_LINES[0]}"; WORKERS="${FIELD_LINES[1]}"; ROUNDS="${FIELD_LINES[2]}"; ARRAY_SPEC="${FIELD_LINES[3]}"
 SBATCH_ACCOUNT="${FIELD_LINES[4]}"; SBATCH_CONSTRAINT="${FIELD_LINES[5]}"
-SBATCH_ARGS=("${FIELD_LINES[@]:6}")
+FIELD_INDEX=6
+SBATCH_COUNT="${FIELD_LINES[$FIELD_INDEX]}"; FIELD_INDEX=$((FIELD_INDEX + 1))
+SBATCH_ARGS=("${FIELD_LINES[@]:$FIELD_INDEX:$SBATCH_COUNT}"); FIELD_INDEX=$((FIELD_INDEX + SBATCH_COUNT))
+FINALIZATION_COUNT="${FIELD_LINES[$FIELD_INDEX]}"; FIELD_INDEX=$((FIELD_INDEX + 1))
+FINALIZATION_SBATCH_ARGS=("${FIELD_LINES[@]:$FIELD_INDEX:$FINALIZATION_COUNT}"); FIELD_INDEX=$((FIELD_INDEX + FINALIZATION_COUNT))
+FINALIZATION_TMP_DIR="${FIELD_LINES[$FIELD_INDEX]}"
 
 PREP="$ENGINE_DIR/slurm/prep_dynamic_queue.sbatch"
 WORKER="$ENGINE_DIR/slurm/run_flat_task_table.sbatch"
 VERIFY="$ENGINE_DIR/slurm/verify_dynamic_queue.sbatch"
-for script in "$PREP" "$WORKER" "$VERIFY"; do [ -f "$script" ] || { echo "Dynamic queue script not found: $script" >&2; exit 1; }; done
+FINALIZER="$ENGINE_DIR/slurm/finalize_dynamic_queue.sbatch"
+for script in "$PREP" "$WORKER" "$VERIFY" "$FINALIZER"; do [ -f "$script" ] || { echo "Dynamic queue script not found: $script" >&2; exit 1; }; done
 # Slurm opens these files before executing any sbatch script.
 mkdir -p logs
 
@@ -82,24 +109,34 @@ for ROUND in $(seq 1 "$ROUNDS"); do
     submit_or_print "prep-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREVIOUS" "$PREP" "$SNAPSHOT" "$ROUND"
   fi
   PREP_JOB="$JOB_ID"
-  [ "$SUBMIT" = "0" ] || RECEIPT+="prep-$ROUND $PREP_JOB"$'\n'
+  if [ "$SUBMIT" != "0" ]; then
+    if [ -z "$PREVIOUS" ]; then RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"none"$'\n';
+    else RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"afterany:$PREVIOUS"$'\n'; fi
+  fi
   submit_or_print "work-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREP_JOB" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" "$ROUND"
   WORK_JOB="$JOB_ID"
-  [ "$SUBMIT" = "0" ] || RECEIPT+="work-$ROUND $WORK_JOB"$'\n'
+  [ "$SUBMIT" = "0" ] || RECEIPT+="work-$ROUND"$'\t'"$WORK_JOB"$'\t'"afterany:$PREP_JOB"$'\n'
   PREVIOUS="$WORK_JOB"
 done
 submit_or_print "verify" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREVIOUS" "$VERIFY" "$SNAPSHOT"
 VERIFY_JOB="$JOB_ID"
-[ "$SUBMIT" = "0" ] || RECEIPT+="verify $VERIFY_JOB"$'\n'
+[ "$SUBMIT" = "0" ] || RECEIPT+="verify"$'\t'"$VERIFY_JOB"$'\t'"afterany:$PREVIOUS"$'\n'
+FINALIZER_COMMAND=("${FINALIZATION_SBATCH_ARGS[@]}" "--dependency=afterok:$VERIFY_JOB" "$FINALIZER" "$SNAPSHOT")
+if [ "$FINALIZATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then
+  FINALIZER_COMMAND+=("$FINALIZATION_TMP_DIR")
+fi
+submit_or_print "finalize" sbatch "${FINALIZER_COMMAND[@]}"
+FINALIZE_JOB="$JOB_ID"
+[ "$SUBMIT" = "0" ] || RECEIPT+="finalize"$'\t'"$FINALIZE_JOB"$'\t'"afterok:$VERIFY_JOB"$'\n'
 
 if [ "$SUBMIT" = "1" ]; then
   RECEIPT_PATH=$("$PYTHON" -c '
 import datetime, json, sys
 from pathlib import Path
-plan = Path(sys.argv[1]); rows = [line.split(" ", 1) for line in sys.stdin if line.strip()]
+plan = Path(sys.argv[1]); rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.strip()]
 p = json.load(plan.open(encoding="utf-8")); submission = p["submission"]
 out = plan.with_name(plan.stem + ".submission-receipt-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json")
-out.write_text(json.dumps({"plan": str(plan.resolve()), "snapshot": p["snapshot"], "sbatch_account": submission["account"], "sbatch_constraint": submission["constraint"], "jobs": [{"label": a, "slurm_job_id": b} for a, b in rows]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+out.write_text(json.dumps({"plan": str(plan.resolve()), "snapshot": p["snapshot"], "sbatch_account": submission["account"], "sbatch_constraint": submission["constraint"], "jobs": [{"label": label, "slurm_job_id": job_id, "dependency": dependency} for label, job_id, dependency in rows]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 print(out)
 ' "$PLAN" <<< "$RECEIPT")
   echo "Receipt: $RECEIPT_PATH"

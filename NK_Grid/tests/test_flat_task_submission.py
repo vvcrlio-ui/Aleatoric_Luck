@@ -14,6 +14,7 @@ SUBMITTER = ENGINE_DIR / "slurm" / "submit_flat_task_table.sh"
 WORKER = ENGINE_DIR / "slurm" / "run_flat_task_table.sbatch"
 PREP = ENGINE_DIR / "slurm" / "prep_dynamic_queue.sbatch"
 VERIFY = ENGINE_DIR / "slurm" / "verify_dynamic_queue.sbatch"
+FINALIZER = ENGINE_DIR / "slurm" / "finalize_dynamic_queue.sbatch"
 CALIBRATE = ENGINE_DIR / "slurm" / "calibrate.sbatch"
 
 
@@ -29,6 +30,10 @@ def _plan(path: Path) -> Path:
             "--partition=long", "--cpus-per-task=1", "--mem=8G", "--time=12:00:00",
             "--account=test-account", "--constraint=test-arch",
         ], "account": "test-account", "constraint": "test-arch"},
+        "finalization": {"sbatch_args": [
+            "--partition=long", "--cpus-per-task=1", "--mem=4G", "--time=02:00:00",
+            "--account=test-account", "--constraint=test-arch",
+        ], "tmp_dir": "/local/finalizer"},
     }), encoding="utf-8")
     return path
 
@@ -43,12 +48,16 @@ def test_dynamic_submitter_prints_the_entire_afterany_chain(tmp_path):
     completed = subprocess.run(["bash", str(SUBMITTER), str(_plan(tmp_path / "plan.json"))], env=_environment(tmp_path), check=False, capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
     lines = completed.stdout.splitlines()
-    assert len(lines) == 5  # prep/work for each round, then verify
+    assert len(lines) == 6  # prep/work for each round, then verify/finalize
     assert all("--cpus-per-task=1" in line for line in lines)
     assert "--dependency=afterany:dry-prep-1" in lines[1]
     assert "--dependency=afterany:dry-work-1" in lines[2]
-    assert "--dependency=afterany:dry-work-2" in lines[-1]
-    assert not any("afterok" in line for line in lines)
+    assert "--dependency=afterany:dry-work-2" in lines[-2]
+    assert "--dependency=afterok:dry-verify" in lines[-1]
+    assert "/local/finalizer" in lines[-1]
+    assert "--mem=4G" in lines[-1]
+    assert "afterany" not in lines[-1]
+    assert not any("afterok" in line for line in lines[:-1])
 
 
 def test_dynamic_submitter_submits_every_link_and_writes_receipt(tmp_path):
@@ -56,12 +65,16 @@ def test_dynamic_submitter_submits_every_link_and_writes_receipt(tmp_path):
     completed = subprocess.run(["bash", str(SUBMITTER), "--submit", str(plan)], cwd=tmp_path, env=environment, check=False, capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
     calls = (tmp_path / "sbatch.log").read_text(encoding="utf-8").splitlines()
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert all("--parsable" in call for call in calls)
-    assert all("afterany" in call for call in calls[1:])
+    assert all("afterany" in call for call in calls[1:-1])
+    assert "afterok:12345" in calls[-1]
+    assert "afterany" not in calls[-1]
     receipt = next(tmp_path.glob("plan.submission-receipt-*.json"))
     receipt_payload = json.loads(receipt.read_text())
-    assert [entry["label"] for entry in receipt_payload["jobs"]] == ["prep-1", "work-1", "prep-2", "work-2", "verify"]
+    assert [entry["label"] for entry in receipt_payload["jobs"]] == ["prep-1", "work-1", "prep-2", "work-2", "verify", "finalize"]
+    assert receipt_payload["jobs"][-1]["slurm_job_id"] == "12345"
+    assert receipt_payload["jobs"][-1]["dependency"] == "afterok:12345"
     assert receipt_payload["sbatch_account"] == "test-account"
     assert receipt_payload["sbatch_constraint"] == "test-arch"
 
@@ -85,6 +98,7 @@ def test_dynamic_submitter_rejects_missing_plan_fields_before_submission(tmp_pat
         ("submission", "sbatch_args"),
         ("submission", "account"),
         ("submission", "constraint"),
+        ("finalization", "sbatch_args"),
     )
     for field_path in required_paths:
         case_dir = tmp_path.joinpath(*field_path)
@@ -130,6 +144,33 @@ def test_dynamic_worker_reports_architecture_without_mislabeling_install(tmp_pat
     assert "not installed" not in completed.stderr
 
 
+def test_dynamic_finalizer_calls_snapshot_cli_with_explicit_tmp_dir(tmp_path):
+    fake_python = tmp_path / "python"
+    _write_executable(
+        fake_python,
+        '#!/bin/bash\nif [ "$1" = "-c" ]; then exit 0; fi\nprintf \'%s\\n\' "$@" > "$FINALIZER_ARGS"\n',
+    )
+    args_path = tmp_path / "finalizer-args.txt"
+    environment = {
+        **os.environ,
+        "ENGINE_DIR": str(ENGINE_DIR),
+        "PYTHON": str(fake_python),
+        "VENV": str(tmp_path / "venv"),
+        "FINALIZER_ARGS": str(args_path),
+    }
+    environment.pop("PYTHON_MODULE", None)
+    completed = subprocess.run(
+        ["bash", str(FINALIZER), "/frozen/snapshot.json", "/local/scratch"],
+        env=environment, check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    args = args_path.read_text(encoding="utf-8").splitlines()
+    assert args == [
+        "-m", "aleatoric_nk_grid.flat_task_table", "finalize",
+        "--snapshot", "/frozen/snapshot.json", "--tmp-dir", "/local/scratch",
+    ]
+
+
 def test_all_compute_scripts_share_the_module_and_architecture_guards():
     module_block = '''if [ -n "${PYTHON_MODULE:-}" ]; then
   command -v module >/dev/null 2>&1 || {
@@ -140,7 +181,7 @@ def test_all_compute_scripts_share_the_module_and_architecture_guards():
   module load "$PYTHON_MODULE"
 fi'''
     block_md5s = set()
-    for script in (WORKER, PREP, VERIFY):
+    for script in (WORKER, PREP, VERIFY, FINALIZER):
         text = script.read_text(encoding="utf-8")
         assert text.count(module_block) == 1
         start = text.index(module_block)

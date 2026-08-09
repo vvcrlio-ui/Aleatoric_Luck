@@ -14,6 +14,12 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+import uuid
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -22,12 +28,22 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .experiment import manifest_path, write_json_atomic
+from .experiment import manifest_path, utc_now, write_json_atomic
 from .nk_grid import NKGridConfig, _process_peak_rss_bytes, resolve_repeat_pairs, run_nk_grid
 
 
 TABLE_FORMAT_VERSION = 2
 TABLE_COLUMNS = ("row_id", "seed", "draw", "N", "K", "group", "models")
+VERIFY_INCOMPLETE_EXIT_CODE = 3
+FINALIZATION_FORMAT_VERSION = 1
+FINALIZATION_BATCH_ROWS = 4_096
+FINALIZATION_MIN_TEMP_BYTES = 64 * 1024**2
+TERMINAL_STATUSES = frozenset({"ok", "skipped"})
+VALID_RESULT_STATUSES = frozenset({"ok", "skipped", "failed"})
+
+
+class FinalizationError(ValueError):
+    """A fail-closed dynamic-result validation or publication error."""
 
 
 @dataclass(frozen=True)
@@ -456,6 +472,14 @@ def verify_rounds(snapshot_path: Path) -> dict[str, object]:
     return result
 
 
+def _verification_failure_counts(result: Mapping[str, object]) -> dict[str, int]:
+    return {
+        "missing_model_keys": int(result["missing_model_keys"]),
+        "crashed_row_ids": len(result["crashed_row_ids"]),
+        "too_long_row_ids": len(result["too_long_row_ids"]),
+    }
+
+
 def finalize_slice_shards(table_path: Path, worker_outputs: Iterable[Path], output: Path) -> Path:
     """Merge dynamic worker shards after exact complete-design validation."""
     expected = expected_model_keys(read_task_table(table_path))
@@ -484,6 +508,379 @@ def finalize_slice_shards(table_path: Path, worker_outputs: Iterable[Path], outp
         writer = csv.DictWriter(handle, fieldnames=header or [])
         writer.writeheader(); writer.writerows(seen[key] for key in sorted(seen))
     return output
+
+
+def finalization_manifest_path(output: Path) -> Path:
+    """Return the receipt path for one atomically materialized dynamic result."""
+
+    output = Path(output)
+    return output.with_name(f"{output.name}.finalization.json")
+
+
+def _iter_task_row_batches(
+    table_path: Path, *, batch_rows: int = FINALIZATION_BATCH_ROWS,
+) -> Iterable[tuple[TaskRow, ...]]:
+    """Stream bounded task-table batches without materializing the design."""
+
+    if batch_rows < 1:
+        raise ValueError("batch_rows must be positive")
+    source = pq.ParquetFile(Path(table_path), memory_map=True)
+    for batch in source.iter_batches(batch_size=batch_rows):
+        yield _task_rows(pa.Table.from_batches([batch]))
+
+
+def _resolve_finalization_tmp_base(
+    snapshot: Mapping[str, object], explicit: Path | None,
+) -> Path:
+    configured: object | None = None
+    finalization = snapshot.get("finalization")
+    if isinstance(finalization, Mapping):
+        configured = finalization.get("tmp_dir")
+    candidate = (
+        explicit
+        if explicit is not None
+        else configured
+        or os.environ.get("NK_GRID_TMPDIR")
+        or os.environ.get("TMPDIR")
+        or tempfile.gettempdir()
+    )
+    base = Path(str(candidate)).expanduser().resolve()
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise FinalizationError(f"cannot create finalization temporary directory {base}: {exc}") from exc
+    if not base.is_dir():
+        raise FinalizationError(f"finalization temporary path is not a directory: {base}")
+    return base
+
+
+def _estimated_finalization_temp_bytes(table_path: Path, shards: Sequence[Path]) -> int:
+    """Conservatively budget the expanded SQLite keys and result payloads."""
+
+    try:
+        task_bytes = Path(table_path).stat().st_size
+        shard_bytes = sum(path.stat().st_size for path in shards)
+    except OSError as exc:
+        raise FinalizationError(f"cannot size finalization inputs: {exc}") from exc
+    return max(
+        FINALIZATION_MIN_TEMP_BYTES,
+        # Parquet keys are compressed; 12x reserves their expanded B-tree.
+        # Three shard copies cover payload/index pages plus rollback journal.
+        FINALIZATION_MIN_TEMP_BYTES + 12 * task_bytes + 3 * shard_bytes,
+    )
+
+
+def _preflight_finalization_space(
+    tmp_base: Path, table_path: Path, shards: Sequence[Path],
+) -> tuple[int, int]:
+    estimated = _estimated_finalization_temp_bytes(table_path, shards)
+    try:
+        available = int(shutil.disk_usage(tmp_base).free)
+    except OSError as exc:
+        raise FinalizationError(
+            f"cannot measure finalization temporary directory {tmp_base}: {exc}"
+        ) from exc
+    if available < estimated:
+        raise FinalizationError(
+            "insufficient finalization temporary space: "
+            f"temporary_directory={tmp_base} available_bytes={available} "
+            f"estimated_required_bytes={estimated}"
+        )
+    return available, estimated
+
+
+def _temporary_directory_bytes(directory: Path) -> int:
+    try:
+        return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
+    except OSError as exc:
+        raise FinalizationError(f"cannot measure finalization temporary usage in {directory}: {exc}") from exc
+
+
+_SQL_KEY_COLUMNS = '"model", "seed", "draw", "N", "K"'
+_SQL_KEY_JOIN = " AND ".join(
+    f'e.{column}=r.{column}' for column in _SQL_KEY_COLUMNS.split(", ")
+)
+
+
+def _create_finalization_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(f"""
+        CREATE TABLE expected (
+            {_SQL_KEY_COLUMNS}, PRIMARY KEY ({_SQL_KEY_COLUMNS})
+        ) WITHOUT ROWID;
+        CREATE TABLE observed (
+            {_SQL_KEY_COLUMNS}, PRIMARY KEY ({_SQL_KEY_COLUMNS})
+        ) WITHOUT ROWID;
+        CREATE TABLE terminal (
+            {_SQL_KEY_COLUMNS}, status TEXT NOT NULL, payload TEXT NOT NULL,
+            PRIMARY KEY ({_SQL_KEY_COLUMNS})
+        ) WITHOUT ROWID;
+        CREATE TABLE terminal_duplicate_keys (
+            {_SQL_KEY_COLUMNS}, PRIMARY KEY ({_SQL_KEY_COLUMNS})
+        ) WITHOUT ROWID;
+        CREATE TABLE failed_counts (
+            {_SQL_KEY_COLUMNS}, row_count INTEGER NOT NULL,
+            PRIMARY KEY ({_SQL_KEY_COLUMNS})
+        ) WITHOUT ROWID;
+    """)
+
+
+def _insert_expected_design(
+    connection: sqlite3.Connection, table_path: Path,
+) -> int:
+    expected_count = 0
+    statement = f"INSERT INTO expected ({_SQL_KEY_COLUMNS}) VALUES (?, ?, ?, ?, ?)"
+    try:
+        for rows in _iter_task_row_batches(table_path):
+            connection.executemany(
+                statement,
+                (
+                    (model, row.seed, row.draw, row.n_samples, row.k_features)
+                    for row in rows
+                    for model in row.models
+                ),
+            )
+            expected_count += sum(len(row.models) for row in rows)
+            connection.commit()
+    except sqlite3.IntegrityError as exc:
+        raise FinalizationError("task table contains duplicate expected model keys") from exc
+    except (OSError, ValueError, pa.ArrowInvalid) as exc:
+        raise FinalizationError(f"cannot stream task table {table_path}: {exc}") from exc
+    return expected_count
+
+
+def _validated_result_header(path: Path, reader: csv.DictReader) -> list[str]:
+    header = list(reader.fieldnames or ())
+    required = {"model", "seed", "draw", "N", "K", "status"}
+    if not header or len(set(header)) != len(header) or not required.issubset(header):
+        raise FinalizationError(
+            f"malformed worker CSV header in {path}: required={sorted(required)} actual={header}"
+        )
+    return header
+
+
+def _ingest_result_shards(
+    connection: sqlite3.Connection, shards: Sequence[Path],
+) -> tuple[list[str], int, int]:
+    header: list[str] | None = None
+    rows_read = 0
+    duplicate_terminal_rows = 0
+    observed_insert = f"INSERT OR IGNORE INTO observed ({_SQL_KEY_COLUMNS}) VALUES (?, ?, ?, ?, ?)"
+    terminal_insert = (
+        f"INSERT OR IGNORE INTO terminal ({_SQL_KEY_COLUMNS}, status, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    terminal_select = (
+        f"SELECT payload FROM terminal WHERE "
+        + " AND ".join(f'"{column}"=?' for column in ("model", "seed", "draw", "N", "K"))
+    )
+    duplicate_insert = (
+        f"INSERT OR IGNORE INTO terminal_duplicate_keys ({_SQL_KEY_COLUMNS}) "
+        "VALUES (?, ?, ?, ?, ?)"
+    )
+    failed_upsert = (
+        f"INSERT INTO failed_counts ({_SQL_KEY_COLUMNS}, row_count) "
+        "VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT (model, seed, draw, N, K) "
+        "DO UPDATE SET row_count=row_count+1"
+    )
+    for path in shards:
+        try:
+            with path.open(newline="", encoding="utf-8") as source:
+                reader = csv.DictReader(source)
+                current_header = _validated_result_header(path, reader)
+                if header is None:
+                    header = current_header
+                elif current_header != header:
+                    raise FinalizationError(f"worker CSV headers differ: {path}")
+                for row in reader:
+                    rows_read += 1
+                    if None in row or any(row.get(column) is None for column in current_header):
+                        raise FinalizationError(f"malformed worker CSV row in {path} at row {rows_read}")
+                    try:
+                        key = _csv_key(row)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise FinalizationError(
+                            f"invalid terminal key in {path} at row {rows_read}: {exc}"
+                        ) from exc
+                    status = str(row.get("status"))
+                    if status not in VALID_RESULT_STATUSES:
+                        raise FinalizationError(
+                            f"invalid result status {status!r} in {path} for key {key}"
+                        )
+                    connection.execute(observed_insert, key)
+                    if status in TERMINAL_STATUSES:
+                        payload = json.dumps(
+                            [row[column] for column in current_header],
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        inserted = connection.execute(
+                            terminal_insert, (*key, status, payload),
+                        ).rowcount
+                        if not inserted:
+                            previous = connection.execute(terminal_select, key).fetchone()
+                            if previous is None or previous[0] != payload:
+                                raise FinalizationError(
+                                    f"conflicting terminal rows for key {key}"
+                                )
+                            connection.execute(duplicate_insert, key)
+                            duplicate_terminal_rows += 1
+                    else:
+                        connection.execute(failed_upsert, key)
+                    if rows_read % FINALIZATION_BATCH_ROWS == 0:
+                        connection.commit()
+        except FinalizationError:
+            raise
+        except (OSError, UnicodeError, csv.Error, sqlite3.Error) as exc:
+            raise FinalizationError(f"cannot ingest worker CSV {path}: {exc}") from exc
+    connection.commit()
+    if header is None:
+        raise FinalizationError("no worker CSV shards were found")
+    return header, rows_read, duplicate_terminal_rows
+
+
+def _validate_finalization_database(
+    connection: sqlite3.Connection, expected_count: int,
+) -> tuple[int, int, int]:
+    extra = connection.execute(
+        f"SELECT {_SQL_KEY_COLUMNS} FROM observed r WHERE NOT EXISTS "
+        f"(SELECT 1 FROM expected e WHERE {_SQL_KEY_JOIN}) LIMIT 3"
+    ).fetchall()
+    if extra:
+        raise FinalizationError(f"worker shards contain out-of-design keys: {extra}")
+    missing_count = int(connection.execute(
+        f"SELECT COUNT(*) FROM expected e WHERE NOT EXISTS "
+        f"(SELECT 1 FROM terminal r WHERE {_SQL_KEY_JOIN})"
+    ).fetchone()[0])
+    if missing_count:
+        missing = connection.execute(
+            f"SELECT {_SQL_KEY_COLUMNS} FROM expected e WHERE NOT EXISTS "
+            f"(SELECT 1 FROM terminal r WHERE {_SQL_KEY_JOIN}) LIMIT 3"
+        ).fetchall()
+        raise FinalizationError(
+            f"finalization is missing {missing_count} expected terminal keys; examples={missing}"
+        )
+    final_rows = int(connection.execute("SELECT COUNT(*) FROM terminal").fetchone()[0])
+    if final_rows != expected_count:
+        raise FinalizationError(
+            f"terminal row count differs from expected design: final={final_rows} expected={expected_count}"
+        )
+    failed_overridden = int(connection.execute(
+        "SELECT COALESCE(SUM(f.row_count), 0) FROM failed_counts f "
+        "WHERE EXISTS (SELECT 1 FROM terminal r WHERE "
+        + " AND ".join(f'f."{column}"=r."{column}"' for column in ("model", "seed", "draw", "N", "K"))
+        + ")"
+    ).fetchone()[0])
+    duplicate_keys = int(connection.execute(
+        "SELECT COUNT(*) FROM terminal_duplicate_keys"
+    ).fetchone()[0])
+    return final_rows, failed_overridden, duplicate_keys
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_final_csv(temporary: Path, output: Path) -> None:
+    os.replace(temporary, output)
+    _fsync_directory(output.parent)
+
+
+def _write_final_csv(
+    connection: sqlite3.Connection, header: Sequence[str], output: Path,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.parent / f".{output.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as destination:
+            writer = csv.writer(destination)
+            writer.writerow(header)
+            for (payload,) in connection.execute(
+                f"SELECT payload FROM terminal ORDER BY {_SQL_KEY_COLUMNS}"
+            ):
+                writer.writerow(json.loads(payload))
+            destination.flush()
+            os.fsync(destination.fileno())
+        _publish_final_csv(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def finalize_snapshot(
+    snapshot_path: Path, *, tmp_dir: Path | None = None,
+) -> dict[str, object]:
+    """Stream, validate and atomically publish all dynamic worker shards.
+
+    The immutable Parquet design is read by bounded Arrow batches.  Expected
+    keys, terminal precedence, duplicate detection and final ordering live in
+    a uniquely named SQLite database under local scratch, never in Python
+    collections proportional to the experiment size.
+    """
+
+    started = time.perf_counter()
+    snapshot = _load_snapshot(snapshot_path)
+    table_path = Path(str(snapshot["task_table"]))
+    output_dir = Path(str(snapshot["output_dir"]))
+    config = snapshot.get("config")
+    if not isinstance(config, Mapping) or not isinstance(config.get("out"), str):
+        raise FinalizationError("snapshot config.out is required for finalization")
+    output = Path(str(config["out"])).expanduser().resolve()
+    shards = tuple(sorted(output_dir.glob("round-*/worker-*.csv")))
+    tmp_base = _resolve_finalization_tmp_base(snapshot, tmp_dir)
+    available_bytes, estimated_bytes = _preflight_finalization_space(
+        tmp_base, table_path, shards,
+    )
+    run_dir = Path(tempfile.mkdtemp(prefix="nk-grid-finalize-", dir=tmp_base))
+    database = run_dir / "index.sqlite"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(database)
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA cache_size=-32768")
+        _create_finalization_tables(connection)
+        expected_count = _insert_expected_design(connection, table_path)
+        header, rows_read, duplicate_terminal_rows = _ingest_result_shards(
+            connection, shards,
+        )
+        final_rows, failed_overridden, duplicate_keys = _validate_finalization_database(
+            connection, expected_count,
+        )
+        _write_final_csv(connection, header, output)
+        temporary_bytes_used = _temporary_directory_bytes(run_dir)
+        receipt: dict[str, object] = {
+            "format_version": FINALIZATION_FORMAT_VERSION,
+            "status": "complete",
+            "created_at_utc": utc_now(),
+            "backend": "sqlite_streaming",
+            "input_shards": len(shards),
+            "rows_read": rows_read,
+            "final_rows": final_rows,
+            "expected_model_keys": expected_count,
+            "historical_failed_rows_overridden": failed_overridden,
+            "duplicate_terminal_keys": duplicate_keys,
+            "duplicate_terminal_rows": duplicate_terminal_rows,
+            "temporary_directory": str(run_dir),
+            "temporary_available_bytes": available_bytes,
+            "estimated_temporary_bytes": estimated_bytes,
+            "temporary_bytes_used": temporary_bytes_used,
+            "wall_time_seconds": time.perf_counter() - started,
+            "task_table": str(table_path.resolve()),
+            "final_output": str(output),
+        }
+        write_json_atomic(finalization_manifest_path(output), receipt)
+        return receipt
+    except sqlite3.Error as exc:
+        raise FinalizationError(f"SQLite finalization failed in {run_dir}: {exc}") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 @dataclass(frozen=True)
@@ -531,24 +928,46 @@ def _config_from_json(payload: Mapping[str, object]) -> NKGridConfig:
     return NKGridConfig(**values)
 
 
-def write_work_snapshot(path: Path, *, table_path: Path, panel: str, config: NKGridConfig, output_dir: Path, workers: int) -> Path:
+def write_work_snapshot(
+    path: Path,
+    *,
+    table_path: Path,
+    panel: str,
+    config: NKGridConfig,
+    output_dir: Path,
+    workers: int,
+    finalization_tmp_dir: Path | str | None = None,
+) -> Path:
     if workers < 1:
         raise ValueError("workers must be positive")
     table = Path(table_path).resolve()
     if not read_task_table(table):
         raise ValueError("task table must contain at least one row")
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(path, {"format_version": TABLE_FORMAT_VERSION, "panel": str(panel), "task_table": str(table), "config": _config_to_json(config), "output_dir": str(Path(output_dir).resolve()), "workers": int(workers)})
+    payload: dict[str, object] = {
+        "format_version": TABLE_FORMAT_VERSION,
+        "panel": str(panel),
+        "task_table": str(table),
+        "config": _config_to_json(config),
+        "output_dir": str(Path(output_dir).resolve()),
+        "workers": int(workers),
+    }
+    if finalization_tmp_dir is not None:
+        payload["finalization"] = {
+            "tmp_dir": str(Path(finalization_tmp_dir).expanduser().resolve()),
+        }
+    write_json_atomic(path, payload)
     os.chmod(path, 0o444)
     return path
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run dynamic NK-grid work slices")
-    parser.add_argument("command", choices=("prep", "run", "verify"))
+    parser.add_argument("command", choices=("prep", "run", "verify", "finalize"))
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--round", type=int)
     parser.add_argument("--worker-index", type=int)
+    parser.add_argument("--tmp-dir", type=Path)
     args = parser.parse_args(argv)
     if args.command == "prep":
         if args.round is None: parser.error("prep requires --round")
@@ -556,8 +975,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.command == "run":
         if args.round is None or args.worker_index is None: parser.error("run requires --round and --worker-index")
         print(run_slice(args.snapshot, round_index=args.round, worker_index=args.worker_index))
+    elif args.command == "verify":
+        result = verify_rounds(args.snapshot)
+        print(json.dumps(result, sort_keys=True), flush=True)
+        failures = _verification_failure_counts(result)
+        if any(failures.values()):
+            print(
+                "verification incomplete: "
+                + "; ".join(f"{category}={count}" for category, count in failures.items()),
+                file=sys.stderr,
+                flush=True,
+            )
+            raise SystemExit(VERIFY_INCOMPLETE_EXIT_CODE)
     else:
-        print(json.dumps(verify_rounds(args.snapshot), sort_keys=True))
+        print(json.dumps(finalize_snapshot(args.snapshot, tmp_dir=args.tmp_dir), sort_keys=True))
 
 
 if __name__ == "__main__":

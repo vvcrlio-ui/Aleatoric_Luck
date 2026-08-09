@@ -4,6 +4,7 @@ import csv
 import json
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pyarrow as pa
@@ -14,10 +15,14 @@ import aleatoric_nk_grid.flat_task_table as ft
 from aleatoric_nk_grid.flat_task_table import (
     ResourceRequest,
     TaskRow,
+    FinalizationError,
+    VERIFY_INCOMPLETE_EXIT_CODE,
     assign_rows_modulo,
     build_rows,
     classify_attempts,
     expected_model_keys,
+    finalization_manifest_path,
+    finalize_snapshot,
     finalize_slice_shards,
     prepare_round,
     read_row_group,
@@ -54,6 +59,34 @@ def _snapshot(tmp_path: Path, *, workers: int = 2, n_grid: tuple[int, ...] = (10
     table = write_task_table(tmp_path / "tasks.parquet", rows, rows_per_group=2)
     snapshot = write_work_snapshot(tmp_path / "snapshot.json", table_path=table, panel="test", config=config, output_dir=tmp_path / "outputs", workers=workers)
     return snapshot, rows
+
+
+RESULT_HEADER = ["model", "seed", "draw", "N", "K", "status", "metric"]
+
+
+def _result_row(row: TaskRow, *, status: str = "ok", metric: str | None = None) -> dict[str, object]:
+    return {
+        "model": row.models[0], "seed": row.seed, "draw": row.draw,
+        "N": row.n_samples, "K": row.k_features, "status": status,
+        "metric": metric if metric is not None else f"{row.n_samples}:{row.k_features}",
+    }
+
+
+def _write_shard(path: Path, rows: list[dict[str, object]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_HEADER)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _write_all_terminal(snapshot: Path, rows: tuple[TaskRow, ...]) -> Path:
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    return _write_shard(
+        Path(payload["output_dir"]) / "round-1" / "worker-0.csv",
+        [_result_row(row) for row in rows],
+    )
 
 
 def test_v2_table_is_immutable_cost_free_and_streamed(tmp_path):
@@ -112,6 +145,70 @@ def test_attempt_classification_keeps_crash_and_too_long_separate():
     assert classify_attempts(shuffled) == (crashed, too_long)
 
 
+def test_verify_cli_writes_complete_json_and_exits_zero(tmp_path, capsys):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    _write_all_terminal(snapshot, rows)
+    ft.main(["verify", "--snapshot", str(snapshot)])
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["missing_model_keys"] == 0
+    assert result["crashed_row_ids"] == []
+    assert result["too_long_row_ids"] == []
+    assert json.loads((tmp_path / "outputs" / "verification.json").read_text()) == result
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("failure", ("missing_model_keys", "crashed_row_ids", "too_long_row_ids"))
+def test_verify_cli_writes_json_then_uses_stable_incomplete_exit_code(
+    tmp_path, capsys, failure,
+):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    output_dir = tmp_path / "outputs"
+    if failure != "missing_model_keys":
+        _write_all_terminal(snapshot, rows)
+    if failure == "crashed_row_ids":
+        attempts = output_dir / "round-2" / "attempts" / "worker-0.jsonl"
+        attempts.parent.mkdir(parents=True)
+        attempts.write_text(
+            '\n'.join((
+                json.dumps({"round": 2, "worker_index": 0, "sequence": 0, "row_id": "crashed"}),
+                json.dumps({"round": 2, "worker_index": 0, "sequence": 1, "row_id": "later"}),
+            )) + '\n',
+            encoding="utf-8",
+        )
+    elif failure == "too_long_row_ids":
+        for round_index in (1, 2, 3):
+            attempts = output_dir / f"round-{round_index}" / "attempts" / "worker-0.jsonl"
+            attempts.parent.mkdir(parents=True, exist_ok=True)
+            attempts.write_text(
+                json.dumps({
+                    "round": round_index, "worker_index": 0,
+                    "sequence": 0, "row_id": "too-long",
+                }) + '\n',
+                encoding="utf-8",
+            )
+    with pytest.raises(SystemExit) as stopped:
+        ft.main(["verify", "--snapshot", str(snapshot)])
+    assert stopped.value.code == VERIFY_INCOMPLETE_EXIT_CODE
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    persisted = json.loads((output_dir / "verification.json").read_text())
+    assert persisted == result
+    count = result[failure] if failure == "missing_model_keys" else len(result[failure])
+    assert count > 0
+    assert f"{failure}={count}" in captured.err
+    assert "missing_model_keys=" in captured.err
+    assert "crashed_row_ids=" in captured.err
+    assert "too_long_row_ids=" in captured.err
+
+
+def test_verify_cli_keeps_malformed_snapshot_as_an_execution_error(tmp_path):
+    snapshot = tmp_path / "malformed.json"
+    snapshot.write_text("not-json", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        ft.main(["verify", "--snapshot", str(snapshot)])
+
+
 @pytest.mark.parametrize("workers,row_count", [(workers, rows) for workers in range(1, 11) for rows in (0, 1, 2, 7, 19)])
 def test_modulo_assignment_is_complete_balanced_and_not_contiguous(workers, row_count):
     rows = tuple(TaskRow(str(index), 1, 0, 10, index + 1, "imputed_core", ("ols",)) for index in range(row_count))
@@ -166,6 +263,164 @@ def test_real_two_round_recovery_converges_to_one_shot_output(tmp_path, monkeypa
         for row in sorted(rows, key=lambda row: (row.n_samples, row.k_features)):
             writer.writerow({"model": "ols", "seed": row.seed, "draw": row.draw, "N": row.n_samples, "K": row.k_features, "status": "ok", "metric": f"{row.n_samples}:{row.k_features}"})
     pd.testing.assert_frame_equal(pd.read_csv(merged).sort_values(["N", "K"]).reset_index(drop=True), pd.read_csv(one_shot).sort_values(["N", "K"]).reset_index(drop=True), check_exact=True)
+
+
+def test_streaming_finalizer_prefers_later_terminal_over_historical_failure(tmp_path):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    _write_shard(tmp_path / "outputs" / "round-1" / "worker-0.csv", [
+        _result_row(rows[0], status="failed", metric="old failure"),
+    ])
+    _write_shard(tmp_path / "outputs" / "round-2" / "worker-0.csv", [
+        _result_row(rows[0], status="ok", metric="recovered"),
+    ])
+    receipt = finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    final_rows = list(csv.DictReader((tmp_path / "unused.csv").open(encoding="utf-8")))
+    assert len(final_rows) == 1
+    assert final_rows[0]["status"] == "ok"
+    assert final_rows[0]["metric"] == "recovered"
+    assert receipt["historical_failed_rows_overridden"] == 1
+    assert receipt["final_rows"] == receipt["expected_model_keys"] == 1
+    assert receipt["input_shards"] == receipt["rows_read"] == 2
+    assert receipt["duplicate_terminal_keys"] == 0
+    assert receipt["temporary_bytes_used"] > 0
+    assert receipt["wall_time_seconds"] > 0
+    assert receipt["final_output"] == str((tmp_path / "unused.csv").resolve())
+    assert not Path(receipt["temporary_directory"]).exists()
+    assert json.loads(finalization_manifest_path(tmp_path / "unused.csv").read_text()) == receipt
+
+
+def test_streaming_finalizer_rejects_conflicting_terminal_rows(tmp_path):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    _write_shard(tmp_path / "outputs" / "round-1" / "worker-0.csv", [
+        _result_row(rows[0], metric="first"),
+    ])
+    _write_shard(tmp_path / "outputs" / "round-2" / "worker-0.csv", [
+        _result_row(rows[0], metric="different"),
+    ])
+    with pytest.raises(FinalizationError, match="conflicting terminal"):
+        finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    assert not (tmp_path / "unused.csv").exists()
+
+
+def test_streaming_finalizer_rejects_out_of_design_key(tmp_path):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    outside = {**_result_row(rows[0]), "N": 999}
+    _write_shard(
+        tmp_path / "outputs" / "round-1" / "worker-0.csv",
+        [_result_row(rows[0]), outside],
+    )
+    with pytest.raises(FinalizationError, match="out-of-design"):
+        finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    assert not (tmp_path / "unused.csv").exists()
+
+
+def test_streaming_finalizer_rejects_missing_terminal_without_publication(tmp_path):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10, 12), k_grid=(1,))
+    _write_shard(
+        tmp_path / "outputs" / "round-1" / "worker-0.csv",
+        [_result_row(rows[0])],
+    )
+    with pytest.raises(FinalizationError, match="missing 1 expected terminal"):
+        finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    assert not (tmp_path / "unused.csv").exists()
+
+
+def test_streaming_finalizer_is_atomic_and_rerunnable_after_injected_failure(
+    tmp_path, monkeypatch,
+):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    _write_all_terminal(snapshot, rows)
+    output = tmp_path / "unused.csv"
+    output.write_bytes(b"previous-complete-output\n")
+    real_publish = ft._publish_final_csv
+
+    def interrupted(temporary, target):
+        assert temporary.exists()
+        assert target == output.resolve()
+        raise RuntimeError("injected before replace")
+
+    monkeypatch.setattr(ft, "_publish_final_csv", interrupted)
+    with pytest.raises(RuntimeError, match="before replace"):
+        finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    assert output.read_bytes() == b"previous-complete-output\n"
+    assert not list(output.parent.glob(f".{output.name}.*.tmp"))
+    monkeypatch.setattr(ft, "_publish_final_csv", real_publish)
+    first = finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    first_bytes = output.read_bytes()
+    second = finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    assert output.read_bytes() == first_bytes
+    assert first["final_rows"] == second["final_rows"] == 1
+
+
+def test_streaming_finalizer_matches_small_reference_byte_for_byte(tmp_path, monkeypatch):
+    snapshot, rows = _snapshot(tmp_path, workers=1)
+    shard = _write_all_terminal(snapshot, rows)
+    legacy = finalize_slice_shards(
+        Path(json.loads(snapshot.read_text())["task_table"]), (shard,), tmp_path / "legacy.csv",
+    )
+    monkeypatch.setattr(
+        ft, "read_task_table",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("production finalizer loaded all tasks")),
+    )
+    finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    assert (tmp_path / "unused.csv").read_bytes() == legacy.read_bytes()
+
+
+def test_streaming_finalizer_counts_idempotent_terminal_duplicates(tmp_path):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    duplicate = _result_row(rows[0])
+    _write_shard(tmp_path / "outputs" / "round-1" / "worker-0.csv", [duplicate])
+    _write_shard(tmp_path / "outputs" / "round-2" / "worker-0.csv", [duplicate])
+    receipt = finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    assert receipt["duplicate_terminal_keys"] == 1
+    assert receipt["duplicate_terminal_rows"] == 1
+    assert receipt["final_rows"] == 1
+
+
+def test_finalize_cli_ignores_stale_unique_temp_directory(tmp_path, capsys):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    _write_all_terminal(snapshot, rows)
+    scratch = tmp_path / "scratch"
+    stale = scratch / "nk-grid-finalize-stale"
+    stale.mkdir(parents=True)
+    (stale / "index.sqlite").write_text("interrupted old run", encoding="utf-8")
+    ft.main(["finalize", "--snapshot", str(snapshot), "--tmp-dir", str(scratch)])
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "complete"
+    assert receipt["final_rows"] == 1
+    assert (tmp_path / "unused.csv").exists()
+    assert stale.exists()
+    assert Path(receipt["temporary_directory"]).name != stale.name
+    assert not Path(receipt["temporary_directory"]).exists()
+
+
+def test_finalization_tmp_directory_priority(tmp_path, monkeypatch):
+    explicit = tmp_path / "explicit"
+    configured = tmp_path / "configured"
+    nk_grid_env = tmp_path / "nk-grid-env"
+    tmp_env = tmp_path / "tmp-env"
+    monkeypatch.setenv("NK_GRID_TMPDIR", str(nk_grid_env))
+    monkeypatch.setenv("TMPDIR", str(tmp_env))
+    snapshot = {"finalization": {"tmp_dir": str(configured)}}
+    assert ft._resolve_finalization_tmp_base(snapshot, explicit) == explicit.resolve()
+    assert ft._resolve_finalization_tmp_base(snapshot, None) == configured.resolve()
+    assert ft._resolve_finalization_tmp_base({}, None) == nk_grid_env.resolve()
+    monkeypatch.delenv("NK_GRID_TMPDIR")
+    assert ft._resolve_finalization_tmp_base({}, None) == tmp_env.resolve()
+
+
+def test_finalizer_temp_space_preflight_reports_directory_and_bytes(tmp_path, monkeypatch):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    _write_all_terminal(snapshot, rows)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(ft.shutil, "disk_usage", lambda path: SimpleNamespace(free=1))
+    with pytest.raises(FinalizationError) as failed:
+        finalize_snapshot(snapshot, tmp_dir=scratch)
+    message = str(failed.value)
+    assert f"temporary_directory={scratch.resolve()}" in message
+    assert "available_bytes=1" in message
+    assert "estimated_required_bytes=" in message
+    assert not list(scratch.glob("nk-grid-finalize-*"))
 
 
 def test_resource_request_is_single_core_and_records_account_constraint():

@@ -55,9 +55,23 @@ def test_memory_formula_and_probe_fail_closed_above_twelve_copies():
 def test_plan_requires_account_and_never_splits_super_learner(tmp_path):
     with pytest.raises(ValueError, match="account"):
         build_dynamic_plan(_config(tmp_path), n_grid=(10,), k_grid=(1,), cluster=_cluster(account=""), table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json", output_dir=tmp_path / "out", panel="p")
-    plan = build_dynamic_plan(_config(tmp_path), n_grid=(10, 20), k_grid=(1, 2), cluster=_cluster(), table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json", output_dir=tmp_path / "out", panel="p")
+    plan = build_dynamic_plan(
+        _config(tmp_path), n_grid=(10, 20), k_grid=(1, 2),
+        cluster=_cluster(
+            finalization_memory="4G", finalization_time_limit="02:00:00",
+            finalization_tmp_dir=str(tmp_path / "scratch"),
+        ),
+        table_path=tmp_path / "tasks.parquet",
+        snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="p",
+    )
     assert plan["submission"]["array"] == "0-3%4"
     assert "--cpus-per-task=1" in plan["submission"]["sbatch_args"]
     assert "--account=project" in plan["submission"]["sbatch_args"]
     assert "--constraint=arch" in plan["submission"]["sbatch_args"]
+    assert "--mem=4G" in plan["finalization"]["sbatch_args"]
+    assert "--time=02:00:00" in plan["finalization"]["sbatch_args"]
+    assert plan["finalization"]["tmp_dir"] == str(tmp_path / "scratch")
+    snapshot = json.loads((tmp_path / "snapshot.json").read_text())
+    assert snapshot["finalization"]["tmp_dir"] == str((tmp_path / "scratch").resolve())
     assert plan["memory"]["frame_copies"] == 12
