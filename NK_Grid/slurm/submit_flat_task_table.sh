@@ -104,6 +104,57 @@ PREPARATION_TMP_DIR="${FIELD_LINES[$FIELD_INDEX]}"; FIELD_INDEX=$((FIELD_INDEX +
 VERIFICATION_TMP_DIR="${FIELD_LINES[$FIELD_INDEX]}"; FIELD_INDEX=$((FIELD_INDEX + 1))
 FINALIZATION_TMP_DIR="${FIELD_LINES[$FIELD_INDEX]}"
 
+# Freeze the exact sealed predecessor while holding the same schedule lease
+# used by prep/CAS.  This lets a resource-only plan (for example 32→600
+# workers) continue the immutable history of an earlier execution plan instead
+# of assuming every new plan starts at pointer version zero.
+if [ -f "$SNAPSHOT" ]; then
+PREDECESSOR_FIELDS=$("$PYTHON" -c '
+import fcntl, json, os, sys
+from pathlib import Path
+snapshot = json.load(open(sys.argv[1], encoding="utf-8"))
+root = Path(snapshot["output_dir"])
+analysis_id = snapshot["analysis_id"]
+current_plan = snapshot["execution_plan_id"]
+lease = root / ".analysis-schedule.lease"
+lease.parent.mkdir(parents=True, exist_ok=True)
+fd = os.open(lease, os.O_RDWR | os.O_CREAT, 0o640)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    pointer_path = root / "active-generation.json"
+    if not pointer_path.exists():
+        print(""); print(""); print(""); print("0"); print(current_plan)
+    else:
+        pointer = json.load(pointer_path.open(encoding="utf-8"))
+        if pointer.get("analysis_id") != analysis_id or not isinstance(pointer.get("pointer_version"), int):
+            raise SystemExit("active pointer does not match this analysis")
+        activation_path = Path(str(pointer.get("generation_activation_path", "")))
+        activation = json.load(activation_path.open(encoding="utf-8"))
+        closed = activation_path.parent / "generation.closed.json"
+        if not closed.is_file() or activation.get("analysis_id") != analysis_id:
+            raise SystemExit("active predecessor is not an exact sealed generation")
+        print(str(activation["execution_plan_id"]))
+        print(str(int(activation["round"])))
+        print(str(activation["submission_generation"]))
+        print(str(int(pointer["pointer_version"])))
+        print(current_plan)
+finally:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+' "$SNAPSHOT")
+else
+  # A dry-run plan fixture may deliberately name a not-yet-mounted snapshot.
+  # Real prep still validates the immutable snapshot before it can publish.
+  PREDECESSOR_FIELDS=$'\n\n\n0\n'
+fi
+PREDECESSOR_LINES=()
+while IFS= read -r line || [ -n "$line" ]; do PREDECESSOR_LINES+=("$line"); done <<< "$PREDECESSOR_FIELDS"
+INITIAL_PREVIOUS_PLAN="${PREDECESSOR_LINES[0]}"
+INITIAL_PREVIOUS_ROUND="${PREDECESSOR_LINES[1]}"
+INITIAL_PREVIOUS_GENERATION="${PREDECESSOR_LINES[2]}"
+INITIAL_POINTER_VERSION="${PREDECESSOR_LINES[3]}"
+CURRENT_PLAN="${PREDECESSOR_LINES[4]:-}"
+
 PREP="$ENGINE_DIR/slurm/prep_dynamic_queue.sbatch"
 WORKER="$ENGINE_DIR/slurm/run_flat_task_table.sbatch"
 CLOSER="$ENGINE_DIR/slurm/close_dynamic_queue.sbatch"
@@ -128,14 +179,20 @@ PREVIOUS_CLOSE=""
 RECEIPT=""
 for ROUND in $(seq 1 "$ROUNDS"); do
   GENERATION="${GENERATIONS[$((ROUND - 1))]}"
-  POINTER_VERSION=$((ROUND - 1))
-  PREVIOUS_GENERATION=""
-  if [ "$ROUND" -gt 1 ]; then PREVIOUS_GENERATION="${GENERATIONS[$((ROUND - 2))]}"; fi
+  POINTER_VERSION=$((INITIAL_POINTER_VERSION + ROUND - 1))
+  PREVIOUS_GENERATION="$INITIAL_PREVIOUS_GENERATION"
+  PREVIOUS_PLAN="$INITIAL_PREVIOUS_PLAN"
+  PREVIOUS_ROUND="$INITIAL_PREVIOUS_ROUND"
+  if [ "$ROUND" -gt 1 ]; then
+    PREVIOUS_GENERATION="${GENERATIONS[$((ROUND - 2))]}"
+    PREVIOUS_PLAN="$CURRENT_PLAN"
+    PREVIOUS_ROUND=$((ROUND - 1))
+  fi
   PREP_COMMAND=("${PREPARATION_SBATCH_ARGS[@]}")
   PREP_TMP_ARG=""
   if [ "$PREPARATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then PREP_TMP_ARG="$PREPARATION_TMP_DIR"; fi
   PREP_SCRIPT_ARGS=("$SNAPSHOT" "$ROUND" "$PREP_TMP_ARG")
-  PREP_SCRIPT_ARGS+=("$GENERATION" "$PREVIOUS_GENERATION" "$POINTER_VERSION")
+  PREP_SCRIPT_ARGS+=("$GENERATION" "$PREVIOUS_GENERATION" "$POINTER_VERSION" "$PREVIOUS_PLAN" "$PREVIOUS_ROUND")
   if [ -z "$PREVIOUS_CLOSE" ]; then
     submit_or_print "prep-$ROUND" sbatch "${PREP_COMMAND[@]}" "$PREP" "${PREP_SCRIPT_ARGS[@]}"
   else
@@ -146,26 +203,28 @@ for ROUND in $(seq 1 "$ROUNDS"); do
     if [ -z "$PREVIOUS_CLOSE" ]; then RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"none"$'\n';
     else RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"afterany:$PREVIOUS_CLOSE"$'\n'; fi
   fi
-  submit_or_print "work-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREP_JOB" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" "$ROUND" "$PREP_JOB" "$GENERATION" "$PREVIOUS_GENERATION" "$POINTER_VERSION"
+  submit_or_print "work-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREP_JOB" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" "$ROUND" "$PREP_JOB" "$GENERATION" "$PREVIOUS_GENERATION" "$POINTER_VERSION" "$PREVIOUS_PLAN" "$PREVIOUS_ROUND"
   WORK_JOB="$JOB_ID"
   [ "$SUBMIT" = "0" ] || RECEIPT+="work-$ROUND"$'\t'"$WORK_JOB"$'\t'"afterany:$PREP_JOB"$'\n'
-  submit_or_print "close-$ROUND" sbatch "${PREPARATION_SBATCH_ARGS[@]}" "--dependency=afterany:$WORK_JOB" "$CLOSER" "$SNAPSHOT" "$ROUND" "$GENERATION" "$PREP_JOB" "$PREVIOUS_GENERATION" "$POINTER_VERSION"
+  submit_or_print "close-$ROUND" sbatch "${PREPARATION_SBATCH_ARGS[@]}" "--dependency=afterany:$WORK_JOB" "$CLOSER" "$SNAPSHOT" "$ROUND" "$GENERATION" "$PREP_JOB" "$PREVIOUS_GENERATION" "$POINTER_VERSION" "$PREVIOUS_PLAN" "$PREVIOUS_ROUND"
   CLOSE_JOB="$JOB_ID"
   [ "$SUBMIT" = "0" ] || RECEIPT+="close-$ROUND"$'\t'"$CLOSE_JOB"$'\t'"afterany:$WORK_JOB"$'\n'
   PREVIOUS_CLOSE="$CLOSE_JOB"
 done
 LAST_GENERATION="${GENERATIONS[$((ROUNDS - 1))]}"
-LAST_PREVIOUS=""
-if [ "$ROUNDS" -gt 1 ]; then LAST_PREVIOUS="${GENERATIONS[$((ROUNDS - 2))]}"; fi
-LAST_POINTER_VERSION=$((ROUNDS - 1))
-VERIFY_COMMAND=("${VERIFICATION_SBATCH_ARGS[@]}" "--dependency=afterany:$PREVIOUS_CLOSE" "$VERIFY" "$SNAPSHOT" "$ROUNDS" "$LAST_GENERATION" "$PREP_JOB" "$LAST_PREVIOUS" "$LAST_POINTER_VERSION")
+LAST_PREVIOUS="$INITIAL_PREVIOUS_GENERATION"
+LAST_PREVIOUS_PLAN="$INITIAL_PREVIOUS_PLAN"
+LAST_PREVIOUS_ROUND="$INITIAL_PREVIOUS_ROUND"
+if [ "$ROUNDS" -gt 1 ]; then LAST_PREVIOUS="${GENERATIONS[$((ROUNDS - 2))]}"; LAST_PREVIOUS_PLAN="$CURRENT_PLAN"; LAST_PREVIOUS_ROUND=$((ROUNDS - 1)); fi
+LAST_POINTER_VERSION=$((INITIAL_POINTER_VERSION + ROUNDS - 1))
+VERIFY_COMMAND=("${VERIFICATION_SBATCH_ARGS[@]}" "--dependency=afterany:$PREVIOUS_CLOSE" "$VERIFY" "$SNAPSHOT" "$ROUNDS" "$LAST_GENERATION" "$PREP_JOB" "$LAST_PREVIOUS" "$LAST_POINTER_VERSION" "$LAST_PREVIOUS_PLAN" "$LAST_PREVIOUS_ROUND")
 if [ "$VERIFICATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then
   VERIFY_COMMAND+=("$VERIFICATION_TMP_DIR")
 fi
 submit_or_print "verify" sbatch "${VERIFY_COMMAND[@]}"
 VERIFY_JOB="$JOB_ID"
 [ "$SUBMIT" = "0" ] || RECEIPT+="verify"$'\t'"$VERIFY_JOB"$'\t'"afterany:$PREVIOUS_CLOSE"$'\n'
-FINALIZER_COMMAND=("${FINALIZATION_SBATCH_ARGS[@]}" "--dependency=afterok:$VERIFY_JOB" "$FINALIZER" "$SNAPSHOT" "$ROUNDS" "$LAST_GENERATION" "$PREP_JOB" "$LAST_PREVIOUS" "$LAST_POINTER_VERSION")
+FINALIZER_COMMAND=("${FINALIZATION_SBATCH_ARGS[@]}" "--dependency=afterok:$VERIFY_JOB" "$FINALIZER" "$SNAPSHOT" "$ROUNDS" "$LAST_GENERATION" "$PREP_JOB" "$LAST_PREVIOUS" "$LAST_POINTER_VERSION" "$LAST_PREVIOUS_PLAN" "$LAST_PREVIOUS_ROUND")
 if [ "$FINALIZATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then
   FINALIZER_COMMAND+=("$FINALIZATION_TMP_DIR")
 fi

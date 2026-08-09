@@ -64,6 +64,20 @@ def sha256_file(path: Path, *, chunk_bytes: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _write_all(descriptor: int, payload: bytes) -> None:
+    """Write an immutable contract fully before its durability barrier."""
+
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except InterruptedError:
+            continue
+        if written is None or written <= 0:
+            raise ContractError("short write while publishing immutable artefact")
+        view = view[written:]
+
+
 def canonical_task_row_payload(row: Any) -> dict[str, object]:
     """Return the logical TaskRow codec shared by planning and assignments."""
 
@@ -161,6 +175,24 @@ class CellExecutionSpec:
         for name in ("resolved_n_grid", "resolved_k_grid", "resolved_repeat_plan"):
             if not isinstance(value.get(name), list) or not value[name]:
                 raise ContractError(f"cell execution spec requires frozen {name}")
+        if not isinstance(value.get("git_commit"), str) or len(str(value["git_commit"])) != 40:
+            raise ContractError("cell execution spec requires a full git commit")
+        if not isinstance(value.get("algorithm_version"), str) or not value["algorithm_version"]:
+            raise ContractError("cell execution spec requires an algorithm version")
+        if not isinstance(value.get("resolved_model_params"), Mapping) or not value["resolved_model_params"]:
+            raise ContractError("cell execution spec requires resolved model parameters")
+        if not isinstance(value.get("environment_overrides"), Mapping):
+            raise ContractError("cell execution spec requires environment overrides")
+        if not isinstance(value.get("execution_groups"), list) or not value["execution_groups"]:
+            raise ContractError("cell execution spec requires ordered execution groups")
+        provenance = value.get("input_provenance")
+        if not isinstance(provenance, Mapping) or not provenance:
+            raise ContractError("cell execution spec requires input provenance")
+        for name, entry in provenance.items():
+            if not isinstance(name, str) or not name or not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str) or not isinstance(entry.get("sha256"), str):
+                raise ContractError("cell execution spec provenance entry is invalid")
+        if not isinstance(value.get("require_clean_worktree"), bool):
+            raise ContractError("cell execution spec requires clean-worktree policy")
         return cls(value)
 
     @classmethod
@@ -178,7 +210,9 @@ class CellExecutionSpec:
         algorithm_version: str | None = None,
         resolved_model_params: Mapping[str, object] | None = None,
         environment_overrides: Mapping[str, object] | None = None,
-        execution_groups: Sequence[tuple[str, Sequence[str]]] | None = None,
+        execution_groups: Sequence[Mapping[str, object]] | None = None,
+        input_provenance: Mapping[str, Mapping[str, object]] | None = None,
+        require_clean_worktree: bool = False,
     ) -> "CellExecutionSpec":
         """Freeze a validated config into a session-only identity.
 
@@ -197,10 +231,23 @@ class CellExecutionSpec:
             raise ContractError("CellExecutionSpec requires resolved grids and repeat plan")
         schema_locator, schema_sha256 = canonical_repo_locator(config.schema, repo_root=repo_root)
         params_locator, params_sha256 = canonical_repo_locator(config.model_params, repo_root=repo_root)
-        groups = [
-            {"group": str(group), "models": [str(model) for model in models]}
-            for group, models in (execution_groups or ())
-        ]
+        if not isinstance(git_commit, str) or len(git_commit) != 40 or any(char not in "0123456789abcdef" for char in git_commit.lower()):
+            raise ContractError("CellExecutionSpec requires a full immutable git commit")
+        if not isinstance(algorithm_version, str) or not algorithm_version:
+            raise ContractError("CellExecutionSpec requires a non-empty algorithm version")
+        if not isinstance(resolved_model_params, Mapping) or not resolved_model_params:
+            raise ContractError("CellExecutionSpec requires resolved model parameters")
+        if not isinstance(environment_overrides, Mapping):
+            raise ContractError("CellExecutionSpec requires environment overrides")
+        if not execution_groups or any(not isinstance(group, Mapping) for group in execution_groups):
+            raise ContractError("CellExecutionSpec requires ordered execution groups")
+        if not isinstance(input_provenance, Mapping) or not input_provenance:
+            raise ContractError("CellExecutionSpec requires frozen input provenance")
+        groups = [dict(group) for group in execution_groups]
+        provenance = {str(name): dict(value) for name, value in input_provenance.items()}
+        for name, entry in provenance.items():
+            if not name or not isinstance(entry.get("path"), str) or not isinstance(entry.get("sha256"), str):
+                raise ContractError("CellExecutionSpec provenance entry is invalid")
         payload: dict[str, object] = {
             "cell_spec_format_version": CELL_SPEC_FORMAT_VERSION,
             "panel_id": None if panel_id is None else str(panel_id),
@@ -214,8 +261,8 @@ class CellExecutionSpec:
             "model_params_locator": params_locator,
             "model_params_sha256": params_sha256,
             "algorithm_version": algorithm_version,
-            "resolved_model_params": dict(resolved_model_params or {}),
-            "environment_overrides": dict(environment_overrides or {}),
+            "resolved_model_params": dict(resolved_model_params),
+            "environment_overrides": dict(environment_overrides),
             "split_seed": int(config.seed),
             "test_size": float(config.test_size),
             "models": [str(model) for model in config.models],
@@ -224,6 +271,8 @@ class CellExecutionSpec:
             "resolved_k_grid": list(k_grid),
             "resolved_repeat_plan": [[seed, draw] for seed, draw in repeats],
             "execution_groups": groups,
+            "input_provenance": provenance,
+            "require_clean_worktree": bool(require_clean_worktree),
             "native_process_max_attempts": int(config.native_process_max_attempts),
             "native_process_timeout_seconds": float(config.native_process_timeout_seconds),
             "min_n": int(config.min_n),
@@ -395,7 +444,7 @@ def immutable_json_bytes(path: Path, payload: Mapping[str, object]) -> None:
             raise ContractError(f"immutable artefact differs: {target}")
         return
     try:
-        os.write(descriptor, encoded)
+        _write_all(descriptor, encoded)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

@@ -87,6 +87,26 @@ def _sync_fd(descriptor: int) -> None:
     sync(descriptor)
 
 
+def _write_all(descriptor: int, payload: bytes) -> None:
+    """Write one protocol record completely, retrying interrupted short writes.
+
+    A two-phase fsync only means what it says after *all* body/trailer bytes
+    have reached the fd.  ``os.write`` is permitted to return a short count,
+    including on a network filesystem, so a single call is not a durable
+    record boundary.
+    """
+
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except InterruptedError:
+            continue
+        if written is None or written <= 0:
+            raise WALProtocolError("short write while publishing WAL record")
+        view = view[written:]
+
+
 def _fsync_parent(path: Path) -> None:
     descriptor = os.open(Path(path).parent, os.O_RDONLY)
     try:
@@ -509,10 +529,10 @@ class WorkerEventLog:
         raw_header, header = _record_header(
             event_type=event_type, sequence=sequence, row_id=row_id, payload=payload,
         )
-        os.write(self._descriptor, _encode_frame(raw_header, payload))
+        _write_all(self._descriptor, _encode_frame(raw_header, payload))
         (sync or _sync_fd)(self._descriptor)  # body durable boundary
         raw_trailer = _commit_trailer(header)
-        os.write(self._descriptor, COMMIT_MAGIC + _LENGTH.pack(len(raw_trailer)) + raw_trailer)
+        _write_all(self._descriptor, COMMIT_MAGIC + _LENGTH.pack(len(raw_trailer)) + raw_trailer)
         (sync or _sync_fd)(self._descriptor)  # commit durable boundary
 
     def commit_started(self, *, row_id: str, metadata: Mapping[str, object] | None = None) -> int:

@@ -17,7 +17,7 @@ import os
 import shutil
 import tempfile
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
@@ -63,6 +63,8 @@ class ActivationTarget:
     expected_pointer_version: int
     prep_job_id: str
     prep_token: str
+    expected_previous_execution_plan_id: str | None = None
+    expected_previous_round_index: int | None = None
 
     def validate(self) -> None:
         if not self.analysis_id or not self.execution_plan_id or not self.execution_contract_sha256:
@@ -71,6 +73,13 @@ class ActivationTarget:
             raise ControlProtocolError("activation target round/pointer version is invalid")
         if not self.submission_generation or not self.prep_job_id or not self.prep_token:
             raise ControlProtocolError("activation target requires generation and prep identity")
+        if self.expected_previous_generation is None:
+            if self.expected_previous_execution_plan_id is not None or self.expected_previous_round_index is not None:
+                raise ControlProtocolError("initial target may not name a predecessor scope")
+        elif (self.expected_previous_execution_plan_id is None) != (self.expected_previous_round_index is None):
+            raise ControlProtocolError("predecessor plan and round must be frozen together")
+        elif self.expected_previous_round_index is not None and self.expected_previous_round_index < 1:
+            raise ControlProtocolError("predecessor round is invalid")
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,20 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _write_all(descriptor: int, payload: bytes) -> None:
+    """Write a control record fully before the associated fsync boundary."""
+
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except InterruptedError:
+            continue
+        if written is None or written <= 0:
+            raise ControlProtocolError("short write while publishing control artefact")
+        view = view[written:]
+
+
 def _write_temp_fsync_rename(
     path: Path,
     payload: Mapping[str, object],
@@ -144,7 +167,7 @@ def _write_temp_fsync_rename(
     temporary = target.parent / f".{target.name}.tmp.{uuid.uuid4().hex}"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
     try:
-        os.write(descriptor, data)
+        _write_all(descriptor, data)
         if fault is not None:
             fault("before_file_fsync")
         os.fsync(descriptor)
@@ -197,6 +220,20 @@ def _lease(path: Path, *, exclusive: bool, create: bool = True) -> Iterator[int]
 
 def analysis_schedule_lease(root: Path) -> Path:
     return Path(root) / ".analysis-schedule.lease"
+
+
+@contextmanager
+def schedule_transaction(root: Path) -> Iterator[None]:
+    """Hold the one analysis schedule lease for a full prep transaction.
+
+    The transaction begins before the sealed-history/todo read and ends only
+    after its no-generation outcome or pointer CAS is durable.  Public helper
+    functions accept ``lease_held=True`` solely for this context; callers must
+    not compose a series of short independent leases.
+    """
+
+    with _lease(analysis_schedule_lease(Path(root)), exclusive=True):
+        yield
 
 
 def _round_dir(root: Path, target: ActivationTarget) -> Path:
@@ -268,9 +305,47 @@ def _validate_outcome(root: Path, target: ActivationTarget) -> tuple[Path, dict[
         raise ControlProtocolError("invalid no-generation prep outcome")
     if not _target_matches_payload(payload, target) or payload.get("todo_count") != 0 or payload.get("no_generation") is not True:
         raise ControlProtocolError("no-generation outcome identity or count mismatch")
-    if not isinstance(payload.get("sealed_history_digest_sha256"), str):
-        raise ControlProtocolError("no-generation outcome lacks sealed-history digest")
+    expected = {
+        "prospective_previous_generation_or_null": target.expected_previous_generation,
+        "prospective_previous_execution_plan_id_or_null": target.expected_previous_execution_plan_id,
+        "prospective_previous_round_or_null": target.expected_previous_round_index,
+        "prospective_pointer_version": target.expected_pointer_version,
+    }
+    if any(payload.get(name) != value for name, value in expected.items()):
+        raise ControlProtocolError("no-generation outcome prospective predecessor mismatch")
+    if not isinstance(payload.get("observed_pointer_version"), int) or int(payload["observed_pointer_version"]) < 0:
+        raise ControlProtocolError("no-generation outcome observed pointer is invalid")
+    observed_pointer = payload.get("observed_pointer_sha256_or_null")
+    if observed_pointer is not None and (not isinstance(observed_pointer, str) or len(observed_pointer) != 64):
+        raise ControlProtocolError("no-generation outcome observed pointer digest is invalid")
+    frontier = payload.get("sealed_history_frontier")
+    if not isinstance(frontier, list):
+        raise ControlProtocolError("no-generation outcome lacks sealed-history frontier")
+    frozen = _validate_frozen_frontier(root, [item for item in frontier if isinstance(item, Mapping)])
+    if len(frozen) != len(frontier):
+        raise ControlProtocolError("no-generation outcome sealed-history frontier is malformed")
+    if payload.get("sealed_history_generation_count") != len(frozen):
+        raise ControlProtocolError("no-generation outcome sealed-history count mismatch")
+    if sha256_bytes(canonical_json_bytes(list(frozen))) != payload.get("sealed_history_digest_sha256"):
+        raise ControlProtocolError("no-generation outcome sealed-history digest mismatch")
+    predecessor_path = payload.get("observed_previous_closed_path_or_null")
+    predecessor_sha = payload.get("observed_previous_closed_sha256_or_null")
+    if (predecessor_path is None) != (predecessor_sha is None):
+        raise ControlProtocolError("no-generation outcome predecessor reference is incomplete")
+    if predecessor_path is None:
+        if frozen:
+            raise ControlProtocolError("no-generation outcome has history without predecessor")
+    elif not frozen or frozen[-1] != {"closed_path": str(Path(str(predecessor_path)).resolve()), "closed_sha256": predecessor_sha}:
+        raise ControlProtocolError("no-generation outcome predecessor does not match frozen history")
     return path, payload, _sha(path)
+
+
+def _outcome_conflicts_with_generation(root: Path, target: ActivationTarget) -> bool:
+    """A todo=0 receipt is mutually exclusive with every activation artefact."""
+
+    directory = generation_dir(root, target)
+    staging = directory.parent / f".{directory.name}.staging"
+    return intent_path(root, target).exists() or directory.exists() or staging.exists()
 
 
 def _validate_activation(root: Path, target: ActivationTarget) -> tuple[Path, dict[str, object], str] | None:
@@ -299,7 +374,8 @@ def _validate_activation(root: Path, target: ActivationTarget) -> tuple[Path, di
     if payload.get("intent_sha256") != _sha(intent_file):
         raise ControlProtocolError("generation activation intent checksum mismatch")
     for name in (
-        "expected_previous_generation_or_null", "expected_pointer_version",
+        "expected_previous_generation_or_null", "expected_previous_execution_plan_id_or_null",
+        "expected_previous_round_or_null", "expected_pointer_version",
         "observed_previous_closed_sha256_or_null", "observed_previous_closed_path_or_null",
         "observed_pointer_sha256_or_null",
     ):
@@ -394,7 +470,7 @@ def _validate_closed(root: Path, target: ActivationTarget, activation_sha256: st
     }
     if set(group_by_worker) != set(range(expected_count)):
         raise ControlProtocolError("assignment index worker groups mismatch")
-    from .worker_event_wal import WAL_FORMAT, WALProtocolError, scan_wal
+    from .worker_event_wal import WAL_FORMAT, WALBusyError, WALProtocolError, WorkerEventLog
     expected_wals = {generation / f"worker-{worker}.events.wal" for worker in range(expected_count)}
     actual_wals = set(generation.glob("worker-*.events.wal"))
     if actual_wals != expected_wals.intersection(actual_wals):
@@ -405,26 +481,6 @@ def _validate_closed(root: Path, target: ActivationTarget, activation_sha256: st
         worker = int(item["worker"])
         wal = generation / f"worker-{worker}.events.wal"
         state = item.get("wal_state")
-        if state == "absent":
-            if wal.exists():
-                try:
-                    uninitialized = scan_wal(wal)
-                except WALProtocolError as exc:
-                    raise ControlProtocolError("abandoned WAL is corrupt") from exc
-                if (
-                    uninitialized.identity is not None or uninitialized.records
-                    or dict(item) != {"worker": worker, "wal_state": "absent", "abandoned_uninitialized_wal": True}
-                ):
-                    raise ControlProtocolError("absent WAL inventory entry conflicts with filesystem")
-            elif set(item) - {"worker", "wal_state"}:
-                raise ControlProtocolError("absent WAL inventory entry conflicts with filesystem")
-            continue
-        if state != "present" or not wal.is_file():
-            raise ControlProtocolError("present WAL inventory entry is invalid")
-        try:
-            scan = scan_wal(wal)
-        except WALProtocolError as exc:
-            raise ControlProtocolError("sealed WAL is corrupt") from exc
         group = group_by_worker[worker]
         expected_identity = {
             "wal_format": WAL_FORMAT,
@@ -443,6 +499,30 @@ def _validate_closed(root: Path, target: ActivationTarget, activation_sha256: st
             "assignment_row_count": int(group["row_count"]),
             "assignment_row_group_digest": group["canonical_task_rows_sha256"],
         }
+        if state == "absent":
+            if wal.exists():
+                try:
+                    uninitialized = WorkerEventLog.open_shared(wal, expected_identity=expected_identity)
+                except WALBusyError as exc:
+                    raise ControlBusyError("abandoned WAL shared lease is busy") from exc
+                except WALProtocolError as exc:
+                    raise ControlProtocolError("abandoned WAL is corrupt") from exc
+                if (
+                    uninitialized.identity is not None or uninitialized.records
+                    or dict(item) != {"worker": worker, "wal_state": "absent", "abandoned_uninitialized_wal": True}
+                ):
+                    raise ControlProtocolError("absent WAL inventory entry conflicts with filesystem")
+            elif set(item) - {"worker", "wal_state"}:
+                raise ControlProtocolError("absent WAL inventory entry conflicts with filesystem")
+            continue
+        if state != "present" or not wal.is_file():
+            raise ControlProtocolError("present WAL inventory entry is invalid")
+        try:
+            scan = WorkerEventLog.open_shared(wal, expected_identity=expected_identity)
+        except WALBusyError as exc:
+            raise ControlBusyError("sealed WAL shared lease is busy") from exc
+        except WALProtocolError as exc:
+            raise ControlProtocolError("sealed WAL is corrupt") from exc
         if scan.identity is None or dict(scan.identity) != expected_identity:
             raise ControlProtocolError("sealed WAL identity mismatch")
         expected = {
@@ -468,7 +548,7 @@ def classify_exact_afterany_target_read_only(root: Path, target: ActivationTarge
     root = Path(root)
     outcome = _validate_outcome(root, target)
     activation = _validate_activation(root, target)
-    if outcome is not None and activation is not None:
+    if outcome is not None and _outcome_conflicts_with_generation(root, target):
         return Dispatch("protocol", PROTOCOL_EXIT_CODE)
     pointer, raw_pointer = _pointer(root)
     if outcome is not None:
@@ -592,6 +672,20 @@ def frozen_sealed_history(
     raise ControlProtocolError("only sealed/outcome dispatch has frozen history")
 
 
+def frozen_history_from_closed(
+    root: Path, *, closed_path: Path | str | None, closed_sha256: str | None,
+) -> tuple[dict[str, object], ...]:
+    """Expose the exact predecessor frontier for the prep schedule transaction."""
+
+    if closed_path is None:
+        if closed_sha256 is not None:
+            raise ControlProtocolError("empty predecessor path has a checksum")
+        return ()
+    if not isinstance(closed_sha256, str):
+        raise ControlProtocolError("predecessor closed marker lacks checksum")
+    return _history_from_closed_marker(Path(root), Path(closed_path), closed_sha256)
+
+
 def _intent_payload(
     root: Path,
     target: ActivationTarget,
@@ -609,6 +703,8 @@ def _intent_payload(
         "round": target.round_index,
         "submission_generation": target.submission_generation,
         "expected_previous_generation_or_null": target.expected_previous_generation,
+        "expected_previous_execution_plan_id_or_null": target.expected_previous_execution_plan_id,
+        "expected_previous_round_or_null": target.expected_previous_round_index,
         "expected_pointer_version": target.expected_pointer_version,
         "observed_previous_closed_sha256_or_null": observed_previous_closed_sha256,
         "observed_previous_closed_path_or_null": observed_previous_closed_path,
@@ -618,6 +714,59 @@ def _intent_payload(
         "staging_id": staging_id,
         "canonical_generation_path": str(generation_dir(root, target).resolve()),
     }
+
+
+def _target_from_intent(payload: Mapping[str, object]) -> ActivationTarget:
+    """Decode an intent only to decide whether its reservation is resolved."""
+
+    try:
+        target = ActivationTarget(
+            analysis_id=str(payload["analysis_id"]),
+            execution_plan_id=str(payload["execution_plan_id"]),
+            execution_contract_sha256=str(payload["execution_contract_sha256"]),
+            round_index=int(payload["round"]),
+            submission_generation=str(payload["submission_generation"]),
+            expected_previous_generation=(
+                None if payload.get("expected_previous_generation_or_null") is None
+                else str(payload["expected_previous_generation_or_null"])
+            ),
+            expected_pointer_version=int(payload["expected_pointer_version"]),
+            prep_job_id=str(payload["prep_job_id"]),
+            prep_token=str(payload["prep_token"]),
+            expected_previous_execution_plan_id=(
+                None if payload.get("expected_previous_execution_plan_id_or_null") is None
+                else str(payload["expected_previous_execution_plan_id_or_null"])
+            ),
+            expected_previous_round_index=(
+                None if payload.get("expected_previous_round_or_null") is None
+                else int(payload["expected_previous_round_or_null"])
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ControlProtocolError("activation intent target is invalid") from exc
+    target.validate()
+    if not _target_matches_payload(payload, target):
+        raise ControlProtocolError("activation intent target identity is invalid")
+    return target
+
+
+def _intent_is_resolved(root: Path, payload: Mapping[str, object], pointer: Mapping[str, object] | None) -> bool:
+    """Only a pointer reference or a valid closed generation resolves intent."""
+
+    target = _target_from_intent(payload)
+    activation = _validate_activation(root, target)
+    if activation is None:
+        return False
+    activation_file, _, activation_sha = activation
+    if pointer is not None and (
+        pointer.get("generation_activation_path") == str(activation_file.resolve())
+        and pointer.get("generation_activation_sha256") == activation_sha
+    ):
+        return True
+    # A later successful activation may move the active pointer onward.  The
+    # prior reservation remains resolved only if its immutable closed marker
+    # binds this activation exactly; an activation record before CAS does not.
+    return _validate_closed(root, target, activation_sha) is not None
 
 
 def _check_predecessor(root: Path, target: ActivationTarget, pointer: Mapping[str, object] | None) -> str | None:
@@ -639,6 +788,11 @@ def _check_predecessor(root: Path, target: ActivationTarget, pointer: Mapping[st
     predecessor_activation = _load_canonical_json(activation_ref, label="predecessor activation")
     if predecessor_activation.get("submission_generation") != target.expected_previous_generation:
         raise ControlSupersededError("pointer predecessor identity differs from frozen target")
+    expected_plan = target.expected_previous_execution_plan_id or target.execution_plan_id
+    if predecessor_activation.get("execution_plan_id") != expected_plan:
+        raise ControlSupersededError("pointer predecessor execution plan differs from frozen target")
+    if target.expected_previous_round_index is not None and predecessor_activation.get("round") != target.expected_previous_round_index:
+        raise ControlSupersededError("pointer predecessor round differs from frozen target")
     predecessor_closed = activation_ref.parent / "generation.closed.json"
     if not predecessor_closed.exists():
         raise ControlBusyError("predecessor generation is not sealed")
@@ -660,10 +814,14 @@ def _expected_no_generation_outcome(
 ) -> tuple[Path, dict[str, object], str] | None:
     """Read only the statically pre-submitted predecessor outcome path."""
 
-    if target.expected_previous_generation is None or target.round_index <= 1:
+    if target.expected_previous_generation is None:
+        return None
+    predecessor_plan = target.expected_previous_execution_plan_id or target.execution_plan_id
+    predecessor_round = target.expected_previous_round_index or (target.round_index - 1)
+    if predecessor_round < 1:
         return None
     candidate = (
-        Path(root) / "executions" / target.execution_plan_id / f"round-{target.round_index - 1}"
+        Path(root) / "executions" / predecessor_plan / f"round-{predecessor_round}"
         / "prep-outcomes" / f"{target.expected_previous_generation}.json"
     )
     if not candidate.exists():
@@ -671,9 +829,8 @@ def _expected_no_generation_outcome(
     payload = _load_canonical_json(candidate, label="prospective predecessor no-generation outcome")
     expected = {
         "analysis_id": target.analysis_id,
-        "execution_plan_id": target.execution_plan_id,
-        "execution_contract_sha256": target.execution_contract_sha256,
-        "round": target.round_index - 1,
+        "execution_plan_id": predecessor_plan,
+        "round": predecessor_round,
         "submission_generation": target.expected_previous_generation,
         "outcome": "no-generation",
         "todo_count": 0,
@@ -683,6 +840,10 @@ def _expected_no_generation_outcome(
         payload.get(key) != value for key, value in expected.items()
     ):
         raise ControlProtocolError("prospective predecessor no-generation outcome identity mismatch")
+    if target.expected_previous_execution_plan_id is not None:
+        # A cross-plan predecessor is a sealed pointer by construction; an
+        # outcome has no pointer activation to carry across plan identities.
+        raise ControlProtocolError("cross-plan predecessor may not be a no-generation outcome")
     frontier = payload.get("sealed_history_frontier")
     if not isinstance(frontier, list):
         raise ControlProtocolError("prospective predecessor outcome lacks frozen frontier")
@@ -715,12 +876,14 @@ def publish_no_generation_outcome(
     *,
     sealed_history_frontier: Sequence[Mapping[str, object]] | None = None,
     fault: Callable[[str], None] | None = None,
+    lease_held: bool = False,
 ) -> Path:
     """Atomically publish the only legal todo=0 durable success artefact."""
 
     target.validate()
     root = Path(root)
-    with _lease(analysis_schedule_lease(root), exclusive=True):
+    lease = nullcontext() if lease_held else _lease(analysis_schedule_lease(root), exclusive=True)
+    with lease:
         if intent_path(root, target).exists() or generation_dir(root, target).exists() or activation_path(root, target).exists():
             raise ControlProtocolError("no-generation outcome conflicts with activation artefacts")
         pointer, raw_pointer = _pointer(root)
@@ -762,6 +925,8 @@ def publish_no_generation_outcome(
             "prep_job_id": target.prep_job_id,
             "prep_token": target.prep_token,
             "prospective_previous_generation_or_null": target.expected_previous_generation,
+            "prospective_previous_execution_plan_id_or_null": target.expected_previous_execution_plan_id,
+            "prospective_previous_round_or_null": target.expected_previous_round_index,
             "prospective_pointer_version": target.expected_pointer_version,
             "observed_pointer_version": 0 if pointer is None else int(pointer["pointer_version"]),
             "observed_pointer_sha256_or_null": None if raw_pointer is None else sha256_bytes(raw_pointer),
@@ -777,7 +942,7 @@ def publish_no_generation_outcome(
         return outcome_path(root, target)
 
 
-def publish_activation_intent(root: Path, target: ActivationTarget) -> Path:
+def publish_activation_intent(root: Path, target: ActivationTarget, *, lease_held: bool = False) -> Path:
     """Durably reserve one exact activation target before any generation file.
 
     The returned intent is deliberately the only authority for a subsequent
@@ -787,7 +952,8 @@ def publish_activation_intent(root: Path, target: ActivationTarget) -> Path:
 
     target.validate()
     root = Path(root)
-    with _lease(analysis_schedule_lease(root), exclusive=True):
+    lease = nullcontext() if lease_held else _lease(analysis_schedule_lease(root), exclusive=True)
+    with lease:
         if outcome_path(root, target).exists():
             raise ControlProtocolError("activation intent conflicts with no-generation outcome")
         pointer, raw_pointer = _pointer(root)
@@ -816,11 +982,8 @@ def publish_activation_intent(root: Path, target: ActivationTarget) -> Path:
                 # A published but not activated intent is an exclusive
                 # schedule reservation.  Do not pick a different target or
                 # silently turn a race into another generation.
-                other_generation = payload.get("submission_generation")
-                if isinstance(other_generation, str):
-                    other_target_dir = root / "executions" / str(payload.get("execution_plan_id")) / f"round-{payload.get('round')}" / f"generation-{other_generation}"
-                    if not (other_target_dir / "generation.activation.json").exists():
-                        unresolved.append(payload)
+                if not _intent_is_resolved(root, payload, pointer):
+                    unresolved.append(payload)
             if len(unresolved) > 1:
                 raise ControlProtocolError("multiple published activation intents are unresolved")
             if unresolved:
@@ -857,6 +1020,7 @@ def activate_generation(
     prep_sha256: str,
     worker_count: int,
     fault: Callable[[str], None] | None = None,
+    lease_held: bool = False,
 ) -> Path:
     """Publish intent → prepared → activation → pointer-CAS for one target.
 
@@ -869,7 +1033,8 @@ def activate_generation(
     root = Path(root)
     canonical_generation = generation_dir(root, target)
     canonical_activation = activation_path(root, target)
-    with _lease(analysis_schedule_lease(root), exclusive=True):
+    lease = nullcontext() if lease_held else _lease(analysis_schedule_lease(root), exclusive=True)
+    with lease:
         if outcome_path(root, target).exists():
             raise ControlProtocolError("activation conflicts with no-generation outcome")
         pointer, raw_pointer = _pointer(root)
@@ -885,14 +1050,9 @@ def activate_generation(
         predecessor_path = intent.get("observed_previous_closed_path_or_null")
         current_pointer_sha = intent.get("observed_pointer_sha256_or_null")
         intent_sha = _sha(existing_intent)
-        # The caller may have populated a private staging directory and
-        # promoted it immediately before this immutable prepared record.  A
-        # pre-existing canonical directory is accepted only while it contains
-        # no conflicting activation; every individual immutable child below is
-        # still create-or-byte-identical.
-        canonical_generation.mkdir(parents=True, exist_ok=True)
         lease_file = canonical_generation / "generation.lease"
-        lease_file.touch(exist_ok=True)
+        if not canonical_generation.is_dir() or not lease_file.is_file():
+            raise ControlBusyError("activation needs a durably promoted generation lease")
         prepared = {
             "prepared_format_version": PREPARED_FORMAT_VERSION,
             "analysis_id": target.analysis_id,
@@ -933,6 +1093,8 @@ def activate_generation(
             "ready_sha256": ready_sha256,
             "worker_count": int(worker_count),
             "expected_previous_generation_or_null": target.expected_previous_generation,
+            "expected_previous_execution_plan_id_or_null": target.expected_previous_execution_plan_id,
+            "expected_previous_round_or_null": target.expected_previous_round_index,
             "expected_pointer_version": target.expected_pointer_version,
             "observed_previous_closed_sha256_or_null": predecessor_sha,
             "observed_previous_closed_path_or_null": predecessor_path,
@@ -961,7 +1123,7 @@ def activate_generation(
         temporary = pointer_path(root).with_name(f".active-generation.json.tmp.{uuid.uuid4().hex}")
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
         try:
-            os.write(descriptor, pointer_bytes)
+            _write_all(descriptor, pointer_bytes)
             if fault is not None:
                 fault("pointer_before_file_fsync")
             os.fsync(descriptor)
@@ -1075,7 +1237,7 @@ def validate_exact_verification_receipt(
     """Validate before a finalizer opens SQLite or creates a final temp file."""
 
     path = verification_path(root, target)
-    payload = _load_json(path, label="verification receipt")
+    payload = _load_canonical_json(path, label="verification receipt")
     if payload.get("verification_format_version") != VERIFICATION_FORMAT_VERSION:
         raise ControlProtocolError("verification receipt format is invalid")
     checks = {

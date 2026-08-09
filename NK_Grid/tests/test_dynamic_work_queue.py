@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
+import numpy as np
+import pandas as pd
+
+from conftest import write_schema_bundle
 
 from aleatoric_nk_grid.chunk_planning import (
     MEMORY_FRAME_COPIES,
@@ -27,7 +31,12 @@ def _schema(path: Path) -> Path:
 
 
 def _config(tmp_path: Path) -> NKGridConfig:
-    return NKGridConfig(schema=_schema(tmp_path / "schema.json"), out=tmp_path / "out.csv", outcome="y", models=("ols", "super_learner"), seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1, max_n=20, max_k=3, batch_size=1, n_jobs=8, repeat_plan=((1, 0),))
+    frame = pd.DataFrame({
+        "x0": np.arange(40, dtype=float), "x1": np.arange(40, dtype=float),
+        "x2": np.arange(40, dtype=float), "y": np.arange(40, dtype=float),
+    })
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x0", "x1", "x2"])
+    return NKGridConfig(schema=schema, out=tmp_path / "out.csv", outcome="y", models=("ols", "super_learner"), seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1, max_n=20, max_k=3, batch_size=1, n_jobs=8, repeat_plan=((1, 0),))
 
 
 def _cluster(**changes: object) -> ClusterPolicy:

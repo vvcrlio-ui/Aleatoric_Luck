@@ -11,8 +11,8 @@ import pandas as pd
 from conftest import write_schema_bundle
 from aleatoric_nk_grid.chunk_planning import ClusterPolicy, build_dynamic_plan
 from aleatoric_nk_grid.flat_task_table import close_generation, finalize_snapshot, prepare_round, recover_generation_activation, run_slice, verify_rounds
-from aleatoric_nk_grid.generation_control import ControlProtocolError
-from aleatoric_nk_grid.nk_grid import NKGridConfig
+from aleatoric_nk_grid.generation_control import ActivationTarget, ControlProtocolError, publish_activation_intent
+from aleatoric_nk_grid.nk_grid import NKGridConfig, run_nk_grid
 from aleatoric_nk_grid.nk_grid import NKGridExecutionSession
 from aleatoric_nk_grid.worker_event_wal import (
     TASK_ABORTED,
@@ -186,6 +186,154 @@ def test_dynamic_worker_writes_one_wal_and_reuses_session_path(tmp_path: Path):
         expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
     )
     assert final["final_rows"] == 1
+
+
+def test_dynamic_final_csv_uses_the_local_stable_public_projection(tmp_path: Path):
+    """Timing/RSS telemetry may differ, but the final scientific CSV may not."""
+
+    frame = pd.DataFrame({"x": np.arange(40, dtype=float), "y": np.arange(40, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=10, max_k=1, batch_size=1, n_jobs=4, repeat_plan=((1, 0),), min_n=2,
+    )
+    run_nk_grid(config)
+    local_bytes = config.out.read_bytes()
+    build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(workers=1, rounds=1, partition="test", time_limit="01:00:00", account="test", constraint="none"),
+        table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    prepare_round(tmp_path / "snapshot.json", round_index=1, prep_token="job-1", prep_job_id="job-1", submission_generation="g1", expected_pointer_version=0)
+    run_slice(tmp_path / "snapshot.json", round_index=1, worker_index=0, expected_prep_token="job-1", prep_job_id="job-1", submission_generation="g1", expected_pointer_version=0)
+    close_generation(tmp_path / "snapshot.json", round_index=1, submission_generation="g1", expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0)
+    verify_rounds(tmp_path / "snapshot.json", round_index=1, submission_generation="g1", expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0)
+    finalize_snapshot(tmp_path / "snapshot.json", round_index=1, submission_generation="g1", expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0)
+    assert config.out.read_bytes() == local_bytes
+
+
+def test_sealed_abandoned_uninitialized_wal_is_a_valid_incomplete_history(tmp_path: Path):
+    frame = pd.DataFrame({"x": np.arange(30, dtype=float), "y": np.arange(30, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=10, max_k=1, batch_size=1, n_jobs=1, repeat_plan=((1, 0),), min_n=2,
+    )
+    plan = build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(workers=1, rounds=1, partition="test", time_limit="01:00:00", account="test", constraint="none"),
+        table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    prepare_round(tmp_path / "snapshot.json", round_index=1, prep_token="job", prep_job_id="job", submission_generation="g1", expected_pointer_version=0)
+    generation = tmp_path / "out" / "executions" / str(plan["execution_plan_id"]) / "round-1" / "generation-g1"
+    (generation / "worker-0.events.wal").touch()
+    close_generation(tmp_path / "snapshot.json", round_index=1, submission_generation="g1", expected_prep_token="job", prep_job_id="job", expected_pointer_version=0)
+    verification = verify_rounds(tmp_path / "snapshot.json", round_index=1, submission_generation="g1", expected_prep_token="job", prep_job_id="job", expected_pointer_version=0)
+    assert verification["exit_code"] == 3
+    assert verification["interrupted_row_ids"] == []
+
+
+def test_new_execution_plan_reuses_a_sealed_predecessor_history(tmp_path: Path):
+    frame = pd.DataFrame({"x": np.arange(40, dtype=float), "y": np.arange(40, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=10, max_k=1, batch_size=1, n_jobs=1, repeat_plan=((1, 0),), min_n=2,
+    )
+    first = build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(workers=1, rounds=1, partition="test", time_limit="01:00:00", account="test", constraint="none"),
+        table_path=tmp_path / "first.parquet", snapshot_path=tmp_path / "first.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    prepare_round(tmp_path / "first.json", round_index=1, prep_token="first-job", prep_job_id="first-job", submission_generation="first-g", expected_pointer_version=0)
+    run_slice(tmp_path / "first.json", round_index=1, worker_index=0, expected_prep_token="first-job", prep_job_id="first-job", submission_generation="first-g", expected_pointer_version=0)
+    close_generation(tmp_path / "first.json", round_index=1, submission_generation="first-g", expected_prep_token="first-job", prep_job_id="first-job", expected_pointer_version=0)
+
+    second = build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(workers=2, rounds=1, partition="test", time_limit="01:00:00", account="test", constraint="none"),
+        table_path=tmp_path / "second.parquet", snapshot_path=tmp_path / "second.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    assert first["analysis_id"] == second["analysis_id"]
+    outcome = prepare_round(
+        tmp_path / "second.json", round_index=1, prep_token="second-job", prep_job_id="second-job",
+        submission_generation="second-g", expected_previous_generation="first-g", expected_pointer_version=1,
+        expected_previous_execution_plan_id=str(first["execution_plan_id"]), expected_previous_round_index=1,
+    )
+    assert outcome["no_generation"] is True
+    verification = verify_rounds(
+        tmp_path / "second.json", round_index=1, submission_generation="second-g",
+        expected_prep_token="second-job", prep_job_id="second-job", expected_previous_generation="first-g",
+        expected_pointer_version=1, expected_previous_execution_plan_id=str(first["execution_plan_id"]),
+        expected_previous_round_index=1,
+    )
+    assert verification["exit_code"] == 0
+
+
+def test_exact_prep_resumes_an_unprepared_staging_directory(tmp_path: Path):
+    frame = pd.DataFrame({"x": np.arange(30, dtype=float), "y": np.arange(30, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=10, max_k=1, batch_size=1, n_jobs=1, repeat_plan=((1, 0),), min_n=2,
+    )
+    build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(workers=1, rounds=1, partition="test", time_limit="01:00:00", account="test", constraint="none"),
+        table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    snapshot = json.loads((tmp_path / "snapshot.json").read_text(encoding="utf-8"))
+    target = ActivationTarget(
+        analysis_id=str(snapshot["analysis_id"]), execution_plan_id=str(snapshot["execution_plan_id"]),
+        execution_contract_sha256=str(snapshot["execution_contract_sha256"]), round_index=1,
+        submission_generation="g1", expected_previous_generation=None, expected_pointer_version=0,
+        prep_job_id="job", prep_token="job",
+    )
+    publish_activation_intent(tmp_path / "out", target)
+    stage = tmp_path / "out" / "executions" / str(snapshot["execution_plan_id"]) / "round-1" / ".generation-g1.staging"
+    stage.mkdir(parents=True)
+    # A crash can leave a partial, uncommitted Parquet target.  Exact prep owns
+    # staging and replaces it deterministically before prepared is published.
+    (stage / "assignment.parquet").write_bytes(b"partial")
+    prepared = prepare_round(tmp_path / "snapshot.json", round_index=1, prep_token="job", prep_job_id="job", submission_generation="g1", expected_pointer_version=0)
+    assert Path(str(prepared["activation"])).is_file()
+
+
+def test_analysis_identity_freezes_commit_environment_groups_and_input_provenance(tmp_path: Path, monkeypatch):
+    frame = pd.DataFrame({"x": np.arange(30, dtype=float), "y": np.arange(30, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=10, max_k=1, batch_size=1, n_jobs=1, repeat_plan=((1, 0),), min_n=2,
+    )
+    cluster = ClusterPolicy(workers=1, rounds=1, partition="test", time_limit="01:00:00", account="test", constraint="none")
+    first = build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,), cluster=cluster,
+        table_path=tmp_path / "first.parquet", snapshot_path=tmp_path / "first.json", output_dir=tmp_path / "first-out", panel="generic",
+    )
+    contract = json.loads((tmp_path / "first-out" / "analysis-contract.json").read_text(encoding="utf-8"))
+    spec = contract["cell_execution_spec"]
+    assert len(spec["git_commit"]) == 40
+    assert spec["resolved_model_params"]
+    assert spec["execution_groups"]
+    assert {"training_table", "feature_universe_definition"}.issubset(spec["input_provenance"])
+
+    monkeypatch.setenv("RF_N_ESTIMATORS", "17")
+    second = build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,), cluster=cluster,
+        table_path=tmp_path / "second.parquet", snapshot_path=tmp_path / "second.json", output_dir=tmp_path / "second-out", panel="generic",
+    )
+    assert second["analysis_id"] != first["analysis_id"]
 
 
 def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monkeypatch):

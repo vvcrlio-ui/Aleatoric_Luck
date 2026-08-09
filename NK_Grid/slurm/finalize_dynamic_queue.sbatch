@@ -13,7 +13,17 @@ GENERATION="${3:?Pass frozen final submission generation}"
 PREP_JOB="${4:?Pass frozen final prep job ID}"
 EXPECTED_PREVIOUS="${5:-}"
 EXPECTED_POINTER_VERSION="${6:?Pass frozen final pointer version}"
-FINALIZATION_TMP_DIR="${7:-}"
+if [ "$#" -eq 7 ]; then
+  # Compatibility for existing frozen submit receipts; new submitter passes
+  # predecessor plan/round before scratch.
+  EXPECTED_PREVIOUS_PLAN=""
+  EXPECTED_PREVIOUS_ROUND=""
+  FINALIZATION_TMP_DIR="${7:-}"
+else
+  EXPECTED_PREVIOUS_PLAN="${7:-}"
+  EXPECTED_PREVIOUS_ROUND="${8:-}"
+  FINALIZATION_TMP_DIR="${9:-}"
+fi
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
   command -v module >/dev/null 2>&1 || {
@@ -48,6 +58,7 @@ fi
 echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND generation=$GENERATION phase=finalize"
 FINALIZE_ARGS=(finalize --snapshot "$SNAPSHOT" --round "$ROUND" --generation "$GENERATION" --expected-prep-token "$PREP_JOB" --prep-job-id "$PREP_JOB" --expected-pointer-version "$EXPECTED_POINTER_VERSION")
 if [ -n "$EXPECTED_PREVIOUS" ]; then FINALIZE_ARGS+=(--expected-previous-generation "$EXPECTED_PREVIOUS"); fi
+if [ -n "$EXPECTED_PREVIOUS_PLAN" ] && [ -n "$EXPECTED_PREVIOUS_ROUND" ]; then FINALIZE_ARGS+=(--expected-previous-execution-plan-id "$EXPECTED_PREVIOUS_PLAN" --expected-previous-round "$EXPECTED_PREVIOUS_ROUND"); fi
 if [ -n "$FINALIZATION_TMP_DIR" ]; then
   FINALIZE_ARGS+=(--tmp-dir "$FINALIZATION_TMP_DIR")
 fi

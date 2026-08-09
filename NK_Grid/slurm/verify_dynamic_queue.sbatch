@@ -13,7 +13,15 @@ GENERATION="${3:?Pass frozen final submission generation}"
 PREP_JOB="${4:?Pass frozen final prep job ID}"
 EXPECTED_PREVIOUS="${5:-}"
 EXPECTED_POINTER_VERSION="${6:?Pass frozen final pointer version}"
-VERIFICATION_TMP_DIR="${7:-}"
+if [ "$#" -eq 7 ]; then
+  EXPECTED_PREVIOUS_PLAN=""
+  EXPECTED_PREVIOUS_ROUND=""
+  VERIFICATION_TMP_DIR="${7:-}"
+else
+  EXPECTED_PREVIOUS_PLAN="${7:-}"
+  EXPECTED_PREVIOUS_ROUND="${8:-}"
+  VERIFICATION_TMP_DIR="${9:-}"
+fi
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
   command -v module >/dev/null 2>&1 || {
@@ -48,6 +56,7 @@ fi
 echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND generation=$GENERATION phase=verify"
 VERIFY_ARGS=(verify --snapshot "$SNAPSHOT" --round "$ROUND" --generation "$GENERATION" --expected-prep-token "$PREP_JOB" --prep-job-id "$PREP_JOB" --expected-pointer-version "$EXPECTED_POINTER_VERSION")
 if [ -n "$EXPECTED_PREVIOUS" ]; then VERIFY_ARGS+=(--expected-previous-generation "$EXPECTED_PREVIOUS"); fi
+if [ -n "$EXPECTED_PREVIOUS_PLAN" ] && [ -n "$EXPECTED_PREVIOUS_ROUND" ]; then VERIFY_ARGS+=(--expected-previous-execution-plan-id "$EXPECTED_PREVIOUS_PLAN" --expected-previous-round "$EXPECTED_PREVIOUS_ROUND"); fi
 if [ -n "$VERIFICATION_TMP_DIR" ]; then
   VERIFY_ARGS+=(--tmp-dir "$VERIFICATION_TMP_DIR")
 fi

@@ -15,6 +15,8 @@ EXPECTED_PREP_TOKEN="${3:?Pass the current prep Slurm job ID}"
 GENERATION="${4:?Pass the frozen submission generation}"
 EXPECTED_PREVIOUS="${5:-}"
 EXPECTED_POINTER_VERSION="${6:?Pass frozen pointer version}"
+EXPECTED_PREVIOUS_PLAN="${7:-}"
+EXPECTED_PREVIOUS_ROUND="${8:-}"
 : "${SLURM_ARRAY_TASK_ID:?Submit this worker as a Slurm array job}"
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
@@ -53,4 +55,5 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND generation=$GENERATION worker=$SLURM_ARRAY_TASK_ID"
 WORK_ARGS=(run --snapshot "$SNAPSHOT" --round "$ROUND" --worker-index "$SLURM_ARRAY_TASK_ID" --expected-prep-token "$EXPECTED_PREP_TOKEN" --prep-job-id "$EXPECTED_PREP_TOKEN" --generation "$GENERATION" --expected-pointer-version "$EXPECTED_POINTER_VERSION")
 if [ -n "$EXPECTED_PREVIOUS" ]; then WORK_ARGS+=(--expected-previous-generation "$EXPECTED_PREVIOUS"); fi
+if [ -n "$EXPECTED_PREVIOUS_PLAN" ] && [ -n "$EXPECTED_PREVIOUS_ROUND" ]; then WORK_ARGS+=(--expected-previous-execution-plan-id "$EXPECTED_PREVIOUS_PLAN" --expected-previous-round "$EXPECTED_PREVIOUS_ROUND"); fi
 "$PYTHON" -m aleatoric_nk_grid.flat_task_table "${WORK_ARGS[@]}"

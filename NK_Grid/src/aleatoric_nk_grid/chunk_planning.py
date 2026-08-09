@@ -18,6 +18,7 @@ from typing import Mapping, Sequence
 from .flat_task_table import (
     ResourceRequest,
     _config_from_json,
+    execution_groups,
     iter_task_rows_canonical,
     sbatch_resource_args,
     write_task_table_streaming,
@@ -29,13 +30,44 @@ from .execution_contract import (
     DynamicExecutionContract,
     immutable_json_bytes,
 )
-from .experiment import git_state
+from .experiment import git_state, model_run_settings
+from .ingest import load_schema
+from .model_registry import load_algorithm_version, load_model_params, resolved_model_params
 from .nk_grid import LARGE_RUN_THRESHOLD, NKGridConfig, _validate_config, public_result_columns, resolve_repeat_pairs
 
 
 ENGINE_VALUE_BYTES = 8
 MEMORY_BASE_BYTES = int(1.25 * 1024 ** 3)
 MEMORY_FRAME_COPIES = 12
+
+
+def _frozen_input_provenance(schema_path: Path) -> dict[str, dict[str, str]]:
+    """Freeze every data/feature file that changes validated numeric input."""
+
+    schema = load_schema(schema_path)
+    definition_value = Path(str(schema.feature_universe["definition_file"]))
+    definition = definition_value if definition_value.is_absolute() else (schema.path.parent / definition_value).resolve()
+    candidates: dict[str, Path | None] = {
+        "training_table": schema.table,
+        "external_test_table": schema.test_table,
+        "feature_manifest": schema.feature_manifest,
+        "feature_universe_definition": definition,
+        "provenance": schema.table.parent / "provenance.json",
+    }
+    provenance: dict[str, dict[str, str]] = {}
+    for name, candidate in candidates.items():
+        if candidate is None:
+            continue
+        path = Path(candidate).resolve()
+        if name == "provenance" and not path.exists():
+            continue
+        if not path.is_file():
+            raise ValueError(f"numeric input provenance file is missing: {name}={path}")
+        from .execution_contract import sha256_file
+        provenance[name] = {"path": str(path), "sha256": sha256_file(path)}
+    if not provenance:
+        raise ValueError("dynamic planning found no numeric input provenance")
+    return provenance
 
 
 def expanded_columns_for_k(schema_path: Path | str, k_features: int) -> int:
@@ -167,7 +199,11 @@ def build_dynamic_plan(
         n_draws=1,
     )
     _validate_config(worker_config)
-    if worker_config.preset == "production" and git_state(Path(__file__).resolve().parents[2]).get("dirty") is not False:
+    engine_root = Path(__file__).resolve().parents[2]
+    source_state = git_state(engine_root)
+    if not isinstance(source_state.get("commit"), str) or len(str(source_state["commit"])) != 40:
+        raise ValueError("dynamic planning requires a resolvable immutable Git commit")
+    if worker_config.preset == "production" and source_state.get("dirty") is not False:
         raise ValueError("Production dynamic planning requires a clean Git worktree")
     # ``CellExecutionSpec`` deliberately freezes dynamic workers at one model
     # job; the local config remains untouched and keeps its original n_jobs.
@@ -178,6 +214,17 @@ def build_dynamic_plan(
         str(Path(worker_config.schema).resolve()),
         str(Path(worker_config.model_params).resolve()),
     ])).resolve()
+    input_schema = load_schema(worker_config.schema)
+    selected_params = load_model_params(
+        worker_config.model_params, task=input_schema.task, models=worker_config.models,
+    )
+    frozen_groups = [
+        {"k_features": int(k_features), "groups": [
+            {"group": group, "models": list(models)}
+            for group, models in execution_groups(worker_config.models, k_features=int(k_features))
+        ]}
+        for k_features in resolved_k_grid
+    ]
     cell_spec = CellExecutionSpec.from_config(
         worker_config,
         repo_root=repo_root,
@@ -186,6 +233,13 @@ def build_dynamic_plan(
         resolved_k_grid=resolved_k_grid,
         resolved_repeat_plan=worker_config.repeat_plan,
         model_n_jobs=1,
+        git_commit=str(source_state["commit"]),
+        algorithm_version=load_algorithm_version(worker_config.model_params),
+        resolved_model_params=resolved_model_params(selected_params),
+        environment_overrides=model_run_settings(worker_config.models),
+        execution_groups=frozen_groups,
+        input_provenance=_frozen_input_provenance(worker_config.schema),
+        require_clean_worktree=worker_config.preset == "production",
     )
     summary = write_task_table_streaming(
         iter_task_rows_canonical(

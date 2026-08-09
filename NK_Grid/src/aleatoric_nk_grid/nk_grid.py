@@ -53,7 +53,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[2]
 
 from .evaluation import r2_against_training_mean
-from .execution_contract import CellExecutionSpec, ContractError
+from .execution_contract import CellExecutionSpec, ContractError, sha256_file
 from .experiment import (
     CHECKPOINT_COMPACTION_LOOSE_PARTS,
     CHECKPOINT_KEY_COLUMNS,
@@ -190,11 +190,25 @@ BASE_RESULT_COLUMNS = (
     "split_random_state", "n_train_total", "n_test_total", "n_features_total",
     "K_expanded", "n_expanded_features_total", "K_unobserved",
 )
-DIAGNOSTIC_RESULT_COLUMNS = (
+STABLE_DIAGNOSTIC_RESULT_COLUMNS = (
     "K_varying", "constant_prediction", "underdetermined", "converged",
-    "_fit_seconds", "_best_rounds", "_preprocess_seconds", "_preprocess_computed",
-    "_preprocess_vectorized", "_slice_seconds", "_cell_wall_seconds", "_peak_rss_bytes",
+    "_preprocess_vectorized",
 )
+
+# These fields describe one process invocation rather than a scientific cell.
+# They are useful in local checkpoint diagnostics, but must never participate
+# in a durable RESULT identity: a perfectly legitimate retry will have new
+# timings (and often a new RSS high-water mark).  Keeping this list separate
+# from ``public_result_columns`` gives the WAL and local materializer one
+# stable public projection.
+TRANSIENT_RESULT_COLUMNS = (
+    "_fit_seconds", "_best_rounds", "_preprocess_seconds", "_preprocess_computed",
+    "_slice_seconds", "_cell_wall_seconds", "_peak_rss_bytes",
+)
+
+# Compatibility name for local diagnostics code which still constructs every
+# field before its checkpoint reducer drops transient values.
+DIAGNOSTIC_RESULT_COLUMNS = (*STABLE_DIAGNOSTIC_RESULT_COLUMNS, *TRANSIENT_RESULT_COLUMNS)
 
 
 def public_result_columns(task: str) -> tuple[str, ...]:
@@ -211,7 +225,40 @@ def public_result_columns(task: str) -> tuple[str, ...]:
     # ``outcome`` originates in metadata and is then overwritten by the base
     # row without changing insertion order.  Deduplicate exactly as Python's
     # dictionary expansion does before CSV serialization.
-    return tuple(dict.fromkeys((*ROW_METADATA_FIELDS, *BASE_RESULT_COLUMNS, *metrics, *DIAGNOSTIC_RESULT_COLUMNS, *task_column, "status", "error")))
+    return tuple(dict.fromkeys((*ROW_METADATA_FIELDS, *BASE_RESULT_COLUMNS, *metrics, *STABLE_DIAGNOSTIC_RESULT_COLUMNS, *task_column, "status", "error")))
+
+
+def execution_groups_for_models(models: Sequence[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return the ordered preprocessing groups used by the task-table codec."""
+
+    selected = tuple(str(model) for model in models)
+    if not selected or len(selected) != len(set(selected)):
+        raise ValueError("models must be non-empty and unique")
+    passthrough = tuple(model for model in selected if model in {"lightgbm", "xgboost"})
+    imputed = tuple(model for model in selected if model not in passthrough)
+    return tuple(
+        (name, group)
+        for name, group in (("imputed_core", imputed), ("passthrough", passthrough))
+        if group
+    )
+
+
+def project_public_result(row: Mapping[str, object], *, header: Sequence[str]) -> dict[str, object]:
+    """Project one computed row into the immutable public result codec.
+
+    Session computation intentionally returns local diagnostic telemetry too.
+    The dynamic WAL must never choose a different subset or preserve whatever
+    dict order happened to be produced by a model; this one projection is the
+    boundary shared with ``public_result_columns`` and final CSV equality.
+    """
+
+    columns = tuple(str(column) for column in header)
+    if not columns or len(columns) != len(set(columns)):
+        raise ValueError("public result header must be non-empty and unique")
+    missing = [column for column in columns if column not in row]
+    if missing:
+        raise ValueError(f"computed result lacks public columns: {missing}")
+    return {column: row[column] for column in columns}
 
 @dataclass(frozen=True)
 class NKGridConfig:
@@ -1677,8 +1724,29 @@ class NKGridExecutionSession:
         if expected_params and expected_params != resolved_model_params(self.selected_model_params):
             raise ContractError("CellExecutionSpec model parameter mismatch")
         expected_commit = value.get("git_commit")
-        if expected_commit is not None and git_state(ROOT).get("commit") != expected_commit:
+        actual_git = git_state(ROOT)
+        if actual_git.get("commit") != expected_commit:
             raise ContractError("CellExecutionSpec git commit mismatch")
+        if bool(value["require_clean_worktree"]) and actual_git.get("dirty") is not False:
+            raise ContractError("CellExecutionSpec requires a clean Git worktree")
+        if value["environment_overrides"] != model_run_settings(self.config.models):
+            raise ContractError("CellExecutionSpec environment override mismatch")
+        expected_groups = [
+            {"k_features": int(k_features), "groups": [
+                {"group": group, "models": list(group_models)}
+                for group, group_models in execution_groups_for_models(self.config.models)
+            ]}
+            for k_features in self.k_grid
+        ]
+        if value["execution_groups"] != expected_groups:
+            raise ContractError("CellExecutionSpec execution groups mismatch")
+        for name, entry in dict(value["input_provenance"]).items():
+            try:
+                actual = sha256_file(Path(str(entry["path"])))
+            except (OSError, ContractError) as exc:
+                raise ContractError(f"CellExecutionSpec provenance input is unavailable: {name}") from exc
+            if actual != entry["sha256"]:
+                raise ContractError(f"CellExecutionSpec provenance checksum mismatch: {name}")
 
     def _orders(self, seed: int, draw: int, train_index: pd.Index) -> DrawOrders:
         key = (int(seed), int(draw))
@@ -2645,15 +2713,7 @@ def _run_nk_grid_locked(
         materialization = merge_checkpoint_parts(
             out_path,
             experiment_id=metadata["experiment_id"],
-            drop_output_columns=[
-                "_fit_seconds",
-                "_best_rounds",
-                "_preprocess_seconds",
-                "_preprocess_computed",
-                "_slice_seconds",
-                "_cell_wall_seconds",
-                "_peak_rss_bytes",
-            ],
+            drop_output_columns=list(TRANSIENT_RESULT_COLUMNS),
         )
         results = None
         result_summary = materialization.summary

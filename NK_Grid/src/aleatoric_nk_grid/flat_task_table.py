@@ -55,6 +55,7 @@ from .generation_control import (
     classify_exact_afterany_target_read_only,
     closed_path,
     frozen_sealed_history,
+    frozen_history_from_closed,
     generation_dir,
     outcome_path,
     predecessor_gate,
@@ -62,10 +63,19 @@ from .generation_control import (
     publish_no_generation_outcome,
     publish_verification_receipt,
     seal_generation,
+    schedule_transaction,
     validate_exact_verification_receipt,
     verification_path,
 )
-from .nk_grid import NKGridConfig, NKGridExecutionSession, _process_peak_rss_bytes, resolve_repeat_pairs, run_nk_grid
+from .nk_grid import (
+    NKGridConfig,
+    NKGridExecutionSession,
+    _process_peak_rss_bytes,
+    execution_groups_for_models,
+    project_public_result,
+    resolve_repeat_pairs,
+    run_nk_grid,
+)
 from .worker_event_wal import (
     TASK_ABORTED,
     TASK_RESULT,
@@ -157,19 +167,7 @@ def pairs_for(
 def execution_groups(models: Sequence[str], *, k_features: int) -> tuple[tuple[str, tuple[str, ...]], ...]:
     """Return indivisible preprocessing groups; Super Learner stays imputed."""
     del k_features
-    selected = tuple(str(model) for model in models)
-    if len(selected) != len(set(selected)):
-        raise ValueError("models must not contain duplicates")
-    passthrough = tuple(model for model in selected if model in {"lightgbm", "xgboost"})
-    imputed = tuple(model for model in selected if model not in passthrough)
-    groups: list[tuple[str, tuple[str, ...]]] = []
-    if imputed:
-        groups.append(("imputed_core", imputed))
-    if passthrough:
-        groups.append(("passthrough", passthrough))
-    if not groups:
-        raise ValueError("models must not be empty")
-    return tuple(groups)
+    return execution_groups_for_models(models)
 
 
 GROUP_PREPROCESS_MODES: Mapping[str, str] = {
@@ -547,6 +545,8 @@ def run_slice(
     expected_previous_generation: str | None = None,
     expected_pointer_version: int | None = None,
     prep_job_id: str | None = None,
+    expected_previous_execution_plan_id: str | None = None,
+    expected_previous_round_index: int | None = None,
 ) -> Path:
     """Run one WAL-owned worker slice; no output CSV/checkpoint path is opened."""
     payload = _load_snapshot(snapshot_path)
@@ -568,6 +568,8 @@ def run_slice(
         expected_pointer_version=(int(round_index) - 1 if expected_pointer_version is None else int(expected_pointer_version)),
         prep_job_id=str(prep_job_id or expected_prep_token),
         prep_token=_validated_prep_token(expected_prep_token),
+        expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+        expected_previous_round_index=expected_previous_round_index,
     )
     dispatch = classify_exact_afterany_target_read_only(Path(str(payload["output_dir"])), target)
     if dispatch.kind in {"no-generation", "sealed-generation"}:
@@ -631,15 +633,20 @@ def run_slice(
                     if row.row_id in completed:
                         continue
                     sequence = wal.commit_started(row_id=row.row_id, metadata={"execution_plan_id": execution.execution_plan_id, "round": round_index, "generation": target.submission_generation, "worker": worker_index})
-                    raw_rows = session.run_cell_group(seed=row.seed, draw=row.draw, n_samples=row.n_samples, k_features=row.k_features, models=row.models)
+                    computed_rows = session.run_cell_group(seed=row.seed, draw=row.draw, n_samples=row.n_samples, k_features=row.k_features, models=row.models)
                     try:
-                        if not isinstance(raw_rows, list) or not raw_rows:
+                        if not isinstance(computed_rows, list) or not computed_rows:
                             raise WALProtocolError("RESULT_PROJECTION_FAILED")
-                        if {str(item.get("model")) for item in raw_rows} != set(row.models):
+                        if {str(item.get("model")) for item in computed_rows} != set(row.models):
                             raise WALProtocolError("RESULT_KEY_SET_MISMATCH")
-                        if any((int(item.get("seed", -1)), int(item.get("draw", -1)), int(item.get("N", -1)), int(item.get("K", -1))) != (row.seed, row.draw, row.n_samples, row.k_features) for item in raw_rows):
+                        if any((int(item.get("seed", -1)), int(item.get("draw", -1)), int(item.get("N", -1)), int(item.get("K", -1))) != (row.seed, row.draw, row.n_samples, row.k_features) for item in computed_rows):
                             raise WALProtocolError("RESULT_KEY_SET_MISMATCH")
-                        if any(not isinstance(item, Mapping) or tuple(item.keys()) != public_schema for item in raw_rows):
+                        raw_rows = [
+                            project_public_result(item, header=public_schema)
+                            for item in computed_rows
+                            if isinstance(item, Mapping)
+                        ]
+                        if len(raw_rows) != len(computed_rows):
                             raise WALProtocolError("PUBLIC_SCHEMA_MISMATCH")
                         wal.commit_result(sequence=sequence, row_id=row.row_id, public_rows=raw_rows, header=public_schema)
                     except (WALFrameTooLarge, WALProtocolError, UnicodeError, csv.Error, ValueError, TypeError) as exc:
@@ -660,6 +667,8 @@ def close_generation(
     snapshot_path: Path, *, round_index: int, submission_generation: str,
     expected_prep_token: str, expected_previous_generation: str | None = None,
     expected_pointer_version: int | None = None, prep_job_id: str | None = None,
+    expected_previous_execution_plan_id: str | None = None,
+    expected_previous_round_index: int | None = None,
 ) -> Path:
     """Seal exactly one generation into the immutable cross-WAL inventory."""
 
@@ -668,6 +677,8 @@ def close_generation(
         snapshot, round_index=round_index, submission_generation=submission_generation,
         prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
         expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+        expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+        expected_previous_round_index=expected_previous_round_index,
         validate_task_table=False,
     )
     root = Path(str(snapshot["output_dir"]))
@@ -740,6 +751,8 @@ def recover_generation_activation(
     snapshot_path: Path, *, round_index: int, submission_generation: str,
     expected_prep_token: str, expected_previous_generation: str | None = None,
     expected_pointer_version: int | None = None, prep_job_id: str | None = None,
+    expected_previous_execution_plan_id: str | None = None,
+    expected_previous_round_index: int | None = None,
 ) -> Path:
     """Resume one exact prepared activation; never select a latest target."""
 
@@ -748,6 +761,8 @@ def recover_generation_activation(
         snapshot, round_index=round_index, submission_generation=submission_generation,
         prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
         expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+        expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+        expected_previous_round_index=expected_previous_round_index,
         validate_task_table=False,
     )
     root = Path(str(snapshot["output_dir"]))
@@ -765,7 +780,22 @@ def recover_generation_activation(
     if staging.exists():
         prepared = staging / "generation.prepared.json"
         if not prepared.is_file():
-            raise ControlBusyError("activation staging is incomplete; exact prep must resume it")
+            # A staging directory is not an immutable generation.  Its intent
+            # freezes the target, while exact prep deterministically rebuilds
+            # any unprepared files under the same schedule transaction.
+            resumed = prepare_round(
+                snapshot_path, round_index=round_index, prep_token=expected_prep_token,
+                submission_generation=submission_generation,
+                expected_previous_generation=expected_previous_generation,
+                expected_pointer_version=expected_pointer_version,
+                prep_job_id=prep_job_id,
+                expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+                expected_previous_round_index=expected_previous_round_index,
+            )
+            activation_value = resumed.get("activation")
+            if not isinstance(activation_value, str):
+                raise ControlProtocolError("activation recovery resumed to a non-generation outcome")
+            return Path(activation_value)
         try:
             os.rename(staging, directory)
             parent_fd = os.open(directory.parent, os.O_RDONLY)
@@ -855,6 +885,8 @@ def _exact_target(
     snapshot: Mapping[str, object], *, round_index: int, submission_generation: str,
     prep_token: str, expected_previous_generation: str | None,
     expected_pointer_version: int | None, prep_job_id: str | None,
+    expected_previous_execution_plan_id: str | None = None,
+    expected_previous_round_index: int | None = None,
     validate_task_table: bool = True,
 ) -> tuple[AnalysisContract, DynamicExecutionContract, ActivationTarget]:
     analysis, execution = _load_contract_chain(snapshot, validate_task_table=validate_task_table)
@@ -868,6 +900,8 @@ def _exact_target(
         expected_pointer_version=(int(round_index) - 1 if expected_pointer_version is None else int(expected_pointer_version)),
         prep_job_id=str(prep_job_id or prep_token),
         prep_token=_validated_prep_token(prep_token),
+        expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+        expected_previous_round_index=expected_previous_round_index,
     )
     return analysis, execution, target
 
@@ -1011,6 +1045,12 @@ def _create_queue_index_tables(connection: sqlite3.Connection) -> None:
             {_QUEUE_KEY_SQL},
             PRIMARY KEY ({_QUEUE_KEY_SQL})
         ) WITHOUT ROWID;
+        CREATE TABLE terminal_payloads (
+            {_QUEUE_KEY_SQL},
+            status TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY ({_QUEUE_KEY_SQL})
+        ) WITHOUT ROWID;
         CREATE TABLE attempts (
             ingest_order INTEGER PRIMARY KEY,
             execution_plan_id TEXT NOT NULL,
@@ -1125,10 +1165,10 @@ def _index_queue_attempts(connection: sqlite3.Connection, output_dir: Path) -> N
 
 
 def _iter_sealed_wal_scans(
-    output_dir: Path, *, analysis_id: str,
+    output_dir: Path, *, analysis: AnalysisContract,
     frozen_frontier: Sequence[Mapping[str, object]] | None = None,
 ):
-    """Yield only WALs behind immutable closed markers, never live workers."""
+    """Yield only fully validated, shared-locked WALs behind closed markers."""
 
     root = Path(output_dir) / "executions"
     if frozen_frontier is None:
@@ -1139,64 +1179,111 @@ def _iter_sealed_wal_scans(
         markers = [Path(str(item["closed_path"])) for item in frozen_frontier]
     for marker in markers:
         if not marker.is_file():
-            raise ValueError(f"sealed generation marker is missing: {marker}")
-        closed = json.loads(marker.read_text(encoding="utf-8"))
-        if closed.get("analysis_id") != analysis_id:
-            raise ValueError("sealed generation from another analysis is present in output root")
-        inventory = closed.get("inventory")
-        if not isinstance(inventory, Mapping):
-            raise ValueError("sealed generation has no immutable inventory")
-        assignment = Path(str(inventory.get("assignment_path", "")))
-        index = Path(str(inventory.get("assignment_index_path", "")))
+            raise ControlProtocolError(f"sealed generation marker is missing: {marker}")
+        try:
+            closed = json.loads(marker.read_text(encoding="utf-8"))
+            activation = json.loads((marker.parent / "generation.activation.json").read_text(encoding="utf-8"))
+            target = ActivationTarget(
+                analysis_id=str(closed["analysis_id"]),
+                execution_plan_id=str(closed["execution_plan_id"]),
+                execution_contract_sha256=str(closed["execution_contract_sha256"]),
+                round_index=int(closed["round"]),
+                submission_generation=str(closed["submission_generation"]),
+                expected_previous_generation=(
+                    None if activation.get("expected_previous_generation_or_null") is None
+                    else str(activation["expected_previous_generation_or_null"])
+                ),
+                expected_pointer_version=int(activation["expected_pointer_version"]),
+                prep_job_id=str(closed["prep_job_id"]),
+                prep_token=str(closed["prep_token"]),
+                expected_previous_execution_plan_id=(
+                    None if activation.get("expected_previous_execution_plan_id_or_null") is None
+                    else str(activation["expected_previous_execution_plan_id_or_null"])
+                ),
+                expected_previous_round_index=(
+                    None if activation.get("expected_previous_round_or_null") is None
+                    else int(activation["expected_previous_round_or_null"])
+                ),
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ControlProtocolError("sealed generation control records are invalid") from exc
+        if target.analysis_id != analysis.analysis_id:
+            raise ControlProtocolError("sealed generation belongs to another analysis")
+        execution_file = Path(output_dir) / "execution-contracts" / f"{target.execution_plan_id}.json"
+        try:
+            execution_raw = execution_file.read_bytes()
+            execution_payload = json.loads(execution_raw.decode("utf-8"))
+            if execution_raw != canonical_json_bytes(execution_payload) + b"\n":
+                raise ContractError("sealed execution contract is not canonical")
+            contract = DynamicExecutionContract.from_payload(execution_payload)
+        except (OSError, ValueError, json.JSONDecodeError, ContractError) as exc:
+            raise ControlProtocolError("sealed generation execution contract is invalid") from exc
         if (
-            not assignment.is_file() or not index.is_file()
-            or inventory.get("assignment_sha256") != sha256_file(assignment)
-            or inventory.get("assignment_index_sha256") != sha256_file(index)
+            contract.sha256 != target.execution_contract_sha256
+            or contract.payload.get("analysis_id") != analysis.analysis_id
+            or contract.payload.get("analysis_contract_sha256") != analysis.sha256
         ):
-            raise ValueError("sealed generation assignment/index checksum mismatch")
-        workers = inventory.get("workers")
-        if not isinstance(workers, list):
-            raise ValueError("sealed generation inventory has no worker list")
-        known_wals = {
-            marker.parent / f"worker-{int(item['worker'])}.events.wal"
-            for item in workers if isinstance(item, Mapping) and item.get("wal_state") == "present"
-        }
-        actual_wals = set(marker.parent.glob("worker-*.events.wal"))
-        if actual_wals - known_wals:
-            raise ValueError("sealed generation has inventory-external WAL")
-        for item in sorted(workers, key=lambda value: int(value["worker"])):
-            if not isinstance(item, Mapping) or item.get("wal_state") != "present":
+            raise ControlProtocolError("sealed generation execution contract scope mismatch")
+        dispatch = classify_exact_afterany_target_read_only(Path(output_dir), target)
+        if dispatch.kind != "sealed-generation" or dispatch.closed_path is None:
+            raise ControlProtocolError("closed marker is not an exact sealed generation")
+        if dispatch.closed_path.resolve() != marker.resolve():
+            raise ControlProtocolError("sealed generation marker is not the exact control target")
+        if frozen_frontier is not None:
+            expected_sha = next((item.get("closed_sha256") for item in frozen_frontier if Path(str(item.get("closed_path"))).resolve() == marker.resolve()), None)
+            if expected_sha != sha256_file(marker):
+                raise ControlProtocolError("frozen sealed marker checksum mismatch")
+        inventory = closed.get("inventory")
+        if not isinstance(inventory, Mapping) or not isinstance(inventory.get("workers"), list):
+            raise ControlProtocolError("sealed generation has no immutable inventory")
+        assignment = Path(str(inventory["assignment_path"])); index = Path(str(inventory["assignment_index_path"]))
+        index_payload = json.loads(index.read_text(encoding="utf-8"))
+        groups = {int(group["worker"]): group for group in index_payload.get("row_groups", [])}
+        for item in sorted(inventory["workers"], key=lambda value: int(value["worker"])):
+            if not isinstance(item, Mapping):
+                raise ControlProtocolError("sealed worker inventory entry is invalid")
+            worker = int(item["worker"])
+            wal_path = marker.parent / f"worker-{worker}.events.wal"
+            if item.get("wal_state") == "absent":
+                # ``classify`` above invokes the canonical closed validator,
+                # including byte-level validation of an abandoned empty inode.
                 continue
-            wal_path = marker.parent / f"worker-{int(item['worker'])}.events.wal"
-            if not wal_path.is_file():
-                raise ValueError("sealed WAL inventory file is missing")
-            scan = scan_wal(wal_path)
-            if (
-                item.get("path") != str(wal_path.resolve())
-                or item.get("size") != wal_path.stat().st_size
-                or item.get("sha256") != sha256_file(wal_path)
-                or item.get("last_committed_offset") != scan.committed_offset
-                or item.get("last_commit_trailer_digest") != scan.trailer_digest
-                or item.get("uncommitted_tail") != scan.has_uncommitted_tail
-            ):
-                raise ValueError("sealed WAL inventory checksum/commit boundary mismatch")
-            if scan.identity is None:
-                raise ValueError("present sealed WAL has no committed identity")
-            if scan.identity.get("analysis_id") != analysis_id:
-                raise ValueError("WAL analysis identity mismatch")
+            if item.get("wal_state") != "present" or worker not in groups:
+                raise ControlProtocolError("sealed worker inventory scope is invalid")
+            group = groups[worker]
+            expected_identity = {
+                "wal_format": WAL_FORMAT, "analysis_id": target.analysis_id,
+                "execution_plan_id": target.execution_plan_id,
+                "execution_contract_sha256": target.execution_contract_sha256,
+                "round": target.round_index, "submission_generation": target.submission_generation,
+                "worker": worker, "workers": len(groups),
+                "assignment_path": str(assignment.resolve()), "assignment_sha256": inventory["assignment_sha256"],
+                "assignment_index_path": str(index.resolve()), "assignment_index_sha256": inventory["assignment_index_sha256"],
+                "assignment_row_group": worker, "assignment_row_count": int(group["row_count"]),
+                "assignment_row_group_digest": group["canonical_task_rows_sha256"],
+            }
+            scan = WorkerEventLog.open_shared(wal_path, expected_identity=expected_identity)
             yield marker, wal_path, scan
 
 
 def _index_queue_wals(
-    connection: sqlite3.Connection, output_dir: Path, *, analysis_id: str,
+    connection: sqlite3.Connection, output_dir: Path, *, analysis: AnalysisContract,
     frozen_frontier: Sequence[Mapping[str, object]] | None = None,
 ) -> None:
     """Stream durable WAL facts into the existing local-only SQLite index."""
 
     complete_insert = f"INSERT OR IGNORE INTO completed ({_QUEUE_KEY_SQL}) VALUES (?, ?, ?, ?, ?)"
+    terminal_insert = (
+        f"INSERT OR IGNORE INTO terminal_payloads ({_QUEUE_KEY_SQL}, status, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    terminal_select = (
+        "SELECT status, payload FROM terminal_payloads WHERE "
+        + " AND ".join(f'\"{column}\"=?' for column in ("model", "seed", "draw", "N", "K"))
+    )
     attempt_insert = "INSERT INTO attempts (execution_plan_id, round_index, submission_generation, worker_index, sequence, row_id) VALUES (?, ?, ?, ?, ?, ?)"
     for marker, wal_path, scan in _iter_sealed_wal_scans(
-        output_dir, analysis_id=analysis_id, frozen_frontier=frozen_frontier,
+        output_dir, analysis=analysis, frozen_frontier=frozen_frontier,
     ) or ():
         identity = scan.identity or {}
         try:
@@ -1235,6 +1322,17 @@ def _index_queue_wals(
                         raise ValueError("TASK_RESULT row ID/public key is outside the frozen task design")
                     status = public.get("status")
                     if status in TERMINAL_STATUSES:
+                        stable_payload = json.dumps(
+                            [public[column] for column in header],
+                            ensure_ascii=False, separators=(",", ":"),
+                        )
+                        inserted = connection.execute(
+                            terminal_insert, (*key, str(status), stable_payload),
+                        ).rowcount
+                        if not inserted:
+                            previous = connection.execute(terminal_select, key).fetchone()
+                            if previous != (str(status), stable_payload):
+                                raise ControlProtocolError("conflicting durable terminal RESULT payload")
                         connection.execute(complete_insert, key)
                     elif status == "failed":
                         connection.execute("INSERT OR IGNORE INTO failed_attempt_rows VALUES (?)", (row_id,))
@@ -1302,6 +1400,11 @@ def _classify_queue_attempts(connection: sqlite3.Connection) -> None:
             final_row_id = str(row_id)
     if prior_group is not None and final_row_id is not None:
         connection.execute("INSERT INTO final_attempts VALUES (?, ?, ?, ?, ?)", (*prior_group, final_row_id))
+    # ``attempts`` contains only durable START records without a matching
+    # RESULT/ABORTED.  The final one in each worker invocation is interrupted
+    # too; retaining it only for the too-long reducer previously hid it from
+    # verification diagnostics.
+    connection.execute("INSERT OR IGNORE INTO crashed_rows SELECT DISTINCT row_id FROM attempts")
     connection.execute("CREATE TABLE final_rounds (execution_plan_id TEXT, row_id TEXT, round_index INTEGER, PRIMARY KEY (execution_plan_id, row_id, round_index)) WITHOUT ROWID")
     connection.execute("INSERT INTO final_rounds SELECT DISTINCT execution_plan_id, row_id, round_index FROM final_attempts")
     connection.execute("""
@@ -1536,6 +1639,9 @@ def prepare_round(
     expected_previous_generation: str | None = None,
     expected_pointer_version: int | None = None,
     prep_job_id: str | None = None,
+    expected_previous_execution_plan_id: str | None = None,
+    expected_previous_round_index: int | None = None,
+    _schedule_locked: bool = False,
 ) -> dict[str, object]:
     """Prepare one immutable generation, or publish the exact todo=0 outcome."""
 
@@ -1561,12 +1667,44 @@ def prepare_round(
         expected_pointer_version=(int(round_index) - 1 if expected_pointer_version is None else int(expected_pointer_version)),
         prep_job_id=str(prep_job_id or prep_token),
         prep_token=prep_token,
+        expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+        expected_previous_round_index=expected_previous_round_index,
     )
+    # Keep one exclusive analysis schedule lease from the predecessor/history
+    # read through durable outcome publication or pointer CAS.  The recursive
+    # entry is deliberately private: it avoids a second fd/lock while keeping
+    # the public preparation API small and exact-target based.
+    if not _schedule_locked:
+        with schedule_transaction(output_dir):
+            return prepare_round(
+                snapshot_path, round_index=round_index, prep_token=prep_token,
+                tmp_dir=tmp_dir, submission_generation=target.submission_generation,
+                expected_previous_generation=expected_previous_generation,
+                expected_pointer_version=target.expected_pointer_version,
+                prep_job_id=target.prep_job_id, _schedule_locked=True,
+                expected_previous_execution_plan_id=target.expected_previous_execution_plan_id,
+                expected_previous_round_index=target.expected_previous_round_index,
+            )
     table_path = Path(str(payload["task_table"]))
-    predecessor_kind, _ = predecessor_gate(output_dir, target)
+    predecessor_kind, predecessor = predecessor_gate(output_dir, target)
+    if predecessor_kind == "no-generation":
+        assert isinstance(predecessor, tuple)
+        prior_outcome = predecessor[1]
+        assert isinstance(prior_outcome, Mapping)
+        raw_frontier = prior_outcome.get("sealed_history_frontier")
+        if not isinstance(raw_frontier, list):
+            raise ControlProtocolError("predecessor no-generation outcome lacks frozen history")
+        frozen_frontier = tuple(dict(item) for item in raw_frontier if isinstance(item, Mapping))
+        if len(frozen_frontier) != len(raw_frontier):
+            raise ControlProtocolError("predecessor no-generation outcome history is malformed")
+    else:
+        assert isinstance(predecessor, tuple)
+        frozen_frontier = frozen_history_from_closed(
+            output_dir, closed_sha256=predecessor[0], closed_path=predecessor[1],
+        )
     with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="preparation") as connection:
         _index_queue_expected_design(connection, table_path)
-        _index_queue_wals(connection, output_dir, analysis_id=analysis.analysis_id)
+        _index_queue_wals(connection, output_dir, analysis=analysis, frozen_frontier=frozen_frontier)
         _index_completed_rows(connection)
         _classify_queue_attempts(connection)
         if _queue_row_ids(connection, "aborted_rows"):
@@ -1587,19 +1725,31 @@ def prepare_round(
             # The intent is the first durable generation artefact.  Build all
             # mutable preparation output in a private sibling and promote it
             # only after every immutable child has been fsynced.
-            intent_file = publish_activation_intent(output_dir, target)
+            intent_file = publish_activation_intent(output_dir, target, lease_held=True)
             if directory.exists():
                 raise ControlProtocolError("generation directory already exists before immutable activation")
             stage_directory = directory.parent / f".{directory.name}.staging"
             try:
-                stage_directory.mkdir(parents=True)
-            except FileExistsError as exc:
-                raise ControlBusyError("activation staging directory requires recovery") from exc
+                stage_directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ControlBusyError("activation staging directory cannot be resumed") from exc
+            # The lease inode is a generation artefact, not an activation
+            # afterthought.  Create and sync it inside private staging before
+            # any prepared record can make this directory promotable.
+            lease_path = stage_directory / "generation.lease"
+            if lease_path.exists() and not lease_path.is_file():
+                raise ControlProtocolError("activation staging lease is not a regular file")
+            lease_descriptor = os.open(lease_path, os.O_RDWR | os.O_CREAT, 0o640)
+            try:
+                os.fsync(lease_descriptor)
+            finally:
+                os.close(lease_descriptor)
+            _fsync_directory(stage_directory)
             assignment, assigned_rows, row_groups = _write_assignment_from_queue_index(
                 stage_directory / "assignment.parquet", connection, workers=workers,
             )
     if todo_rows == 0:
-        receipt = publish_no_generation_outcome(output_dir, target)
+        receipt = publish_no_generation_outcome(output_dir, target, lease_held=True)
         return {
             "round": round_index, "todo_rows": 0, "no_generation": True,
             "prep_outcome": str(receipt), "submission_generation": target.submission_generation,
@@ -1686,6 +1836,7 @@ def prepare_round(
         output_dir, target, assignment_path=assignment, assignment_sha256=assignment_sha,
         assignment_index_path=index, assignment_index_sha256=index_sha, ready_path=ready,
         ready_sha256=ready_sha, prep_path=prep, prep_sha256=prep_sha, worker_count=workers,
+        lease_held=True,
     )
     stats["activation"] = str(activation)
     return stats
@@ -1696,6 +1847,8 @@ def verify_rounds(
     round_index: int | None = None, submission_generation: str | None = None,
     expected_prep_token: str | None = None, expected_previous_generation: str | None = None,
     expected_pointer_version: int | None = None, prep_job_id: str | None = None,
+    expected_previous_execution_plan_id: str | None = None,
+    expected_previous_round_index: int | None = None,
 ) -> dict[str, object]:
     """Verify only an exact sealed/outcome target and its frozen WAL history."""
 
@@ -1708,6 +1861,8 @@ def verify_rounds(
         payload, round_index=round_index, submission_generation=submission_generation,
         prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
         expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+        expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+        expected_previous_round_index=expected_previous_round_index,
     )
     output_dir = Path(str(payload["output_dir"])); table_path = Path(str(payload["task_table"]))
     dispatch = classify_exact_afterany_target_read_only(output_dir, target)
@@ -1722,7 +1877,7 @@ def verify_rounds(
     with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="verification") as connection:
         expected_model_keys = _index_queue_expected_design(connection, table_path)
         _index_queue_wals(
-            connection, output_dir, analysis_id=analysis.analysis_id,
+            connection, output_dir, analysis=analysis,
             frozen_frontier=frozen_frontier,
         )
         _index_completed_rows(connection); _classify_queue_attempts(connection)
@@ -1781,7 +1936,7 @@ def finalize_slice_shards(table_path: Path, worker_outputs: Iterable[Path], outp
         raise ValueError(f"merged output is missing {len(missing)} expected keys")
     output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=header or [])
+        writer = csv.DictWriter(handle, fieldnames=header or [], lineterminator="\n")
         writer.writeheader(); writer.writerows(seen[key] for key in sorted(seen))
     return output
 
@@ -1830,12 +1985,14 @@ def _resolve_finalization_tmp_base(
     return base
 
 
-def _estimated_finalization_temp_bytes(table_path: Path, shards: Sequence[Path]) -> int:
+def _estimated_finalization_temp_bytes(
+    table_path: Path, shards: Sequence[Path], *, sealed_wal_bytes: int = 0,
+) -> int:
     """Conservatively budget the expanded SQLite keys and result payloads."""
 
     try:
         task_bytes = Path(table_path).stat().st_size
-        shard_bytes = sum(path.stat().st_size for path in shards)
+        shard_bytes = sum(path.stat().st_size for path in shards) + int(sealed_wal_bytes)
     except OSError as exc:
         raise FinalizationError(f"cannot size finalization inputs: {exc}") from exc
     return max(
@@ -1847,9 +2004,9 @@ def _estimated_finalization_temp_bytes(table_path: Path, shards: Sequence[Path])
 
 
 def _preflight_finalization_space(
-    tmp_base: Path, table_path: Path, shards: Sequence[Path],
+    tmp_base: Path, table_path: Path, shards: Sequence[Path], *, sealed_wal_bytes: int = 0,
 ) -> tuple[int, int]:
-    estimated = _estimated_finalization_temp_bytes(table_path, shards)
+    estimated = _estimated_finalization_temp_bytes(table_path, shards, sealed_wal_bytes=sealed_wal_bytes)
     try:
         available = int(shutil.disk_usage(tmp_base).free)
     except OSError as exc:
@@ -1870,6 +2027,29 @@ def _temporary_directory_bytes(directory: Path) -> int:
         return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
     except OSError as exc:
         raise FinalizationError(f"cannot measure finalization temporary usage in {directory}: {exc}") from exc
+
+
+def _frozen_wal_inventory_bytes(frozen_frontier: Sequence[Mapping[str, object]]) -> int:
+    """Sum immutable inventory sizes before finalizer creates its first temp file."""
+
+    total = 0
+    for item in frozen_frontier:
+        try:
+            closed = json.loads(Path(str(item["closed_path"])).read_text(encoding="utf-8"))
+            workers = closed["inventory"]["workers"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise FinalizationError("cannot read frozen WAL inventory for temp preflight") from exc
+        if not isinstance(workers, list):
+            raise FinalizationError("frozen WAL inventory workers are invalid")
+        for worker in workers:
+            if not isinstance(worker, Mapping):
+                raise FinalizationError("frozen WAL inventory worker is invalid")
+            if worker.get("wal_state") == "present":
+                size = worker.get("size")
+                if not isinstance(size, int) or size < 0:
+                    raise FinalizationError("frozen WAL inventory size is invalid")
+                total += size
+    return total
 
 
 _SQL_KEY_COLUMNS = '"model", "seed", "draw", "N", "K"'
@@ -2073,7 +2253,7 @@ def _write_final_csv(
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
         with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as destination:
-            writer = csv.writer(destination)
+            writer = csv.writer(destination, lineterminator="\n")
             writer.writerow(header)
             for (payload,) in connection.execute(
                 f"SELECT payload FROM terminal ORDER BY {_SQL_KEY_COLUMNS}"
@@ -2087,7 +2267,7 @@ def _write_final_csv(
 
 
 def _write_sealed_wal_csv(
-    output: Path, *, history_root: Path, analysis_id: str,
+    output: Path, *, history_root: Path, analysis: AnalysisContract,
     frozen_frontier: Sequence[Mapping[str, object]],
 ) -> tuple[Path, int]:
     """Materialize one local temporary CSV from sealed WAL RESULT payloads."""
@@ -2098,7 +2278,7 @@ def _write_sealed_wal_csv(
     with target.open("w", newline="", encoding="utf-8") as handle:
         writer: csv.DictWriter | None = None
         for _, _, scan in _iter_sealed_wal_scans(
-            history_root, analysis_id=analysis_id, frozen_frontier=frozen_frontier,
+            history_root, analysis=analysis, frozen_frontier=frozen_frontier,
         ) or ():
             for record in scan.records:
                 if record.event_type != TASK_RESULT:
@@ -2122,6 +2302,8 @@ def finalize_snapshot(
     round_index: int | None = None, submission_generation: str | None = None,
     expected_prep_token: str | None = None, expected_previous_generation: str | None = None,
     expected_pointer_version: int | None = None, prep_job_id: str | None = None,
+    expected_previous_execution_plan_id: str | None = None,
+    expected_previous_round_index: int | None = None,
 ) -> dict[str, object]:
     """Stream, validate and atomically publish all dynamic worker shards.
 
@@ -2145,6 +2327,8 @@ def finalize_snapshot(
             snapshot, round_index=round_index, submission_generation=submission_generation,
             prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
             expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+            expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+            expected_previous_round_index=expected_previous_round_index,
         )
         dispatch = classify_exact_afterany_target_read_only(output_dir, target)
         if dispatch.kind not in {"sealed-generation", "no-generation"}:
@@ -2158,8 +2342,9 @@ def finalize_snapshot(
     output = Path(str(config["out"])).expanduser().resolve()
     shards: tuple[Path, ...] = tuple(sorted(output_dir.glob("round-*/worker-*.csv"))) if legacy else ()
     tmp_base = _resolve_finalization_tmp_base(snapshot, tmp_dir)
+    sealed_wal_bytes = 0 if legacy else _frozen_wal_inventory_bytes(frozen_frontier)
     available_bytes, estimated_bytes = _preflight_finalization_space(
-        tmp_base, table_path, shards,
+        tmp_base, table_path, shards, sealed_wal_bytes=sealed_wal_bytes,
     )
     run_dir = Path(tempfile.mkdtemp(prefix="nk-grid-finalize-", dir=tmp_base))
     database = run_dir / "index.sqlite"
@@ -2171,7 +2356,7 @@ def finalize_snapshot(
             assert analysis is not None
             wal_csv, wal_rows = _write_sealed_wal_csv(
                 run_dir / "sealed-results.csv", history_root=output_dir,
-                analysis_id=analysis.analysis_id, frozen_frontier=frozen_frontier,
+                analysis=analysis, frozen_frontier=frozen_frontier,
             )
             shards = (wal_csv,)
         connection = sqlite3.connect(database)
@@ -2196,6 +2381,7 @@ def finalize_snapshot(
             "backend": "sqlite_streaming",
             "input_shards": len(shards),
             "wal_result_rows": wal_rows,
+            "frozen_wal_input_bytes": sealed_wal_bytes,
             "analysis_id": None if analysis is None else analysis.analysis_id,
             "execution_plan_ids": [] if execution is None else [execution.execution_plan_id],
             "verification_receipt": None if target is None else str(verification_path(output_dir, target)),
@@ -2353,6 +2539,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--expected-prep-token")
     parser.add_argument("--generation")
     parser.add_argument("--expected-previous-generation")
+    parser.add_argument("--expected-previous-execution-plan-id")
+    parser.add_argument("--expected-previous-round", type=int)
     parser.add_argument("--expected-pointer-version", type=int)
     parser.add_argument("--prep-job-id")
     args = parser.parse_args(argv)
@@ -2365,6 +2553,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 tmp_dir=args.tmp_dir, submission_generation=args.generation,
                 expected_previous_generation=args.expected_previous_generation,
                 expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+                expected_previous_execution_plan_id=args.expected_previous_execution_plan_id,
+                expected_previous_round_index=args.expected_previous_round,
             ), sort_keys=True))
         elif args.command == "recover-activation":
             if args.round is None or args.expected_prep_token is None or args.generation is None:
@@ -2374,6 +2564,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 expected_prep_token=args.expected_prep_token,
                 expected_previous_generation=args.expected_previous_generation,
                 expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+                expected_previous_execution_plan_id=args.expected_previous_execution_plan_id,
+                expected_previous_round_index=args.expected_previous_round,
             ))
         elif args.command == "run":
             if args.round is None or args.worker_index is None or args.expected_prep_token is None or args.generation is None:
@@ -2383,6 +2575,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 expected_prep_token=args.expected_prep_token, submission_generation=args.generation,
                 expected_previous_generation=args.expected_previous_generation,
                 expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+                expected_previous_execution_plan_id=args.expected_previous_execution_plan_id,
+                expected_previous_round_index=args.expected_previous_round,
             ))
         elif args.command == "close":
             if args.round is None or args.expected_prep_token is None or args.generation is None:
@@ -2392,6 +2586,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 expected_prep_token=args.expected_prep_token,
                 expected_previous_generation=args.expected_previous_generation,
                 expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+                expected_previous_execution_plan_id=args.expected_previous_execution_plan_id,
+                expected_previous_round_index=args.expected_previous_round,
             ))
         elif args.command == "verify":
             legacy = "analysis_contract" not in _load_snapshot(args.snapshot)
@@ -2402,6 +2598,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 submission_generation=args.generation, expected_prep_token=args.expected_prep_token,
                 expected_previous_generation=args.expected_previous_generation,
                 expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+                expected_previous_execution_plan_id=args.expected_previous_execution_plan_id,
+                expected_previous_round_index=args.expected_previous_round,
             )
             print(json.dumps(result, sort_keys=True), flush=True)
             if legacy:
@@ -2433,8 +2631,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 submission_generation=args.generation, expected_prep_token=args.expected_prep_token,
                 expected_previous_generation=args.expected_previous_generation,
                 expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+                expected_previous_execution_plan_id=args.expected_previous_execution_plan_id,
+                expected_previous_round_index=args.expected_previous_round,
             ), sort_keys=True))
-    except (ControlProtocolError, WALProtocolError) as exc:
+    except json.JSONDecodeError:
+        # Preserve the public CLI's long-standing malformed-user-input
+        # behaviour; committed protocol artefacts are normalized below.
+        raise
+    except (ControlProtocolError, WALProtocolError, FinalizationError, ContractError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(PROTOCOL_EXIT_CODE) from exc
     except (ControlBusyError, WALBusyError) as exc:
