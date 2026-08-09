@@ -93,7 +93,7 @@ def _measure_prep(root: Path, row_count: int, *, workers: int) -> tuple[int, dic
     gc.collect()
     tracemalloc.start()
     try:
-        result = prepare_round(snapshot, round_index=1)
+        result = prepare_round(snapshot, round_index=1, prep_token="prep-1")
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()

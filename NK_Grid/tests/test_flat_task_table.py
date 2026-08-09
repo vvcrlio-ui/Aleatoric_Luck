@@ -106,6 +106,43 @@ def test_v1_table_is_rejected_fail_closed(tmp_path):
         read_task_table(path)
 
 
+def test_snapshot_freeze_rejects_v1_table_without_publishing(tmp_path):
+    table = tmp_path / "v1.parquet"
+    pq.write_table(pa.table({
+        "row_id": ["a"], "seed": [1], "draw": [0], "N": [10], "K": [1],
+        "group": ["imputed_core"], "models": [["ols"]],
+        "est_cost": [1.0], "chunk_id": [0],
+    }), table)
+    snapshot = tmp_path / "snapshot.json"
+    with pytest.raises(ValueError, match="v1"):
+        write_work_snapshot(
+            snapshot, table_path=table, panel="test", config=_config(tmp_path),
+            output_dir=tmp_path / "outputs", workers=1,
+        )
+    assert not snapshot.exists()
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra"))
+def test_snapshot_freeze_rejects_non_v2_schema_without_publishing(tmp_path, mutation):
+    columns = {
+        "row_id": ["a"], "seed": [1], "draw": [0], "N": [10], "K": [1],
+        "group": ["imputed_core"], "models": [["ols"]],
+    }
+    if mutation == "missing":
+        del columns["models"]
+    else:
+        columns["unexpected"] = ["value"]
+    table = tmp_path / f"{mutation}.parquet"
+    pq.write_table(pa.table(columns), table)
+    snapshot = tmp_path / "snapshot.json"
+    with pytest.raises(ValueError, match="schema"):
+        write_work_snapshot(
+            snapshot, table_path=table, panel="test", config=_config(tmp_path),
+            output_dir=tmp_path / "outputs", workers=1,
+        )
+    assert not snapshot.exists()
+
+
 @pytest.mark.parametrize("workers,row_count", [(1, 5), (2, 5), (7, 5), (4, 0)])
 def test_prepare_round_assigns_every_todo_row_by_index_modulo(tmp_path, workers, row_count):
     snapshot, rows = _snapshot(tmp_path, workers=workers, n_grid=(10, 12, 14, 16, 18), k_grid=(1,))
@@ -120,7 +157,7 @@ def test_prepare_round_assigns_every_todo_row_by_index_modulo(tmp_path, workers,
         with (output / "worker-0.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=["model", "seed", "draw", "N", "K", "status"]); writer.writeheader()
             for row in rows: writer.writerow({"model": "ols", "seed": row.seed, "draw": row.draw, "N": row.n_samples, "K": row.k_features, "status": "ok"})
-    stats = prepare_round(snapshot, round_index=1)
+    stats = prepare_round(snapshot, round_index=1, prep_token="prep-1")
     assignment = Path(stats["assignment"])
     groups = [read_row_group(assignment, index) for index in range(workers)]
     assigned = [row for group in groups for row in group]
@@ -148,7 +185,33 @@ def test_attempt_classification_keeps_crash_and_too_long_separate():
 def test_worker_refuses_an_unready_assignment_after_failed_prep(tmp_path):
     snapshot, _ = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
     with pytest.raises(RuntimeError, match="assignment is not ready.*prep may have failed"):
-        run_slice(snapshot, round_index=1, worker_index=0)
+        run_slice(snapshot, round_index=1, worker_index=0, expected_prep_token="prep-1")
+
+
+def test_worker_rejects_stale_ready_marker_from_prior_prep_job(tmp_path, monkeypatch):
+    snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
+    _write_all_terminal(snapshot, rows)
+    stats = prepare_round(snapshot, round_index=1, prep_token="old-prep-job")
+    marker = json.loads((Path(stats["assignment"]).parent / "assignment.ready.json").read_text())
+    assert marker["prep_token"] == "old-prep-job"
+    # The current token succeeds even for the todo=0 path.
+    run_slice(
+        snapshot, round_index=1, worker_index=0,
+        expected_prep_token="old-prep-job",
+    )
+    monkeypatch.setattr(
+        ft, "read_row_group",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("stale assignment was read before token validation")
+        ),
+    )
+    # Simulate a newly submitted prep dying in its shell before Python can
+    # replace the old marker. The dependent worker knows the new Slurm job ID.
+    with pytest.raises(RuntimeError, match="prep may have failed"):
+        run_slice(
+            snapshot, round_index=1, worker_index=0,
+            expected_prep_token="new-prep-job",
+        )
 
 
 def test_verify_cli_writes_complete_json_and_exits_zero(tmp_path, capsys):
@@ -227,7 +290,7 @@ def test_modulo_assignment_is_complete_balanced_and_not_contiguous(workers, row_
 
 def test_each_successful_cell_is_atomically_persisted_before_interruption(tmp_path, monkeypatch):
     snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10, 12, 14), k_grid=(1,))
-    prepare_round(snapshot, round_index=1)
+    prepare_round(snapshot, round_index=1, prep_token="prep-1")
     calls = 0
 
     def interrupted(config, **kwargs):
@@ -239,27 +302,27 @@ def test_each_successful_cell_is_atomically_persisted_before_interruption(tmp_pa
 
     monkeypatch.setattr(ft, "run_nk_grid", interrupted)
     with pytest.raises(RuntimeError, match="SIGKILL"):
-        run_slice(snapshot, round_index=1, worker_index=0)
+        run_slice(snapshot, round_index=1, worker_index=0, expected_prep_token="prep-1")
     shard = tmp_path / "outputs" / "round-1" / "worker-0.csv"
     persisted = list(csv.DictReader(shard.open(encoding="utf-8")))
     assert len(persisted) == 2
     assert json.loads(ft.manifest_path(shard).read_text())["completion"]["materialized_rows"] == 2
     assert all(not path.name.endswith(".tmp") for path in shard.parent.iterdir())
     monkeypatch.setattr(ft, "run_nk_grid", _fake_run)
-    run_slice(snapshot, round_index=1, worker_index=0)
+    run_slice(snapshot, round_index=1, worker_index=0, expected_prep_token="prep-1")
     assert len(list(csv.DictReader(shard.open(encoding="utf-8")))) == len(expected_model_keys(rows))
 
 
 def test_real_two_round_recovery_converges_to_one_shot_output(tmp_path, monkeypatch):
     snapshot, rows = _snapshot(tmp_path, workers=2)
     monkeypatch.setattr(ft, "run_nk_grid", _fake_run)
-    first = prepare_round(snapshot, round_index=1)
+    first = prepare_round(snapshot, round_index=1, prep_token="prep-1")
     assert first["todo_rows"] == len(rows)
-    run_slice(snapshot, round_index=1, worker_index=0)
-    second = prepare_round(snapshot, round_index=2)
+    run_slice(snapshot, round_index=1, worker_index=0, expected_prep_token="prep-1")
+    second = prepare_round(snapshot, round_index=2, prep_token="prep-2")
     assert second["todo_rows"] == len(rows) - len(read_row_group(Path(first["assignment"]), 0))
-    run_slice(snapshot, round_index=2, worker_index=0)
-    run_slice(snapshot, round_index=2, worker_index=1)
+    run_slice(snapshot, round_index=2, worker_index=0, expected_prep_token="prep-2")
+    run_slice(snapshot, round_index=2, worker_index=1, expected_prep_token="prep-2")
     result = verify_rounds(snapshot)
     assert result["missing_model_keys"] == 0
     merged = finalize_slice_shards(Path(json.loads(snapshot.read_text())["task_table"]), (tmp_path / "outputs" / "round-1" / "worker-0.csv", tmp_path / "outputs" / "round-2" / "worker-0.csv", tmp_path / "outputs" / "round-2" / "worker-1.csv"), tmp_path / "merged.csv")

@@ -10,6 +10,7 @@ PYTHON="${PYTHON:-$VENV/bin/python}"
 SNAPSHOT="${1:?Pass a frozen dynamic-work-queue snapshot}"
 ROUND="${2:?Pass the dynamic-work-queue round}"
 PREPARATION_TMP_DIR="${3:-}"
+: "${SLURM_JOB_ID:?Submit prep through Slurm so its job ID can bind the assignment}"
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
   command -v module >/dev/null 2>&1 || {
@@ -42,7 +43,7 @@ else
   fi
 fi
 echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND phase=prep"
-PREP_ARGS=(prep --snapshot "$SNAPSHOT" --round "$ROUND")
+PREP_ARGS=(prep --snapshot "$SNAPSHOT" --round "$ROUND" --prep-token "$SLURM_JOB_ID")
 if [ -n "$PREPARATION_TMP_DIR" ]; then
   PREP_ARGS+=(--tmp-dir "$PREPARATION_TMP_DIR")
 fi

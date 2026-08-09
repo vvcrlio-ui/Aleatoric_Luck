@@ -59,6 +59,7 @@ def test_dynamic_submitter_prints_the_entire_afterany_chain(tmp_path):
     assert len(lines) == 6  # prep/work for each round, then verify/finalize
     assert all("--cpus-per-task=1" in line for line in lines)
     assert "--dependency=afterany:dry-prep-1" in lines[1]
+    assert lines[1].endswith("/frozen/snapshot.json 1 dry-prep-1")
     assert "--dependency=afterany:dry-work-1" in lines[2]
     assert "--dependency=afterany:dry-work-2" in lines[-2]
     assert "--dependency=afterok:dry-verify" in lines[-1]
@@ -78,6 +79,7 @@ def test_dynamic_submitter_submits_every_link_and_writes_receipt(tmp_path):
     assert len(calls) == 6
     assert all("--parsable" in call for call in calls)
     assert all("afterany" in call for call in calls[1:-1])
+    assert calls[1].endswith("/frozen/snapshot.json 1 12345")
     assert "afterok:12345" in calls[-1]
     assert "afterany" not in calls[-1]
     receipt = next(tmp_path.glob("plan.submission-receipt-*.json"))
@@ -143,20 +145,50 @@ def test_dynamic_worker_uses_venv_python_and_skips_module_when_unset(tmp_path):
     fake_python = tmp_path / "python"
     _write_executable(fake_python, "#!/bin/bash\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nprintf '%s\\n' \"$*\" > \"$WORKER_ARGS\"\n")
     environment = _worker_environment(tmp_path, fake_python); environment["WORKER_ARGS"] = str(tmp_path / "args.txt")
-    completed = subprocess.run(["bash", str(WORKER), "/frozen/snapshot.json", "3"], env=environment, check=False, capture_output=True, text=True)
+    completed = subprocess.run(["bash", str(WORKER), "/frozen/snapshot.json", "3", "98765"], env=environment, check=False, capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
     assert f"python={fake_python}" in completed.stdout
     assert "--round 3 --worker-index 7" in (tmp_path / "args.txt").read_text()
+    assert "--expected-prep-token 98765" in (tmp_path / "args.txt").read_text()
 
 
 def test_dynamic_worker_reports_architecture_without_mislabeling_install(tmp_path):
     fake_python = tmp_path / "python"
     _write_executable(fake_python, "#!/bin/bash\necho 'Illegal instruction' >&2\nexit 132\n")
     environment = _worker_environment(tmp_path, fake_python); environment.update({"BMRC_GCC_ARCH_NATIVE": "native", "MODULE_CPU_TYPE": "cpu"})
-    completed = subprocess.run(["bash", str(WORKER), "/frozen/snapshot.json", "1"], env=environment, check=False, capture_output=True, text=True)
+    completed = subprocess.run(["bash", str(WORKER), "/frozen/snapshot.json", "1", "98765"], env=environment, check=False, capture_output=True, text=True)
     assert completed.returncode != 0
     assert "CPU architecture" in completed.stderr
     assert "not installed" not in completed.stderr
+
+
+def test_dynamic_prep_binds_marker_token_to_slurm_job_id(tmp_path):
+    fake_python = tmp_path / "python"
+    _write_executable(
+        fake_python,
+        '#!/bin/bash\nif [ "$1" = "-c" ]; then exit 0; fi\nprintf \'%s\\n\' "$@" > "$PREP_CAPTURE"\n',
+    )
+    args_path = tmp_path / "prep-args.txt"
+    environment = {
+        **os.environ,
+        "ENGINE_DIR": str(ENGINE_DIR),
+        "PYTHON": str(fake_python),
+        "VENV": str(tmp_path / "venv"),
+        "SLURM_JOB_ID": "24680",
+        "PREP_CAPTURE": str(args_path),
+    }
+    environment.pop("PYTHON_MODULE", None)
+    completed = subprocess.run(
+        ["bash", str(PREP), "/frozen/snapshot.json", "4"],
+        env=environment, check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    args = args_path.read_text(encoding="utf-8").splitlines()
+    assert args == [
+        "-m", "aleatoric_nk_grid.flat_task_table", "prep",
+        "--snapshot", "/frozen/snapshot.json", "--round", "4",
+        "--prep-token", "24680",
+    ]
 
 
 def test_dynamic_finalizer_calls_snapshot_cli_with_explicit_tmp_dir(tmp_path):

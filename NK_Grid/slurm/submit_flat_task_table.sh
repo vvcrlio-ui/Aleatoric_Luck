@@ -140,7 +140,7 @@ for ROUND in $(seq 1 "$ROUNDS"); do
     if [ -z "$PREVIOUS" ]; then RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"none"$'\n';
     else RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"afterany:$PREVIOUS"$'\n'; fi
   fi
-  submit_or_print "work-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREP_JOB" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" "$ROUND"
+  submit_or_print "work-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREP_JOB" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" "$ROUND" "$PREP_JOB"
   WORK_JOB="$JOB_ID"
   [ "$SUBMIT" = "0" ] || RECEIPT+="work-$ROUND"$'\t'"$WORK_JOB"$'\t'"afterany:$PREP_JOB"$'\n'
   PREVIOUS="$WORK_JOB"

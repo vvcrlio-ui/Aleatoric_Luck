@@ -11,6 +11,7 @@ VENV="${VENV:-$(cd "$ENGINE_DIR/.." && pwd)/.venv}"
 PYTHON="${PYTHON:-$VENV/bin/python}"
 SNAPSHOT="${1:?Pass a frozen dynamic-work-queue snapshot}"
 ROUND="${2:?Pass the dynamic-work-queue round}"
+EXPECTED_PREP_TOKEN="${3:?Pass the current prep Slurm job ID}"
 : "${SLURM_ARRAY_TASK_ID:?Submit this worker as a Slurm array job}"
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
@@ -47,4 +48,4 @@ fi
 # wasting cores while each dynamic worker runs exactly one cell group at a time.
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND worker=$SLURM_ARRAY_TASK_ID"
-"$PYTHON" -m aleatoric_nk_grid.flat_task_table run --snapshot "$SNAPSHOT" --round "$ROUND" --worker-index "$SLURM_ARRAY_TASK_ID"
+"$PYTHON" -m aleatoric_nk_grid.flat_task_table run --snapshot "$SNAPSHOT" --round "$ROUND" --worker-index "$SLURM_ARRAY_TASK_ID" --expected-prep-token "$EXPECTED_PREP_TOKEN"

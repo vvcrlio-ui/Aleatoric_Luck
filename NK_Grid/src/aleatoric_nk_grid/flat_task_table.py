@@ -179,14 +179,18 @@ def write_task_table(path: Path, rows: Sequence[TaskRow], *, rows_per_group: int
     return _write_table_groups(path, [ordered[start:start + rows_per_group] for start in range(0, len(ordered), rows_per_group)])
 
 
-def _task_rows(table: pa.Table) -> tuple[TaskRow, ...]:
-    payload = table.to_pydict()
+def _validate_task_table_columns(columns: Iterable[str]) -> None:
     required = set(TABLE_COLUMNS)
-    actual = set(payload)
+    actual = {str(column) for column in columns}
     if required != actual:
         if {"est_cost", "chunk_id"}.issubset(actual):
             raise ValueError("unsupported v1 flat-task table; rebuild a v2 dynamic-work-queue table")
         raise ValueError("unsupported flat-task table schema")
+
+
+def _task_rows(table: pa.Table) -> tuple[TaskRow, ...]:
+    payload = table.to_pydict()
+    _validate_task_table_columns(payload)
     return tuple(TaskRow(
         row_id=str(payload["row_id"][index]), seed=int(payload["seed"][index]),
         draw=int(payload["draw"][index]), n_samples=int(payload["N"][index]),
@@ -317,13 +321,19 @@ def _sweep_slice_temporaries(output: Path, *, round_index: int, worker_index: in
         manifest_path(temporary).unlink(missing_ok=True)
 
 
-def run_slice(snapshot_path: Path, *, round_index: int, worker_index: int) -> Path:
+def run_slice(
+    snapshot_path: Path, *, round_index: int, worker_index: int,
+    expected_prep_token: str,
+) -> Path:
     """Run one worker's fixed modulo slice, publishing after every cell group."""
     payload = _load_snapshot(snapshot_path)
     workers = int(payload["workers"])
     if not 0 <= worker_index < workers:
         raise IndexError("worker_index is outside the frozen worker count")
-    assignment = _require_ready_assignment(payload, round_index=round_index, workers=workers)
+    assignment = _require_ready_assignment(
+        payload, round_index=round_index, workers=workers,
+        expected_prep_token=_validated_prep_token(expected_prep_token),
+    )
     rows = read_row_group(assignment, worker_index)
     output = _round_directory(payload, round_index) / f"worker-{worker_index}.csv"
     _sweep_slice_temporaries(output, round_index=round_index, worker_index=worker_index)
@@ -797,8 +807,15 @@ def _assignment_ready_path(round_dir: Path) -> Path:
     return Path(round_dir) / "assignment.ready.json"
 
 
+def _validated_prep_token(value: str) -> str:
+    if not isinstance(value, str) or not value or any(character.isspace() for character in value):
+        raise ValueError("prep token must be a non-empty, whitespace-free string")
+    return value
+
+
 def _require_ready_assignment(
     snapshot: Mapping[str, object], *, round_index: int, workers: int,
+    expected_prep_token: str,
 ) -> Path:
     round_dir = _round_directory(snapshot, round_index)
     assignment = round_dir / "assignment.parquet"
@@ -814,6 +831,7 @@ def _require_ready_assignment(
         or int(payload.get("round", -1)) != round_index
         or int(payload.get("workers", -1)) != workers
         or payload.get("assignment") != str(assignment.resolve())
+        or payload.get("prep_token") != expected_prep_token
     ):
         raise RuntimeError(
             f"assignment readiness record is invalid for round {round_index}; prep may have failed: {ready}"
@@ -826,7 +844,8 @@ def _require_ready_assignment(
 
 
 def prepare_round(
-    snapshot_path: Path, *, round_index: int, tmp_dir: Path | None = None,
+    snapshot_path: Path, *, round_index: int, prep_token: str,
+    tmp_dir: Path | None = None,
 ) -> dict[str, object]:
     """Stream durable state into one modulo row group per worker.
 
@@ -835,6 +854,7 @@ def prepare_round(
     as that worker's assignment, preserving the frozen W-row-group contract.
     """
 
+    prep_token = _validated_prep_token(prep_token)
     payload = _load_snapshot(snapshot_path)
     output_dir = Path(str(payload["output_dir"])); workers = int(payload["workers"])
     table_path = Path(str(payload["task_table"]))
@@ -862,12 +882,13 @@ def prepare_round(
         "round": round_index, "workers": workers, "todo_rows": todo_rows,
         "assigned_rows": assigned_rows, "completed_model_keys": completed_model_keys,
         "crashed_row_ids": crashed, "too_long_row_ids": too_long,
-        "assignment": str(assignment),
+        "assignment": str(assignment), "prep_token": prep_token,
     }
     write_json_atomic(round_dir / "prep.json", stats)
     write_json_atomic(ready, {
         "format_version": TABLE_FORMAT_VERSION, "round": round_index,
         "workers": workers, "assignment": str(assignment.resolve()),
+        "prep_token": prep_token,
     })
     return stats
 
@@ -1369,7 +1390,9 @@ def write_work_snapshot(
         raise ValueError("workers must be positive")
     table = Path(table_path).resolve()
     try:
-        if pq.ParquetFile(table, memory_map=True).metadata.num_rows < 1:
+        source = pq.ParquetFile(table, memory_map=True)
+        _validate_task_table_columns(source.schema_arrow.names)
+        if source.metadata.num_rows < 1:
             raise ValueError("task table must contain at least one row")
     except ValueError:
         raise
@@ -1405,13 +1428,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--round", type=int)
     parser.add_argument("--worker-index", type=int)
     parser.add_argument("--tmp-dir", type=Path)
+    parser.add_argument("--prep-token")
+    parser.add_argument("--expected-prep-token")
     args = parser.parse_args(argv)
     if args.command == "prep":
-        if args.round is None: parser.error("prep requires --round")
-        print(json.dumps(prepare_round(args.snapshot, round_index=args.round, tmp_dir=args.tmp_dir), sort_keys=True))
+        if args.round is None or args.prep_token is None:
+            parser.error("prep requires --round and --prep-token")
+        print(json.dumps(prepare_round(
+            args.snapshot, round_index=args.round, prep_token=args.prep_token,
+            tmp_dir=args.tmp_dir,
+        ), sort_keys=True))
     elif args.command == "run":
-        if args.round is None or args.worker_index is None: parser.error("run requires --round and --worker-index")
-        print(run_slice(args.snapshot, round_index=args.round, worker_index=args.worker_index))
+        if args.round is None or args.worker_index is None or args.expected_prep_token is None:
+            parser.error("run requires --round, --worker-index, and --expected-prep-token")
+        print(run_slice(
+            args.snapshot, round_index=args.round, worker_index=args.worker_index,
+            expected_prep_token=args.expected_prep_token,
+        ))
     elif args.command == "verify":
         result = verify_rounds(args.snapshot, tmp_dir=args.tmp_dir)
         print(json.dumps(result, sort_keys=True), flush=True)
