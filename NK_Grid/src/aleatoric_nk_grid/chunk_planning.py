@@ -10,19 +10,27 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
 from .flat_task_table import (
     ResourceRequest,
     _config_from_json,
-    build_rows,
+    iter_task_rows_canonical,
     sbatch_resource_args,
-    write_task_table,
+    write_task_table_streaming,
     write_work_snapshot,
 )
-from .nk_grid import NKGridConfig
+from .execution_contract import (
+    AnalysisContract,
+    CellExecutionSpec,
+    DynamicExecutionContract,
+    immutable_json_bytes,
+)
+from .experiment import git_state
+from .nk_grid import LARGE_RUN_THRESHOLD, NKGridConfig, _validate_config, public_result_columns, resolve_repeat_pairs
 
 
 ENGINE_VALUE_BYTES = 8
@@ -35,8 +43,18 @@ def expanded_columns_for_k(schema_path: Path | str, k_features: int) -> int:
     if k_features < 1:
         raise ValueError("k_features must be positive")
     try:
-        document = json.loads(Path(schema_path).read_text(encoding="utf-8"))
-        sources = document["sources"]
+        document_path = Path(schema_path)
+        document = json.loads(document_path.read_text(encoding="utf-8"))
+        sources = document.get("sources")
+        if sources is None:
+            feature_universe = document.get("feature_universe", {})
+            definition = feature_universe.get("definition_file") if isinstance(feature_universe, Mapping) else None
+            if not isinstance(definition, str) or not definition:
+                raise KeyError("sources")
+            definition_path = Path(definition)
+            if not definition_path.is_absolute():
+                definition_path = document_path.parent / definition_path
+            sources = json.loads(definition_path.read_text(encoding="utf-8"))["sources"]
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid feature-universe schema: {schema_path}") from exc
     if not isinstance(sources, list) or k_features > len(sources):
@@ -135,10 +153,57 @@ def build_dynamic_plan(
 ) -> dict[str, object]:
     """Freeze one cost-free table, one worker request, and the round count."""
     cluster.validate()
-    rows = build_rows(config, n_grid=n_grid, k_grid=k_grid)
-    table = write_task_table(Path(table_path), rows, rows_per_group=cluster.rows_per_group)
-    max_n = max(row.n_samples for row in rows)
-    max_k = max(row.k_features for row in rows)
+    resolved_n_grid = tuple(sorted({int(value) for value in n_grid}))
+    resolved_k_grid = tuple(sorted({int(value) for value in k_grid}))
+    if not resolved_n_grid or not resolved_k_grid:
+        raise ValueError("dynamic planning requires non-empty resolved N and K grids")
+    worker_config = replace(
+        config,
+        n_jobs=1,
+        n_grid=resolved_n_grid,
+        k_grid=resolved_k_grid,
+        repeat_plan=tuple(resolve_repeat_pairs(config)),
+        n_seeds=1,
+        n_draws=1,
+    )
+    _validate_config(worker_config)
+    if worker_config.preset == "production" and git_state(Path(__file__).resolve().parents[2]).get("dirty") is not False:
+        raise ValueError("Production dynamic planning requires a clean Git worktree")
+    # ``CellExecutionSpec`` deliberately freezes dynamic workers at one model
+    # job; the local config remains untouched and keeps its original n_jobs.
+    # Production schemas/parameters live under the repository root.  Unit
+    # tests intentionally use temporary generic schemas, for which their
+    # common immutable-input root is still a strict relative-locator root.
+    repo_root = Path(os.path.commonpath([
+        str(Path(worker_config.schema).resolve()),
+        str(Path(worker_config.model_params).resolve()),
+    ])).resolve()
+    cell_spec = CellExecutionSpec.from_config(
+        worker_config,
+        repo_root=repo_root,
+        panel_id=panel,
+        resolved_n_grid=resolved_n_grid,
+        resolved_k_grid=resolved_k_grid,
+        resolved_repeat_plan=worker_config.repeat_plan,
+        model_n_jobs=1,
+    )
+    summary = write_task_table_streaming(
+        iter_task_rows_canonical(
+            worker_config,
+            n_grid=resolved_n_grid,
+            k_grid=resolved_k_grid,
+            repeat_pairs=worker_config.repeat_plan,
+        ),
+        Path(table_path),
+        rows_per_group=cluster.rows_per_group,
+    )
+    table = summary.path
+    if summary.expected_model_rows > LARGE_RUN_THRESHOLD and not worker_config.allow_large_run:
+        raise ValueError(
+            f"Large dynamic run requires --allow-large-run: {summary.expected_model_rows:,} model cells exceed {LARGE_RUN_THRESHOLD:,}"
+        )
+    max_n = summary.max_n
+    max_k = summary.max_k
     expanded = expanded_columns_for_k(config.schema, max_k)
     formula_bytes = peak_memory_bytes(max_n, expanded)
     request = ResourceRequest(
@@ -176,18 +241,63 @@ def build_dynamic_plan(
     preparation_tmp_dir = resolve_tmp_dir(cluster.preparation_tmp_dir)
     verification_tmp_dir = resolve_tmp_dir(cluster.verification_tmp_dir)
     finalization_tmp_dir = resolve_tmp_dir(cluster.finalization_tmp_dir)
+    schema_payload = json.loads(Path(worker_config.schema).read_text(encoding="utf-8"))
+    # Generic legacy test schemas omit ``task``; validated NK-grid input
+    # treats that omission as continuous/regression, so the immutable schema
+    # codec must make the same deterministic choice.
+    task = str(schema_payload.get("task") or "regression")
+    public_schema = public_result_columns(task)
+    analysis_contract = AnalysisContract.create(
+        cell_execution_spec=cell_spec,
+        task_design_digest=summary.task_design_digest,
+        expected_task_rows=summary.expected_task_rows,
+        expected_model_rows=summary.expected_model_rows,
+        public_result_schema=public_schema,
+        protocol_limits={"result_payload_max_bytes": 8 * 1024 * 1024},
+    )
+    output_root = Path(output_dir)
+    immutable_json_bytes(output_root / "analysis-contract.json", analysis_contract.to_payload())
+    execution_contract = DynamicExecutionContract.create(
+        analysis_contract=analysis_contract,
+        task_table_path=str(table.resolve()),
+        task_table_file_sha256=summary.task_table_file_sha256,
+        task_table_rows=summary.expected_task_rows,
+        worker_count=cluster.workers,
+        initial_round_count=cluster.rounds,
+        resources={
+            "worker": list(sbatch_resource_args(request)),
+            "prep": list(sbatch_resource_args(preparation_request)),
+            "verify": list(sbatch_resource_args(verification_request)),
+            "finalize": list(sbatch_resource_args(finalization_request)),
+            "tmp_dirs": {"prep": preparation_tmp_dir, "verify": verification_tmp_dir, "finalize": finalization_tmp_dir},
+        },
+        output_root=output_root,
+        wal_limits={"identity_max_bytes": 64 * 1024, "metadata_max_bytes": 4 * 1024, "payload_max_bytes": 8 * 1024 * 1024, "abort_max_bytes": 4 * 1024},
+    )
+    immutable_json_bytes(
+        output_root / "execution-contracts" / f"{execution_contract.execution_plan_id}.json",
+        execution_contract.to_payload(),
+    )
     snapshot = write_work_snapshot(
-        Path(snapshot_path), table_path=table, panel=panel, config=config,
+        Path(snapshot_path), table_path=table, panel=panel, config=worker_config,
         output_dir=Path(output_dir), workers=cluster.workers,
         preparation_tmp_dir=preparation_tmp_dir,
         verification_tmp_dir=verification_tmp_dir,
         finalization_tmp_dir=finalization_tmp_dir,
+        analysis_contract=analysis_contract,
+        execution_contract=execution_contract,
+        task_summary=summary,
+        cell_spec_repo_root=repo_root,
     )
     return {
         "format_version": 2,
         "task_table": str(table), "snapshot": str(snapshot), "workers": cluster.workers,
         "rounds": cluster.rounds,
-        "row_count": len(rows),
+        "row_count": summary.expected_task_rows,
+        "model_row_count": summary.expected_model_rows,
+        "analysis_id": analysis_contract.analysis_id,
+        "execution_plan_id": execution_contract.execution_plan_id,
+        "task_design_digest": summary.task_design_digest,
         "memory": {
             "max_n": max_n, "max_k": max_k, "expanded_columns": expanded,
             "formula_bytes": formula_bytes, "frame_copies": MEMORY_FRAME_COPIES,

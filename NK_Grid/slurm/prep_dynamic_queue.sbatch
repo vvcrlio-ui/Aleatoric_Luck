@@ -10,6 +10,9 @@ PYTHON="${PYTHON:-$VENV/bin/python}"
 SNAPSHOT="${1:?Pass a frozen dynamic-work-queue snapshot}"
 ROUND="${2:?Pass the dynamic-work-queue round}"
 PREPARATION_TMP_DIR="${3:-}"
+GENERATION="${4:?Pass frozen submission generation}"
+EXPECTED_PREVIOUS="${5:-}"
+EXPECTED_POINTER_VERSION="${6:?Pass frozen pointer version}"
 : "${SLURM_JOB_ID:?Submit prep through Slurm so its job ID can bind the assignment}"
 
 if [ -n "${PYTHON_MODULE:-}" ]; then
@@ -42,8 +45,9 @@ else
     exit 1
   fi
 fi
-echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND phase=prep"
-PREP_ARGS=(prep --snapshot "$SNAPSHOT" --round "$ROUND" --prep-token "$SLURM_JOB_ID")
+echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND generation=$GENERATION phase=prep"
+PREP_ARGS=(prep --snapshot "$SNAPSHOT" --round "$ROUND" --prep-token "$SLURM_JOB_ID" --prep-job-id "$SLURM_JOB_ID" --generation "$GENERATION" --expected-pointer-version "$EXPECTED_POINTER_VERSION")
+if [ -n "$EXPECTED_PREVIOUS" ]; then PREP_ARGS+=(--expected-previous-generation "$EXPECTED_PREVIOUS"); fi
 if [ -n "$PREPARATION_TMP_DIR" ]; then
   PREP_ARGS+=(--tmp-dir "$PREPARATION_TMP_DIR")
 fi

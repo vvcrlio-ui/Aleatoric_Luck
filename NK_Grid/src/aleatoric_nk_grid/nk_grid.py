@@ -53,6 +53,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[2]
 
 from .evaluation import r2_against_training_mean
+from .execution_contract import CellExecutionSpec, ContractError
 from .experiment import (
     CHECKPOINT_COMPACTION_LOOSE_PARTS,
     CHECKPOINT_KEY_COLUMNS,
@@ -184,6 +185,34 @@ CLASSIFICATION_METRIC_COLUMNS = (
     "mcfadden_pseudo_r2",
 )
 
+BASE_RESULT_COLUMNS = (
+    "dataset", "outcome", "model", "seed", "draw", "N", "K",
+    "split_random_state", "n_train_total", "n_test_total", "n_features_total",
+    "K_expanded", "n_expanded_features_total", "K_unobserved",
+)
+DIAGNOSTIC_RESULT_COLUMNS = (
+    "K_varying", "constant_prediction", "underdetermined", "converged",
+    "_fit_seconds", "_best_rounds", "_preprocess_seconds", "_preprocess_computed",
+    "_preprocess_vectorized", "_slice_seconds", "_cell_wall_seconds", "_peak_rss_bytes",
+)
+
+
+def public_result_columns(task: str) -> tuple[str, ...]:
+    """Return the byte-serialized result schema for one immutable analysis."""
+
+    if task == "regression":
+        metrics = METRIC_COLUMNS
+        task_column: tuple[str, ...] = ()
+    elif task == "classification":
+        metrics = CLASSIFICATION_METRIC_COLUMNS
+        task_column = ("task",)
+    else:
+        raise ValueError(f"unsupported NK-grid task {task!r}")
+    # ``outcome`` originates in metadata and is then overwritten by the base
+    # row without changing insertion order.  Deduplicate exactly as Python's
+    # dictionary expansion does before CSV serialization.
+    return tuple(dict.fromkeys((*ROW_METADATA_FIELDS, *BASE_RESULT_COLUMNS, *metrics, *DIAGNOSTIC_RESULT_COLUMNS, *task_column, "status", "error")))
+
 @dataclass(frozen=True)
 class NKGridConfig:
     schema: Path
@@ -232,6 +261,70 @@ class SplitData:
 class DrawOrders:
     row_index: np.ndarray
     feature_names: np.ndarray
+
+
+@dataclass(frozen=True)
+class SplitIndexes:
+    """A split's stable row labels, not a copied predictor DataFrame."""
+
+    train_index: pd.Index
+    test_index: pd.Index
+    external_test: bool
+
+
+class SplitIndexManager:
+    """Lazily cache only train/test labels for each seed.
+
+    The old ``split_frame`` remains public for checkpoint compatibility.  New
+    sessions use this class, whose internal-random construction is the same
+    sklearn call/order as ``split_frame`` but never keeps seed × predictor
+    frames alive.
+    """
+
+    def __init__(
+        self,
+        *,
+        frame: pd.DataFrame,
+        external_frame: pd.DataFrame | None,
+        predictors: Sequence[str],
+        outcome: str,
+        test_size: float,
+        task: str,
+    ) -> None:
+        self.frame = frame
+        self.external_frame = external_frame
+        self.predictors = tuple(str(value) for value in predictors)
+        self.outcome = str(outcome)
+        self.test_size = float(test_size)
+        self.task = str(task)
+        self._cache: dict[int, SplitIndexes] = {}
+        if external_frame is not None:
+            train_complete = frame.dropna(subset=[outcome])
+            test_complete = external_frame.dropna(subset=[outcome])
+            self._external = SplitIndexes(
+                train_index=train_complete.index.copy(),
+                test_index=test_complete.index.copy(),
+                external_test=True,
+            )
+        else:
+            self._external = None
+
+    def for_seed(self, seed: int) -> SplitIndexes:
+        if self._external is not None:
+            return self._external
+        frozen = self._cache.get(int(seed))
+        if frozen is not None:
+            return frozen
+        target = self.frame[self.outcome]
+        train_index, test_index = train_test_split(
+            self.frame.index,
+            test_size=self.test_size,
+            random_state=int(seed),
+            stratify=target if self.task == "classification" else None,
+        )
+        frozen = SplitIndexes(pd.Index(train_index), pd.Index(test_index), False)
+        self._cache[int(seed)] = frozen
+        return frozen
 
 
 def resolve_repeat_pairs(config: NKGridConfig) -> tuple[tuple[int, int], ...]:
@@ -1414,6 +1507,329 @@ def _fit_predict_model_cell(
     }
 
 
+class NKGridExecutionSession:
+    """One validated input/model/native-runner lifetime for many cell groups.
+
+    It has no output-path, manifest, checkpoint, lock, assignment, round, or
+    generation knowledge.  The local orchestrator and dynamic WAL worker both
+    use ``run_cell_group`` as their only numerical primitive.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: NKGridConfig,
+        spec: CellExecutionSpec | None,
+        loaded: LoadedInput,
+        source_definitions: Sequence[SourceGroup],
+        selected_model_params: Mapping[str, Mapping[str, object]],
+        algorithm_version: str,
+    ) -> None:
+        self.config = config
+        self.spec = spec
+        self.loaded = loaded
+        self.source_definitions = tuple(source_definitions)
+        self.schema = loaded.schema
+        self.task = self.schema.task
+        self.dataset = self.schema.dataset
+        self.data_path = self.schema.table
+        self.test_path = self.schema.test_table
+        self.frame = loaded.train
+        self.external_frame = loaded.test
+        self.predictors = tuple(loaded.predictors)
+        self.feature_units = tuple(group.name for group in self.source_definitions)
+        self.feature_groups = {group.name: tuple(group.features) for group in self.source_definitions}
+        self.groups_by_name = {group.name: group for group in self.source_definitions}
+        self.selected_model_params = dict(selected_model_params)
+        self.algorithm_version = algorithm_version
+        self.split_manager = SplitIndexManager(
+            frame=self.frame,
+            external_frame=self.external_frame if self.schema.split_mode == "external_test" else None,
+            predictors=self.predictors,
+            outcome=config.outcome,
+            test_size=config.test_size,
+            task=self.task,
+        )
+        self.repeat_pairs = resolve_repeat_pairs(config)
+        first_split = self.split_manager.for_seed(self.repeat_pairs[0][0])
+        self.n_grid = (
+            np.asarray(config.n_grid, dtype=int)
+            if config.n_grid else log2_size_grid(
+                len(first_split.train_index), config.n_sizes_n, config.max_n, min_size=config.min_n,
+            )
+        )
+        self.k_grid = (
+            np.asarray(config.k_grid, dtype=int)
+            if config.k_grid else log2_size_grid(len(self.feature_units), config.n_sizes_k, config.max_k)
+        )
+        self.semantic_contract = {
+            "kind": "nk_grid" if self.task == "regression" else "nk_grid_classification",
+            "algorithm_version": algorithm_version,
+            "dataset": self.dataset,
+            "outcome": config.outcome,
+            "task": self.task,
+            "split_mode": self.schema.split_mode,
+            "split_seed": config.seed,
+            "test_size": config.test_size if self.schema.split_mode == "internal_random" else None,
+            "predictors": list(self.predictors),
+            "model": list(config.models),
+            "resolved_model_params": resolved_model_params(self.selected_model_params),
+            "imputation": dict(self.schema.imputation),
+            "feature_universe": dict(self.schema.semantic_contract.get("feature_universe", {})),
+            "environment_overrides": model_run_settings(config.models),
+        }
+        self.metadata = build_experiment_metadata(
+            kind="nk_grid" if self.task == "regression" else "nk_grid_classification",
+            experiment_id=config.experiment_id,
+            data_version=config.data_version,
+            model_spec_version=config.model_spec_version,
+            outcome=config.outcome,
+            test_size=config.test_size,
+            split_seed=config.seed,
+            algorithm_version=algorithm_version,
+            semantic_contract=self.semantic_contract,
+            split_mode=self.schema.split_mode,
+        )
+        self.row_metadata = {field: self.metadata[field] for field in ROW_METADATA_FIELDS}
+        self._draw_orders: dict[tuple[int, int], DrawOrders] = {}
+        self._runner = IsolatedProcessRunner(
+            max_attempts=config.native_process_max_attempts,
+            timeout_seconds=config.native_process_timeout_seconds,
+        )
+        self._closed = False
+        self._validate_spec()
+
+    @classmethod
+    def _open_config(cls, config: NKGridConfig, *, spec: CellExecutionSpec | None = None) -> "NKGridExecutionSession":
+        _validate_config(config)
+        raw_loaded = load_input(config.schema, config.outcome)
+        if raw_loaded.schema.split_mode == "internal_random" and not 0.0 < config.test_size < 1.0:
+            raise ValueError("test_size must be strictly between 0 and 1")
+        loaded, source_definitions = validate_input(
+            raw_loaded, config.outcome, models=config.models, min_n=config.min_n,
+            test_size=config.test_size, seed=config.seed,
+        )
+        selected_model_params = load_model_params(config.model_params, task=loaded.schema.task, models=config.models)
+        return cls(
+            config=config, spec=spec, loaded=loaded, source_definitions=source_definitions,
+            selected_model_params=selected_model_params,
+            algorithm_version=load_algorithm_version(config.model_params),
+        )
+
+    @classmethod
+    def open(cls, spec: CellExecutionSpec, *, repo_root: Path = ROOT) -> "NKGridExecutionSession":
+        """Open a session from the session-only canonical execution spec."""
+
+        spec = CellExecutionSpec.from_payload(spec.payload)
+        schema, model_params = spec.resolve_inputs(repo_root=repo_root)
+        value = spec.payload
+        config = NKGridConfig(
+            schema=schema,
+            out=Path(repo_root) / ".nk-grid-session-no-output.csv",
+            outcome=str(value["outcome"]),
+            models=tuple(str(item) for item in value["models"]),
+            seed=int(value["split_seed"]),
+            test_size=float(value["test_size"]),
+            n_seeds=1,
+            n_draws=1,
+            n_sizes_n=len(value["resolved_n_grid"]),
+            n_sizes_k=len(value["resolved_k_grid"]),
+            max_n=max(int(item) for item in value["resolved_n_grid"]),
+            max_k=max(int(item) for item in value["resolved_k_grid"]),
+            batch_size=1,
+            n_jobs=int(value["model_n_jobs"]),
+            min_n=int(value["min_n"]),
+            model_params=model_params,
+            native_process_max_attempts=int(value["native_process_max_attempts"]),
+            native_process_timeout_seconds=float(value["native_process_timeout_seconds"]),
+            preset=value.get("preset") if isinstance(value.get("preset"), str) else None,
+            experiment_id=str(value["experiment_id"]),
+            data_version=str(value["data_version"]),
+            model_spec_version=str(value["model_spec_version"]),
+            repeat_plan=tuple((int(pair[0]), int(pair[1])) for pair in value["resolved_repeat_plan"]),
+            n_grid=tuple(int(item) for item in value["resolved_n_grid"]),
+            k_grid=tuple(int(item) for item in value["resolved_k_grid"]),
+        )
+        return cls._open_config(config, spec=spec)
+
+    @classmethod
+    def open_from_config(cls, config: NKGridConfig) -> "NKGridExecutionSession":
+        """Local full-run entrypoint; no dynamic field is manufactured."""
+
+        return cls._open_config(config)
+
+    def _validate_spec(self) -> None:
+        if self.spec is None:
+            return
+        value = self.spec.payload
+        if tuple(int(item) for item in value["resolved_n_grid"]) != tuple(int(item) for item in self.n_grid):
+            raise ContractError("CellExecutionSpec resolved N grid does not match validated input")
+        if tuple(int(item) for item in value["resolved_k_grid"]) != tuple(int(item) for item in self.k_grid):
+            raise ContractError("CellExecutionSpec resolved K grid does not match validated input")
+        if tuple((int(pair[0]), int(pair[1])) for pair in value["resolved_repeat_plan"]) != self.repeat_pairs:
+            raise ContractError("CellExecutionSpec repeat plan does not match validated configuration")
+        if int(value["model_n_jobs"]) != int(self.config.n_jobs):
+            raise ContractError("CellExecutionSpec model_n_jobs does not match training configuration")
+        expected_algorithm = value.get("algorithm_version")
+        if expected_algorithm is not None and expected_algorithm != self.algorithm_version:
+            raise ContractError("CellExecutionSpec algorithm version mismatch")
+        expected_params = value.get("resolved_model_params")
+        if expected_params and expected_params != resolved_model_params(self.selected_model_params):
+            raise ContractError("CellExecutionSpec model parameter mismatch")
+        expected_commit = value.get("git_commit")
+        if expected_commit is not None and git_state(ROOT).get("commit") != expected_commit:
+            raise ContractError("CellExecutionSpec git commit mismatch")
+
+    def _orders(self, seed: int, draw: int, train_index: pd.Index) -> DrawOrders:
+        key = (int(seed), int(draw))
+        existing = self._draw_orders.get(key)
+        if existing is None:
+            if len(self._draw_orders) >= 8:
+                self._draw_orders.pop(next(iter(self._draw_orders)))
+            existing = _freeze_draw_orders(draw_orders(train_index, self.feature_units, seed=seed, draw=draw))
+            self._draw_orders[key] = existing
+        return existing
+
+    def run_cell_group(
+        self, *, seed: int, draw: int, n_samples: int, k_features: int, models: Sequence[str],
+    ) -> list[dict[str, object]]:
+        """Run one frozen cell group without creating any persistence artefact."""
+
+        if self._closed:
+            raise RuntimeError("NKGridExecutionSession is closed")
+        frozen_models = tuple(str(model) for model in models)
+        if not frozen_models or len(frozen_models) != len(set(frozen_models)) or not set(frozen_models).issubset(self.config.models):
+            raise ValueError("cell group models must be a unique subset of the frozen model list")
+        if (int(seed), int(draw)) not in self.repeat_pairs:
+            raise ValueError("cell group seed/draw is outside the frozen repeat plan")
+        if int(n_samples) not in set(map(int, self.n_grid)) or int(k_features) not in set(map(int, self.k_grid)):
+            raise ValueError("cell group N/K is outside the frozen resolved grid")
+        indexes = self.split_manager.for_seed(int(seed))
+        orders = self._orders(int(seed), int(draw), indexes.train_index)
+        selected_rows = orders.row_index[: int(n_samples)]
+        selected_units = [str(unit) for unit in orders.feature_names[: int(k_features)]]
+        selected_cols = [feature for unit in selected_units for feature in self.feature_groups[unit]]
+        selected_groups = [self.groups_by_name[unit] for unit in selected_units]
+        test_frame = self.external_frame if indexes.external_test else self.frame
+        if test_frame is None:
+            raise RuntimeError("validated external test frame is missing")
+        started = time.perf_counter()
+        try:
+            X_sub_raw = self.frame.loc[selected_rows, selected_cols]
+            y_sub = self.frame.loc[selected_rows, self.config.outcome]
+            X_test_raw = test_frame.loc[indexes.test_index, selected_cols]
+            y_test = test_frame.loc[indexes.test_index, self.config.outcome]
+        except Exception as exc:
+            return self._slice_failure_rows(
+                exc, frozen_models, seed=int(seed), draw=int(draw), n_samples=int(n_samples),
+                k_features=int(k_features), slice_seconds=time.perf_counter() - started,
+                n_train_total=len(indexes.train_index), n_test_total=len(indexes.test_index),
+            )
+        slice_seconds = time.perf_counter() - started
+        unobserved = count_unobserved_sources(X_sub_raw, selected_groups)
+        prepared: dict[str, object] = {}; preparation_errors: dict[str, Exception] = {}
+        try:
+            rows: list[dict[str, object]] = []
+            for position, model_name in enumerate(frozen_models):
+                rows.append(self._run_model(
+                    model_name=model_name, position=position, seed=int(seed), draw=int(draw),
+                    n_samples=int(n_samples), k_features=int(k_features), X_sub_raw=X_sub_raw,
+                    y_sub=y_sub, X_test_raw=X_test_raw, y_test=y_test, selected_groups=selected_groups,
+                    unobserved=unobserved, slice_seconds=slice_seconds, prepared=prepared,
+                    preparation_errors=preparation_errors, n_train_total=len(indexes.train_index),
+                    n_test_total=len(indexes.test_index),
+                ))
+            return rows
+        finally:
+            prepared.clear(); preparation_errors.clear()
+
+    def _base(self, *, model_name: str, seed: int, draw: int, n_samples: int, k_features: int, n_train_total: int, n_test_total: int) -> dict[str, object]:
+        return _base_row(
+            dataset=self.dataset, outcome=self.config.outcome, model_name=model_name,
+            seed=seed, draw=draw, n_samples=n_samples, k_features=k_features,
+            n_train_total=n_train_total, n_test_total=n_test_total,
+            n_features_total=len(self.feature_units),
+            k_expanded=0, n_expanded_features_total=len(self.predictors),
+        )
+
+    def _slice_failure_rows(self, exc: Exception, models: Sequence[str], *, seed: int, draw: int, n_samples: int, k_features: int, slice_seconds: float, n_train_total: int, n_test_total: int) -> list[dict[str, object]]:
+        result: list[dict[str, object]] = []
+        metrics = _empty_metrics() if self.task == "regression" else _empty_classification_metrics()
+        for position, model_name in enumerate(models):
+            row = self._base(model_name=model_name, seed=seed, draw=draw, n_samples=n_samples, k_features=k_features, n_train_total=n_train_total, n_test_total=n_test_total)
+            diagnostics = _empty_diagnostics(); diagnostics["_slice_seconds"] = slice_seconds if position == 0 else 0.0; diagnostics["_peak_rss_bytes"] = _process_peak_rss_bytes()
+            result.append(add_metadata({**row, **metrics, **diagnostics, **({"task": self.task} if self.task == "classification" else {}), "status": "failed", "error": f"{type(exc).__name__}: {exc}"}, self.row_metadata))
+        return result
+
+    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> dict[str, object]:
+        model_started = time.perf_counter()
+        row = self._base(model_name=model_name, seed=seed, draw=draw, n_samples=n_samples, k_features=k_features, n_train_total=n_train_total, n_test_total=n_test_total)
+        row["K_expanded"] = X_sub_raw.shape[1]; row["K_unobserved"] = unobserved
+        diagnostics = _empty_diagnostics(); diagnostics["_slice_seconds"] = slice_seconds if position == 0 else 0.0
+        empty_metrics = _empty_metrics() if self.task == "regression" else _empty_classification_metrics()
+
+        def result(metrics: dict[str, object], *, status: str, error: str, peak: int | None = None) -> dict[str, object]:
+            diagnostics["_cell_wall_seconds"] = time.perf_counter() - model_started
+            diagnostics["_peak_rss_bytes"] = _process_peak_rss_bytes() if peak is None else int(peak)
+            return add_metadata({**row, **metrics, **diagnostics, **({"task": self.task} if self.task == "classification" else {}), "status": status, "error": error}, self.row_metadata)
+
+        if unobserved == k_features:
+            return result(empty_metrics, status="skipped", error="all_selected_sources_unobserved")
+        if self.task == "regression" and model_name in REGRESSION_CV_MIN_N and n_samples < REGRESSION_CV_MIN_N[model_name]:
+            return result(empty_metrics, status="skipped", error=f"below minimum N for {model_name}'s internal CV (requires N>={REGRESSION_CV_MIN_N[model_name]})")
+        try:
+            mode = "passthrough" if self.schema.imputation["model_overrides"].get(model_name) == "passthrough" else "imputed"
+            if mode in preparation_errors:
+                raise preparation_errors[mode]
+            if mode not in prepared:
+                preprocess_started = time.perf_counter(); diagnostics["_preprocess_computed"] = True
+                try:
+                    prepared_cell = preprocess_cell(X_sub_raw, X_test_raw, selected_groups, self.schema.imputation, model_name=model_name)
+                except Exception as exc:
+                    preparation_errors[mode] = exc; raise
+                finally:
+                    diagnostics["_preprocess_seconds"] = time.perf_counter() - preprocess_started
+                if prepared_cell.K_unobserved != unobserved:
+                    mismatch = RuntimeError("preprocessing changed the precomputed K_unobserved count"); preparation_errors[mode] = mismatch; raise mismatch
+                prepared[mode] = prepared_cell
+            prepared_cell = prepared[mode]
+            diagnostics["_preprocess_vectorized"] = bool(prepared_cell.X_train.attrs.get("_preprocess_vectorized", False))
+            X_prepared = prepared_cell.X_train; X_test_prepared = prepared_cell.X_test
+            diagnostics["K_varying"] = int(sum(X_prepared.loc[:, list(group.features)].nunique(dropna=True).gt(1).any() for group in selected_groups))
+            diagnostics["underdetermined"] = bool(self.task == "regression" and model_name == "ols" and _ols_is_underdetermined(X_prepared))
+            if self.task == "classification" and len(np.unique(y_sub)) < 2:
+                return result(empty_metrics, status="skipped", error="single-class training sample for classification")
+            if self.task == "classification" and model_name == "super_learner" and int(y_sub.value_counts().min()) < 2:
+                return result(empty_metrics, status="skipped", error="below minimum per-class count for super_learner CV")
+            if model_name in {"lightgbm", "super_learner"}:
+                log_progress(f"cell starting model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features}")
+            X_fit = X_prepared if model_name in SERIAL_OUTER_MODELS else X_prepared.copy(deep=True)
+            X_test_fit = X_test_prepared if model_name in SERIAL_OUTER_MODELS else X_test_prepared.copy(deep=True)
+            arguments = {"model_name": model_name, "model_seed": _model_seed(seed, draw, n_samples, k_features), "model_n_jobs": self.config.n_jobs if model_name == "super_learner" else 1, "task": self.task, "params": self.selected_model_params[model_name], "X_train": X_fit, "y_train": y_sub, "X_test": X_test_fit}
+            if model_name in SERIAL_OUTER_MODELS:
+                fit = _run_native_model_cell_locked(self._runner, fit_arguments=arguments, on_native_crash=lambda attempt, exc: log_progress(f"native subprocess crashed attempt={attempt}/{self.config.native_process_max_attempts} model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features} error={exc}"), on_native_timeout=lambda attempt, exc: log_progress(f"native subprocess timed out attempt={attempt}/{self.config.native_process_max_attempts} model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features} error={exc}"))
+            else:
+                fit = _fit_predict_model_cell(**arguments)
+            predictions = np.asarray(fit["predictions"])
+            diagnostics["_fit_seconds"] = fit["fit_seconds"]; diagnostics["_best_rounds"] = fit["best_rounds"]; diagnostics["converged"] = fit["converged"]; diagnostics["constant_prediction"] = _constant_prediction(predictions)
+            metrics = compute_classification_metrics(y_test, predictions, y_sub) if self.task == "classification" else compute_regression_metrics(y_test, predictions, y_sub)
+            return result(metrics, status="ok", error="", peak=int(fit["peak_rss_bytes"]))
+        except Exception as exc:
+            return result(empty_metrics, status="failed", error=f"{type(exc).__name__}: {exc}")
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._runner.close()
+            self._draw_orders.clear()
+
+    def __enter__(self) -> "NKGridExecutionSession":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
 def run_nk_grid(
     config: NKGridConfig,
     *,
@@ -1541,6 +1957,18 @@ def _run_nk_grid_locked(
     )
     resolved_selected_model_params = resolved_model_params(selected_model_params)
     algorithm_version = load_algorithm_version(model_params_path)
+    # The local orchestration owns manifests/checkpoints, but the numerical
+    # cell primitive is the same long-lived session used by queue workers.
+    # Reuse the already validated input/model state here: no second load or
+    # validation is introduced by the extraction.
+    execution_session = NKGridExecutionSession(
+        config=config,
+        spec=None,
+        loaded=loaded,
+        source_definitions=source_definitions,
+        selected_model_params=selected_model_params,
+        algorithm_version=algorithm_version,
+    )
     log_progress(
         "loaded data "
         f"path={data_path} rows={len(frame)} sources={len(feature_units)} "
@@ -1595,20 +2023,19 @@ def _run_nk_grid_locked(
     row_metadata = {field: metadata[field] for field in ROW_METADATA_FIELDS}
 
     split_seeds = sorted({seed for seed, _ in execution_pairs})
+    # Manifest metadata needs one representative split count only.  Retaining
+    # a full ``SplitData`` for every seed would keep seed × base-frame copies
+    # alive even though execution now uses ``SplitIndexManager`` lazily.
     if fixed_split is None:
+        first_seed = split_seeds[0]
         splits = {
-            seed: split_frame(
-                frame,
-                predictors,
-                config.outcome,
-                test_size=config.test_size,
-                seed=seed,
-                task=task,
+            first_seed: split_frame(
+                frame, predictors, config.outcome, test_size=config.test_size,
+                seed=first_seed, task=task,
             )
-            for seed in split_seeds
         }
     else:
-        splits = {seed: fixed_split for seed in split_seeds}
+        splits = {split_seeds[0]: fixed_split}
     n_grid = np.asarray(config.n_grid, dtype=int) if config.n_grid else log2_size_grid(
         len(next(iter(splits.values())).X_train),
         config.n_sizes_n,
@@ -1771,11 +2198,6 @@ def _run_nk_grid_locked(
                 draw=draw,
             )
         )
-
-    native_process_runner = IsolatedProcessRunner(
-        max_attempts=config.native_process_max_attempts,
-        timeout_seconds=config.native_process_timeout_seconds,
-    )
 
     def run_cell_group(
         seed: int,
@@ -2110,14 +2532,17 @@ def _run_nk_grid_locked(
     # groups serially: no joblib windows and therefore no window barrier.
     for cell_key, cell_jobs in pending_cell_groups.items():
         seed, draw, n_samples, k_features = cell_key
-        cell_rows = run_cell_group(
-            seed,
-            draw,
-            n_samples,
-            k_features,
-            tuple(job[0] for job in cell_jobs),
-            orders=cached_draw_orders(seed, draw),
-        )
+        try:
+            cell_rows = execution_session.run_cell_group(
+                seed=seed,
+                draw=draw,
+                n_samples=n_samples,
+                k_features=k_features,
+                models=tuple(job[0] for job in cell_jobs),
+            )
+        except BaseException:
+            execution_session.close()
+            raise
         checkpoint_buffer.extend(cell_rows)
         while len(checkpoint_buffer) >= config.batch_size:
             checkpoint_batch_index += 1
@@ -2195,7 +2620,7 @@ def _run_nk_grid_locked(
                     "graceful stop arrived after the final pending batch; "
                     "the run will finalize without requeue"
                 )
-    native_process_runner.close()
+    execution_session.close()
     if not pending:
         log_progress("no pending jobs; checkpoint is already complete")
     if (

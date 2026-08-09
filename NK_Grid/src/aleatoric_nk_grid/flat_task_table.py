@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import hashlib
 import json
 import multiprocessing
@@ -30,7 +31,54 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .experiment import manifest_path, utc_now, write_json_atomic
-from .nk_grid import NKGridConfig, _process_peak_rss_bytes, resolve_repeat_pairs, run_nk_grid
+from .execution_contract import (
+    AnalysisContract,
+    CellExecutionSpec,
+    ContractError,
+    DynamicExecutionContract,
+    canonical_json_bytes,
+    canonical_task_row_payload,
+    sha256_file,
+    task_row_digest,
+    immutable_json_bytes,
+)
+from .generation_control import (
+    ActivationTarget,
+    ControlBusyError,
+    ControlProtocolError,
+    ControlSupersededError,
+    PROTOCOL_EXIT_CODE,
+    RETRYABLE_EXIT_CODE,
+    SUCCESS_EXIT_CODE,
+    SUPERSEDED_EXIT_CODE,
+    activate_generation,
+    classify_exact_afterany_target_read_only,
+    closed_path,
+    frozen_sealed_history,
+    generation_dir,
+    outcome_path,
+    predecessor_gate,
+    publish_activation_intent,
+    publish_no_generation_outcome,
+    publish_verification_receipt,
+    seal_generation,
+    validate_exact_verification_receipt,
+    verification_path,
+)
+from .nk_grid import NKGridConfig, NKGridExecutionSession, _process_peak_rss_bytes, resolve_repeat_pairs, run_nk_grid
+from .worker_event_wal import (
+    TASK_ABORTED,
+    TASK_RESULT,
+    TASK_STARTED,
+    WAL_FORMAT,
+    WALFrameTooLarge,
+    WALBusyError,
+    WALProtocolError,
+    WorkerEventLog,
+    bounded_abort_payload,
+    decode_public_rows,
+    scan_wal,
+)
 
 
 TABLE_FORMAT_VERSION = 2
@@ -43,10 +91,29 @@ QUEUE_INDEX_BATCH_ROWS = 4_096
 QUEUE_INDEX_QUERY_ROWS = 512
 TERMINAL_STATUSES = frozenset({"ok", "skipped"})
 VALID_RESULT_STATUSES = frozenset({"ok", "skipped", "failed"})
+TASK_TABLE_ROWS_PER_GROUP_MAX = 100_000
 
 
 class FinalizationError(ValueError):
     """A fail-closed dynamic-result validation or publication error."""
+
+
+@contextmanager
+def _generation_shared_lease(path: Path):
+    """Hold a generation shared lease for the complete worker invocation."""
+
+    descriptor = os.open(Path(path), os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ControlBusyError(f"generation lease is busy: {path}") from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -62,6 +129,21 @@ class TaskRow:
     @property
     def key(self) -> tuple[int, int, int, int, str]:
         return (self.seed, self.draw, self.n_samples, self.k_features, self.group)
+
+
+@dataclass(frozen=True)
+class TaskTableSummary:
+    """One-pass logical and physical task-table facts for immutable contracts."""
+
+    path: Path
+    task_design_digest: str
+    task_table_file_sha256: str
+    expected_task_rows: int
+    expected_model_rows: int
+    max_n: int
+    max_k: int
+    row_group_digests: tuple[dict[str, object], ...]
+    logical_schema_fingerprint: str
 
 
 def pairs_for(
@@ -133,6 +215,143 @@ def build_rows(
     if len({row.row_id for row in rows}) != len(rows):
         raise ValueError("task table would contain duplicate row IDs")
     return tuple(rows)
+
+
+def iter_task_rows_canonical(
+    config: NKGridConfig,
+    *,
+    n_grid: Sequence[int],
+    k_grid: Sequence[int],
+    repeat_pairs: Sequence[tuple[int, int]] | None = None,
+) -> Iterable[TaskRow]:
+    """Yield the canonical table order without materialising the full design."""
+
+    pairs = tuple(sorted((int(seed), int(draw)) for seed, draw in (repeat_pairs or resolve_repeat_pairs(config))))
+    if not pairs:
+        raise ValueError("repeat plan must not be empty")
+    for k_features in sorted({int(value) for value in k_grid}):
+        for n_samples in sorted({int(value) for value in n_grid}):
+            for seed, draw in pairs:
+                for group, group_models in execution_groups(config.models, k_features=k_features):
+                    yield TaskRow(
+                        row_id=_row_id(seed, draw, n_samples, k_features, group, group_models),
+                        seed=seed,
+                        draw=draw,
+                        n_samples=n_samples,
+                        k_features=k_features,
+                        group=group,
+                        models=group_models,
+                    )
+
+
+def _task_table_schema_fingerprint() -> str:
+    return hashlib.sha256(canonical_json_bytes({
+        "columns": list(TABLE_COLUMNS),
+        "format": "task-table-v2",
+        "models_encoding": "ordered-string-list",
+    })).hexdigest()
+
+
+def _durable_replace(source: Path, target: Path) -> None:
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(source, target)
+    directory = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def write_task_table_streaming(
+    rows: Iterable[TaskRow],
+    path: Path,
+    *,
+    rows_per_group: int = TASK_TABLE_ROWS_PER_GROUP_MAX,
+    tmp_dir: Path | None = None,
+) -> TaskTableSummary:
+    """Write Task Table v2 in bounded Arrow/SQLite buffers.
+
+    Both uniqueness constraints are owned by local scratch SQLite tables.  In
+    particular, this does not create a Python ``set`` proportional to the
+    design and does not reread Parquet as TaskRows to compute its file hash.
+    """
+
+    if not 1 <= rows_per_group <= TASK_TABLE_ROWS_PER_GROUP_MAX:
+        raise ValueError(f"rows_per_group must be between 1 and {TASK_TABLE_ROWS_PER_GROUP_MAX}")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    local_base = Path(tmp_dir) if tmp_dir is not None else Path(tempfile.gettempdir())
+    local_base.mkdir(parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix="nk-grid-plan-", dir=local_base))
+    temporary = target.with_suffix(target.suffix + f".tmp.{uuid.uuid4().hex}")
+    writer: pq.ParquetWriter | None = None
+    connection: sqlite3.Connection | None = None
+    digest = hashlib.sha256()
+    row_group_digests: list[dict[str, object]] = []
+    task_rows = 0; model_rows = 0; max_n = 0; max_k = 0
+    buffer: list[TaskRow] = []
+
+    def flush() -> None:
+        nonlocal buffer
+        if not buffer:
+            return
+        assert writer is not None
+        writer.write_table(_arrow_table(buffer))
+        row_group_digests.append({
+            "row_group": len(row_group_digests),
+            "row_count": len(buffer),
+            "canonical_task_rows_sha256": task_row_digest(buffer),
+        })
+        buffer = []
+
+    try:
+        connection = sqlite3.connect(scratch / "planning-uniqueness.sqlite")
+        connection.execute("CREATE TABLE rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID")
+        connection.execute("CREATE TABLE model_keys (model TEXT, seed INTEGER, draw INTEGER, N INTEGER, K INTEGER, PRIMARY KEY (model, seed, draw, N, K)) WITHOUT ROWID")
+        writer = pq.ParquetWriter(temporary, _empty_arrow_table().schema, compression="zstd")
+        for row in rows:
+            try:
+                connection.execute("INSERT INTO rows VALUES (?)", (row.row_id,))
+                connection.executemany(
+                    "INSERT INTO model_keys VALUES (?, ?, ?, ?, ?)",
+                    [(model, row.seed, row.draw, row.n_samples, row.k_features) for model in row.models],
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("streaming task planning found duplicate row ID or public model key") from exc
+            digest.update(canonical_json_bytes(canonical_task_row_payload(row))); digest.update(b"\n")
+            task_rows += 1; model_rows += len(row.models)
+            max_n = max(max_n, row.n_samples); max_k = max(max_k, row.k_features)
+            buffer.append(row)
+            if len(buffer) == rows_per_group:
+                flush(); connection.commit()
+        flush(); connection.commit()
+        if task_rows == 0:
+            raise ValueError("task table must not be empty")
+        writer.close(); writer = None
+        _durable_replace(temporary, target)
+        os.chmod(target, 0o444)
+        return TaskTableSummary(
+            path=target,
+            task_design_digest=digest.hexdigest(),
+            task_table_file_sha256=sha256_file(target),
+            expected_task_rows=task_rows,
+            expected_model_rows=model_rows,
+            max_n=max_n,
+            max_k=max_k,
+            row_group_digests=tuple(row_group_digests),
+            logical_schema_fingerprint=_task_table_schema_fingerprint(),
+        )
+    finally:
+        if writer is not None:
+            writer.close()
+        if connection is not None:
+            connection.close()
+        temporary.unlink(missing_ok=True)
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _arrow_table(rows: Sequence[TaskRow]) -> pa.Table:
@@ -324,57 +543,254 @@ def _sweep_slice_temporaries(output: Path, *, round_index: int, worker_index: in
 def run_slice(
     snapshot_path: Path, *, round_index: int, worker_index: int,
     expected_prep_token: str,
+    submission_generation: str | None = None,
+    expected_previous_generation: str | None = None,
+    expected_pointer_version: int | None = None,
+    prep_job_id: str | None = None,
 ) -> Path:
-    """Run one worker's fixed modulo slice, publishing after every cell group."""
+    """Run one WAL-owned worker slice; no output CSV/checkpoint path is opened."""
     payload = _load_snapshot(snapshot_path)
+    if "analysis_contract" not in payload:
+        return _legacy_run_slice(snapshot_path, round_index=round_index, worker_index=worker_index, expected_prep_token=expected_prep_token)
+    analysis, execution = _load_contract_chain(payload, validate_task_table=False)
     workers = int(payload["workers"])
     if not 0 <= worker_index < workers:
         raise IndexError("worker_index is outside the frozen worker count")
-    assignment = _require_ready_assignment(
-        payload, round_index=round_index, workers=workers,
-        expected_prep_token=_validated_prep_token(expected_prep_token),
+    if submission_generation is None:
+        raise ValueError("worker requires an exact submission generation")
+    target = ActivationTarget(
+        analysis_id=analysis.analysis_id,
+        execution_plan_id=execution.execution_plan_id,
+        execution_contract_sha256=execution.sha256,
+        round_index=int(round_index),
+        submission_generation=str(submission_generation),
+        expected_previous_generation=expected_previous_generation,
+        expected_pointer_version=(int(round_index) - 1 if expected_pointer_version is None else int(expected_pointer_version)),
+        prep_job_id=str(prep_job_id or expected_prep_token),
+        prep_token=_validated_prep_token(expected_prep_token),
     )
+    dispatch = classify_exact_afterany_target_read_only(Path(str(payload["output_dir"])), target)
+    if dispatch.kind in {"no-generation", "sealed-generation"}:
+        return Path(dispatch.outcome_path or dispatch.closed_path)
+    if dispatch.kind != "active-generation":
+        if dispatch.exit_code == SUPERSEDED_EXIT_CODE:
+            raise ControlSupersededError("worker target was superseded")
+        if dispatch.exit_code == PROTOCOL_EXIT_CODE:
+            raise ControlProtocolError("worker target has a protocol conflict")
+        raise ControlBusyError("worker target needs activation recovery")
+    activation = json.loads(Path(dispatch.activation_path).read_text(encoding="utf-8"))
+    assignment = Path(str(activation["assignment_path"])); index_path = Path(str(activation["assignment_index_path"]))
+    if sha256_file(index_path) != activation["assignment_index_sha256"]:
+        raise ControlProtocolError("assignment index checksum mismatch")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    own = next((item for item in index.get("row_groups", []) if int(item.get("worker", -1)) == worker_index), None)
+    if not isinstance(own, Mapping):
+        raise ControlProtocolError("assignment index lacks worker row group")
     rows = read_row_group(assignment, worker_index)
-    output = _round_directory(payload, round_index) / f"worker-{worker_index}.csv"
-    _sweep_slice_temporaries(output, round_index=round_index, worker_index=worker_index)
-    header: list[str] | None = None
-    materialized: list[dict[str, str]] = []
-    if output.exists():
-        header, materialized = _read_csv_keys(output)
-    by_key = {_csv_key(row): row for row in materialized}
-    if len(by_key) != len(materialized):
-        raise ValueError("worker output contains duplicate keys")
-    completed = {key for key, row in by_key.items() if row.get("status") in {"ok", "skipped"}}
-    expected = expected_model_keys(rows)
-    config = _config_from_json(payload["config"])
-    for sequence, row in enumerate(pending_rows(rows, completed)):
-        _append_attempt(_round_directory(payload, round_index) / "attempts" / f"worker-{worker_index}.jsonl", round_index=round_index, worker_index=worker_index, sequence=sequence, row_id=row.row_id)
-        row_out = output.parent / f".{output.stem}.round-{round_index}.worker-{worker_index}.{row.row_id}.csv"
-        # A worker is one CPU.  Keeping this at one also preserves deterministic
-        # estimator behaviour; Super Learner remains in imputed_core and its
-        # internal model_n_jobs is consequently one as well.
-        row_config = replace(
-            config, out=row_out, models=row.models, n_grid=(row.n_samples,), k_grid=(row.k_features,),
-            n_seeds=1, n_draws=1, repeat_plan=((row.seed, row.draw),), n_jobs=1,
+    if len(rows) != int(own.get("row_count", -1)) or task_row_digest(rows) != own.get("canonical_task_rows_sha256"):
+        raise ControlProtocolError("worker assignment row group digest mismatch")
+    identity = {
+        "wal_format": WAL_FORMAT,
+        "analysis_id": analysis.analysis_id,
+        "execution_plan_id": execution.execution_plan_id,
+        "execution_contract_sha256": execution.sha256,
+        "round": round_index,
+        "submission_generation": target.submission_generation,
+        "worker": worker_index,
+        "workers": workers,
+        "assignment_path": str(assignment.resolve()),
+        "assignment_sha256": activation["assignment_sha256"],
+        "assignment_index_path": str(index_path.resolve()),
+        "assignment_index_sha256": activation["assignment_index_sha256"],
+        "assignment_row_group": worker_index,
+        "assignment_row_count": len(rows),
+        "assignment_row_group_digest": own["canonical_task_rows_sha256"],
+    }
+    generation = generation_dir(Path(str(payload["output_dir"])), target)
+    wal_path = generation / f"worker-{worker_index}.events.wal"
+    with _generation_shared_lease(generation / "generation.lease"):
+        # A closer can seal between the first read-only classifier and this
+        # lease acquisition.  Reclassify before even opening the WAL inode.
+        rechecked = classify_exact_afterany_target_read_only(Path(str(payload["output_dir"])), target)
+        if rechecked.kind in {"no-generation", "sealed-generation"}:
+            return Path(rechecked.outcome_path or rechecked.closed_path)
+        if rechecked.kind != "active-generation":
+            if rechecked.exit_code == SUPERSEDED_EXIT_CODE:
+                raise ControlSupersededError("worker target was superseded after lease acquisition")
+            if rechecked.exit_code == PROTOCOL_EXIT_CODE:
+                raise ControlProtocolError("worker target became protocol-invalid after lease acquisition")
+            raise ControlBusyError("worker target needs activation recovery after lease acquisition")
+        with WorkerEventLog.open_exclusive_and_repair(wal_path, identity=identity) as wal:
+            completed = wal.committed_terminal_row_ids()
+            spec = CellExecutionSpec.from_payload(analysis.payload["cell_execution_spec"])
+            if int(spec.payload["model_n_jobs"]) != 1:
+                raise ControlProtocolError("dynamic worker CellExecutionSpec must fix model_n_jobs=1")
+            public_schema = tuple(str(column) for column in analysis.payload["public_result_schema"]["columns"])
+            with NKGridExecutionSession.open(spec, repo_root=Path(str(payload["cell_spec_repo_root"]))) as session:
+                for row in rows:
+                    if row.row_id in completed:
+                        continue
+                    sequence = wal.commit_started(row_id=row.row_id, metadata={"execution_plan_id": execution.execution_plan_id, "round": round_index, "generation": target.submission_generation, "worker": worker_index})
+                    raw_rows = session.run_cell_group(seed=row.seed, draw=row.draw, n_samples=row.n_samples, k_features=row.k_features, models=row.models)
+                    try:
+                        if not isinstance(raw_rows, list) or not raw_rows:
+                            raise WALProtocolError("RESULT_PROJECTION_FAILED")
+                        if {str(item.get("model")) for item in raw_rows} != set(row.models):
+                            raise WALProtocolError("RESULT_KEY_SET_MISMATCH")
+                        if any((int(item.get("seed", -1)), int(item.get("draw", -1)), int(item.get("N", -1)), int(item.get("K", -1))) != (row.seed, row.draw, row.n_samples, row.k_features) for item in raw_rows):
+                            raise WALProtocolError("RESULT_KEY_SET_MISMATCH")
+                        if any(not isinstance(item, Mapping) or tuple(item.keys()) != public_schema for item in raw_rows):
+                            raise WALProtocolError("PUBLIC_SCHEMA_MISMATCH")
+                        wal.commit_result(sequence=sequence, row_id=row.row_id, public_rows=raw_rows, header=public_schema)
+                    except (WALFrameTooLarge, WALProtocolError, UnicodeError, csv.Error, ValueError, TypeError) as exc:
+                        if isinstance(exc, WALFrameTooLarge):
+                            reason = "RESULT_FRAME_TOO_LARGE"
+                        elif "PUBLIC_SCHEMA_MISMATCH" in str(exc):
+                            reason = "PUBLIC_SCHEMA_MISMATCH"
+                        elif isinstance(exc, (UnicodeError, csv.Error, TypeError)):
+                            reason = "RESULT_ENCODING_FAILED"
+                        else:
+                            reason = "RESULT_PROTOCOL_VIOLATION"
+                        wal.commit_aborted(sequence=sequence, row_id=row.row_id, payload=bounded_abort_payload(reason_code=reason, exception=exc, diagnostic=str(exc)))
+                        raise ControlProtocolError(f"durable TASK_ABORTED: {reason}") from exc
+    return wal_path
+
+
+def close_generation(
+    snapshot_path: Path, *, round_index: int, submission_generation: str,
+    expected_prep_token: str, expected_previous_generation: str | None = None,
+    expected_pointer_version: int | None = None, prep_job_id: str | None = None,
+) -> Path:
+    """Seal exactly one generation into the immutable cross-WAL inventory."""
+
+    snapshot = _load_snapshot(snapshot_path)
+    analysis, execution, target = _exact_target(
+        snapshot, round_index=round_index, submission_generation=submission_generation,
+        prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
+        expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+        validate_task_table=False,
+    )
+    root = Path(str(snapshot["output_dir"]))
+    dispatch = classify_exact_afterany_target_read_only(root, target)
+    if dispatch.kind == "no-generation":
+        return Path(dispatch.outcome_path)
+    if dispatch.kind == "sealed-generation":
+        return Path(dispatch.closed_path)
+    if dispatch.kind != "active-generation":
+        if dispatch.exit_code == SUPERSEDED_EXIT_CODE:
+            raise ControlSupersededError("closer target was superseded")
+        if dispatch.exit_code == PROTOCOL_EXIT_CODE:
+            raise ControlProtocolError("closer target has protocol conflict")
+        raise ControlBusyError("closer target needs activation recovery")
+    def build_inventory() -> Mapping[str, object]:
+        """Run only while ``seal_generation`` holds the exclusive lease."""
+
+        activation = json.loads(Path(dispatch.activation_path).read_text(encoding="utf-8"))
+        assignment = Path(str(activation["assignment_path"])); index = Path(str(activation["assignment_index_path"]))
+        assignment_sha = sha256_file(assignment)
+        index_sha = sha256_file(index)
+        if assignment_sha != activation["assignment_sha256"] or index_sha != activation["assignment_index_sha256"]:
+            raise ControlProtocolError("closer assignment/index checksum mismatch")
+        index_payload = json.loads(index.read_text(encoding="utf-8"))
+        groups = index_payload.get("row_groups")
+        if not isinstance(groups, list) or len(groups) != int(snapshot["workers"]):
+            raise ControlProtocolError("closer assignment index worker groups are invalid")
+        wal_inventory: list[dict[str, object]] = []
+        for group in sorted(groups, key=lambda value: int(value["worker"])):
+            worker = int(group["worker"])
+            wal = generation_dir(root, target) / f"worker-{worker}.events.wal"
+            if not wal.exists():
+                wal_inventory.append({"worker": worker, "wal_state": "absent"})
+                continue
+            expected_identity = {
+                "wal_format": WAL_FORMAT, "analysis_id": analysis.analysis_id,
+                "execution_plan_id": execution.execution_plan_id,
+                "execution_contract_sha256": execution.sha256, "round": round_index,
+                "submission_generation": target.submission_generation, "worker": worker,
+                "workers": int(snapshot["workers"]), "assignment_path": str(assignment.resolve()),
+                "assignment_sha256": activation["assignment_sha256"], "assignment_index_path": str(index.resolve()),
+                "assignment_index_sha256": activation["assignment_index_sha256"], "assignment_row_group": worker,
+                "assignment_row_count": int(group["row_count"]),
+                "assignment_row_group_digest": group["canonical_task_rows_sha256"],
+            }
+            # The closer is in the generation-exclusive lease here.  The WAL
+            # reader still takes its own nonblocking shared fd lease as a
+            # defense against out-of-protocol writers.
+            scan = WorkerEventLog.open_shared(wal, expected_identity=expected_identity)
+            if scan.identity is None:
+                wal_inventory.append({"worker": worker, "wal_state": "absent", "abandoned_uninitialized_wal": True})
+                continue
+            wal_inventory.append({
+                "worker": worker, "wal_state": "present", "path": str(wal.resolve()),
+                "size": wal.stat().st_size, "sha256": sha256_file(wal),
+                "last_committed_offset": scan.committed_offset,
+                "last_commit_trailer_digest": scan.trailer_digest,
+                "uncommitted_tail": scan.has_uncommitted_tail,
+            })
+        return {
+            "assignment_path": str(assignment.resolve()), "assignment_sha256": assignment_sha,
+            "assignment_index_path": str(index.resolve()), "assignment_index_sha256": index_sha,
+            "workers": wal_inventory,
+        }
+
+    return seal_generation(root, target, inventory_builder=build_inventory)
+
+
+def recover_generation_activation(
+    snapshot_path: Path, *, round_index: int, submission_generation: str,
+    expected_prep_token: str, expected_previous_generation: str | None = None,
+    expected_pointer_version: int | None = None, prep_job_id: str | None = None,
+) -> Path:
+    """Resume one exact prepared activation; never select a latest target."""
+
+    snapshot = _load_snapshot(snapshot_path)
+    analysis, execution, target = _exact_target(
+        snapshot, round_index=round_index, submission_generation=submission_generation,
+        prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
+        expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+        validate_task_table=False,
+    )
+    root = Path(str(snapshot["output_dir"]))
+    dispatch = classify_exact_afterany_target_read_only(root, target)
+    if dispatch.kind in {"no-generation", "sealed-generation", "active-generation"}:
+        return Path(dispatch.outcome_path or dispatch.closed_path or dispatch.activation_path)
+    if dispatch.exit_code == SUPERSEDED_EXIT_CODE:
+        raise ControlSupersededError("activation recovery target was superseded")
+    if dispatch.exit_code == PROTOCOL_EXIT_CODE:
+        raise ControlProtocolError("activation recovery target has a protocol conflict")
+    directory = generation_dir(root, target)
+    staging = directory.parent / f".{directory.name}.staging"
+    if directory.exists() and staging.exists():
+        raise ControlProtocolError("activation recovery found both canonical and staging directories")
+    if staging.exists():
+        prepared = staging / "generation.prepared.json"
+        if not prepared.is_file():
+            raise ControlBusyError("activation staging is incomplete; exact prep must resume it")
+        try:
+            os.rename(staging, directory)
+            parent_fd = os.open(directory.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError as exc:
+            raise ControlBusyError(f"activation staging promotion is indeterminate: {exc}") from exc
+    prepared_path = directory / "generation.prepared.json"
+    if not prepared_path.is_file():
+        raise ControlBusyError("activation recovery needs a complete prepared record")
+    try:
+        prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
+        activation = activate_generation(
+            root, target,
+            assignment_path=Path(str(prepared["assignment_path"])), assignment_sha256=str(prepared["assignment_sha256"]),
+            assignment_index_path=Path(str(prepared["assignment_index_path"])), assignment_index_sha256=str(prepared["assignment_index_sha256"]),
+            ready_path=Path(str(prepared["ready_path"])), ready_sha256=str(prepared["ready_sha256"]),
+            prep_path=Path(str(prepared["prep_path"])), prep_sha256=str(prepared["prep_sha256"]),
+            worker_count=int(prepared["worker_count"]),
         )
-        run_nk_grid(row_config, execution_pairs=((row.seed, row.draw),), exact_output_path=True, defer_failure_policy=True)
-        current_header, current_rows = _read_csv_keys(row_out)
-        if header is None:
-            header = current_header
-        elif current_header != header:
-            raise ValueError("worker rows produced inconsistent CSV headers")
-        for current in current_rows:
-            by_key[_csv_key(current)] = current
-        _write_materialized_rows(output, header, by_key, execution={"mode": "slice", "round": round_index, "worker_index": worker_index}, expected_rows=len(expected))
-        row_out.unlink(missing_ok=True)
-        manifest_path(row_out).unlink(missing_ok=True)
-    if header is None and rows:
-        raise RuntimeError("slice produced no rows")
-    if header is None:
-        # Empty assignments deliberately have no output file; their manifest is
-        # still useful to distinguish an idle worker from an unstarted one.
-        write_json_atomic(manifest_path(output), {"format_version": TABLE_FORMAT_VERSION, "execution": {"mode": "slice", "round": round_index, "worker_index": worker_index}, "completion": {"expected_rows": 0, "materialized_rows": 0}})
-    return output
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ControlProtocolError("activation recovery prepared record is invalid") from exc
+    return activation
 
 
 def _round_directory(snapshot: Mapping[str, object], round_index: int) -> Path:
@@ -386,10 +802,74 @@ def _round_directory(snapshot: Mapping[str, object], round_index: int) -> Path:
 def _load_snapshot(path: Path) -> dict[str, object]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if payload.get("format_version") != TABLE_FORMAT_VERSION:
-        if payload.get("format_version") == 1:
-            raise ValueError("unsupported v1 flat-task snapshot; rebuild a v2 dynamic-work-queue plan")
-        raise ValueError("unsupported flat-task snapshot")
+        raise ValueError("unsupported legacy dynamic snapshot/result store; rebuild a worker-event-wal-v1 plan")
+    if "analysis_contract" in payload:
+        if payload.get("result_store_format") != "worker-event-wal-v1":
+            raise ValueError("dynamic WAL snapshot is missing its result-store identity")
+    elif not (
+        payload.get("result_store_format") == "test-legacy-csv-v2"
+        and payload.get("test_compatibility_mode") is True
+    ):
+        raise ValueError("unsupported legacy dynamic snapshot/result store; rebuild a worker-event-wal-v1 plan")
     return payload
+
+
+def _load_contract_chain(
+    snapshot: Mapping[str, object], *, validate_task_table: bool = True,
+) -> tuple[AnalysisContract, DynamicExecutionContract]:
+    """Load immutable contract files before accepting any task/result key."""
+
+    try:
+        analysis_path = Path(str(snapshot["analysis_contract"]))
+        execution_path = Path(str(snapshot["execution_contract"]))
+        analysis_raw = analysis_path.read_bytes(); execution_raw = execution_path.read_bytes()
+        analysis_payload = json.loads(analysis_raw.decode("utf-8"))
+        execution_payload = json.loads(execution_raw.decode("utf-8"))
+        if (
+            analysis_raw != canonical_json_bytes(analysis_payload) + b"\n"
+            or execution_raw != canonical_json_bytes(execution_payload) + b"\n"
+        ):
+            raise ContractError("immutable contract file is not canonical")
+        analysis = AnalysisContract.from_payload(analysis_payload)
+        execution = DynamicExecutionContract.from_payload(execution_payload)
+    except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError, ContractError) as exc:
+        raise ValueError("dynamic snapshot lacks a valid immutable contract chain") from exc
+    if (
+        snapshot.get("analysis_id") != analysis.analysis_id
+        or snapshot.get("analysis_contract_sha256") != analysis.sha256
+        or snapshot.get("execution_plan_id") != execution.execution_plan_id
+        or snapshot.get("execution_contract_sha256") != execution.sha256
+        or execution.payload.get("analysis_id") != analysis.analysis_id
+        or execution.payload.get("analysis_contract_sha256") != analysis.sha256
+    ):
+        raise ValueError("dynamic snapshot immutable contract identity mismatch")
+    table_path = Path(str(snapshot["task_table"]))
+    if execution.payload.get("task_table_path") != str(table_path.resolve()):
+        raise ValueError("dynamic snapshot task table path mismatch")
+    if validate_task_table and execution.payload.get("task_table_file_sha256") != sha256_file(table_path):
+        raise ValueError("dynamic snapshot task table checksum mismatch")
+    return analysis, execution
+
+
+def _exact_target(
+    snapshot: Mapping[str, object], *, round_index: int, submission_generation: str,
+    prep_token: str, expected_previous_generation: str | None,
+    expected_pointer_version: int | None, prep_job_id: str | None,
+    validate_task_table: bool = True,
+) -> tuple[AnalysisContract, DynamicExecutionContract, ActivationTarget]:
+    analysis, execution = _load_contract_chain(snapshot, validate_task_table=validate_task_table)
+    target = ActivationTarget(
+        analysis_id=analysis.analysis_id,
+        execution_plan_id=execution.execution_plan_id,
+        execution_contract_sha256=execution.sha256,
+        round_index=int(round_index),
+        submission_generation=str(submission_generation),
+        expected_previous_generation=expected_previous_generation,
+        expected_pointer_version=(int(round_index) - 1 if expected_pointer_version is None else int(expected_pointer_version)),
+        prep_job_id=str(prep_job_id or prep_token),
+        prep_token=_validated_prep_token(prep_token),
+    )
+    return analysis, execution, target
 
 
 def _completed_keys(output_dir: Path) -> set[tuple[str, int, int, int, int]]:
@@ -533,15 +1013,19 @@ def _create_queue_index_tables(connection: sqlite3.Connection) -> None:
         ) WITHOUT ROWID;
         CREATE TABLE attempts (
             ingest_order INTEGER PRIMARY KEY,
+            execution_plan_id TEXT NOT NULL,
             round_index INTEGER NOT NULL,
+            submission_generation TEXT NOT NULL,
             worker_index INTEGER NOT NULL,
             sequence INTEGER NOT NULL,
             row_id TEXT NOT NULL
         );
-        CREATE INDEX attempts_order ON attempts (round_index, worker_index, sequence, ingest_order);
+        CREATE INDEX attempts_order ON attempts (execution_plan_id, round_index, submission_generation, worker_index, sequence, ingest_order);
         CREATE TABLE completed_rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID;
         CREATE TABLE crashed_rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID;
         CREATE TABLE too_long_rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID;
+        CREATE TABLE aborted_rows (row_id TEXT PRIMARY KEY, reason_code TEXT NOT NULL) WITHOUT ROWID;
+        CREATE TABLE failed_attempt_rows (row_id TEXT PRIMARY KEY) WITHOUT ROWID;
     """)
 
 
@@ -558,7 +1042,10 @@ def _queue_index(
 
     output_dir = Path(str(snapshot["output_dir"]))
     table_path = Path(str(snapshot["task_table"]))
-    inputs = (*_result_shards(output_dir), *_attempt_logs(output_dir))
+    wal_inputs = tuple(sorted(
+        output_dir.glob("executions/*/round-*/generation-*/worker-*.events.wal")
+    ))
+    inputs = (*_result_shards(output_dir), *_attempt_logs(output_dir), *wal_inputs)
     tmp_base = _resolve_queue_index_tmp_base(snapshot, explicit_tmp_dir, phase=phase)
     _preflight_queue_index_space(tmp_base, table_path, inputs, phase=phase)
     run_dir = Path(tempfile.mkdtemp(prefix=f"nk-grid-{phase}-", dir=tmp_base))
@@ -616,8 +1103,8 @@ def _index_queue_completed_shards(connection: sqlite3.Connection, output_dir: Pa
 
 def _index_queue_attempts(connection: sqlite3.Connection, output_dir: Path) -> None:
     statement = (
-        "INSERT INTO attempts (round_index, worker_index, sequence, row_id) "
-        "VALUES (?, ?, ?, ?)"
+        "INSERT INTO attempts (execution_plan_id, round_index, submission_generation, worker_index, sequence, row_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)"
     )
     for path in _attempt_logs(output_dir):
         try:
@@ -626,7 +1113,7 @@ def _index_queue_attempts(connection: sqlite3.Connection, output_dir: Path) -> N
                     try:
                         item = json.loads(line)
                         connection.execute(statement, (
-                            int(item["round"]), int(item["worker_index"]),
+                            "__legacy__", int(item["round"]), "__legacy__", int(item["worker_index"]),
                             int(item["sequence"]), str(item["row_id"]),
                         ))
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -635,6 +1122,140 @@ def _index_queue_attempts(connection: sqlite3.Connection, output_dir: Path) -> N
         except (OSError, UnicodeError) as exc:
             raise ValueError(f"cannot read attempt log {path}: {exc}") from exc
         connection.commit()
+
+
+def _iter_sealed_wal_scans(
+    output_dir: Path, *, analysis_id: str,
+    frozen_frontier: Sequence[Mapping[str, object]] | None = None,
+):
+    """Yield only WALs behind immutable closed markers, never live workers."""
+
+    root = Path(output_dir) / "executions"
+    if frozen_frontier is None:
+        if not root.exists():
+            return
+        markers = sorted(root.glob("*/round-*/generation-*/generation.closed.json"))
+    else:
+        markers = [Path(str(item["closed_path"])) for item in frozen_frontier]
+    for marker in markers:
+        if not marker.is_file():
+            raise ValueError(f"sealed generation marker is missing: {marker}")
+        closed = json.loads(marker.read_text(encoding="utf-8"))
+        if closed.get("analysis_id") != analysis_id:
+            raise ValueError("sealed generation from another analysis is present in output root")
+        inventory = closed.get("inventory")
+        if not isinstance(inventory, Mapping):
+            raise ValueError("sealed generation has no immutable inventory")
+        assignment = Path(str(inventory.get("assignment_path", "")))
+        index = Path(str(inventory.get("assignment_index_path", "")))
+        if (
+            not assignment.is_file() or not index.is_file()
+            or inventory.get("assignment_sha256") != sha256_file(assignment)
+            or inventory.get("assignment_index_sha256") != sha256_file(index)
+        ):
+            raise ValueError("sealed generation assignment/index checksum mismatch")
+        workers = inventory.get("workers")
+        if not isinstance(workers, list):
+            raise ValueError("sealed generation inventory has no worker list")
+        known_wals = {
+            marker.parent / f"worker-{int(item['worker'])}.events.wal"
+            for item in workers if isinstance(item, Mapping) and item.get("wal_state") == "present"
+        }
+        actual_wals = set(marker.parent.glob("worker-*.events.wal"))
+        if actual_wals - known_wals:
+            raise ValueError("sealed generation has inventory-external WAL")
+        for item in sorted(workers, key=lambda value: int(value["worker"])):
+            if not isinstance(item, Mapping) or item.get("wal_state") != "present":
+                continue
+            wal_path = marker.parent / f"worker-{int(item['worker'])}.events.wal"
+            if not wal_path.is_file():
+                raise ValueError("sealed WAL inventory file is missing")
+            scan = scan_wal(wal_path)
+            if (
+                item.get("path") != str(wal_path.resolve())
+                or item.get("size") != wal_path.stat().st_size
+                or item.get("sha256") != sha256_file(wal_path)
+                or item.get("last_committed_offset") != scan.committed_offset
+                or item.get("last_commit_trailer_digest") != scan.trailer_digest
+                or item.get("uncommitted_tail") != scan.has_uncommitted_tail
+            ):
+                raise ValueError("sealed WAL inventory checksum/commit boundary mismatch")
+            if scan.identity is None:
+                raise ValueError("present sealed WAL has no committed identity")
+            if scan.identity.get("analysis_id") != analysis_id:
+                raise ValueError("WAL analysis identity mismatch")
+            yield marker, wal_path, scan
+
+
+def _index_queue_wals(
+    connection: sqlite3.Connection, output_dir: Path, *, analysis_id: str,
+    frozen_frontier: Sequence[Mapping[str, object]] | None = None,
+) -> None:
+    """Stream durable WAL facts into the existing local-only SQLite index."""
+
+    complete_insert = f"INSERT OR IGNORE INTO completed ({_QUEUE_KEY_SQL}) VALUES (?, ?, ?, ?, ?)"
+    attempt_insert = "INSERT INTO attempts (execution_plan_id, round_index, submission_generation, worker_index, sequence, row_id) VALUES (?, ?, ?, ?, ?, ?)"
+    for marker, wal_path, scan in _iter_sealed_wal_scans(
+        output_dir, analysis_id=analysis_id, frozen_frontier=frozen_frontier,
+    ) or ():
+        identity = scan.identity or {}
+        try:
+            execution_plan_id = str(identity["execution_plan_id"])
+            generation = str(identity["submission_generation"])
+            round_index = int(identity["round"]); worker_index = int(identity["worker"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"WAL has invalid scope identity: {wal_path}") from exc
+        terminal: set[tuple[int, str]] = set()
+        starts: list[tuple[int, str]] = []
+        for record in scan.records:
+            if record.event_type == TASK_STARTED:
+                starts.append((record.sequence, str(record.row_id)))
+            elif record.event_type == TASK_ABORTED:
+                terminal.add((record.sequence, str(record.row_id)))
+                try:
+                    abort = json.loads(record.payload.decode("utf-8"))
+                    reason = str(abort["reason_code"])
+                except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                    raise ValueError("TASK_ABORTED payload is corrupt") from exc
+                connection.execute("INSERT OR IGNORE INTO aborted_rows VALUES (?, ?)", (str(record.row_id), reason))
+            elif record.event_type == TASK_RESULT:
+                terminal.add((record.sequence, str(record.row_id)))
+                header, public_rows = decode_public_rows(record.payload)
+                required = {"model", "seed", "draw", "N", "K", "status"}
+                if not required.issubset(header):
+                    raise ValueError("TASK_RESULT public schema lacks required key/status columns")
+                for public in public_rows:
+                    key = _csv_key(public)
+                    row_id = str(record.row_id)
+                    expected = connection.execute(
+                        'SELECT row_id FROM expected WHERE "model"=? AND "seed"=? AND "draw"=? AND "N"=? AND "K"=?',
+                        key,
+                    ).fetchone()
+                    if expected is None or str(expected[0]) != row_id:
+                        raise ValueError("TASK_RESULT row ID/public key is outside the frozen task design")
+                    status = public.get("status")
+                    if status in TERMINAL_STATUSES:
+                        connection.execute(complete_insert, key)
+                    elif status == "failed":
+                        connection.execute("INSERT OR IGNORE INTO failed_attempt_rows VALUES (?)", (row_id,))
+                    else:
+                        raise ValueError("TASK_RESULT has unsupported public status")
+        for sequence, row_id in starts:
+            if (sequence, row_id) not in terminal:
+                connection.execute(attempt_insert, (execution_plan_id, round_index, generation, worker_index, sequence, row_id))
+        connection.commit()
+
+
+def _sealed_history_digest(output_dir: Path, *, analysis_id: str) -> str:
+    frontier: list[dict[str, object]] = []
+    root = Path(output_dir) / "executions"
+    if root.exists():
+        for marker in sorted(root.glob("*/round-*/generation-*/generation.closed.json")):
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            if payload.get("analysis_id") != analysis_id:
+                raise ValueError("sealed history includes a different analysis")
+            frontier.append({"closed_path": str(marker.resolve()), "closed_sha256": sha256_file(marker)})
+    return hashlib.sha256(canonical_json_bytes(frontier)).hexdigest()
 
 
 def _index_completed_rows(connection: sqlite3.Connection) -> None:
@@ -655,20 +1276,20 @@ def _index_completed_rows(connection: sqlite3.Connection) -> None:
 def _classify_queue_attempts(connection: sqlite3.Connection) -> None:
     """Classify attempts using SQL order but the exact existing two-rule logic."""
 
-    connection.execute("CREATE TABLE final_attempts (round_index INTEGER, worker_index INTEGER, row_id TEXT, PRIMARY KEY (round_index, worker_index)) WITHOUT ROWID")
-    prior_group: tuple[int, int] | None = None
+    connection.execute("CREATE TABLE final_attempts (execution_plan_id TEXT, round_index INTEGER, submission_generation TEXT, worker_index INTEGER, row_id TEXT, PRIMARY KEY (execution_plan_id, round_index, submission_generation, worker_index)) WITHOUT ROWID")
+    prior_group: tuple[str, int, str, int] | None = None
     final_sequence: int | None = None
     final_row_id: str | None = None
     cursor = connection.execute(
-        "SELECT round_index, worker_index, sequence, row_id FROM attempts "
-        "ORDER BY round_index, worker_index, sequence, ingest_order"
+        "SELECT execution_plan_id, round_index, submission_generation, worker_index, sequence, row_id FROM attempts "
+        "ORDER BY execution_plan_id, round_index, submission_generation, worker_index, sequence, ingest_order"
     )
-    for round_index, worker_index, sequence, row_id in cursor:
-        group = (int(round_index), int(worker_index))
+    for execution_plan_id, round_index, generation, worker_index, sequence, row_id in cursor:
+        group = (str(execution_plan_id), int(round_index), str(generation), int(worker_index))
         if group != prior_group:
             if prior_group is not None and final_row_id is not None:
                 connection.execute(
-                    "INSERT INTO final_attempts VALUES (?, ?, ?)",
+                    "INSERT INTO final_attempts VALUES (?, ?, ?, ?, ?)",
                     (*prior_group, final_row_id),
                 )
             prior_group = group
@@ -680,16 +1301,16 @@ def _classify_queue_attempts(connection: sqlite3.Connection) -> None:
             final_sequence = int(sequence)
             final_row_id = str(row_id)
     if prior_group is not None and final_row_id is not None:
-        connection.execute("INSERT INTO final_attempts VALUES (?, ?, ?)", (*prior_group, final_row_id))
-    connection.execute("CREATE TABLE final_rounds (row_id TEXT, round_index INTEGER, PRIMARY KEY (row_id, round_index)) WITHOUT ROWID")
-    connection.execute("INSERT INTO final_rounds SELECT DISTINCT row_id, round_index FROM final_attempts")
+        connection.execute("INSERT INTO final_attempts VALUES (?, ?, ?, ?, ?)", (*prior_group, final_row_id))
+    connection.execute("CREATE TABLE final_rounds (execution_plan_id TEXT, row_id TEXT, round_index INTEGER, PRIMARY KEY (execution_plan_id, row_id, round_index)) WITHOUT ROWID")
+    connection.execute("INSERT INTO final_rounds SELECT DISTINCT execution_plan_id, row_id, round_index FROM final_attempts")
     connection.execute("""
         INSERT INTO too_long_rows (row_id)
         SELECT DISTINCT first.row_id FROM final_rounds first
         JOIN final_rounds second
-          ON second.row_id=first.row_id AND second.round_index=first.round_index + 1
+          ON second.execution_plan_id=first.execution_plan_id AND second.row_id=first.row_id AND second.round_index=first.round_index + 1
         JOIN final_rounds third
-          ON third.row_id=first.row_id AND third.round_index=first.round_index + 2
+          ON third.execution_plan_id=first.execution_plan_id AND third.row_id=first.row_id AND third.round_index=first.round_index + 2
     """)
     connection.execute("DELETE FROM crashed_rows WHERE row_id IN (SELECT row_id FROM completed_rows)")
     connection.execute("DELETE FROM too_long_rows WHERE row_id IN (SELECT row_id FROM completed_rows)")
@@ -773,7 +1394,7 @@ def _stage_queue_todo(
 
 def _write_assignment_from_queue_index(
     path: Path, connection: sqlite3.Connection, *, workers: int,
-) -> tuple[Path, list[int]]:
+) -> tuple[Path, list[int], list[dict[str, object]]]:
     """Publish exactly one modulo-ordered Parquet row group for every worker."""
 
     path = Path(path)
@@ -782,6 +1403,7 @@ def _write_assignment_from_queue_index(
     temporary.unlink(missing_ok=True)
     writer = pq.ParquetWriter(temporary, _empty_arrow_table().schema, compression="zstd")
     assigned_rows: list[int] = []
+    row_groups: list[dict[str, object]] = []
     try:
         for worker_index in range(workers):
             records = connection.execute(
@@ -795,12 +1417,17 @@ def _write_assignment_from_queue_index(
                 models=tuple(str(model) for model in json.loads(models_json)),
             ) for row_id, seed, draw, n_samples, k_features, group, models_json in records)
             assigned_rows.append(len(rows))
+            row_groups.append({
+                "worker": worker_index,
+                "row_count": len(rows),
+                "canonical_task_rows_sha256": task_row_digest(rows),
+            })
             writer.write_table(_arrow_table(rows) if rows else _empty_arrow_table())
     finally:
         writer.close()
-    os.replace(temporary, path)
+    _durable_replace(temporary, path)
     os.chmod(path, 0o444)
-    return path, assigned_rows
+    return path, assigned_rows, row_groups
 
 
 def _assignment_ready_path(round_dir: Path) -> Path:
@@ -843,86 +1470,289 @@ def _require_ready_assignment(
     return assignment
 
 
-def prepare_round(
-    snapshot_path: Path, *, round_index: int, prep_token: str,
-    tmp_dir: Path | None = None,
-) -> dict[str, object]:
-    """Stream durable state into one modulo row group per worker.
-
-    The task design and all prior durable artefacts are indexed on disk.  The
-    only per-worker materialisation is the one row group that must be written
-    as that worker's assignment, preserving the frozen W-row-group contract.
-    """
-
-    prep_token = _validated_prep_token(prep_token)
+# Compatibility is intentionally restricted to in-process/test snapshots made
+# by the old helper without any contract fields.  On-disk v1/v2 snapshots are
+# rejected by ``_load_snapshot``; production planning always supplies the
+# contract chain and therefore cannot reach these helpers.
+def _legacy_prepare_round(snapshot_path: Path, *, round_index: int, prep_token: str, tmp_dir: Path | None) -> dict[str, object]:
     payload = _load_snapshot(snapshot_path)
     output_dir = Path(str(payload["output_dir"])); workers = int(payload["workers"])
-    table_path = Path(str(payload["task_table"]))
-    round_dir = _round_directory(payload, round_index); round_dir.mkdir(parents=True, exist_ok=True)
-    ready = _assignment_ready_path(round_dir)
-    ready.unlink(missing_ok=True)
+    table_path = Path(str(payload["task_table"])); round_dir = _round_directory(payload, round_index); round_dir.mkdir(parents=True, exist_ok=True)
+    stage_directory: Path | None = None
     with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="preparation") as connection:
         _index_queue_expected_design(connection, table_path)
         completed_model_keys = _index_queue_completed_shards(connection, output_dir)
-        _index_queue_attempts(connection, output_dir)
-        _index_completed_rows(connection)
-        _classify_queue_attempts(connection)
-        _queue_incomplete_rows(connection)
+        _index_queue_attempts(connection, output_dir); _index_completed_rows(connection); _classify_queue_attempts(connection); _queue_incomplete_rows(connection)
         todo_rows = _stage_queue_todo(connection, table_path, workers=workers)
-        assignment, assigned_rows = _write_assignment_from_queue_index(
-            round_dir / "assignment.parquet", connection, workers=workers,
-        )
-        crashed = _queue_row_ids(connection, "crashed_rows")
-        too_long = _queue_row_ids(connection, "too_long_rows")
-    # These diagnostics and prep receipt are durable before the worker-facing
-    # readiness marker.  A failed prep therefore cannot look like an idle run.
-    write_json_atomic(round_dir / "crashed.json", {"round": round_index, "row_ids": crashed})
-    write_json_atomic(round_dir / "too-long.json", {"round": round_index, "row_ids": too_long})
-    stats: dict[str, object] = {
-        "round": round_index, "workers": workers, "todo_rows": todo_rows,
-        "assigned_rows": assigned_rows, "completed_model_keys": completed_model_keys,
-        "crashed_row_ids": crashed, "too_long_row_ids": too_long,
-        "assignment": str(assignment), "prep_token": prep_token,
-    }
-    write_json_atomic(round_dir / "prep.json", stats)
-    write_json_atomic(ready, {
-        "format_version": TABLE_FORMAT_VERSION, "round": round_index,
-        "workers": workers, "assignment": str(assignment.resolve()),
-        "prep_token": prep_token,
-    })
+        assignment, assigned_rows, _ = _write_assignment_from_queue_index(round_dir / "assignment.parquet", connection, workers=workers)
+        crashed = _queue_row_ids(connection, "crashed_rows"); too_long = _queue_row_ids(connection, "too_long_rows")
+    stats: dict[str, object] = {"round": round_index, "workers": workers, "todo_rows": todo_rows, "assigned_rows": assigned_rows, "completed_model_keys": completed_model_keys, "crashed_row_ids": crashed, "too_long_row_ids": too_long, "assignment": str(assignment), "prep_token": prep_token}
+    write_json_atomic(round_dir / "crashed.json", {"round": round_index, "row_ids": crashed}); write_json_atomic(round_dir / "too-long.json", {"round": round_index, "row_ids": too_long}); write_json_atomic(round_dir / "prep.json", stats)
+    write_json_atomic(_assignment_ready_path(round_dir), {"format_version": TABLE_FORMAT_VERSION, "round": round_index, "workers": workers, "assignment": str(assignment.resolve()), "prep_token": prep_token})
     return stats
 
 
-def verify_rounds(snapshot_path: Path, *, tmp_dir: Path | None = None) -> dict[str, object]:
-    """Stream all durable state into a complete-design verification receipt."""
+def _legacy_run_slice(snapshot_path: Path, *, round_index: int, worker_index: int, expected_prep_token: str) -> Path:
+    payload = _load_snapshot(snapshot_path); workers = int(payload["workers"])
+    if not 0 <= worker_index < workers:
+        raise IndexError("worker_index is outside the frozen worker count")
+    assignment = _require_ready_assignment(payload, round_index=round_index, workers=workers, expected_prep_token=_validated_prep_token(expected_prep_token))
+    rows = read_row_group(assignment, worker_index); output = _round_directory(payload, round_index) / f"worker-{worker_index}.csv"
+    _sweep_slice_temporaries(output, round_index=round_index, worker_index=worker_index)
+    header: list[str] | None = None; materialized: list[dict[str, str]] = []
+    if output.exists(): header, materialized = _read_csv_keys(output)
+    by_key = {_csv_key(row): row for row in materialized}
+    if len(by_key) != len(materialized): raise ValueError("worker output contains duplicate keys")
+    completed = {key for key, row in by_key.items() if row.get("status") in TERMINAL_STATUSES}; config = _config_from_json(payload["config"])
+    for sequence, row in enumerate(pending_rows(rows, completed)):
+        _append_attempt(_round_directory(payload, round_index) / "attempts" / f"worker-{worker_index}.jsonl", round_index=round_index, worker_index=worker_index, sequence=sequence, row_id=row.row_id)
+        row_out = output.parent / f".{output.stem}.round-{round_index}.worker-{worker_index}.{row.row_id}.csv"
+        row_config = replace(config, out=row_out, models=row.models, n_grid=(row.n_samples,), k_grid=(row.k_features,), n_seeds=1, n_draws=1, repeat_plan=((row.seed, row.draw),), n_jobs=1)
+        run_nk_grid(row_config, execution_pairs=((row.seed, row.draw),), exact_output_path=True, defer_failure_policy=True)
+        current_header, current_rows = _read_csv_keys(row_out)
+        if header is None: header = current_header
+        elif current_header != header: raise ValueError("worker rows produced inconsistent CSV headers")
+        for current in current_rows: by_key[_csv_key(current)] = current
+        _write_materialized_rows(output, header, by_key, execution={"mode": "slice", "round": round_index, "worker_index": worker_index}, expected_rows=len(expected_model_keys(rows)))
+        row_out.unlink(missing_ok=True); manifest_path(row_out).unlink(missing_ok=True)
+    if header is None and rows: raise RuntimeError("slice produced no rows")
+    if header is None: write_json_atomic(manifest_path(output), {"format_version": TABLE_FORMAT_VERSION, "execution": {"mode": "slice", "round": round_index, "worker_index": worker_index}, "completion": {"expected_rows": 0, "materialized_rows": 0}})
+    return output
 
-    payload = _load_snapshot(snapshot_path)
-    output_dir = Path(str(payload["output_dir"]))
-    table_path = Path(str(payload["task_table"]))
+
+def _legacy_verify_rounds(snapshot_path: Path, *, tmp_dir: Path | None) -> dict[str, object]:
+    payload = _load_snapshot(snapshot_path); output_dir = Path(str(payload["output_dir"])); table_path = Path(str(payload["task_table"]))
     with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="verification") as connection:
-        expected_model_keys = _index_queue_expected_design(connection, table_path)
-        completed_model_keys = _index_queue_completed_shards(connection, output_dir)
-        _index_queue_attempts(connection, output_dir)
+        expected = _index_queue_expected_design(connection, table_path); complete = _index_queue_completed_shards(connection, output_dir); _index_queue_attempts(connection, output_dir); _index_completed_rows(connection); _classify_queue_attempts(connection)
+        result = {"expected_model_keys": expected, "completed_model_keys": complete, "missing_model_keys": _queue_missing_model_keys(connection), "crashed_row_ids": _queue_row_ids(connection, "crashed_rows"), "too_long_row_ids": _queue_row_ids(connection, "too_long_rows")}
+    write_json_atomic(output_dir / "verification.json", result)
+    return result
+
+
+def prepare_round(
+    snapshot_path: Path, *, round_index: int, prep_token: str,
+    tmp_dir: Path | None = None,
+    submission_generation: str | None = None,
+    expected_previous_generation: str | None = None,
+    expected_pointer_version: int | None = None,
+    prep_job_id: str | None = None,
+) -> dict[str, object]:
+    """Prepare one immutable generation, or publish the exact todo=0 outcome."""
+
+    prep_token = _validated_prep_token(prep_token)
+    payload = _load_snapshot(snapshot_path)
+    if "analysis_contract" not in payload:
+        return _legacy_prepare_round(snapshot_path, round_index=round_index, prep_token=prep_token, tmp_dir=tmp_dir)
+    analysis, execution = _load_contract_chain(payload)
+    output_dir = Path(str(payload["output_dir"])); workers = int(payload["workers"])
+    if workers != int(execution.payload["worker_count"]):
+        raise ValueError("snapshot worker count differs from immutable execution contract")
+    config = _config_from_json(payload["config"])
+    if config.n_jobs != 1:
+        raise ValueError("dynamic worker config must freeze model_n_jobs=1")
+    generation = submission_generation or uuid.uuid4().hex
+    target = ActivationTarget(
+        analysis_id=analysis.analysis_id,
+        execution_plan_id=execution.execution_plan_id,
+        execution_contract_sha256=execution.sha256,
+        round_index=int(round_index),
+        submission_generation=str(generation),
+        expected_previous_generation=expected_previous_generation,
+        expected_pointer_version=(int(round_index) - 1 if expected_pointer_version is None else int(expected_pointer_version)),
+        prep_job_id=str(prep_job_id or prep_token),
+        prep_token=prep_token,
+    )
+    table_path = Path(str(payload["task_table"]))
+    predecessor_kind, _ = predecessor_gate(output_dir, target)
+    with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="preparation") as connection:
+        _index_queue_expected_design(connection, table_path)
+        _index_queue_wals(connection, output_dir, analysis_id=analysis.analysis_id)
         _index_completed_rows(connection)
         _classify_queue_attempts(connection)
+        if _queue_row_ids(connection, "aborted_rows"):
+            raise ControlProtocolError("durable TASK_ABORTED exists; refusing to publish a new ready assignment")
+        _queue_incomplete_rows(connection)
+        todo_rows = _stage_queue_todo(connection, table_path, workers=workers)
+        completed_model_keys = int(connection.execute("SELECT COUNT(*) FROM completed").fetchone()[0])
+        crashed = _queue_row_ids(connection, "crashed_rows")
+        too_long = _queue_row_ids(connection, "too_long_rows")
+        if todo_rows == 0:
+            assignment = None; assigned_rows: list[int] = []; row_groups: list[dict[str, object]] = []
+        else:
+            if predecessor_kind == "no-generation":
+                raise ControlProtocolError(
+                    "todo reappeared after an exact no-generation predecessor; refusing activation"
+                )
+            directory = generation_dir(output_dir, target)
+            # The intent is the first durable generation artefact.  Build all
+            # mutable preparation output in a private sibling and promote it
+            # only after every immutable child has been fsynced.
+            intent_file = publish_activation_intent(output_dir, target)
+            if directory.exists():
+                raise ControlProtocolError("generation directory already exists before immutable activation")
+            stage_directory = directory.parent / f".{directory.name}.staging"
+            try:
+                stage_directory.mkdir(parents=True)
+            except FileExistsError as exc:
+                raise ControlBusyError("activation staging directory requires recovery") from exc
+            assignment, assigned_rows, row_groups = _write_assignment_from_queue_index(
+                stage_directory / "assignment.parquet", connection, workers=workers,
+            )
+    if todo_rows == 0:
+        receipt = publish_no_generation_outcome(output_dir, target)
+        return {
+            "round": round_index, "todo_rows": 0, "no_generation": True,
+            "prep_outcome": str(receipt), "submission_generation": target.submission_generation,
+            "prep_token": prep_token,
+        }
+    assert assignment is not None
+    assert stage_directory is not None
+    directory = generation_dir(output_dir, target)
+    stage_assignment = assignment
+    canonical_assignment = directory / stage_assignment.name
+    assignment_sha = sha256_file(assignment)
+    index = stage_directory / "assignment.index.json"
+    canonical_index = directory / index.name
+    index_payload = {
+        "execution_plan_id": execution.execution_plan_id,
+        "execution_contract_sha256": execution.sha256,
+        "submission_generation": target.submission_generation,
+        "round": round_index,
+        "workers": workers,
+        "assignment_file_sha256": assignment_sha,
+        "row_groups": row_groups,
+    }
+    immutable_json_bytes(index, index_payload)
+    index_sha = sha256_file(index)
+    stats: dict[str, object] = {
+        "round": round_index, "workers": workers, "todo_rows": todo_rows,
+        "assigned_rows": assigned_rows, "completed_model_keys": completed_model_keys,
+        "interrupted_row_ids": crashed, "too_long_row_ids": too_long,
+        "assignment": str(canonical_assignment.resolve()), "assignment_index": str(canonical_index.resolve()),
+        "submission_generation": target.submission_generation, "prep_token": prep_token,
+        "prep_job_id": target.prep_job_id,
+    }
+    prep = stage_directory / "prep.json"; immutable_json_bytes(prep, stats)
+    ready = stage_directory / "assignment.ready.json"
+    ready_payload = {
+        "format_version": TABLE_FORMAT_VERSION, "execution_plan_id": execution.execution_plan_id,
+        "execution_contract_sha256": execution.sha256, "round": round_index, "workers": workers,
+        "submission_generation": target.submission_generation, "assignment": str(canonical_assignment.resolve()),
+        "assignment_sha256": assignment_sha, "assignment_index": str(canonical_index.resolve()),
+        "assignment_index_sha256": index_sha, "prep_token": prep_token, "prep_job_id": target.prep_job_id,
+    }
+    immutable_json_bytes(ready, ready_payload)
+    ready_sha = sha256_file(ready)
+    # ``prepared`` is part of the immutable staging directory, not a record
+    # synthesized after canonical promotion.  ``activate_generation`` will
+    # only byte-verify this exact record before publishing activation/CAS.
+    prepared = stage_directory / "generation.prepared.json"
+    prepared_payload = {
+        "prepared_format_version": 1,
+        "analysis_id": target.analysis_id,
+        "execution_plan_id": target.execution_plan_id,
+        "execution_contract_sha256": target.execution_contract_sha256,
+        "round": target.round_index,
+        "submission_generation": target.submission_generation,
+        "intent_sha256": sha256_file(intent_file),
+        "assignment_path": str(canonical_assignment.resolve()),
+        "assignment_sha256": assignment_sha,
+        "assignment_index_path": str(canonical_index.resolve()),
+        "assignment_index_sha256": index_sha,
+        "ready_path": str((directory / ready.name).resolve()),
+        "ready_sha256": ready_sha,
+        "prep_path": str((directory / prep.name).resolve()),
+        "prep_sha256": sha256_file(prep),
+        "worker_count": workers,
+    }
+    immutable_json_bytes(prepared, prepared_payload)
+    # Directory rename is the generation-artifact publication boundary.  The
+    # parent fsync makes it durable before the prepared/activation records.
+    try:
+        os.rename(stage_directory, directory)
+    except FileExistsError as exc:
+        raise ControlBusyError("canonical generation appeared while staging") from exc
+    parent_fd = os.open(directory.parent, os.O_RDONLY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    assignment = directory / stage_assignment.name
+    index = directory / index.name
+    prep = directory / prep.name
+    ready = directory / ready.name
+    prep_sha = sha256_file(prep)
+    activation = activate_generation(
+        output_dir, target, assignment_path=assignment, assignment_sha256=assignment_sha,
+        assignment_index_path=index, assignment_index_sha256=index_sha, ready_path=ready,
+        ready_sha256=ready_sha, prep_path=prep, prep_sha256=prep_sha, worker_count=workers,
+    )
+    stats["activation"] = str(activation)
+    return stats
+
+
+def verify_rounds(
+    snapshot_path: Path, *, tmp_dir: Path | None = None,
+    round_index: int | None = None, submission_generation: str | None = None,
+    expected_prep_token: str | None = None, expected_previous_generation: str | None = None,
+    expected_pointer_version: int | None = None, prep_job_id: str | None = None,
+) -> dict[str, object]:
+    """Verify only an exact sealed/outcome target and its frozen WAL history."""
+
+    payload = _load_snapshot(snapshot_path)
+    if "analysis_contract" not in payload:
+        return _legacy_verify_rounds(snapshot_path, tmp_dir=tmp_dir)
+    if round_index is None or submission_generation is None or expected_prep_token is None:
+        raise ValueError("verify requires exact last round, generation, and prep token")
+    analysis, execution, target = _exact_target(
+        payload, round_index=round_index, submission_generation=submission_generation,
+        prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
+        expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+    )
+    output_dir = Path(str(payload["output_dir"])); table_path = Path(str(payload["task_table"]))
+    dispatch = classify_exact_afterany_target_read_only(output_dir, target)
+    if dispatch.kind not in {"sealed-generation", "no-generation"}:
+        if dispatch.exit_code == SUPERSEDED_EXIT_CODE:
+            raise ControlSupersededError("verify target was superseded")
+        if dispatch.exit_code == PROTOCOL_EXIT_CODE:
+            raise ControlProtocolError("verify target has protocol conflict")
+        raise ControlBusyError("verify target is not sealed")
+    frozen_frontier = frozen_sealed_history(output_dir, target, dispatch)
+    history_digest = hashlib.sha256(canonical_json_bytes(list(frozen_frontier))).hexdigest()
+    with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="verification") as connection:
+        expected_model_keys = _index_queue_expected_design(connection, table_path)
+        _index_queue_wals(
+            connection, output_dir, analysis_id=analysis.analysis_id,
+            frozen_frontier=frozen_frontier,
+        )
+        _index_completed_rows(connection); _classify_queue_attempts(connection)
+        completed_model_keys = int(connection.execute("SELECT COUNT(*) FROM completed").fetchone()[0])
+        aborted = _queue_row_ids(connection, "aborted_rows")
         result: dict[str, object] = {
             "expected_model_keys": expected_model_keys,
             "completed_model_keys": completed_model_keys,
             "missing_model_keys": _queue_missing_model_keys(connection),
-            "crashed_row_ids": _queue_row_ids(connection, "crashed_rows"),
+            "failed_attempt_row_ids": _queue_row_ids(connection, "failed_attempt_rows"),
+            "aborted_tasks": aborted,
+            "interrupted_row_ids": _queue_row_ids(connection, "crashed_rows"),
             "too_long_row_ids": _queue_row_ids(connection, "too_long_rows"),
         }
-    # Completeness failures are data results, not index construction errors:
-    # publish them atomically before the CLI converts them to exit code 3.
-    write_json_atomic(output_dir / "verification.json", result)
+    exit_code = PROTOCOL_EXIT_CODE if result["aborted_tasks"] else (VERIFY_INCOMPLETE_EXIT_CODE if result["missing_model_keys"] or result["interrupted_row_ids"] or result["too_long_row_ids"] else SUCCESS_EXIT_CODE)
+    result.update({"complete": exit_code == SUCCESS_EXIT_CODE, "exit_code": exit_code, "sealed_history_digest_sha256": history_digest, "dispatch_kind": dispatch.kind})
+    receipt = publish_verification_receipt(
+        output_dir, target, dispatch=dispatch, sealed_history_digest_sha256=history_digest,
+        complete=bool(result["complete"]), exit_code=exit_code, extra=result,
+    )
+    result["verification_receipt"] = str(receipt)
     return result
 
 
 def _verification_failure_counts(result: Mapping[str, object]) -> dict[str, int]:
     return {
         "missing_model_keys": int(result["missing_model_keys"]),
-        "crashed_row_ids": len(result["crashed_row_ids"]),
+        "interrupted_row_ids": len(result["interrupted_row_ids"]),
         "too_long_row_ids": len(result["too_long_row_ids"]),
+        "aborted_tasks": len(result["aborted_tasks"]),
     }
 
 
@@ -1256,8 +2086,42 @@ def _write_final_csv(
         temporary.unlink(missing_ok=True)
 
 
+def _write_sealed_wal_csv(
+    output: Path, *, history_root: Path, analysis_id: str,
+    frozen_frontier: Sequence[Mapping[str, object]],
+) -> tuple[Path, int]:
+    """Materialize one local temporary CSV from sealed WAL RESULT payloads."""
+
+    target = Path(output)
+    header: tuple[str, ...] | None = None
+    count = 0
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer: csv.DictWriter | None = None
+        for _, _, scan in _iter_sealed_wal_scans(
+            history_root, analysis_id=analysis_id, frozen_frontier=frozen_frontier,
+        ) or ():
+            for record in scan.records:
+                if record.event_type != TASK_RESULT:
+                    continue
+                current_header, rows = decode_public_rows(record.payload)
+                if header is None:
+                    header = current_header
+                    writer = csv.DictWriter(handle, fieldnames=list(header), lineterminator="\n")
+                    writer.writeheader()
+                elif current_header != header:
+                    raise FinalizationError("sealed WAL RESULT payload headers differ")
+                assert writer is not None
+                writer.writerows(rows); count += len(rows)
+    if header is None:
+        raise FinalizationError("sealed history has no RESULT rows")
+    return target, count
+
+
 def finalize_snapshot(
     snapshot_path: Path, *, tmp_dir: Path | None = None,
+    round_index: int | None = None, submission_generation: str | None = None,
+    expected_prep_token: str | None = None, expected_previous_generation: str | None = None,
+    expected_pointer_version: int | None = None, prep_job_id: str | None = None,
 ) -> dict[str, object]:
     """Stream, validate and atomically publish all dynamic worker shards.
 
@@ -1271,11 +2135,28 @@ def finalize_snapshot(
     snapshot = _load_snapshot(snapshot_path)
     table_path = Path(str(snapshot["task_table"]))
     output_dir = Path(str(snapshot["output_dir"]))
+    legacy = "analysis_contract" not in snapshot
+    if legacy:
+        analysis = None; execution = None; target = None; dispatch = None
+    else:
+        if round_index is None or submission_generation is None or expected_prep_token is None:
+            raise FinalizationError("finalizer requires an exact verification target")
+        analysis, execution, target = _exact_target(
+            snapshot, round_index=round_index, submission_generation=submission_generation,
+            prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
+            expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+        )
+        dispatch = classify_exact_afterany_target_read_only(output_dir, target)
+        if dispatch.kind not in {"sealed-generation", "no-generation"}:
+            raise FinalizationError("finalizer target is not exact sealed/no-generation dispatch")
+        frozen_frontier = frozen_sealed_history(output_dir, target, dispatch)
+        history_digest = hashlib.sha256(canonical_json_bytes(list(frozen_frontier))).hexdigest()
+        validate_exact_verification_receipt(output_dir, target, expected_dispatch=dispatch, sealed_history_digest_sha256=history_digest)
     config = snapshot.get("config")
     if not isinstance(config, Mapping) or not isinstance(config.get("out"), str):
         raise FinalizationError("snapshot config.out is required for finalization")
     output = Path(str(config["out"])).expanduser().resolve()
-    shards = tuple(sorted(output_dir.glob("round-*/worker-*.csv")))
+    shards: tuple[Path, ...] = tuple(sorted(output_dir.glob("round-*/worker-*.csv"))) if legacy else ()
     tmp_base = _resolve_finalization_tmp_base(snapshot, tmp_dir)
     available_bytes, estimated_bytes = _preflight_finalization_space(
         tmp_base, table_path, shards,
@@ -1284,6 +2165,15 @@ def finalize_snapshot(
     database = run_dir / "index.sqlite"
     connection: sqlite3.Connection | None = None
     try:
+        if legacy:
+            wal_rows = 0
+        else:
+            assert analysis is not None
+            wal_csv, wal_rows = _write_sealed_wal_csv(
+                run_dir / "sealed-results.csv", history_root=output_dir,
+                analysis_id=analysis.analysis_id, frozen_frontier=frozen_frontier,
+            )
+            shards = (wal_csv,)
         connection = sqlite3.connect(database)
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=FULL")
@@ -1305,6 +2195,10 @@ def finalize_snapshot(
             "created_at_utc": utc_now(),
             "backend": "sqlite_streaming",
             "input_shards": len(shards),
+            "wal_result_rows": wal_rows,
+            "analysis_id": None if analysis is None else analysis.analysis_id,
+            "execution_plan_ids": [] if execution is None else [execution.execution_plan_id],
+            "verification_receipt": None if target is None else str(verification_path(output_dir, target)),
             "rows_read": rows_read,
             "final_rows": final_rows,
             "expected_model_keys": expected_count,
@@ -1385,6 +2279,10 @@ def write_work_snapshot(
     preparation_tmp_dir: Path | str | None = None,
     verification_tmp_dir: Path | str | None = None,
     finalization_tmp_dir: Path | str | None = None,
+    analysis_contract: AnalysisContract | None = None,
+    execution_contract: DynamicExecutionContract | None = None,
+    task_summary: TaskTableSummary | None = None,
+    cell_spec_repo_root: Path | None = None,
 ) -> Path:
     if workers < 1:
         raise ValueError("workers must be positive")
@@ -1407,6 +2305,29 @@ def write_work_snapshot(
         "output_dir": str(Path(output_dir).resolve()),
         "workers": int(workers),
     }
+    if (analysis_contract is None) != (execution_contract is None):
+        raise ValueError("analysis and execution contracts must be supplied together")
+    if analysis_contract is not None and execution_contract is not None:
+        if execution_contract.payload.get("analysis_id") != analysis_contract.analysis_id:
+            raise ValueError("execution contract does not bind analysis contract")
+        payload["analysis_id"] = analysis_contract.analysis_id
+        payload["analysis_contract_sha256"] = analysis_contract.sha256
+        payload["analysis_contract"] = str((Path(output_dir) / "analysis-contract.json").resolve())
+        payload["execution_plan_id"] = execution_contract.execution_plan_id
+        payload["execution_contract_sha256"] = execution_contract.sha256
+        payload["execution_contract"] = str((Path(output_dir) / "execution-contracts" / f"{execution_contract.execution_plan_id}.json").resolve())
+        payload["cell_spec_repo_root"] = str((cell_spec_repo_root or Path(__file__).resolve().parents[2]).resolve())
+        payload["result_store_format"] = "worker-event-wal-v1"
+    else:
+        # Direct unit tests retain a deliberately explicit CSV compatibility
+        # fixture.  It cannot be mistaken for an old production WAL plan.
+        payload["result_store_format"] = "test-legacy-csv-v2"
+        payload["test_compatibility_mode"] = True
+    if task_summary is not None:
+        payload["task_table_file_sha256"] = task_summary.task_table_file_sha256
+        payload["task_design_digest"] = task_summary.task_design_digest
+        payload["expected_task_rows"] = task_summary.expected_task_rows
+        payload["expected_model_rows"] = task_summary.expected_model_rows
     for phase, temporary_directory in (
         ("preparation", preparation_tmp_dir),
         ("verification", verification_tmp_dir),
@@ -1423,42 +2344,105 @@ def write_work_snapshot(
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run dynamic NK-grid work slices")
-    parser.add_argument("command", choices=("prep", "run", "verify", "finalize"))
+    parser.add_argument("command", choices=("prep", "recover-activation", "run", "close", "verify", "finalize"))
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--round", type=int)
     parser.add_argument("--worker-index", type=int)
     parser.add_argument("--tmp-dir", type=Path)
     parser.add_argument("--prep-token")
     parser.add_argument("--expected-prep-token")
+    parser.add_argument("--generation")
+    parser.add_argument("--expected-previous-generation")
+    parser.add_argument("--expected-pointer-version", type=int)
+    parser.add_argument("--prep-job-id")
     args = parser.parse_args(argv)
-    if args.command == "prep":
-        if args.round is None or args.prep_token is None:
-            parser.error("prep requires --round and --prep-token")
-        print(json.dumps(prepare_round(
-            args.snapshot, round_index=args.round, prep_token=args.prep_token,
-            tmp_dir=args.tmp_dir,
-        ), sort_keys=True))
-    elif args.command == "run":
-        if args.round is None or args.worker_index is None or args.expected_prep_token is None:
-            parser.error("run requires --round, --worker-index, and --expected-prep-token")
-        print(run_slice(
-            args.snapshot, round_index=args.round, worker_index=args.worker_index,
-            expected_prep_token=args.expected_prep_token,
-        ))
-    elif args.command == "verify":
-        result = verify_rounds(args.snapshot, tmp_dir=args.tmp_dir)
-        print(json.dumps(result, sort_keys=True), flush=True)
-        failures = _verification_failure_counts(result)
-        if any(failures.values()):
-            print(
-                "verification incomplete: "
-                + "; ".join(f"{category}={count}" for category, count in failures.items()),
-                file=sys.stderr,
-                flush=True,
+    try:
+        if args.command == "prep":
+            if args.round is None or args.prep_token is None or args.generation is None:
+                parser.error("prep requires --round, --prep-token, and --generation")
+            print(json.dumps(prepare_round(
+                args.snapshot, round_index=args.round, prep_token=args.prep_token,
+                tmp_dir=args.tmp_dir, submission_generation=args.generation,
+                expected_previous_generation=args.expected_previous_generation,
+                expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+            ), sort_keys=True))
+        elif args.command == "recover-activation":
+            if args.round is None or args.expected_prep_token is None or args.generation is None:
+                parser.error("recover-activation requires --round, --expected-prep-token, and --generation")
+            print(recover_generation_activation(
+                args.snapshot, round_index=args.round, submission_generation=args.generation,
+                expected_prep_token=args.expected_prep_token,
+                expected_previous_generation=args.expected_previous_generation,
+                expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+            ))
+        elif args.command == "run":
+            if args.round is None or args.worker_index is None or args.expected_prep_token is None or args.generation is None:
+                parser.error("run requires --round, --worker-index, --expected-prep-token, and --generation")
+            print(run_slice(
+                args.snapshot, round_index=args.round, worker_index=args.worker_index,
+                expected_prep_token=args.expected_prep_token, submission_generation=args.generation,
+                expected_previous_generation=args.expected_previous_generation,
+                expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+            ))
+        elif args.command == "close":
+            if args.round is None or args.expected_prep_token is None or args.generation is None:
+                parser.error("close requires --round, --expected-prep-token, and --generation")
+            print(close_generation(
+                args.snapshot, round_index=args.round, submission_generation=args.generation,
+                expected_prep_token=args.expected_prep_token,
+                expected_previous_generation=args.expected_previous_generation,
+                expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+            ))
+        elif args.command == "verify":
+            legacy = "analysis_contract" not in _load_snapshot(args.snapshot)
+            if not legacy and (args.round is None or args.expected_prep_token is None or args.generation is None):
+                parser.error("verify requires --round, --expected-prep-token, and --generation")
+            result = verify_rounds(
+                args.snapshot, tmp_dir=args.tmp_dir, round_index=args.round,
+                submission_generation=args.generation, expected_prep_token=args.expected_prep_token,
+                expected_previous_generation=args.expected_previous_generation,
+                expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
             )
-            raise SystemExit(VERIFY_INCOMPLETE_EXIT_CODE)
-    else:
-        print(json.dumps(finalize_snapshot(args.snapshot, tmp_dir=args.tmp_dir), sort_keys=True))
+            print(json.dumps(result, sort_keys=True), flush=True)
+            if legacy:
+                if any(_verification_failure_counts({
+                    "missing_model_keys": result["missing_model_keys"],
+                    "interrupted_row_ids": result["crashed_row_ids"],
+                    "too_long_row_ids": result["too_long_row_ids"],
+                    "aborted_tasks": [],
+                }).values()):
+                    print(
+                        "verification incomplete: "
+                        + "; ".join((
+                            f"missing_model_keys={result['missing_model_keys']}",
+                            f"crashed_row_ids={len(result['crashed_row_ids'])}",
+                            f"too_long_row_ids={len(result['too_long_row_ids'])}",
+                        )),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    raise SystemExit(VERIFY_INCOMPLETE_EXIT_CODE)
+            elif result["exit_code"] != SUCCESS_EXIT_CODE:
+                raise SystemExit(int(result["exit_code"]))
+        else:
+            legacy = "analysis_contract" not in _load_snapshot(args.snapshot)
+            if not legacy and (args.round is None or args.expected_prep_token is None or args.generation is None):
+                parser.error("finalize requires exact --round, --expected-prep-token, and --generation")
+            print(json.dumps(finalize_snapshot(
+                args.snapshot, tmp_dir=args.tmp_dir, round_index=args.round,
+                submission_generation=args.generation, expected_prep_token=args.expected_prep_token,
+                expected_previous_generation=args.expected_previous_generation,
+                expected_pointer_version=args.expected_pointer_version, prep_job_id=args.prep_job_id,
+            ), sort_keys=True))
+    except (ControlProtocolError, WALProtocolError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(PROTOCOL_EXIT_CODE) from exc
+    except (ControlBusyError, WALBusyError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(RETRYABLE_EXIT_CODE) from exc
+    except ControlSupersededError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(SUPERSEDED_EXIT_CODE) from exc
 
 
 if __name__ == "__main__":

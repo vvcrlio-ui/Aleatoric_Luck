@@ -106,9 +106,10 @@ FINALIZATION_TMP_DIR="${FIELD_LINES[$FIELD_INDEX]}"
 
 PREP="$ENGINE_DIR/slurm/prep_dynamic_queue.sbatch"
 WORKER="$ENGINE_DIR/slurm/run_flat_task_table.sbatch"
+CLOSER="$ENGINE_DIR/slurm/close_dynamic_queue.sbatch"
 VERIFY="$ENGINE_DIR/slurm/verify_dynamic_queue.sbatch"
 FINALIZER="$ENGINE_DIR/slurm/finalize_dynamic_queue.sbatch"
-for script in "$PREP" "$WORKER" "$VERIFY" "$FINALIZER"; do [ -f "$script" ] || { echo "Dynamic queue script not found: $script" >&2; exit 1; }; done
+for script in "$PREP" "$WORKER" "$CLOSER" "$VERIFY" "$FINALIZER"; do [ -f "$script" ] || { echo "Dynamic queue script not found: $script" >&2; exit 1; }; done
 # Slurm opens these files before executing any sbatch script.
 mkdir -p logs
 
@@ -122,37 +123,49 @@ submit_or_print() {
   fi
 }
 
-PREVIOUS=""
+GENERATIONS=($("$PYTHON" -c 'import sys, uuid; [print(uuid.uuid4()) for _ in range(int(sys.argv[1]))]' "$ROUNDS"))
+PREVIOUS_CLOSE=""
 RECEIPT=""
 for ROUND in $(seq 1 "$ROUNDS"); do
+  GENERATION="${GENERATIONS[$((ROUND - 1))]}"
+  POINTER_VERSION=$((ROUND - 1))
+  PREVIOUS_GENERATION=""
+  if [ "$ROUND" -gt 1 ]; then PREVIOUS_GENERATION="${GENERATIONS[$((ROUND - 2))]}"; fi
   PREP_COMMAND=("${PREPARATION_SBATCH_ARGS[@]}")
-  PREP_SCRIPT_ARGS=("$SNAPSHOT" "$ROUND")
-  if [ "$PREPARATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then
-    PREP_SCRIPT_ARGS+=("$PREPARATION_TMP_DIR")
-  fi
-  if [ -z "$PREVIOUS" ]; then
+  PREP_TMP_ARG=""
+  if [ "$PREPARATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then PREP_TMP_ARG="$PREPARATION_TMP_DIR"; fi
+  PREP_SCRIPT_ARGS=("$SNAPSHOT" "$ROUND" "$PREP_TMP_ARG")
+  PREP_SCRIPT_ARGS+=("$GENERATION" "$PREVIOUS_GENERATION" "$POINTER_VERSION")
+  if [ -z "$PREVIOUS_CLOSE" ]; then
     submit_or_print "prep-$ROUND" sbatch "${PREP_COMMAND[@]}" "$PREP" "${PREP_SCRIPT_ARGS[@]}"
   else
-    submit_or_print "prep-$ROUND" sbatch "${PREP_COMMAND[@]}" "--dependency=afterany:$PREVIOUS" "$PREP" "${PREP_SCRIPT_ARGS[@]}"
+    submit_or_print "prep-$ROUND" sbatch "${PREP_COMMAND[@]}" "--dependency=afterany:$PREVIOUS_CLOSE" "$PREP" "${PREP_SCRIPT_ARGS[@]}"
   fi
   PREP_JOB="$JOB_ID"
   if [ "$SUBMIT" != "0" ]; then
-    if [ -z "$PREVIOUS" ]; then RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"none"$'\n';
-    else RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"afterany:$PREVIOUS"$'\n'; fi
+    if [ -z "$PREVIOUS_CLOSE" ]; then RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"none"$'\n';
+    else RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"afterany:$PREVIOUS_CLOSE"$'\n'; fi
   fi
-  submit_or_print "work-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREP_JOB" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" "$ROUND" "$PREP_JOB"
+  submit_or_print "work-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREP_JOB" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" "$ROUND" "$PREP_JOB" "$GENERATION" "$PREVIOUS_GENERATION" "$POINTER_VERSION"
   WORK_JOB="$JOB_ID"
   [ "$SUBMIT" = "0" ] || RECEIPT+="work-$ROUND"$'\t'"$WORK_JOB"$'\t'"afterany:$PREP_JOB"$'\n'
-  PREVIOUS="$WORK_JOB"
+  submit_or_print "close-$ROUND" sbatch "${PREPARATION_SBATCH_ARGS[@]}" "--dependency=afterany:$WORK_JOB" "$CLOSER" "$SNAPSHOT" "$ROUND" "$GENERATION" "$PREP_JOB" "$PREVIOUS_GENERATION" "$POINTER_VERSION"
+  CLOSE_JOB="$JOB_ID"
+  [ "$SUBMIT" = "0" ] || RECEIPT+="close-$ROUND"$'\t'"$CLOSE_JOB"$'\t'"afterany:$WORK_JOB"$'\n'
+  PREVIOUS_CLOSE="$CLOSE_JOB"
 done
-VERIFY_COMMAND=("${VERIFICATION_SBATCH_ARGS[@]}" "--dependency=afterany:$PREVIOUS" "$VERIFY" "$SNAPSHOT")
+LAST_GENERATION="${GENERATIONS[$((ROUNDS - 1))]}"
+LAST_PREVIOUS=""
+if [ "$ROUNDS" -gt 1 ]; then LAST_PREVIOUS="${GENERATIONS[$((ROUNDS - 2))]}"; fi
+LAST_POINTER_VERSION=$((ROUNDS - 1))
+VERIFY_COMMAND=("${VERIFICATION_SBATCH_ARGS[@]}" "--dependency=afterany:$PREVIOUS_CLOSE" "$VERIFY" "$SNAPSHOT" "$ROUNDS" "$LAST_GENERATION" "$PREP_JOB" "$LAST_PREVIOUS" "$LAST_POINTER_VERSION")
 if [ "$VERIFICATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then
   VERIFY_COMMAND+=("$VERIFICATION_TMP_DIR")
 fi
 submit_or_print "verify" sbatch "${VERIFY_COMMAND[@]}"
 VERIFY_JOB="$JOB_ID"
-[ "$SUBMIT" = "0" ] || RECEIPT+="verify"$'\t'"$VERIFY_JOB"$'\t'"afterany:$PREVIOUS"$'\n'
-FINALIZER_COMMAND=("${FINALIZATION_SBATCH_ARGS[@]}" "--dependency=afterok:$VERIFY_JOB" "$FINALIZER" "$SNAPSHOT")
+[ "$SUBMIT" = "0" ] || RECEIPT+="verify"$'\t'"$VERIFY_JOB"$'\t'"afterany:$PREVIOUS_CLOSE"$'\n'
+FINALIZER_COMMAND=("${FINALIZATION_SBATCH_ARGS[@]}" "--dependency=afterok:$VERIFY_JOB" "$FINALIZER" "$SNAPSHOT" "$ROUNDS" "$LAST_GENERATION" "$PREP_JOB" "$LAST_PREVIOUS" "$LAST_POINTER_VERSION")
 if [ "$FINALIZATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then
   FINALIZER_COMMAND+=("$FINALIZATION_TMP_DIR")
 fi
