@@ -13,7 +13,6 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -2071,10 +2070,6 @@ def _run_nk_grid_locked(
     frame = loaded.train
     predictors = list(loaded.predictors)
     feature_units = [group.name for group in source_definitions]
-    feature_groups = {
-        group.name: list(group.features) for group in source_definitions
-    }
-    groups_by_name = {group.name: group for group in source_definitions}
     selected_model_params = load_model_params(
         model_params_path,
         task=task,
@@ -2323,335 +2318,6 @@ def _run_nk_grid_locked(
     # structures for the lifetime of the run.
     del existing_index, indexed_completed, existing, completed, jobs
 
-    @lru_cache(maxsize=8)
-    def cached_draw_orders(seed: int, draw: int) -> DrawOrders:
-        """Bounded run-local cache consumed only in the parent process."""
-
-        split = splits[seed]
-        return _freeze_draw_orders(
-            draw_orders(
-                split.X_train.index,
-                feature_units,
-                seed=seed,
-                draw=draw,
-            )
-        )
-
-    def run_cell_group(
-        seed: int,
-        draw: int,
-        n_samples: int,
-        k_features: int,
-        models: Sequence[str],
-        *,
-        orders: DrawOrders | None = None,
-    ) -> list[dict]:
-        split = splits[seed]
-        if orders is None:
-            orders = draw_orders(
-                split.X_train.index, feature_units, seed=seed, draw=draw
-            )
-        selected_rows = orders.row_index[:n_samples]
-        selected_units = [str(unit) for unit in orders.feature_names[:k_features]]
-        selected_cols = [
-            feature for unit in selected_units for feature in feature_groups[unit]
-        ]
-        selected_groups = [groups_by_name[unit] for unit in selected_units]
-        slice_started = time.perf_counter()
-        try:
-            X_sub_raw = split.X_train.loc[selected_rows, selected_cols]
-            y_sub = split.y_train.loc[selected_rows]
-            X_test_raw = split.X_test.loc[:, selected_cols]
-        except Exception as exc:
-            slice_seconds = time.perf_counter() - slice_started
-            failed_rows = []
-            for position, model_name in enumerate(models):
-                row = _base_row(
-                    dataset=dataset,
-                    outcome=config.outcome,
-                    model_name=model_name,
-                    seed=seed,
-                    draw=draw,
-                    n_samples=n_samples,
-                    k_features=k_features,
-                    n_train_total=len(split.X_train),
-                    n_test_total=len(split.X_test),
-                    n_features_total=len(feature_units),
-                    k_expanded=len(selected_cols),
-                    n_expanded_features_total=len(predictors),
-                )
-                diagnostics = _empty_diagnostics()
-                diagnostics["_slice_seconds"] = (
-                    slice_seconds if position == 0 else 0.0
-                )
-                diagnostics["_peak_rss_bytes"] = _process_peak_rss_bytes()
-                failed_rows.append(
-                    add_metadata(
-                        {
-                            **row,
-                            **(
-                                _empty_metrics()
-                                if task == "regression"
-                                else _empty_classification_metrics()
-                            ),
-                            **diagnostics,
-                            **(
-                                {"task": task}
-                                if task == "classification"
-                                else {}
-                            ),
-                            "status": "failed",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        },
-                        row_metadata,
-                    )
-                )
-            return failed_rows
-
-        slice_seconds = time.perf_counter() - slice_started
-        unobserved = count_unobserved_sources(X_sub_raw, selected_groups)
-        prepared: dict[str, Any] = {}
-        preparation_errors: dict[str, Exception] = {}
-
-        def run_model(model_name: str, position: int) -> dict:
-            model_started = time.perf_counter()
-            row = _base_row(
-                dataset=dataset,
-                outcome=config.outcome,
-                model_name=model_name,
-                seed=seed,
-                draw=draw,
-                n_samples=n_samples,
-                k_features=k_features,
-                n_train_total=len(split.X_train),
-                n_test_total=len(split.X_test),
-                n_features_total=len(feature_units),
-                k_expanded=len(selected_cols),
-                n_expanded_features_total=len(predictors),
-            )
-            row["K_unobserved"] = unobserved
-            diagnostics = _empty_diagnostics()
-            diagnostics["_slice_seconds"] = (
-                slice_seconds if position == 0 else 0.0
-            )
-
-            def result_row(
-                metrics: dict[str, Any],
-                *,
-                status: str,
-                error: str,
-                peak_rss_bytes: int | None = None,
-            ) -> dict:
-                diagnostics["_cell_wall_seconds"] = (
-                    time.perf_counter() - model_started
-                )
-                diagnostics["_peak_rss_bytes"] = (
-                    _process_peak_rss_bytes()
-                    if peak_rss_bytes is None
-                    else int(peak_rss_bytes)
-                )
-                return add_metadata(
-                    {
-                        **row,
-                        **metrics,
-                        **diagnostics,
-                        **(
-                            {"task": task}
-                            if task == "classification"
-                            else {}
-                        ),
-                        "status": status,
-                        "error": error,
-                    },
-                    row_metadata,
-                )
-
-            empty_metrics = (
-                _empty_metrics()
-                if task == "regression"
-                else _empty_classification_metrics()
-            )
-            if unobserved == k_features:
-                return result_row(
-                    empty_metrics,
-                    status="skipped",
-                    error="all_selected_sources_unobserved",
-                )
-            if (
-                task == "regression"
-                and model_name in REGRESSION_CV_MIN_N
-                and n_samples < REGRESSION_CV_MIN_N[model_name]
-            ):
-                min_required = REGRESSION_CV_MIN_N[model_name]
-                return result_row(
-                    empty_metrics,
-                    status="skipped",
-                    error=(
-                        f"below minimum N for {model_name}'s internal CV "
-                        f"(requires N>={min_required})"
-                    ),
-                )
-            try:
-                mode = (
-                    "passthrough"
-                    if schema.imputation["model_overrides"].get(model_name)
-                    == "passthrough"
-                    else "imputed"
-                )
-                if mode in preparation_errors:
-                    raise preparation_errors[mode]
-                if mode not in prepared:
-                    preprocess_started = time.perf_counter()
-                    diagnostics["_preprocess_computed"] = True
-                    try:
-                        prepared_cell = preprocess_cell(
-                            X_sub_raw,
-                            X_test_raw,
-                            selected_groups,
-                            schema.imputation,
-                            model_name=model_name,
-                        )
-                    except Exception as exc:
-                        preparation_errors[mode] = exc
-                        raise
-                    finally:
-                        diagnostics["_preprocess_seconds"] = (
-                            time.perf_counter() - preprocess_started
-                        )
-                    if prepared_cell.K_unobserved != unobserved:
-                        mismatch = RuntimeError(
-                            "preprocessing changed the precomputed "
-                            "K_unobserved count"
-                        )
-                        preparation_errors[mode] = mismatch
-                        raise mismatch
-                    prepared[mode] = prepared_cell
-                prepared_cell = prepared[mode]
-                diagnostics["_preprocess_vectorized"] = bool(
-                    prepared_cell.X_train.attrs.get("_preprocess_vectorized", False)
-                )
-                X_prepared = prepared_cell.X_train
-                X_test_prepared = prepared_cell.X_test
-                k_varying = int(
-                    sum(
-                        X_prepared.loc[:, list(group.features)]
-                        .nunique(dropna=True)
-                        .gt(1)
-                        .any()
-                        for group in selected_groups
-                    )
-                )
-                diagnostics["K_varying"] = k_varying
-                diagnostics["underdetermined"] = bool(
-                    task == "regression"
-                    and model_name == "ols"
-                    and _ols_is_underdetermined(X_prepared)
-                )
-                if task == "classification" and len(np.unique(y_sub)) < 2:
-                    return result_row(
-                        empty_metrics,
-                        status="skipped",
-                        error="single-class training sample for classification",
-                    )
-                if task == "classification" and model_name == "super_learner":
-                    min_class_count = int(y_sub.value_counts().min())
-                    if min_class_count < 2:
-                        return result_row(
-                            empty_metrics,
-                            status="skipped",
-                            error=(
-                                "below minimum per-class count for "
-                                "super_learner CV"
-                            ),
-                        )
-                if model_name in {"lightgbm", "super_learner"}:
-                    log_progress(
-                        "cell starting "
-                        f"model={model_name} seed={seed} draw={draw} "
-                        f"N={n_samples} K={k_features}"
-                    )
-                if model_name in SERIAL_OUTER_MODELS:
-                    X_fit = X_prepared
-                    X_test_fit = X_test_prepared
-                else:
-                    X_fit = X_prepared.copy(deep=True)
-                    X_test_fit = X_test_prepared.copy(deep=True)
-                fit_arguments = {
-                    "model_name": model_name,
-                    "model_seed": _model_seed(
-                        seed, draw, n_samples, k_features
-                    ),
-                    "model_n_jobs": config.n_jobs if model_name == "super_learner" else 1,
-                    "task": task,
-                    "params": selected_model_params[model_name],
-                    "X_train": X_fit,
-                    "y_train": y_sub,
-                    "X_test": X_test_fit,
-                }
-                if model_name in SERIAL_OUTER_MODELS:
-                    fit_result = _run_native_model_cell_locked(
-                        native_process_runner,
-                        fit_arguments=fit_arguments,
-                        on_native_crash=lambda attempt, exc: log_progress(
-                            "native subprocess crashed while running "
-                            "isolated cell "
-                            f"attempt={attempt}/"
-                            f"{config.native_process_max_attempts} "
-                            f"model={model_name} seed={seed} draw={draw} "
-                            f"N={n_samples} K={k_features} error={exc}"
-                        ),
-                        on_native_timeout=lambda attempt, exc: log_progress(
-                            "native subprocess timed out while running "
-                            "isolated cell "
-                            f"attempt={attempt}/"
-                            f"{config.native_process_max_attempts} "
-                            f"timeout_seconds="
-                            f"{config.native_process_timeout_seconds:g} "
-                            f"model={model_name} seed={seed} draw={draw} "
-                            f"N={n_samples} K={k_features} error={exc}"
-                        ),
-                    )
-                else:
-                    fit_result = _fit_predict_model_cell(**fit_arguments)
-                del fit_arguments, X_fit, X_test_fit
-                predictions = np.asarray(fit_result["predictions"])
-                diagnostics["_fit_seconds"] = fit_result["fit_seconds"]
-                diagnostics["_best_rounds"] = fit_result["best_rounds"]
-                diagnostics["converged"] = fit_result["converged"]
-                diagnostics["constant_prediction"] = _constant_prediction(
-                    predictions
-                )
-                if task == "classification":
-                    metrics = compute_classification_metrics(
-                        split.y_test, predictions, y_sub
-                    )
-                else:
-                    metrics = compute_regression_metrics(
-                        split.y_test, predictions, y_sub
-                    )
-                return result_row(
-                    metrics,
-                    status="ok",
-                    error="",
-                    peak_rss_bytes=fit_result["peak_rss_bytes"],
-                )
-            except Exception as exc:
-                return result_row(
-                    empty_metrics,
-                    status="failed",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-
-        try:
-            return [
-                run_model(model_name, position)
-                for position, model_name in enumerate(models)
-            ]
-        finally:
-            prepared.clear()
-            preparation_errors.clear()
-            del X_sub_raw, y_sub, X_test_raw
-
     # Open the native runner only after all manifest/checkpoint-resume work
     # has succeeded.  From here every cell and checkpoint failure closes it
     # before escaping this function.
@@ -2663,32 +2329,28 @@ def _run_nk_grid_locked(
         algorithm_version=algorithm_version,
     )
 
-    def write_session_checkpoint(rows: list[dict]) -> Path | None:
-        try:
+    try:
+        def write_session_checkpoint(rows: list[dict]) -> Path | None:
             return write_checkpoint_part(rows, out_path)
-        except BaseException:
-            execution_session.close()
-            raise
 
-    pending_cell_groups: dict[
-        tuple[int, int, int, int], list[tuple[str, int, int, int, int]]
-    ] = {}
-    for job in pending:
-        pending_cell_groups.setdefault(job[1:], []).append(job)
-    total_batches = (
-        int(np.ceil(len(pending) / config.batch_size)) if pending else 0
-    )
-    graceful_stop = False
-    stop_before_materialization = False
-    processed_rows = 0
-    checkpoint_buffer: list[dict] = []
-    checkpoint_batch_index = 0
-    # Array workers are the only outer concurrency layer.  Keep one complete
-    # cell group together so its imputation cache remains shared, but execute
-    # groups serially: no joblib windows and therefore no window barrier.
-    for cell_key, cell_jobs in pending_cell_groups.items():
-        seed, draw, n_samples, k_features = cell_key
-        try:
+        pending_cell_groups: dict[
+            tuple[int, int, int, int], list[tuple[str, int, int, int, int]]
+        ] = {}
+        for job in pending:
+            pending_cell_groups.setdefault(job[1:], []).append(job)
+        total_batches = (
+            int(np.ceil(len(pending) / config.batch_size)) if pending else 0
+        )
+        graceful_stop = False
+        stop_before_materialization = False
+        processed_rows = 0
+        checkpoint_buffer: list[dict] = []
+        checkpoint_batch_index = 0
+        # Array workers are the only outer concurrency layer.  Keep one complete
+        # cell group together so its imputation cache remains shared, but execute
+        # groups serially: no joblib windows and therefore no window barrier.
+        for cell_key, cell_jobs in pending_cell_groups.items():
+            seed, draw, n_samples, k_features = cell_key
             cell_rows = execution_session.run_cell_group(
                 seed=seed,
                 draw=draw,
@@ -2696,41 +2358,71 @@ def _run_nk_grid_locked(
                 k_features=k_features,
                 models=tuple(job[0] for job in cell_jobs),
             )
-        except BaseException:
-            execution_session.close()
-            raise
-        checkpoint_buffer.extend(cell_rows)
-        while len(checkpoint_buffer) >= config.batch_size:
+            checkpoint_buffer.extend(cell_rows)
+            while len(checkpoint_buffer) >= config.batch_size:
+                checkpoint_batch_index += 1
+                batch_rows = checkpoint_buffer[: config.batch_size]
+                del checkpoint_buffer[: config.batch_size]
+                log_progress(
+                    f"batch {checkpoint_batch_index}/{total_batches} starting "
+                    f"jobs={len(batch_rows)}"
+                )
+                part = write_session_checkpoint(batch_rows)
+                ok_count = sum(row.get("status") == "ok" for row in batch_rows)
+                failed_count = sum(
+                    row.get("status") == "failed" for row in batch_rows
+                )
+                skipped_count = sum(
+                    row.get("status") == "skipped" for row in batch_rows
+                )
+                log_progress(
+                    f"batch {checkpoint_batch_index}/{total_batches} wrote "
+                    f"checkpoint new_rows={len(batch_rows)} ok={ok_count} "
+                    f"failed={failed_count} skipped={skipped_count} "
+                    f"part={part.name if part else 'none'} out={out_path}"
+                )
+                processed_rows += len(batch_rows)
+                if stop_after_batch is not None and stop_after_batch():
+                    if processed_rows < len(pending):
+                        graceful_stop = True
+                        log_progress(
+                            "graceful stop requested; latest batch is checkpointed "
+                            "and remaining cells will resume on the next invocation"
+                        )
+                        break
+                    if defer_materialization_on_stop:
+                        graceful_stop = True
+                        stop_before_materialization = True
+                        log_progress(
+                            "graceful stop arrived after the final cell checkpoint; "
+                            "full CSV materialization is deferred to the next invocation"
+                        )
+                        break
+                    log_progress(
+                        "graceful stop arrived after the final pending batch; "
+                        "the run will finalize without requeue"
+                    )
+            if graceful_stop:
+                break
+        if checkpoint_buffer and not graceful_stop:
             checkpoint_batch_index += 1
-            batch_rows = checkpoint_buffer[: config.batch_size]
-            del checkpoint_buffer[: config.batch_size]
+            batch_rows = checkpoint_buffer
             log_progress(
                 f"batch {checkpoint_batch_index}/{total_batches} starting "
                 f"jobs={len(batch_rows)}"
             )
             part = write_session_checkpoint(batch_rows)
             ok_count = sum(row.get("status") == "ok" for row in batch_rows)
-            failed_count = sum(
-                row.get("status") == "failed" for row in batch_rows
-            )
-            skipped_count = sum(
-                row.get("status") == "skipped" for row in batch_rows
-            )
+            failed_count = sum(row.get("status") == "failed" for row in batch_rows)
+            skipped_count = sum(row.get("status") == "skipped" for row in batch_rows)
             log_progress(
-                f"batch {checkpoint_batch_index}/{total_batches} wrote "
-                f"checkpoint new_rows={len(batch_rows)} ok={ok_count} "
-                f"failed={failed_count} skipped={skipped_count} "
+                f"batch {checkpoint_batch_index}/{total_batches} wrote checkpoint "
+                f"new_rows={len(batch_rows)} ok={ok_count} failed={failed_count} "
+                f"skipped={skipped_count} "
                 f"part={part.name if part else 'none'} out={out_path}"
             )
             processed_rows += len(batch_rows)
             if stop_after_batch is not None and stop_after_batch():
-                if processed_rows < len(pending):
-                    graceful_stop = True
-                    log_progress(
-                        "graceful stop requested; latest batch is checkpointed "
-                        "and remaining cells will resume on the next invocation"
-                    )
-                    break
                 if defer_materialization_on_stop:
                     graceful_stop = True
                     stop_before_materialization = True
@@ -2738,45 +2430,13 @@ def _run_nk_grid_locked(
                         "graceful stop arrived after the final cell checkpoint; "
                         "full CSV materialization is deferred to the next invocation"
                     )
-                    break
-                log_progress(
-                    "graceful stop arrived after the final pending batch; "
-                    "the run will finalize without requeue"
-                )
-        if graceful_stop:
-            break
-    if checkpoint_buffer and not graceful_stop:
-        checkpoint_batch_index += 1
-        batch_rows = checkpoint_buffer
-        log_progress(
-            f"batch {checkpoint_batch_index}/{total_batches} starting "
-            f"jobs={len(batch_rows)}"
-        )
-        part = write_session_checkpoint(batch_rows)
-        ok_count = sum(row.get("status") == "ok" for row in batch_rows)
-        failed_count = sum(row.get("status") == "failed" for row in batch_rows)
-        skipped_count = sum(row.get("status") == "skipped" for row in batch_rows)
-        log_progress(
-            f"batch {checkpoint_batch_index}/{total_batches} wrote checkpoint "
-            f"new_rows={len(batch_rows)} ok={ok_count} failed={failed_count} "
-            f"skipped={skipped_count} "
-            f"part={part.name if part else 'none'} out={out_path}"
-        )
-        processed_rows += len(batch_rows)
-        if stop_after_batch is not None and stop_after_batch():
-            if defer_materialization_on_stop:
-                graceful_stop = True
-                stop_before_materialization = True
-                log_progress(
-                    "graceful stop arrived after the final cell checkpoint; "
-                    "full CSV materialization is deferred to the next invocation"
-                )
-            else:
-                log_progress(
-                    "graceful stop arrived after the final pending batch; "
-                    "the run will finalize without requeue"
-                )
-    execution_session.close()
+                else:
+                    log_progress(
+                        "graceful stop arrived after the final pending batch; "
+                        "the run will finalize without requeue"
+                    )
+    finally:
+        execution_session.close()
     if not pending:
         log_progress("no pending jobs; checkpoint is already complete")
     if (

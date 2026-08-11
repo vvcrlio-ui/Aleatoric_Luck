@@ -18,6 +18,7 @@ from aleatoric_nk_grid.experiment import load_checkpoint, write_checkpoint_part
 from aleatoric_nk_grid.nk_grid import (
     METRIC_COLUMNS,
     NKGridConfig,
+    NKGridExecutionSession,
     run_nk_grid,
 )
 from aleatoric_nk_grid.preprocessing import preprocess_cell
@@ -100,6 +101,41 @@ def _metric_rows(path: Path) -> pd.DataFrame:
     return frame.loc[:, columns].sort_values(
         ["seed", "draw", "K", "N", "model"], kind="stable"
     ).reset_index(drop=True)
+
+
+@pytest.mark.parametrize("raise_after_batch", [False, True])
+def test_session_closes_native_runner_after_success_and_exception(
+    tmp_path, monkeypatch, raise_after_batch,
+):
+    frame = _frame(rows=32, features=1)
+    schema = write_schema_bundle(
+        tmp_path / "input", frame, predictors=["X_000"]
+    )
+    config = _config(
+        schema, tmp_path / "out.csv", models=("ols",), batch_size=1,
+        max_n=12, max_k=1,
+    )
+    closes = 0
+    original_close = NKGridExecutionSession.close
+
+    def counted_close(session):
+        nonlocal closes
+        closes += 1
+        return original_close(session)
+
+    monkeypatch.setattr(NKGridExecutionSession, "close", counted_close)
+
+    def stop() -> bool:
+        if raise_after_batch:
+            raise RuntimeError("injected checkpoint callback failure")
+        return False
+
+    if raise_after_batch:
+        with pytest.raises(RuntimeError, match="checkpoint callback"):
+            run_nk_grid(config, stop_after_batch=stop)
+    else:
+        run_nk_grid(config, stop_after_batch=stop)
+    assert closes == 1
 
 
 def test_cell_group_metrics_exactly_match_model_at_a_time_execution(tmp_path):

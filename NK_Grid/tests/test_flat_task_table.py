@@ -11,6 +11,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from conftest import write_legacy_dynamic_fixture as write_work_snapshot
+
 import aleatoric_nk_grid.flat_task_table as ft
 from aleatoric_nk_grid.flat_task_table import (
     ResourceRequest,
@@ -31,9 +33,11 @@ from aleatoric_nk_grid.flat_task_table import (
     sbatch_resource_args,
     verify_rounds,
     write_task_table,
-    write_work_snapshot,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
+
+
+pytestmark = pytest.mark.usefixtures("retired_legacy_dynamic_adapter")
 
 
 def _config(tmp_path: Path, *, models: tuple[str, ...] = ("ols",)) -> NKGridConfig:

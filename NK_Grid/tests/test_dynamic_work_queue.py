@@ -24,6 +24,7 @@ from aleatoric_nk_grid.flat_task_table import (
     ResultKeySetError,
     ResultProjectionError,
     _aborted_reason,
+    _load_snapshot,
 )
 from aleatoric_nk_grid.worker_event_wal import WALFrameTooLarge
 
@@ -75,6 +76,22 @@ def test_aborted_reason_mapping_is_typed_and_exhaustive():
     assert _aborted_reason(ResultKeySetError("x")) == "RESULT_KEY_SET_MISMATCH"
     assert _aborted_reason(UnicodeError("x")) == "RESULT_ENCODING_FAILED"
     assert _aborted_reason(RuntimeError("RESULT_KEY_SET_MISMATCH")) == "RESULT_PROTOCOL_VIOLATION"
+
+
+def test_serialized_compatibility_flags_cannot_enable_legacy_csv_execution(tmp_path):
+    snapshot = tmp_path / "forged-legacy.json"
+    snapshot.write_text(
+        json.dumps({
+            "format_version": 2,
+            "result_store_format": "test-legacy-csv-v2",
+            "test_compatibility_mode": True,
+            "task_table": str(tmp_path / "tasks.parquet"),
+            "output_dir": str(tmp_path / "out"),
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unsupported legacy dynamic snapshot"):
+        _load_snapshot(snapshot)
 
 
 def test_plan_requires_account_and_never_splits_super_learner(tmp_path):

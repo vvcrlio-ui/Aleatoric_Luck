@@ -123,6 +123,110 @@ def test_started_metadata_limit_and_uncommitted_body_recovery(tmp_path: Path, mo
     assert scan_wal(path).has_uncommitted_tail is False
 
 
+@pytest.mark.parametrize("event_type", ["START", "RESULT", "ABORTED"])
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "before_body_sync",
+        "after_body_sync",
+        "after_commit_trailer",
+        "before_commit_sync",
+        "after_commit_sync",
+    ],
+)
+def test_each_wal_event_recovers_at_every_two_phase_sync_boundary(
+    tmp_path: Path, event_type: str, boundary: str,
+):
+    path = tmp_path / f"{event_type}-{boundary}.wal"
+    with WorkerEventLog.open_exclusive_and_repair(path, identity=_identity()) as log:
+        sequence = None
+        if event_type != "START":
+            sequence = log.commit_started(row_id="row-1")
+
+        def crash(observed: str) -> None:
+            if observed == boundary:
+                raise RuntimeError(f"injected {boundary}")
+
+        with pytest.raises(RuntimeError, match="injected"):
+            if event_type == "START":
+                log.commit_started(row_id="row-1", fault=crash)
+            elif event_type == "RESULT":
+                assert sequence is not None
+                log.commit_result(
+                    sequence=sequence, row_id="row-1",
+                    public_rows=[_row()], fault=crash,
+                )
+            else:
+                assert sequence is not None
+                log.commit_aborted(
+                    sequence=sequence, row_id="row-1",
+                    payload=bounded_abort_payload(
+                        reason_code="RESULT_PROTOCOL_VIOLATION",
+                        actual_bytes=0,
+                        diagnostic="injected",
+                    ),
+                    fault=crash,
+                )
+
+    trailer_written = boundary in {
+        "after_commit_trailer", "before_commit_sync", "after_commit_sync"
+    }
+    before = scan_wal(path)
+    assert before.has_uncommitted_tail is (not trailer_written)
+    with WorkerEventLog.open_exclusive_and_repair(
+        path, identity=_identity()
+    ):
+        pass
+    recovered = scan_wal(path)
+    assert recovered.has_uncommitted_tail is False
+    committed_types = [record.event_type for record in recovered.records]
+    expected = [] if event_type == "START" else ["TASK_STARTED"]
+    if trailer_written:
+        expected.append(
+            {
+                "START": "TASK_STARTED",
+                "RESULT": TASK_RESULT,
+                "ABORTED": TASK_ABORTED,
+            }[event_type]
+        )
+    assert committed_types == expected
+
+
+@pytest.mark.slow
+def test_wal_bytes_are_linear_and_inode_count_is_task_count_independent(
+    tmp_path: Path, monkeypatch,
+):
+    # Preserve the production encoder/write path while avoiding 200k physical
+    # fsync calls in a local complexity test.  Durability boundaries are
+    # exercised independently by the crash matrix above.
+    monkeypatch.setattr("aleatoric_nk_grid.worker_event_wal._sync_fd", lambda _: None)
+    measurements: list[tuple[int, int, int]] = []
+    for task_count in (10, 1_000, 50_000):
+        root = tmp_path / str(task_count)
+        path = root / "worker.events.wal"
+        root.mkdir()
+        with WorkerEventLog.open_exclusive_and_repair(
+            path, identity=_identity()
+        ) as log:
+            for index in range(task_count):
+                row_id = f"row-{index:05d}"
+                sequence = log.commit_started(row_id=row_id)
+                log.commit_result(
+                    sequence=sequence, row_id=row_id, public_rows=[_row()]
+                )
+        inode_count = sum(1 for item in root.rglob("*") if item.is_file())
+        measurements.append((task_count, path.stat().st_size, inode_count))
+
+    assert [inode_count for _, _, inode_count in measurements] == [1, 1, 1]
+    small_slope = (measurements[1][1] - measurements[0][1]) / (
+        measurements[1][0] - measurements[0][0]
+    )
+    large_slope = (measurements[2][1] - measurements[1][1]) / (
+        measurements[2][0] - measurements[1][0]
+    )
+    assert 0.8 <= large_slope / small_slope <= 1.25
+
+
 def test_terminal_events_cannot_be_duplicated_in_one_writer(tmp_path: Path):
     path = tmp_path / "worker.events.wal"
     with WorkerEventLog.open_exclusive_and_repair(path, identity=_identity()) as log:

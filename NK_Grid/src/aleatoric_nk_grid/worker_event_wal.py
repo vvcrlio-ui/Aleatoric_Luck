@@ -558,6 +558,7 @@ class WorkerEventLog:
         payload: bytes,
         *,
         sync: Callable[[int], None] | None = None,
+        fault: Callable[[str], None] | None = None,
     ) -> None:
         if self._closed:
             raise WALProtocolError("cannot append to a closed WorkerEventLog")
@@ -565,14 +566,29 @@ class WorkerEventLog:
             event_type=event_type, sequence=sequence, row_id=row_id, payload=payload,
         )
         _write_all(self._descriptor, _encode_frame(raw_header, payload))
+        if fault is not None:
+            fault("before_body_sync")
         (sync or _sync_fd)(self._descriptor)  # body durable boundary
+        if fault is not None:
+            fault("after_body_sync")
         raw_trailer = _commit_trailer(header)
         _write_all(self._descriptor, COMMIT_MAGIC + _LENGTH.pack(len(raw_trailer)) + raw_trailer)
+        if fault is not None:
+            fault("after_commit_trailer")
+            fault("before_commit_sync")
         (sync or _sync_fd)(self._descriptor)  # commit durable boundary
+        if fault is not None:
+            fault("after_commit_sync")
 
-    def commit_started(self, *, row_id: str, metadata: Mapping[str, object] | None = None) -> int:
+    def commit_started(
+        self, *, row_id: str, metadata: Mapping[str, object] | None = None,
+        fault: Callable[[str], None] | None = None,
+    ) -> int:
         sequence = self._next_sequence
-        self._commit(TASK_STARTED, sequence, row_id, canonical_json_bytes(dict(metadata or {})))
+        self._commit(
+            TASK_STARTED, sequence, row_id,
+            canonical_json_bytes(dict(metadata or {})), fault=fault,
+        )
         self._started.add((sequence, str(row_id)))
         self._next_sequence += 1
         return sequence
@@ -580,16 +596,23 @@ class WorkerEventLog:
     def commit_result(
         self, *, sequence: int, row_id: str, public_rows: Sequence[Mapping[str, object]],
         header: Sequence[str] | None = None,
+        fault: Callable[[str], None] | None = None,
     ) -> None:
         key = (int(sequence), str(row_id))
         if key not in self._started:
             raise WALProtocolError("TASK_RESULT sequence has no durable TASK_STARTED")
         if key in self._terminal:
             raise WALProtocolError("TASK_RESULT duplicates an existing terminal event")
-        self._commit(TASK_RESULT, sequence, row_id, encode_public_rows(public_rows, header=header))
+        self._commit(
+            TASK_RESULT, sequence, row_id,
+            encode_public_rows(public_rows, header=header), fault=fault,
+        )
         self._terminal.add(key)
 
-    def commit_aborted(self, *, sequence: int, row_id: str, payload: bytes) -> None:
+    def commit_aborted(
+        self, *, sequence: int, row_id: str, payload: bytes,
+        fault: Callable[[str], None] | None = None,
+    ) -> None:
         key = (int(sequence), str(row_id))
         if key not in self._started:
             raise WALProtocolError("TASK_ABORTED sequence has no durable TASK_STARTED")
@@ -597,7 +620,7 @@ class WorkerEventLog:
             raise WALProtocolError("TASK_ABORTED duplicates an existing terminal event")
         if len(payload) > ABORT_PAYLOAD_LIMIT:
             raise WALProtocolError("TASK_ABORTED payload exceeds 4 KiB")
-        self._commit(TASK_ABORTED, sequence, row_id, payload)
+        self._commit(TASK_ABORTED, sequence, row_id, payload, fault=fault)
         self._terminal.add(key)
 
     def committed_terminal_row_ids(self) -> set[str]:

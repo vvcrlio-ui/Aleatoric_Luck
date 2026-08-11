@@ -5,13 +5,19 @@ import gc
 import tracemalloc
 from pathlib import Path
 
+import pytest
+
+from conftest import write_legacy_dynamic_fixture as write_work_snapshot
+
 from aleatoric_nk_grid.flat_task_table import (
     TaskRow,
     finalize_snapshot,
     write_task_table,
-    write_work_snapshot,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
+
+
+pytestmark = pytest.mark.usefixtures("retired_legacy_dynamic_adapter")
 
 
 def _config(root: Path) -> NKGridConfig:

@@ -227,6 +227,10 @@ def _write_temp_fsync_rename(
         existing = target.read_bytes()
         if existing != data:
             raise ControlProtocolError(f"immutable control artefact differs: {target}")
+        # The prior attempt may have crashed after rename but before its
+        # parent-directory fsync.  Visibility alone is not durability;
+        # idempotent success must complete the missing commit boundary.
+        _fsync_directory(target.parent)
         return sha256_bytes(existing)
     temporary = target.parent / f".{target.name}.tmp.{uuid.uuid4().hex}"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
@@ -247,6 +251,7 @@ def _write_temp_fsync_rename(
         existing = target.read_bytes()
         if existing != data:
             raise ControlProtocolError(f"immutable control artefact differs: {target}")
+        _fsync_directory(target.parent)
         return sha256_bytes(existing)
     if fault is not None:
         fault("after_rename")

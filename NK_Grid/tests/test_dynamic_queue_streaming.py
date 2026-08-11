@@ -6,6 +6,9 @@ import tracemalloc
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import pytest
+
+from conftest import write_legacy_dynamic_fixture as write_work_snapshot
 
 import aleatoric_nk_grid.flat_task_table as ft
 from aleatoric_nk_grid.flat_task_table import (
@@ -13,9 +16,11 @@ from aleatoric_nk_grid.flat_task_table import (
     prepare_round,
     verify_rounds,
     write_task_table,
-    write_work_snapshot,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
+
+
+pytestmark = pytest.mark.usefixtures("retired_legacy_dynamic_adapter")
 
 
 def _config(root: Path) -> NKGridConfig:

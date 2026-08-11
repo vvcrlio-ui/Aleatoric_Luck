@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
 
 from aleatoric_nk_grid.preprocessing import source_groups
 from aleatoric_nk_grid.validate_input import canonical_feature_universe
@@ -122,3 +126,83 @@ def write_repo_schema_bundle(_temporary_root: Path, train: pd.DataFrame, **kwarg
     repo_root = Path(__file__).resolve().parents[2]
     root = repo_root / ".pytest_cache" / "nk-grid-inputs" / uuid.uuid4().hex
     return write_schema_bundle(root, train, **kwargs)
+
+
+def write_legacy_dynamic_fixture(
+    path: Path,
+    *,
+    table_path: Path,
+    panel: str,
+    config: Any,
+    output_dir: Path,
+    workers: int,
+    preparation_tmp_dir: Path | str | None = None,
+    verification_tmp_dir: Path | str | None = None,
+    finalization_tmp_dir: Path | str | None = None,
+    **_: object,
+) -> Path:
+    """Build an old CSV snapshot solely for tests of the retired adapter.
+
+    Production ``write_work_snapshot`` no longer has a compatibility switch;
+    keeping this encoder under ``tests/`` prevents a serialized flag from
+    re-enabling the retired per-task state machine.
+    """
+
+    from aleatoric_nk_grid import flat_task_table as ft
+
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    table = Path(table_path).resolve()
+    try:
+        source = pq.ParquetFile(table, memory_map=True)
+        ft._validate_task_table_columns(source.schema_arrow.names)
+        if source.metadata.num_rows < 1:
+            raise ValueError("task table must contain at least one row")
+    except ValueError:
+        raise
+    except (OSError, pa.ArrowInvalid) as exc:
+        raise ValueError(f"cannot read task table metadata {table}: {exc}") from exc
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "format_version": ft.TABLE_FORMAT_VERSION,
+        "panel": str(panel),
+        "task_table": str(table),
+        "config": ft._config_to_json(config),
+        "output_dir": str(Path(output_dir).resolve()),
+        "workers": int(workers),
+        "result_store_format": "retired-test-csv-adapter-v1",
+    }
+    for phase, temporary_directory in (
+        ("preparation", preparation_tmp_dir),
+        ("verification", verification_tmp_dir),
+        ("finalization", finalization_tmp_dir),
+    ):
+        if temporary_directory is not None:
+            payload[phase] = {
+                "tmp_dir": str(Path(temporary_directory).expanduser().resolve())
+            }
+    ft.write_json_atomic(target, payload)
+    os.chmod(target, 0o444)
+    return target
+
+
+@pytest.fixture
+def retired_legacy_dynamic_adapter(monkeypatch):
+    """Enable the removed CSV codec only inside explicitly marked tests."""
+
+    from aleatoric_nk_grid import flat_task_table as ft
+
+    production_loader = ft._load_snapshot
+
+    def load_with_production_fallback(path: Path) -> dict[str, object]:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if (
+            payload.get("format_version") == ft.TABLE_FORMAT_VERSION
+            and payload.get("result_store_format")
+            == "retired-test-csv-adapter-v1"
+        ):
+            return payload
+        return production_loader(path)
+
+    monkeypatch.setattr(ft, "_load_snapshot", load_with_production_fallback)

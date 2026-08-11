@@ -860,12 +860,10 @@ def _load_snapshot(path: Path) -> dict[str, object]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if payload.get("format_version") != TABLE_FORMAT_VERSION:
         raise ValueError("unsupported legacy dynamic snapshot/result store; rebuild a worker-event-wal-v1 plan")
-    if "analysis_contract" in payload:
-        if payload.get("result_store_format") != "worker-event-wal-v1":
-            raise ValueError("dynamic WAL snapshot is missing its result-store identity")
-    elif not (
-        payload.get("result_store_format") == "test-legacy-csv-v2"
-        and payload.get("test_compatibility_mode") is True
+    if (
+        not isinstance(payload.get("analysis_contract"), str)
+        or not isinstance(payload.get("execution_contract"), str)
+        or payload.get("result_store_format") != "worker-event-wal-v1"
     ):
         raise ValueError("unsupported legacy dynamic snapshot/result store; rebuild a worker-event-wal-v1 plan")
     return payload
@@ -2530,24 +2528,21 @@ def write_work_snapshot(
         "output_dir": str(Path(output_dir).resolve()),
         "workers": int(workers),
     }
-    if (analysis_contract is None) != (execution_contract is None):
-        raise ValueError("analysis and execution contracts must be supplied together")
-    if analysis_contract is not None and execution_contract is not None:
-        if execution_contract.payload.get("analysis_id") != analysis_contract.analysis_id:
-            raise ValueError("execution contract does not bind analysis contract")
-        payload["analysis_id"] = analysis_contract.analysis_id
-        payload["analysis_contract_sha256"] = analysis_contract.sha256
-        payload["analysis_contract"] = str((Path(output_dir) / "analysis-contract.json").resolve())
-        payload["execution_plan_id"] = execution_contract.execution_plan_id
-        payload["execution_contract_sha256"] = execution_contract.sha256
-        payload["execution_contract"] = str((Path(output_dir) / "execution-contracts" / f"{execution_contract.execution_plan_id}.json").resolve())
-        payload["cell_spec_repo_root"] = str((cell_spec_repo_root or Path(__file__).resolve().parents[2]).resolve())
-        payload["result_store_format"] = "worker-event-wal-v1"
-    else:
-        # Direct unit tests retain a deliberately explicit CSV compatibility
-        # fixture.  It cannot be mistaken for an old production WAL plan.
-        payload["result_store_format"] = "test-legacy-csv-v2"
-        payload["test_compatibility_mode"] = True
+    if analysis_contract is None or execution_contract is None:
+        raise ValueError(
+            "dynamic snapshots require analysis and execution contracts; "
+            "legacy CSV fixtures belong in test-only adapters"
+        )
+    if execution_contract.payload.get("analysis_id") != analysis_contract.analysis_id:
+        raise ValueError("execution contract does not bind analysis contract")
+    payload["analysis_id"] = analysis_contract.analysis_id
+    payload["analysis_contract_sha256"] = analysis_contract.sha256
+    payload["analysis_contract"] = str((Path(output_dir) / "analysis-contract.json").resolve())
+    payload["execution_plan_id"] = execution_contract.execution_plan_id
+    payload["execution_contract_sha256"] = execution_contract.sha256
+    payload["execution_contract"] = str((Path(output_dir) / "execution-contracts" / f"{execution_contract.execution_plan_id}.json").resolve())
+    payload["cell_spec_repo_root"] = str((cell_spec_repo_root or Path(__file__).resolve().parents[2]).resolve())
+    payload["result_store_format"] = "worker-event-wal-v1"
     if task_summary is not None:
         payload["task_table_file_sha256"] = task_summary.task_table_file_sha256
         payload["task_design_digest"] = task_summary.task_design_digest
