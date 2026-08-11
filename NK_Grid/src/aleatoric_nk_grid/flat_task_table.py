@@ -14,7 +14,6 @@ import errno
 import fcntl
 import hashlib
 import json
-import multiprocessing
 import os
 import shutil
 import sqlite3
@@ -94,7 +93,6 @@ from .worker_event_wal import (
     WorkerEventLog,
     bounded_abort_payload,
     decode_public_rows,
-    scan_wal,
 )
 
 
@@ -214,13 +212,6 @@ def execution_groups(models: Sequence[str], *, k_features: int) -> tuple[tuple[s
 GROUP_PREPROCESS_MODES: Mapping[str, str] = {
     "imputed_core": "imputed", "passthrough": "passthrough",
 }
-
-
-def preprocess_mode_for_group(group: str) -> str:
-    try:
-        return GROUP_PREPROCESS_MODES[str(group)]
-    except KeyError:
-        raise ValueError(f"unknown execution group {group!r}") from None
 
 
 def _row_id(seed: int, draw: int, n_samples: int, k_features: int, group: str, models: tuple[str, ...]) -> str:
@@ -479,23 +470,6 @@ def _synthetic_arrow_table(count: int) -> pa.Table:
     })
 
 
-def write_synthetic_task_table(path: Path, *, row_count: int, rows_per_group: int = 100_000) -> Path:
-    if row_count < 1 or rows_per_group < 1:
-        raise ValueError("row_count and rows_per_group must be positive")
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    writer = pq.ParquetWriter(temporary, _synthetic_arrow_table(1).schema, compression="zstd")
-    try:
-        for start in range(0, row_count, rows_per_group):
-            writer.write_table(_synthetic_arrow_table(min(rows_per_group, row_count - start)))
-    finally:
-        writer.close()
-    os.replace(temporary, path)
-    os.chmod(path, 0o444)
-    return path
-
-
 def _read_group_rss_worker(path: str, row_group: int, connection) -> None:
     try:
         before = _process_peak_rss_bytes()
@@ -504,18 +478,6 @@ def _read_group_rss_worker(path: str, row_group: int, connection) -> None:
         connection.send({"rows": len(rows), "rss_delta_bytes": max(0, after - before)})
     finally:
         connection.close()
-
-
-def measure_group_read_rss(path: Path, *, row_group: int = 0) -> dict[str, int]:
-    parent, child = multiprocessing.get_context("spawn").Pipe(duplex=False)
-    process = multiprocessing.get_context("spawn").Process(
-        target=_read_group_rss_worker, args=(str(Path(path)), int(row_group), child),
-    )
-    process.start(); child.close()
-    payload = parent.recv(); process.join(); parent.close()
-    if process.exitcode != 0:
-        raise RuntimeError(f"RSS worker failed with exit code {process.exitcode}")
-    return {"rows": int(payload["rows"]), "rss_delta_bytes": int(payload["rss_delta_bytes"])}
 
 
 def expected_model_keys(rows: Iterable[TaskRow]) -> set[tuple[str, int, int, int, int]]:
@@ -873,12 +835,6 @@ def _recover_generation_activation_locked(
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ControlProtocolError("activation recovery prepared record is invalid") from exc
     return activation
-
-
-def _round_directory(snapshot: Mapping[str, object], round_index: int) -> Path:
-    if round_index < 1:
-        raise ValueError("round_index must be >= 1")
-    return Path(str(snapshot["output_dir"])) / f"round-{round_index}"
 
 
 def _load_snapshot(path: Path) -> dict[str, object]:
@@ -1296,18 +1252,6 @@ def _index_queue_wals(
             if (sequence, row_id) not in terminal:
                 connection.execute(attempt_insert, (execution_plan_id, round_index, generation, worker_index, sequence, row_id))
         connection.commit()
-
-
-def _sealed_history_digest(output_dir: Path, *, analysis_id: str) -> str:
-    frontier: list[dict[str, object]] = []
-    root = Path(output_dir) / "executions"
-    if root.exists():
-        for marker in sorted(root.glob("*/round-*/generation-*/generation.closed.json")):
-            payload = json.loads(marker.read_text(encoding="utf-8"))
-            if payload.get("analysis_id") != analysis_id:
-                raise ValueError("sealed history includes a different analysis")
-            frontier.append({"closed_path": str(marker.resolve()), "closed_sha256": sha256_file(marker)})
-    return hashlib.sha256(canonical_json_bytes(frontier)).hexdigest()
 
 
 def _index_completed_rows(connection: sqlite3.Connection) -> None:
