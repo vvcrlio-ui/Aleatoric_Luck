@@ -11,7 +11,14 @@ import pandas as pd
 from conftest import write_repo_schema_bundle as write_schema_bundle
 from aleatoric_nk_grid.chunk_planning import ClusterPolicy, build_dynamic_plan
 from aleatoric_nk_grid.flat_task_table import close_generation, finalize_snapshot, prepare_round, recover_generation_activation, run_slice, verify_rounds
-from aleatoric_nk_grid.generation_control import ActivationTarget, ControlProtocolError, publish_activation_intent
+from aleatoric_nk_grid.generation_control import (
+    ActivationTarget,
+    ControlBusyError,
+    ControlProtocolError,
+    ControlSupersededError,
+    publish_activation_intent,
+)
+import aleatoric_nk_grid.nk_grid as ng
 from aleatoric_nk_grid.nk_grid import NKGridConfig, run_nk_grid
 from aleatoric_nk_grid.nk_grid import NKGridExecutionSession
 from aleatoric_nk_grid.worker_event_wal import (
@@ -289,11 +296,15 @@ def test_dynamic_worker_writes_one_wal_and_reuses_session_path(tmp_path: Path, m
     tampered = json.loads(original_receipt)
     tampered["sealed_history_digest_sha256"] = "0" * 64
     receipt.write_text(json.dumps(tampered, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    scratch = tmp_path / "final-scratch"
     with pytest.raises(ControlProtocolError, match="verification receipt"):
         finalize_snapshot(
             tmp_path / "snapshot.json", round_index=1, submission_generation="generation-1",
             expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
+            tmp_dir=scratch,
         )
+    assert not scratch.exists()
+    assert not config.out.exists()
     receipt.write_bytes(original_receipt)
     final = finalize_snapshot(
         tmp_path / "snapshot.json", round_index=1, submission_generation="generation-1",
@@ -528,27 +539,32 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
         submission_generation="generation-1", expected_pointer_version=0,
     )
     snapshot = json.loads((tmp_path / "snapshot.json").read_text(encoding="utf-8"))
-    schema_columns = json.loads(Path(str(snapshot["analysis_contract"])).read_text(encoding="utf-8"))["public_result_schema"]["columns"]
     opens = 0
+    fit_calls = 0
+    original_init = NKGridExecutionSession.__init__
 
-    class FakeSession:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            return None
-
-        def run_cell_group(self, *, seed, draw, n_samples, k_features, models):
-            row = {column: "" for column in schema_columns}
-            row.update({"model": models[0], "seed": seed, "draw": draw, "N": n_samples, "K": k_features, "status": "ok", "error": ""})
-            return [row]
-
-    def fake_open(*args, **kwargs):
+    def counted_init(session, *args, **kwargs):
         nonlocal opens
         opens += 1
-        return FakeSession()
+        return original_init(session, *args, **kwargs)
 
-    monkeypatch.setattr(NKGridExecutionSession, "open", staticmethod(fake_open))
+    def deterministic_fit(**kwargs):
+        nonlocal fit_calls
+        fit_calls += 1
+        y_train = np.asarray(kwargs["y_train"], dtype=float)
+        return {
+            "predictions": np.full(len(kwargs["X_test"]), float(y_train.mean())),
+            "fit_seconds": 0.0,
+            "best_rounds": None,
+            "converged": True,
+            "solver": "test-deterministic",
+            "iterations": None,
+            "alpha": None,
+            "peak_rss_bytes": 0,
+        }
+
+    monkeypatch.setattr(ng.NKGridExecutionSession, "__init__", counted_init)
+    monkeypatch.setattr(ng, "_fit_predict_model_cell", deterministic_fit)
     run_slice(
         tmp_path / "snapshot.json", round_index=1, worker_index=0, expected_prep_token="job-1",
         prep_job_id="job-1", submission_generation="generation-1", expected_pointer_version=0,
@@ -556,7 +572,138 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
     wal = tmp_path / "out" / "executions" / snapshot["execution_plan_id"] / "round-1" / "generation-generation-1" / "worker-0.events.wal"
     assert prepared["todo_rows"] == 100
     assert opens == 1
+    assert fit_calls == 100
     assert len(scan_wal(wal).records) == 200
+
+
+def test_production_afterany_entries_share_exact_target_lifecycle(tmp_path: Path):
+    frame = pd.DataFrame({"x": np.arange(40, dtype=float), "y": np.arange(40, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1,
+        n_sizes_k=1, max_n=10, max_k=1, batch_size=1, n_jobs=1,
+        repeat_plan=((1, 0),), min_n=2,
+    )
+    plan = build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(
+            workers=1, rounds=2, partition="test", time_limit="01:00:00",
+            account="test", constraint="none",
+        ),
+        table_path=tmp_path / "tasks.parquet",
+        snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    snapshot = tmp_path / "snapshot.json"
+    prepared = prepare_round(
+        snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+        submission_generation="g1", expected_pointer_version=0,
+    )
+    with pytest.raises(ControlBusyError):
+        verify_rounds(
+            snapshot, round_index=1, submission_generation="g1",
+            expected_prep_token="job-1", prep_job_id="job-1",
+            expected_pointer_version=0,
+        )
+    wal = run_slice(
+        snapshot, round_index=1, worker_index=0, expected_prep_token="job-1",
+        prep_job_id="job-1", submission_generation="g1", expected_pointer_version=0,
+    )
+    assert wal.is_file()
+    closed = close_generation(
+        snapshot, round_index=1, submission_generation="g1",
+        expected_prep_token="job-1", prep_job_id="job-1",
+        expected_pointer_version=0,
+    )
+    assert closed.is_file()
+    verified = verify_rounds(
+        snapshot, round_index=1, submission_generation="g1",
+        expected_prep_token="job-1", prep_job_id="job-1",
+        expected_pointer_version=0,
+    )
+    assert verified["exit_code"] == 0
+    final = finalize_snapshot(
+        snapshot, round_index=1, submission_generation="g1",
+        expected_prep_token="job-1", prep_job_id="job-1",
+        expected_pointer_version=0,
+    )
+    assert final["final_rows"] == 1
+    next_prep = prepare_round(
+        snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
+        submission_generation="g2", expected_previous_generation="g1",
+        expected_pointer_version=1, expected_previous_execution_plan_id=str(plan["execution_plan_id"]),
+        expected_previous_round_index=1,
+    )
+    assert next_prep["no_generation"] is True
+
+
+@pytest.mark.parametrize("entry", [run_slice, close_generation, verify_rounds])
+@pytest.mark.parametrize("fact", ["missing", "superseded", "corruption"])
+def test_production_afterany_entries_fail_closed_without_control_tree_writes(
+    tmp_path: Path, entry, fact: str,
+):
+    frame = pd.DataFrame({"x": np.arange(30, dtype=float), "y": np.arange(30, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1,
+        n_sizes_k=1, max_n=10, max_k=1, batch_size=1, n_jobs=1,
+        repeat_plan=((1, 0),), min_n=2,
+    )
+    build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(
+            workers=1, rounds=2, partition="test", time_limit="01:00:00",
+            account="test", constraint="none",
+        ),
+        table_path=tmp_path / "tasks.parquet",
+        snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    snapshot = tmp_path / "snapshot.json"
+    target_generation = "g1"
+    if fact == "superseded":
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-2", prep_job_id="job-2",
+            submission_generation="g2", expected_pointer_version=0,
+        )
+    elif fact == "corruption":
+        prepared = prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0,
+        )
+        assignment = Path(str(prepared["assignment"]))
+        assignment.chmod(0o644)
+        assignment.write_bytes(assignment.read_bytes() + b"corruption")
+        assignment.chmod(0o444)
+
+    output_root = tmp_path / "out"
+    def tree_state() -> dict[str, tuple[int, bytes]]:
+        return {
+            str(path.relative_to(output_root)): (path.stat().st_ino, path.read_bytes())
+            for path in output_root.rglob("*") if path.is_file()
+        }
+
+    before = tree_state()
+    kwargs = {
+        "round_index": 1,
+        "expected_prep_token": "job-1" if fact != "superseded" else "job-1",
+        "prep_job_id": "job-1",
+        "submission_generation": target_generation,
+        "expected_pointer_version": 0,
+    }
+    expected_error = {
+        "missing": ControlBusyError,
+        "superseded": ControlSupersededError,
+        "corruption": ControlProtocolError,
+    }[fact]
+    with pytest.raises(expected_error):
+        if entry is run_slice:
+            entry(snapshot, worker_index=0, **kwargs)
+        else:
+            entry(snapshot, **kwargs)
+    assert tree_state() == before
 
 
 def test_malformed_session_row_is_durably_aborted_not_interrupted(tmp_path: Path, monkeypatch):

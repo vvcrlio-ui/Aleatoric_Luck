@@ -9,18 +9,20 @@ import pyarrow.parquet as pq
 import pytest
 
 from conftest import write_legacy_dynamic_fixture as write_work_snapshot
+import legacy_dynamic_adapter as legacy
+from legacy_dynamic_adapter import (
+    _attempt_records,
+    _completed_keys,
+    prepare_round,
+    verify_rounds,
+)
 
 import aleatoric_nk_grid.flat_task_table as ft
 from aleatoric_nk_grid.flat_task_table import (
     TaskRow,
-    prepare_round,
-    verify_rounds,
     write_task_table,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
-
-
-pytestmark = pytest.mark.usefixtures("retired_legacy_dynamic_adapter")
 
 
 def _config(root: Path) -> NKGridConfig:
@@ -64,7 +66,7 @@ def _snapshot(root: Path, row_count: int, *, workers: int) -> tuple[Path, tuple[
 
 
 def _write_complete_shard(snapshot: Path, rows: tuple[TaskRow, ...]) -> None:
-    output = Path(ft._load_snapshot(snapshot)["output_dir"]) / "round-1" / "worker-0.csv"
+    output = Path(legacy._load_snapshot(snapshot)["output_dir"]) / "round-1" / "worker-0.csv"
     output.parent.mkdir(parents=True)
     with output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -112,17 +114,17 @@ def _measure_prep(root: Path, row_count: int, *, workers: int) -> tuple[int, dic
 
 def test_verify_rounds_streams_sqlite_index_across_tenfold_scale(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        ft,
+        legacy,
         "read_task_table",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("verify loaded all task rows")),
     )
     monkeypatch.setattr(
-        ft,
+        legacy,
         "_completed_keys",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("verify loaded completed keys")),
     )
     monkeypatch.setattr(
-        ft,
+        legacy,
         "_attempt_records",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("verify loaded attempts")),
     )
@@ -136,17 +138,17 @@ def test_verify_rounds_streams_sqlite_index_across_tenfold_scale(tmp_path, monke
 
 def test_prepare_round_streams_modulo_staging_across_tenfold_scale(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        ft,
+        legacy,
         "read_task_table",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("prep loaded all task rows")),
     )
     monkeypatch.setattr(
-        ft,
+        legacy,
         "_completed_keys",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("prep loaded completed keys")),
     )
     monkeypatch.setattr(
-        ft,
+        legacy,
         "_attempt_records",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("prep loaded attempts")),
     )

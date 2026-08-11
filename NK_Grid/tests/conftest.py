@@ -9,7 +9,6 @@ from typing import Any
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 from aleatoric_nk_grid.preprocessing import source_groups
 from aleatoric_nk_grid.validate_input import canonical_feature_universe
@@ -185,24 +184,3 @@ def write_legacy_dynamic_fixture(
     ft.write_json_atomic(target, payload)
     os.chmod(target, 0o444)
     return target
-
-
-@pytest.fixture
-def retired_legacy_dynamic_adapter(monkeypatch):
-    """Enable the removed CSV codec only inside explicitly marked tests."""
-
-    from aleatoric_nk_grid import flat_task_table as ft
-
-    production_loader = ft._load_snapshot
-
-    def load_with_production_fallback(path: Path) -> dict[str, object]:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        if (
-            payload.get("format_version") == ft.TABLE_FORMAT_VERSION
-            and payload.get("result_store_format")
-            == "retired-test-csv-adapter-v1"
-        ):
-            return payload
-        return production_loader(path)
-
-    monkeypatch.setattr(ft, "_load_snapshot", load_with_production_fallback)

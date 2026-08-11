@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from typing import Sequence
 
 from .generation_control import (
+    INCOMPLETE_EXIT_CODE,
     PROTOCOL_EXIT_CODE,
     RETRYABLE_EXIT_CODE,
     SUCCESS_EXIT_CODE,
@@ -38,6 +39,8 @@ def classify_dynamic_exit(exit_code: int) -> ExitDecision:
         return ExitDecision(code, "success", False, False, True)
     if code == PROTOCOL_EXIT_CODE:
         return ExitDecision(code, "protocol-or-corruption", False, True, True)
+    if code == INCOMPLETE_EXIT_CODE:
+        return ExitDecision(code, "verification-incomplete", False, False, True)
     if code == RETRYABLE_EXIT_CODE:
         return ExitDecision(code, "busy-or-recovery-required", True, False, False)
     if code == SUPERSEDED_EXIT_CODE:

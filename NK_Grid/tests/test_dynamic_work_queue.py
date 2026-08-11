@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from conftest import write_repo_schema_bundle as write_schema_bundle
+import aleatoric_nk_grid.flat_task_table as ft
 
 from aleatoric_nk_grid.chunk_planning import (
     MEMORY_FRAME_COPIES,
@@ -92,6 +93,26 @@ def test_serialized_compatibility_flags_cannot_enable_legacy_csv_execution(tmp_p
     )
     with pytest.raises(ValueError, match="unsupported legacy dynamic snapshot"):
         _load_snapshot(snapshot)
+
+
+def test_production_cli_rejects_legacy_snapshot_before_any_csv_state_machine(
+    tmp_path,
+):
+    snapshot = tmp_path / "forged-legacy.json"
+    snapshot.write_text(
+        json.dumps({
+            "format_version": 2,
+            "result_store_format": "test-legacy-csv-v2",
+            "test_compatibility_mode": True,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as stopped:
+        ft.main([
+            "verify", "--snapshot", str(snapshot), "--round", "1",
+            "--generation", "g1", "--expected-prep-token", "prep",
+        ])
+    assert stopped.value.code == 6
 
 
 def test_plan_requires_account_and_never_splits_super_learner(tmp_path):

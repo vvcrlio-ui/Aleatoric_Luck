@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import weakref
+import tracemalloc
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +20,8 @@ from aleatoric_nk_grid.nk_grid import (
     METRIC_COLUMNS,
     NKGridConfig,
     NKGridExecutionSession,
+    SplitIndexManager,
+    split_frame,
     run_nk_grid,
 )
 from aleatoric_nk_grid.preprocessing import preprocess_cell
@@ -136,6 +139,82 @@ def test_session_closes_native_runner_after_success_and_exception(
     else:
         run_nk_grid(config, stop_after_batch=stop)
     assert closes == 1
+
+
+@pytest.mark.parametrize("task", ["regression", "classification"])
+def test_split_index_manager_matches_materialized_split_for_noncontiguous_index(
+    tmp_path, task,
+):
+    frame = _frame(rows=80, features=2).set_index(np.arange(100, 180))
+    if task == "classification":
+        frame["y"] = (frame["y"] > frame["y"].median()).astype(int)
+    predictors = ["X_000", "X_001"]
+    manager = SplitIndexManager(
+        frame=frame, external_frame=None, predictors=predictors, outcome="y",
+        test_size=0.25, task=task,
+    )
+    for seed in (0, 7, 23):
+        expected = split_frame(
+            frame, predictors, "y", test_size=0.25, seed=seed, task=task,
+        )
+        observed = manager.for_seed(seed)
+        assert tuple(observed.train_index) == tuple(expected.X_train.index)
+        assert tuple(observed.test_index) == tuple(expected.X_test.index)
+        assert observed.external_test is False
+
+
+@pytest.mark.slow
+def test_split_index_memory_is_bounded_across_many_seeds(tmp_path):
+    frame = _frame(rows=2_000, features=4).set_index(np.arange(10_000, 12_000))
+    manager = SplitIndexManager(
+        frame=frame, external_frame=None,
+        predictors=[f"X_{index:03d}" for index in range(4)],
+        outcome="y", test_size=0.2, task="regression",
+    )
+    tracemalloc.start()
+    try:
+        for seed in range(100):
+            manager.for_seed(seed)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 1024 * 1024
+    assert len(manager._cache) == 100
+
+
+def test_persistent_session_revisiting_a_cell_matches_fresh_session(
+    tmp_path, monkeypatch,
+):
+    frame = _frame(rows=64, features=2)
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["X_000", "X_001"])
+    config = _config(
+        schema, tmp_path / "out.csv", models=("super_learner",),
+        n_jobs=1, n_grid=(10, 12), k_grid=(1,),
+    )
+    runners = []
+
+    def fake_native(runner, *, fit_arguments, **_):
+        if not runners or runners[-1] is not runner:
+            runners.append(runner)
+        y_train = np.asarray(fit_arguments["y_train"], dtype=float)
+        return {
+            "predictions": np.full(len(fit_arguments["X_test"]), float(y_train.mean())),
+            "fit_seconds": 0.0, "best_rounds": None, "converged": True,
+            "solver": "test-native", "iterations": None, "alpha": None,
+            "peak_rss_bytes": 0,
+        }
+
+    monkeypatch.setattr("aleatoric_nk_grid.nk_grid._run_native_model_cell_locked", fake_native)
+    with NKGridExecutionSession.open_from_config(config) as session:
+        first = session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("super_learner",))
+        session.run_cell_group(seed=321, draw=0, n_samples=12, k_features=1, models=("super_learner",))
+        revisited = session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("super_learner",))
+    with NKGridExecutionSession.open_from_config(config) as fresh_session:
+        fresh = fresh_session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("super_learner",))
+    stable = lambda rows: [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]
+    assert stable(revisited) == stable(first) == stable(fresh)
+    assert len(runners) == 2
+    assert runners[0] is not runners[1]
 
 
 def test_cell_group_metrics_exactly_match_model_at_a_time_execution(tmp_path):

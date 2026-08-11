@@ -224,7 +224,6 @@ def test_activation_retry_converges_across_every_pointer_cas_boundary(
     assert dispatch.exit_code == SUCCESS_EXIT_CODE
 
 
-@pytest.mark.parametrize("consumer", ["work", "close", "next-prep", "verify"])
 @pytest.mark.parametrize(
     "fact,expected_code",
     [
@@ -236,12 +235,9 @@ def test_activation_retry_converges_across_every_pointer_cas_boundary(
         ("corruption", PROTOCOL_EXIT_CODE),
     ],
 )
-def test_all_afterany_consumers_share_the_six_fact_exit_matrix(
-    tmp_path: Path, consumer: str, fact: str, expected_code: int,
+def test_shared_afterany_classifier_has_the_six_fact_exit_matrix(
+    tmp_path: Path, fact: str, expected_code: int,
 ):
-    # ``consumer`` names the four production gates that call this exact
-    # read-only classifier before writing phase artefacts.
-    assert consumer in {"work", "close", "next-prep", "verify"}
     target = _target()
     if fact in {"active", "sealed"}:
         publish_activation_intent(tmp_path, target)

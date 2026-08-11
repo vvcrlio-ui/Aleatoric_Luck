@@ -12,6 +12,16 @@ import pyarrow.parquet as pq
 import pytest
 
 from conftest import write_legacy_dynamic_fixture as write_work_snapshot
+from legacy_dynamic_adapter import (
+    classify_attempts,
+    finalize_snapshot as legacy_finalize_snapshot,
+    finalize_slice_shards,
+    main as legacy_main,
+    prepare_round,
+    run_slice,
+    verify_rounds,
+)
+import legacy_dynamic_adapter as legacy
 
 import aleatoric_nk_grid.flat_task_table as ft
 from aleatoric_nk_grid.flat_task_table import (
@@ -21,23 +31,14 @@ from aleatoric_nk_grid.flat_task_table import (
     VERIFY_INCOMPLETE_EXIT_CODE,
     assign_rows_modulo,
     build_rows,
-    classify_attempts,
     expected_model_keys,
     finalization_manifest_path,
-    finalize_snapshot,
-    finalize_slice_shards,
-    prepare_round,
     read_row_group,
     read_task_table,
-    run_slice,
     sbatch_resource_args,
-    verify_rounds,
     write_task_table,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
-
-
-pytestmark = pytest.mark.usefixtures("retired_legacy_dynamic_adapter")
 
 
 def _config(tmp_path: Path, *, models: tuple[str, ...] = ("ols",)) -> NKGridConfig:
@@ -221,7 +222,7 @@ def test_worker_rejects_stale_ready_marker_from_prior_prep_job(tmp_path, monkeyp
 def test_verify_cli_writes_complete_json_and_exits_zero(tmp_path, capsys):
     snapshot, rows = _snapshot(tmp_path, workers=1, n_grid=(10,), k_grid=(1,))
     _write_all_terminal(snapshot, rows)
-    ft.main(["verify", "--snapshot", str(snapshot)])
+    legacy_main(["verify", "--snapshot", str(snapshot)])
     captured = capsys.readouterr()
     result = json.loads(captured.out)
     assert result["missing_model_keys"] == 0
@@ -261,7 +262,7 @@ def test_verify_cli_writes_json_then_uses_stable_incomplete_exit_code(
                 encoding="utf-8",
             )
     with pytest.raises(SystemExit) as stopped:
-        ft.main(["verify", "--snapshot", str(snapshot)])
+        legacy_main(["verify", "--snapshot", str(snapshot)])
     assert stopped.value.code == VERIFY_INCOMPLETE_EXIT_CODE
     captured = capsys.readouterr()
     result = json.loads(captured.out)
@@ -279,7 +280,7 @@ def test_verify_cli_keeps_malformed_snapshot_as_an_execution_error(tmp_path):
     snapshot = tmp_path / "malformed.json"
     snapshot.write_text("not-json", encoding="utf-8")
     with pytest.raises(json.JSONDecodeError):
-        ft.main(["verify", "--snapshot", str(snapshot)])
+        legacy_main(["verify", "--snapshot", str(snapshot)])
 
 
 @pytest.mark.parametrize("workers,row_count", [(workers, rows) for workers in range(1, 11) for rows in (0, 1, 2, 7, 19)])
@@ -304,22 +305,22 @@ def test_each_successful_cell_is_atomically_persisted_before_interruption(tmp_pa
             raise RuntimeError("simulated SIGKILL boundary")
         _fake_run(config, **kwargs)
 
-    monkeypatch.setattr(ft, "run_nk_grid", interrupted)
+    monkeypatch.setattr(legacy, "run_nk_grid", interrupted)
     with pytest.raises(RuntimeError, match="SIGKILL"):
         run_slice(snapshot, round_index=1, worker_index=0, expected_prep_token="prep-1")
     shard = tmp_path / "outputs" / "round-1" / "worker-0.csv"
     persisted = list(csv.DictReader(shard.open(encoding="utf-8")))
     assert len(persisted) == 2
-    assert json.loads(ft.manifest_path(shard).read_text())["completion"]["materialized_rows"] == 2
+    assert json.loads(legacy.manifest_path(shard).read_text())["completion"]["materialized_rows"] == 2
     assert all(not path.name.endswith(".tmp") for path in shard.parent.iterdir())
-    monkeypatch.setattr(ft, "run_nk_grid", _fake_run)
+    monkeypatch.setattr(legacy, "run_nk_grid", _fake_run)
     run_slice(snapshot, round_index=1, worker_index=0, expected_prep_token="prep-1")
     assert len(list(csv.DictReader(shard.open(encoding="utf-8")))) == len(expected_model_keys(rows))
 
 
 def test_real_two_round_recovery_converges_to_one_shot_output(tmp_path, monkeypatch):
     snapshot, rows = _snapshot(tmp_path, workers=2)
-    monkeypatch.setattr(ft, "run_nk_grid", _fake_run)
+    monkeypatch.setattr(legacy, "run_nk_grid", _fake_run)
     first = prepare_round(snapshot, round_index=1, prep_token="prep-1")
     assert first["todo_rows"] == len(rows)
     run_slice(snapshot, round_index=1, worker_index=0, expected_prep_token="prep-1")
@@ -346,7 +347,7 @@ def test_streaming_finalizer_prefers_later_terminal_over_historical_failure(tmp_
     _write_shard(tmp_path / "outputs" / "round-2" / "worker-0.csv", [
         _result_row(rows[0], status="ok", metric="recovered"),
     ])
-    receipt = finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    receipt = legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     final_rows = list(csv.DictReader((tmp_path / "unused.csv").open(encoding="utf-8")))
     assert len(final_rows) == 1
     assert final_rows[0]["status"] == "ok"
@@ -371,7 +372,7 @@ def test_streaming_finalizer_rejects_conflicting_terminal_rows(tmp_path):
         _result_row(rows[0], metric="different"),
     ])
     with pytest.raises(FinalizationError, match="conflicting terminal"):
-        finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+        legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     assert not (tmp_path / "unused.csv").exists()
 
 
@@ -383,7 +384,7 @@ def test_streaming_finalizer_rejects_out_of_design_key(tmp_path):
         [_result_row(rows[0]), outside],
     )
     with pytest.raises(FinalizationError, match="out-of-design"):
-        finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+        legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     assert not (tmp_path / "unused.csv").exists()
 
 
@@ -394,7 +395,7 @@ def test_streaming_finalizer_rejects_missing_terminal_without_publication(tmp_pa
         [_result_row(rows[0])],
     )
     with pytest.raises(FinalizationError, match="missing 1 expected terminal"):
-        finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+        legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     assert not (tmp_path / "unused.csv").exists()
 
 
@@ -414,13 +415,13 @@ def test_streaming_finalizer_is_atomic_and_rerunnable_after_injected_failure(
 
     monkeypatch.setattr(ft, "_publish_final_csv", interrupted)
     with pytest.raises(RuntimeError, match="before replace"):
-        finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+        legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     assert output.read_bytes() == b"previous-complete-output\n"
     assert not list(output.parent.glob(f".{output.name}.*.tmp"))
     monkeypatch.setattr(ft, "_publish_final_csv", real_publish)
-    first = finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    first = legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     first_bytes = output.read_bytes()
-    second = finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    second = legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     assert output.read_bytes() == first_bytes
     assert first["final_rows"] == second["final_rows"] == 1
 
@@ -435,7 +436,7 @@ def test_streaming_finalizer_matches_small_reference_byte_for_byte(tmp_path, mon
         ft, "read_task_table",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("production finalizer loaded all tasks")),
     )
-    finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     assert (tmp_path / "unused.csv").read_bytes() == legacy.read_bytes()
 
 
@@ -444,7 +445,7 @@ def test_streaming_finalizer_counts_idempotent_terminal_duplicates(tmp_path):
     duplicate = _result_row(rows[0])
     _write_shard(tmp_path / "outputs" / "round-1" / "worker-0.csv", [duplicate])
     _write_shard(tmp_path / "outputs" / "round-2" / "worker-0.csv", [duplicate])
-    receipt = finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
+    receipt = legacy_finalize_snapshot(snapshot, tmp_dir=tmp_path / "scratch")
     assert receipt["duplicate_terminal_keys"] == 1
     assert receipt["duplicate_terminal_rows"] == 1
     assert receipt["final_rows"] == 1
@@ -457,7 +458,7 @@ def test_finalize_cli_ignores_stale_unique_temp_directory(tmp_path, capsys):
     stale = scratch / "nk-grid-finalize-stale"
     stale.mkdir(parents=True)
     (stale / "index.sqlite").write_text("interrupted old run", encoding="utf-8")
-    ft.main(["finalize", "--snapshot", str(snapshot), "--tmp-dir", str(scratch)])
+    legacy_main(["finalize", "--snapshot", str(snapshot), "--tmp-dir", str(scratch)])
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["status"] == "complete"
     assert receipt["final_rows"] == 1
@@ -488,7 +489,7 @@ def test_finalizer_temp_space_preflight_reports_directory_and_bytes(tmp_path, mo
     scratch = tmp_path / "scratch"
     monkeypatch.setattr(ft.shutil, "disk_usage", lambda path: SimpleNamespace(free=1))
     with pytest.raises(FinalizationError) as failed:
-        finalize_snapshot(snapshot, tmp_dir=scratch)
+        legacy_finalize_snapshot(snapshot, tmp_dir=scratch)
     message = str(failed.value)
     assert f"temporary_directory={scratch.resolve()}" in message
     assert "available_bytes=1" in message

@@ -22,7 +22,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -30,7 +30,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .experiment import manifest_path, utc_now, write_json_atomic
+from .experiment import utc_now, write_json_atomic
 from .execution_contract import (
     AnalysisContract,
     CellExecutionSpec,
@@ -75,7 +75,6 @@ from .nk_grid import (
     execution_groups_for_models,
     project_public_result,
     resolve_repeat_pairs,
-    run_nk_grid,
 )
 from .worker_event_wal import (
     TASK_ABORTED,
@@ -515,56 +514,8 @@ def pending_rows(rows: Iterable[TaskRow], completed: Iterable[tuple[str, int, in
     return tuple(row for row in rows if any((model, row.seed, row.draw, row.n_samples, row.k_features) not in done for model in row.models))
 
 
-def _read_csv_keys(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    with Path(path).open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        return list(reader.fieldnames or ()), list(reader)
-
-
 def _csv_key(row: Mapping[str, str]) -> tuple[str, int, int, int, int]:
     return (str(row["model"]), int(row["seed"]), int(row["draw"]), int(row["N"]), int(row["K"]))
-
-
-def _write_materialized_rows(
-    output: Path, header: Sequence[str], by_key: Mapping[tuple[str, int, int, int, int], Mapping[str, str]],
-    *, execution: Mapping[str, object], expected_rows: int,
-) -> None:
-    """Atomically publish a whole worker shard after every successful cell group."""
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    with temporary.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(header))
-        writer.writeheader()
-        writer.writerows(by_key[key] for key in sorted(by_key))
-    os.replace(temporary, output)
-    write_json_atomic(manifest_path(output), {
-        "format_version": TABLE_FORMAT_VERSION, "execution": dict(execution),
-        "completion": {"expected_rows": expected_rows, "materialized_rows": len(by_key)},
-    })
-
-
-def _append_attempt(path: Path, *, round_index: int, worker_index: int, sequence: int, row_id: str) -> None:
-    """Append one bounded JSON record before starting a row.
-
-    The record is below PIPE_BUF and therefore an O_APPEND write cannot be
-    interleaved with another worker's record (workers have distinct files in
-    normal operation).  A trailing malformed record after SIGKILL is ignored
-    by the reader below.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"round": round_index, "worker_index": worker_index, "sequence": sequence, "row_id": row_id}, sort_keys=True) + "\n"
-    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-    try:
-        os.write(descriptor, payload.encode("utf-8"))
-    finally:
-        os.close(descriptor)
-
-
-def _sweep_slice_temporaries(output: Path, *, round_index: int, worker_index: int) -> None:
-    prefix = f".{output.stem}.round-{round_index}.worker-{worker_index}."
-    for temporary in output.parent.glob(prefix + "*.csv"):
-        temporary.unlink(missing_ok=True)
-        manifest_path(temporary).unlink(missing_ok=True)
 
 
 def run_slice(
@@ -579,8 +530,6 @@ def run_slice(
 ) -> Path:
     """Run one WAL-owned worker slice; no output CSV/checkpoint path is opened."""
     payload = _load_snapshot(snapshot_path)
-    if "analysis_contract" not in payload:
-        return _legacy_run_slice(snapshot_path, round_index=round_index, worker_index=worker_index, expected_prep_token=expected_prep_token)
     analysis, execution = _load_contract_chain(payload, validate_task_table=False)
     workers = int(payload["workers"])
     if not 0 <= worker_index < workers:
@@ -931,55 +880,6 @@ def _exact_target(
     return analysis, execution, target
 
 
-def _completed_keys(output_dir: Path) -> set[tuple[str, int, int, int, int]]:
-    completed: set[tuple[str, int, int, int, int]] = set()
-    for path in sorted(output_dir.glob("round-*/worker-*.csv")):
-        _, rows = _read_csv_keys(path)
-        completed.update(_csv_key(row) for row in rows if row.get("status") in {"ok", "skipped"})
-    return completed
-
-
-def _attempt_records(output_dir: Path) -> list[dict[str, int | str]]:
-    records: list[dict[str, int | str]] = []
-    for path in sorted(output_dir.glob("round-*/attempts/worker-*.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                item = json.loads(line)
-                records.append({"round": int(item["round"]), "worker_index": int(item["worker_index"]), "sequence": int(item["sequence"]), "row_id": str(item["row_id"])})
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                # A Slurm SIGKILL can leave the diagnostic tail incomplete.
-                continue
-    return records
-
-
-def classify_attempts(
-    records: Iterable[Mapping[str, int | str]], *, completed_row_ids: Iterable[str] = (),
-) -> tuple[set[str], set[str]]:
-    """Return (crashed, too_long) using the two intentionally distinct rules."""
-    attempts = sorted(
-        (dict(record) for record in records),
-        key=lambda record: (int(record["round"]), int(record["worker_index"]), int(record["sequence"])),
-    )
-    crashed: set[str] = set()
-    finals: dict[tuple[int, int], tuple[int, str]] = {}
-    for record in attempts:
-        round_index = int(record["round"]); worker = int(record["worker_index"]); sequence = int(record["sequence"]); row_id = str(record["row_id"])
-        prior = finals.get((round_index, worker))
-        if prior is not None:
-            crashed.add(prior[1])
-        if prior is None or sequence > prior[0]:
-            finals[(round_index, worker)] = (sequence, row_id)
-    final_rounds: dict[str, set[int]] = {}
-    for (round_index, _), (_, row_id) in finals.items():
-        final_rounds.setdefault(row_id, set()).add(round_index)
-    too_long = {
-        row_id for row_id, rounds in final_rounds.items()
-        if any({round_index, round_index + 1, round_index + 2}.issubset(rounds) for round_index in rounds)
-    }
-    completed = set(completed_row_ids)
-    return crashed - completed, too_long - completed
-
-
 def assign_rows_modulo(rows: Sequence[TaskRow], workers: int) -> tuple[tuple[TaskRow, ...], ...]:
     """Assign ordered todo rows by index modulo worker count, never by ranges."""
     if workers < 1:
@@ -995,14 +895,6 @@ def _queue_key_join(left: str, right: str) -> str:
     return " AND ".join(
         f'{left}."{column}"={right}."{column}"' for column in _QUEUE_KEY_COLUMNS
     )
-
-
-def _result_shards(output_dir: Path) -> tuple[Path, ...]:
-    return tuple(sorted(Path(output_dir).glob("round-*/worker-*.csv")))
-
-
-def _attempt_logs(output_dir: Path) -> tuple[Path, ...]:
-    return tuple(sorted(Path(output_dir).glob("round-*/attempts/worker-*.jsonl")))
 
 
 def _resolve_queue_index_tmp_base(
@@ -1110,7 +1002,7 @@ def _queue_index(
     wal_inputs = tuple(sorted(
         output_dir.glob("executions/*/round-*/generation-*/worker-*.events.wal")
     ))
-    inputs = (*_result_shards(output_dir), *_attempt_logs(output_dir), *wal_inputs)
+    inputs = wal_inputs
     tmp_base = _resolve_queue_index_tmp_base(snapshot, explicit_tmp_dir, phase=phase)
     _preflight_queue_index_space(tmp_base, table_path, inputs, phase=phase)
     run_dir = Path(tempfile.mkdtemp(prefix=f"nk-grid-{phase}-", dir=tmp_base))
@@ -1148,45 +1040,6 @@ def _index_queue_expected_design(connection: sqlite3.Connection, table_path: Pat
     except (OSError, ValueError, pa.ArrowInvalid) as exc:
         raise ValueError(f"cannot stream task table {table_path}: {exc}") from exc
     return expected_count
-
-
-def _index_queue_completed_shards(connection: sqlite3.Connection, output_dir: Path) -> int:
-    statement = f"INSERT OR IGNORE INTO completed ({_QUEUE_KEY_SQL}) VALUES (?, ?, ?, ?, ?)"
-    for path in _result_shards(output_dir):
-        try:
-            with path.open(newline="", encoding="utf-8") as source:
-                reader = csv.DictReader(source)
-                for row in reader:
-                    if row.get("status") not in TERMINAL_STATUSES:
-                        continue
-                    connection.execute(statement, _csv_key(row))
-        except (OSError, UnicodeError, csv.Error, KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"cannot read completed worker CSV {path}: {exc}") from exc
-        connection.commit()
-    return int(connection.execute("SELECT COUNT(*) FROM completed").fetchone()[0])
-
-
-def _index_queue_attempts(connection: sqlite3.Connection, output_dir: Path) -> None:
-    statement = (
-        "INSERT INTO attempts (execution_plan_id, round_index, submission_generation, worker_index, sequence, row_id) "
-        "VALUES (?, ?, ?, ?, ?, ?)"
-    )
-    for path in _attempt_logs(output_dir):
-        try:
-            with path.open(encoding="utf-8") as source:
-                for line in source:
-                    try:
-                        item = json.loads(line)
-                        connection.execute(statement, (
-                            "__legacy__", int(item["round"]), "__legacy__", int(item["worker_index"]),
-                            int(item["sequence"]), str(item["row_id"]),
-                        ))
-                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                        # A Slurm SIGKILL can leave only the final JSON line malformed.
-                        continue
-        except (OSError, UnicodeError) as exc:
-            raise ValueError(f"cannot read attempt log {path}: {exc}") from exc
-        connection.commit()
 
 
 def _iter_sealed_wal_scans(
@@ -1564,103 +1417,10 @@ def _write_assignment_from_queue_index(
     return path, assigned_rows, row_groups
 
 
-def _assignment_ready_path(round_dir: Path) -> Path:
-    return Path(round_dir) / "assignment.ready.json"
-
-
 def _validated_prep_token(value: str) -> str:
     if not isinstance(value, str) or not value or any(character.isspace() for character in value):
         raise ValueError("prep token must be a non-empty, whitespace-free string")
     return value
-
-
-def _require_ready_assignment(
-    snapshot: Mapping[str, object], *, round_index: int, workers: int,
-    expected_prep_token: str,
-) -> Path:
-    round_dir = _round_directory(snapshot, round_index)
-    assignment = round_dir / "assignment.parquet"
-    ready = _assignment_ready_path(round_dir)
-    try:
-        payload = json.loads(ready.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"assignment is not ready for round {round_index}; prep may have failed: {ready}"
-        ) from exc
-    if (
-        payload.get("format_version") != TABLE_FORMAT_VERSION
-        or int(payload.get("round", -1)) != round_index
-        or int(payload.get("workers", -1)) != workers
-        or payload.get("assignment") != str(assignment.resolve())
-        or payload.get("prep_token") != expected_prep_token
-    ):
-        raise RuntimeError(
-            f"assignment readiness record is invalid for round {round_index}; prep may have failed: {ready}"
-        )
-    if not assignment.is_file():
-        raise RuntimeError(
-            f"assignment is not ready for round {round_index}; prep may have failed: {assignment}"
-        )
-    return assignment
-
-
-# Compatibility is intentionally restricted to in-process/test snapshots made
-# by the old helper without any contract fields.  On-disk v1/v2 snapshots are
-# rejected by ``_load_snapshot``; production planning always supplies the
-# contract chain and therefore cannot reach these helpers.
-def _legacy_prepare_round(snapshot_path: Path, *, round_index: int, prep_token: str, tmp_dir: Path | None) -> dict[str, object]:
-    payload = _load_snapshot(snapshot_path)
-    output_dir = Path(str(payload["output_dir"])); workers = int(payload["workers"])
-    table_path = Path(str(payload["task_table"])); round_dir = _round_directory(payload, round_index); round_dir.mkdir(parents=True, exist_ok=True)
-    stage_directory: Path | None = None
-    with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="preparation") as connection:
-        _index_queue_expected_design(connection, table_path)
-        completed_model_keys = _index_queue_completed_shards(connection, output_dir)
-        _index_queue_attempts(connection, output_dir); _index_completed_rows(connection); _classify_queue_attempts(connection); _queue_incomplete_rows(connection)
-        todo_rows = _stage_queue_todo(connection, table_path, workers=workers)
-        assignment, assigned_rows, _ = _write_assignment_from_queue_index(round_dir / "assignment.parquet", connection, workers=workers)
-        crashed = _queue_row_ids(connection, "crashed_rows"); too_long = _queue_row_ids(connection, "too_long_rows")
-    stats: dict[str, object] = {"round": round_index, "workers": workers, "todo_rows": todo_rows, "assigned_rows": assigned_rows, "completed_model_keys": completed_model_keys, "crashed_row_ids": crashed, "too_long_row_ids": too_long, "assignment": str(assignment), "prep_token": prep_token}
-    write_json_atomic(round_dir / "crashed.json", {"round": round_index, "row_ids": crashed}); write_json_atomic(round_dir / "too-long.json", {"round": round_index, "row_ids": too_long}); write_json_atomic(round_dir / "prep.json", stats)
-    write_json_atomic(_assignment_ready_path(round_dir), {"format_version": TABLE_FORMAT_VERSION, "round": round_index, "workers": workers, "assignment": str(assignment.resolve()), "prep_token": prep_token})
-    return stats
-
-
-def _legacy_run_slice(snapshot_path: Path, *, round_index: int, worker_index: int, expected_prep_token: str) -> Path:
-    payload = _load_snapshot(snapshot_path); workers = int(payload["workers"])
-    if not 0 <= worker_index < workers:
-        raise IndexError("worker_index is outside the frozen worker count")
-    assignment = _require_ready_assignment(payload, round_index=round_index, workers=workers, expected_prep_token=_validated_prep_token(expected_prep_token))
-    rows = read_row_group(assignment, worker_index); output = _round_directory(payload, round_index) / f"worker-{worker_index}.csv"
-    _sweep_slice_temporaries(output, round_index=round_index, worker_index=worker_index)
-    header: list[str] | None = None; materialized: list[dict[str, str]] = []
-    if output.exists(): header, materialized = _read_csv_keys(output)
-    by_key = {_csv_key(row): row for row in materialized}
-    if len(by_key) != len(materialized): raise ValueError("worker output contains duplicate keys")
-    completed = {key for key, row in by_key.items() if row.get("status") in TERMINAL_STATUSES}; config = _config_from_json(payload["config"])
-    for sequence, row in enumerate(pending_rows(rows, completed)):
-        _append_attempt(_round_directory(payload, round_index) / "attempts" / f"worker-{worker_index}.jsonl", round_index=round_index, worker_index=worker_index, sequence=sequence, row_id=row.row_id)
-        row_out = output.parent / f".{output.stem}.round-{round_index}.worker-{worker_index}.{row.row_id}.csv"
-        row_config = replace(config, out=row_out, models=row.models, n_grid=(row.n_samples,), k_grid=(row.k_features,), n_seeds=1, n_draws=1, repeat_plan=((row.seed, row.draw),), n_jobs=1)
-        run_nk_grid(row_config, execution_pairs=((row.seed, row.draw),), exact_output_path=True, defer_failure_policy=True)
-        current_header, current_rows = _read_csv_keys(row_out)
-        if header is None: header = current_header
-        elif current_header != header: raise ValueError("worker rows produced inconsistent CSV headers")
-        for current in current_rows: by_key[_csv_key(current)] = current
-        _write_materialized_rows(output, header, by_key, execution={"mode": "slice", "round": round_index, "worker_index": worker_index}, expected_rows=len(expected_model_keys(rows)))
-        row_out.unlink(missing_ok=True); manifest_path(row_out).unlink(missing_ok=True)
-    if header is None and rows: raise RuntimeError("slice produced no rows")
-    if header is None: write_json_atomic(manifest_path(output), {"format_version": TABLE_FORMAT_VERSION, "execution": {"mode": "slice", "round": round_index, "worker_index": worker_index}, "completion": {"expected_rows": 0, "materialized_rows": 0}})
-    return output
-
-
-def _legacy_verify_rounds(snapshot_path: Path, *, tmp_dir: Path | None) -> dict[str, object]:
-    payload = _load_snapshot(snapshot_path); output_dir = Path(str(payload["output_dir"])); table_path = Path(str(payload["task_table"]))
-    with _queue_index(payload, explicit_tmp_dir=tmp_dir, phase="verification") as connection:
-        expected = _index_queue_expected_design(connection, table_path); complete = _index_queue_completed_shards(connection, output_dir); _index_queue_attempts(connection, output_dir); _index_completed_rows(connection); _classify_queue_attempts(connection)
-        result = {"expected_model_keys": expected, "completed_model_keys": complete, "missing_model_keys": _queue_missing_model_keys(connection), "crashed_row_ids": _queue_row_ids(connection, "crashed_rows"), "too_long_row_ids": _queue_row_ids(connection, "too_long_rows")}
-    write_json_atomic(output_dir / "verification.json", result)
-    return result
 
 
 def prepare_round(
@@ -1678,8 +1438,6 @@ def prepare_round(
 
     prep_token = _validated_prep_token(prep_token)
     payload = _load_snapshot(snapshot_path)
-    if "analysis_contract" not in payload:
-        return _legacy_prepare_round(snapshot_path, round_index=round_index, prep_token=prep_token, tmp_dir=tmp_dir)
     analysis, execution = _load_contract_chain(payload)
     output_dir = Path(str(payload["output_dir"])); workers = int(payload["workers"])
     if workers != int(execution.payload["worker_count"]):
@@ -1884,8 +1642,6 @@ def verify_rounds(
     """Verify only an exact sealed/outcome target and its frozen WAL history."""
 
     payload = _load_snapshot(snapshot_path)
-    if "analysis_contract" not in payload:
-        return _legacy_verify_rounds(snapshot_path, tmp_dir=tmp_dir)
     if round_index is None or submission_generation is None or expected_prep_token is None:
         raise ValueError("verify requires exact last round, generation, and prep token")
     analysis, execution, target = _exact_target(
@@ -1933,45 +1689,6 @@ def verify_rounds(
     )
     result["verification_receipt"] = str(receipt)
     return result
-
-
-def _verification_failure_counts(result: Mapping[str, object]) -> dict[str, int]:
-    return {
-        "missing_model_keys": int(result["missing_model_keys"]),
-        "interrupted_row_ids": len(result["interrupted_row_ids"]),
-        "too_long_row_ids": len(result["too_long_row_ids"]),
-        "aborted_tasks": len(result["aborted_tasks"]),
-    }
-
-
-def finalize_slice_shards(table_path: Path, worker_outputs: Iterable[Path], output: Path) -> Path:
-    """Merge dynamic worker shards after exact complete-design validation."""
-    expected = expected_model_keys(read_task_table(table_path))
-    seen: dict[tuple[str, int, int, int, int], dict[str, str]] = {}
-    header: list[str] | None = None
-    for path in worker_outputs:
-        if not Path(path).exists():
-            continue
-        current_header, rows = _read_csv_keys(Path(path))
-        if header is None:
-            header = current_header
-        elif current_header != header:
-            raise ValueError("worker CSV headers differ")
-        for row in rows:
-            key = _csv_key(row)
-            if key not in expected:
-                raise ValueError(f"merged output contains an out-of-design key: {key}")
-            if key in seen:
-                raise ValueError(f"merged output contains a duplicate key: {key}")
-            seen[key] = row
-    missing = expected - set(seen)
-    if missing:
-        raise ValueError(f"merged output is missing {len(missing)} expected keys")
-    output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=header or [], lineterminator="\n")
-        writer.writeheader(); writer.writerows(seen[key] for key in sorted(seen))
-    return output
 
 
 def finalization_manifest_path(output: Path) -> Path:
@@ -2352,33 +2069,32 @@ def finalize_snapshot(
     snapshot = _load_snapshot(snapshot_path)
     table_path = Path(str(snapshot["task_table"]))
     output_dir = Path(str(snapshot["output_dir"]))
-    legacy = "analysis_contract" not in snapshot
-    if legacy:
-        analysis = None; execution = None; target = None; dispatch = None
-    else:
-        if round_index is None or submission_generation is None or expected_prep_token is None:
-            raise FinalizationError("finalizer requires an exact verification target")
-        analysis, execution, target = _exact_target(
-            snapshot, round_index=round_index, submission_generation=submission_generation,
-            prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
-            expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
-            expected_previous_execution_plan_id=expected_previous_execution_plan_id,
-            expected_previous_round_index=expected_previous_round_index,
-        )
-        validation_cache = GenerationValidationCache()
-        dispatch = classify_exact_afterany_target_read_only(output_dir, target, cache=validation_cache)
-        if dispatch.kind not in {"sealed-generation", "no-generation"}:
-            raise FinalizationError("finalizer target is not exact sealed/no-generation dispatch")
-        frozen_frontier = frozen_sealed_history(output_dir, target, dispatch)
-        history_digest = hashlib.sha256(canonical_json_bytes(list(frozen_frontier))).hexdigest()
-        validate_exact_verification_receipt(output_dir, target, expected_dispatch=dispatch, sealed_history_digest_sha256=history_digest)
+    if round_index is None or submission_generation is None or expected_prep_token is None:
+        raise FinalizationError("finalizer requires an exact verification target")
+    analysis, execution, target = _exact_target(
+        snapshot, round_index=round_index, submission_generation=submission_generation,
+        prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
+        expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+        expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+        expected_previous_round_index=expected_previous_round_index,
+    )
+    validation_cache = GenerationValidationCache()
+    dispatch = classify_exact_afterany_target_read_only(output_dir, target, cache=validation_cache)
+    if dispatch.kind not in {"sealed-generation", "no-generation"}:
+        raise FinalizationError("finalizer target is not exact sealed/no-generation dispatch")
+    frozen_frontier = frozen_sealed_history(output_dir, target, dispatch)
+    history_digest = hashlib.sha256(canonical_json_bytes(list(frozen_frontier))).hexdigest()
+    validate_exact_verification_receipt(
+        output_dir, target, expected_dispatch=dispatch,
+        sealed_history_digest_sha256=history_digest,
+    )
     config = snapshot.get("config")
     if not isinstance(config, Mapping) or not isinstance(config.get("out"), str):
         raise FinalizationError("snapshot config.out is required for finalization")
     output = Path(str(config["out"])).expanduser().resolve()
-    shards: tuple[Path, ...] = tuple(sorted(output_dir.glob("round-*/worker-*.csv"))) if legacy else ()
+    shards: tuple[Path, ...] = ()
     tmp_base = _resolve_finalization_tmp_base(snapshot, tmp_dir)
-    sealed_wal_bytes = 0 if legacy else _frozen_wal_inventory_bytes(frozen_frontier)
+    sealed_wal_bytes = _frozen_wal_inventory_bytes(frozen_frontier)
     available_bytes, estimated_bytes = _preflight_finalization_space(
         tmp_base, table_path, shards, sealed_wal_bytes=sealed_wal_bytes,
     )
@@ -2386,16 +2102,12 @@ def finalize_snapshot(
     database = run_dir / "index.sqlite"
     connection: sqlite3.Connection | None = None
     try:
-        if legacy:
-            wal_rows = 0
-        else:
-            assert analysis is not None
-            wal_csv, wal_rows = _write_sealed_wal_csv(
-                run_dir / "sealed-results.csv", history_root=output_dir,
-                analysis=analysis, frozen_frontier=frozen_frontier,
-                validation_cache=validation_cache,
-            )
-            shards = (wal_csv,)
+        wal_csv, wal_rows = _write_sealed_wal_csv(
+            run_dir / "sealed-results.csv", history_root=output_dir,
+            analysis=analysis, frozen_frontier=frozen_frontier,
+            validation_cache=validation_cache,
+        )
+        shards = (wal_csv,)
         connection = sqlite3.connect(database)
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=FULL")
@@ -2419,9 +2131,9 @@ def finalize_snapshot(
             "input_shards": len(shards),
             "wal_result_rows": wal_rows,
             "frozen_wal_input_bytes": sealed_wal_bytes,
-            "analysis_id": None if analysis is None else analysis.analysis_id,
-            "execution_plan_ids": [] if execution is None else [execution.execution_plan_id],
-            "verification_receipt": None if target is None else str(verification_path(output_dir, target)),
+            "analysis_id": analysis.analysis_id,
+            "execution_plan_ids": [execution.execution_plan_id],
+            "verification_receipt": str(verification_path(output_dir, target)),
             "rows_read": rows_read,
             "final_rows": final_rows,
             "expected_model_keys": expected_count,
@@ -2479,6 +2191,8 @@ def _config_to_json(config: NKGridConfig) -> dict[str, object]:
 
 
 def _config_from_json(payload: Mapping[str, object]) -> NKGridConfig:
+    """Decode the immutable planner config used by contract-backed paths."""
+
     values = dict(payload)
     for field in ("schema", "out", "model_params"):
         values[field] = Path(str(values[field]))
@@ -2487,7 +2201,9 @@ def _config_from_json(payload: Mapping[str, object]) -> NKGridConfig:
         if values.get(field) is not None:
             values[field] = tuple(int(value) for value in values[field])
     if values.get("repeat_plan") is not None:
-        values["repeat_plan"] = tuple((int(pair[0]), int(pair[1])) for pair in values["repeat_plan"])
+        values["repeat_plan"] = tuple(
+            (int(pair[0]), int(pair[1])) for pair in values["repeat_plan"]
+        )
     return NKGridConfig(**values)
 
 
@@ -2624,8 +2340,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 expected_previous_round_index=args.expected_previous_round,
             ))
         elif args.command == "verify":
-            legacy = "analysis_contract" not in _load_snapshot(args.snapshot)
-            if not legacy and (args.round is None or args.expected_prep_token is None or args.generation is None):
+            if args.round is None or args.expected_prep_token is None or args.generation is None:
                 parser.error("verify requires --round, --expected-prep-token, and --generation")
             result = verify_rounds(
                 args.snapshot, tmp_dir=args.tmp_dir, round_index=args.round,
@@ -2636,29 +2351,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 expected_previous_round_index=args.expected_previous_round,
             )
             print(json.dumps(result, sort_keys=True), flush=True)
-            if legacy:
-                if any(_verification_failure_counts({
-                    "missing_model_keys": result["missing_model_keys"],
-                    "interrupted_row_ids": result["crashed_row_ids"],
-                    "too_long_row_ids": result["too_long_row_ids"],
-                    "aborted_tasks": [],
-                }).values()):
-                    print(
-                        "verification incomplete: "
-                        + "; ".join((
-                            f"missing_model_keys={result['missing_model_keys']}",
-                            f"crashed_row_ids={len(result['crashed_row_ids'])}",
-                            f"too_long_row_ids={len(result['too_long_row_ids'])}",
-                        )),
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    raise SystemExit(VERIFY_INCOMPLETE_EXIT_CODE)
-            elif result["exit_code"] != SUCCESS_EXIT_CODE:
+            if result["exit_code"] != SUCCESS_EXIT_CODE:
                 raise SystemExit(int(result["exit_code"]))
         else:
-            legacy = "analysis_contract" not in _load_snapshot(args.snapshot)
-            if not legacy and (args.round is None or args.expected_prep_token is None or args.generation is None):
+            if args.round is None or args.expected_prep_token is None or args.generation is None:
                 parser.error("finalize requires exact --round, --expected-prep-token, and --generation")
             print(json.dumps(finalize_snapshot(
                 args.snapshot, tmp_dir=args.tmp_dir, round_index=args.round,
