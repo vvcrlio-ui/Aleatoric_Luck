@@ -10,7 +10,7 @@ import pandas as pd
 
 from conftest import write_repo_schema_bundle as write_schema_bundle
 from aleatoric_nk_grid.chunk_planning import ClusterPolicy, build_dynamic_plan
-from aleatoric_nk_grid.execution_contract import canonical_json_bytes
+from aleatoric_nk_grid.execution_contract import canonical_json_bytes, sha256_file
 from aleatoric_nk_grid.flat_task_table import (
     FinalizationError,
     close_generation,
@@ -19,7 +19,9 @@ from aleatoric_nk_grid.flat_task_table import (
     recover_generation_activation,
     run_slice,
     verify_rounds,
+    main as flat_task_table_main,
 )
+from aleatoric_nk_grid.dynamic_exit_monitor import classify_dynamic_exit
 from aleatoric_nk_grid.generation_control import (
     ActivationTarget,
     ControlBusyError,
@@ -472,13 +474,12 @@ def test_exact_prep_resumes_an_empty_unprepared_staging_directory(tmp_path: Path
         output_dir=tmp_path / "out", panel="generic",
     )
     snapshot = json.loads((tmp_path / "snapshot.json").read_text(encoding="utf-8"))
-    target = ActivationTarget(
-        analysis_id=str(snapshot["analysis_id"]), execution_plan_id=str(snapshot["execution_plan_id"]),
-        execution_contract_sha256=str(snapshot["execution_contract_sha256"]), round_index=1,
-        submission_generation="g1", expected_previous_generation=None, expected_pointer_version=0,
-        prep_job_id="job", prep_token="job",
-    )
-    publish_activation_intent(tmp_path / "out", target)
+    with pytest.raises(_InjectedPrepareCrash):
+        prepare_round(
+            tmp_path / "snapshot.json", round_index=1, prep_token="job", prep_job_id="job",
+            submission_generation="g1", expected_pointer_version=0,
+            fault=lambda label: (_ for _ in ()).throw(_InjectedPrepareCrash()) if label == "after_intent" else None,
+        )
     stage = tmp_path / "out" / "executions" / str(snapshot["execution_plan_id"]) / "round-1" / ".generation-g1.staging"
     stage.mkdir(parents=True)
     # A crash before publishing any child leaves an empty staging directory;
@@ -502,13 +503,12 @@ def test_exact_prep_preserves_conflicting_staging_assignment_evidence(tmp_path: 
         output_dir=tmp_path / "out", panel="generic",
     )
     snapshot = json.loads((tmp_path / "snapshot.json").read_text(encoding="utf-8"))
-    target = ActivationTarget(
-        analysis_id=str(snapshot["analysis_id"]), execution_plan_id=str(snapshot["execution_plan_id"]),
-        execution_contract_sha256=str(snapshot["execution_contract_sha256"]), round_index=1,
-        submission_generation="g1", expected_previous_generation=None, expected_pointer_version=0,
-        prep_job_id="job", prep_token="job",
-    )
-    publish_activation_intent(tmp_path / "out", target)
+    with pytest.raises(_InjectedPrepareCrash):
+        prepare_round(
+            tmp_path / "snapshot.json", round_index=1, prep_token="job", prep_job_id="job",
+            submission_generation="g1", expected_pointer_version=0,
+            fault=lambda label: (_ for _ in ()).throw(_InjectedPrepareCrash()) if label == "after_intent" else None,
+        )
     stage = tmp_path / "out" / "executions" / str(snapshot["execution_plan_id"]) / "round-1" / ".generation-g1.staging"
     stage.mkdir(parents=True)
     conflicting = stage / "assignment.parquet"
@@ -516,6 +516,35 @@ def test_exact_prep_preserves_conflicting_staging_assignment_evidence(tmp_path: 
     with pytest.raises(ControlProtocolError, match="staging assignment differs"):
         prepare_round(tmp_path / "snapshot.json", round_index=1, prep_token="job", prep_job_id="job", submission_generation="g1", expected_pointer_version=0)
     assert conflicting.read_bytes() == b"partial"
+
+
+def test_intent_only_recovery_rejects_changed_todo_contents(tmp_path: Path):
+    snapshot, plan = _fault_plan(tmp_path)
+
+    def crash_after_intent(label: str) -> None:
+        if label == "after_intent":
+            raise _InjectedPrepareCrash(label)
+
+    with pytest.raises(_InjectedPrepareCrash):
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0, fault=crash_after_intent,
+        )
+    intent = (
+        tmp_path / "out" / "activation-intents" / "g1.json"
+    )
+    payload = json.loads(intent.read_text(encoding="utf-8"))
+    assert payload["todo_rows"] == 1
+    assert isinstance(payload["canonical_task_rows_sha256"], str)
+    payload["canonical_task_rows_sha256"] = "0" * 64
+    intent.chmod(0o644)
+    intent.write_bytes(canonical_json_bytes(payload) + b"\n")
+    intent.chmod(0o444)
+    with pytest.raises(ControlProtocolError, match="todo contents differ"):
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0,
+        )
 
 
 def test_analysis_identity_freezes_commit_environment_groups_and_input_provenance(tmp_path: Path, monkeypatch):
@@ -571,12 +600,11 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
     snapshot = json.loads((tmp_path / "snapshot.json").read_text(encoding="utf-8"))
     opens = 0
     fit_calls = 0
-    init_counts = {"load_input": 0, "validate_input": 0, "load_model_params": 0, "native_runner": 0}
+    init_counts = {"load_input": 0, "validate_input": 0, "load_model_params": 0}
     original_init = NKGridExecutionSession.__init__
     original_load_input = ng.load_input
     original_validate_input = ng.validate_input
     original_load_model_params = ng.load_model_params
-    original_runner_init = ng.IsolatedProcessRunner.__init__
 
     def counted_init(session, *args, **kwargs):
         nonlocal opens
@@ -594,10 +622,6 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
     def counted_load_model_params(*args, **kwargs):
         init_counts["load_model_params"] += 1
         return original_load_model_params(*args, **kwargs)
-
-    def counted_runner_init(runner, *args, **kwargs):
-        init_counts["native_runner"] += 1
-        return original_runner_init(runner, *args, **kwargs)
 
     def deterministic_fit(**kwargs):
         nonlocal fit_calls
@@ -618,7 +642,6 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
     monkeypatch.setattr(ng, "load_input", counted_load_input)
     monkeypatch.setattr(ng, "validate_input", counted_validate_input)
     monkeypatch.setattr(ng, "load_model_params", counted_load_model_params)
-    monkeypatch.setattr(ng.IsolatedProcessRunner, "__init__", counted_runner_init)
     monkeypatch.setattr(ng, "_fit_predict_model_cell", deterministic_fit)
     run_slice(
         tmp_path / "snapshot.json", round_index=1, worker_index=0, expected_prep_token="job-1",
@@ -630,9 +653,112 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
     assert fit_calls == 100
     assert init_counts == {
         "load_input": 1, "validate_input": 1,
-        "load_model_params": 1, "native_runner": 1,
+        "load_model_params": 1,
     }
     assert len(scan_wal(wal).records) == 200
+
+
+def test_worker_reuses_one_native_subprocess_for_twenty_lightgbm_tasks(tmp_path: Path, monkeypatch):
+    frame = pd.DataFrame({"x": np.arange(120, dtype=float), "y": np.arange(120, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    repeats = tuple((seed, 0) for seed in range(1, 21))
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("lightgbm",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=10, max_k=1, batch_size=1, n_jobs=1, repeat_plan=repeats, min_n=2,
+    )
+    build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(workers=1, rounds=1, partition="test", time_limit="01:00:00", account="test", constraint="none"),
+        table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    prepare_round(
+        tmp_path / "snapshot.json", round_index=1, prep_token="job-1", prep_job_id="job-1",
+        submission_generation="generation-1", expected_pointer_version=0,
+    )
+    spawns = 0
+    fits = 0
+    original_start = ng.IsolatedProcessRunner._start_worker
+    original_run = ng.IsolatedProcessRunner.run
+
+    def counted_start(runner):
+        nonlocal spawns
+        spawns += 1
+        return original_start(runner)
+
+    def counted_run(runner, *args, **kwargs):
+        nonlocal fits
+        fits += 1
+        return original_run(runner, *args, **kwargs)
+
+    monkeypatch.setattr(ng.IsolatedProcessRunner, "_start_worker", counted_start)
+    monkeypatch.setattr(ng.IsolatedProcessRunner, "run", counted_run)
+    run_slice(
+        tmp_path / "snapshot.json", round_index=1, worker_index=0, expected_prep_token="job-1",
+        prep_job_id="job-1", submission_generation="generation-1", expected_pointer_version=0,
+    )
+    assert spawns == 1
+    assert fits == 20
+
+
+@pytest.mark.parametrize(
+    ("entry", "command"),
+    [
+        (prepare_round, "prep"),
+        (run_slice, "run"),
+        (close_generation, "close"),
+        (verify_rounds, "verify"),
+        (finalize_snapshot, "finalize"),
+    ],
+)
+def test_missing_schedule_lease_is_protocol_failure_for_every_entry_without_writes(
+    tmp_path: Path, entry, command: str,
+):
+    snapshot, _ = _fault_plan(tmp_path)
+    output_root = tmp_path / "out"
+    (output_root / ".analysis-schedule.lease").unlink()
+
+    def tree_state() -> dict[str, tuple[int, bytes] | tuple[int, None]]:
+        return {
+            str(path.relative_to(output_root)): (
+                path.stat().st_ino,
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in output_root.rglob("*")
+        }
+
+    before = tree_state()
+    kwargs = {
+        "round_index": 1,
+        "submission_generation": "g1",
+        "expected_pointer_version": 0,
+        "prep_job_id": "job-1",
+    }
+    with pytest.raises(ControlProtocolError, match="republish the plan snapshot"):
+        if entry is prepare_round:
+            entry(snapshot, prep_token="job-1", **kwargs)
+        elif entry is run_slice:
+            entry(snapshot, worker_index=0, expected_prep_token="job-1", **kwargs)
+        else:
+            entry(snapshot, expected_prep_token="job-1", **kwargs)
+    assert tree_state() == before
+
+    cli_args = [
+        command, "--snapshot", str(snapshot), "--round", "1", "--generation", "g1",
+        "--expected-pointer-version", "0", "--prep-job-id", "job-1",
+    ]
+    if command == "prep":
+        cli_args.extend(["--prep-token", "job-1"])
+    else:
+        cli_args.extend(["--expected-prep-token", "job-1"])
+    if command == "run":
+        cli_args.extend(["--worker-index", "0"])
+    with pytest.raises(SystemExit) as exc_info:
+        flat_task_table_main(cli_args)
+    assert exc_info.value.code == 6
+    assert classify_dynamic_exit(6).retry is False
+    assert tree_state() == before
 
 
 def test_production_afterany_entries_share_exact_target_lifecycle(tmp_path: Path):
@@ -861,7 +987,13 @@ class _InjectedPrepareCrash(RuntimeError):
 def test_production_prepare_fault_boundaries_recover_exact_generation(
     tmp_path: Path, fault_label: str,
 ):
-    snapshot, _ = _fault_plan(tmp_path)
+    snapshot, plan = _fault_plan(tmp_path)
+    output_root = tmp_path / "out"
+
+    def tree_state() -> set[str]:
+        return {str(path.relative_to(output_root)) for path in output_root.rglob("*")}
+
+    before = tree_state()
     triggered = False
 
     def fault(label: str) -> None:
@@ -881,6 +1013,21 @@ def test_production_prepare_fault_boundaries_recover_exact_generation(
     )
     assert recovered.is_file()
     assert triggered is True
+    after = tree_state()
+    assert not any(".tmp." in path or ".staging" in path for path in after - before)
+    generation = output_root / "executions" / str(plan["execution_plan_id"]) / "round-1" / "generation-g1"
+    artefacts = [
+        generation / "assignment.parquet", generation / "assignment.index.json",
+        generation / "assignment.ready.json", generation / "prep.json",
+        generation / "generation.prepared.json", generation / "generation.activation.json",
+        output_root / "active-generation.json",
+    ]
+    baseline = {path: sha256_file(path) for path in artefacts}
+    assert recover_generation_activation(
+        snapshot, round_index=1, submission_generation="g1",
+        expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
+    ) == recovered
+    assert {path: sha256_file(path) for path in artefacts} == baseline
 
 
 @pytest.mark.parametrize(
@@ -893,7 +1040,11 @@ def test_production_prepare_fault_boundaries_recover_exact_generation(
 def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
     tmp_path: Path, fault_label: str,
 ):
-    snapshot, _ = _fault_plan(tmp_path, rounds=2)
+    snapshot, plan = _fault_plan(tmp_path, rounds=2)
+    output_root = tmp_path / "out"
+
+    def tree_state() -> set[str]:
+        return {str(path.relative_to(output_root)) for path in output_root.rglob("*")}
     prepare_round(
         snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
         submission_generation="g1", expected_pointer_version=0,
@@ -920,6 +1071,7 @@ def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
             submission_generation="g2", expected_previous_generation="g1",
             expected_pointer_version=1, fault=fault,
         )
+    before_recovery = tree_state()
     recovered = prepare_round(
         snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
         submission_generation="g2", expected_previous_generation="g1",
@@ -928,6 +1080,17 @@ def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
     assert recovered["no_generation"] is True
     assert Path(str(recovered["prep_outcome"])).is_file()
     assert triggered is True
+    after_recovery = tree_state()
+    assert not any(".tmp." in path or ".staging" in path for path in after_recovery - before_recovery)
+    outcome = output_root / "executions" / str(plan["execution_plan_id"]) / "round-2" / "prep-outcomes" / "g2.json"
+    baseline = sha256_file(outcome)
+    repeated = prepare_round(
+        snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
+        submission_generation="g2", expected_previous_generation="g1",
+        expected_pointer_version=1,
+    )
+    assert repeated["no_generation"] is True
+    assert sha256_file(outcome) == baseline
 
 
 @pytest.mark.parametrize("entry", [run_slice, close_generation, verify_rounds])

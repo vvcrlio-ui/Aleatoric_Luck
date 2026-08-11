@@ -233,42 +233,54 @@ def _write_temp_fsync_rename(
         _fsync_directory(target.parent)
         return sha256_bytes(existing)
     temporary = target.parent / f".{target.name}.tmp.{uuid.uuid4().hex}"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
     try:
-        _write_all(descriptor, data)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+        try:
+            _write_all(descriptor, data)
+            if fault is not None:
+                fault("before_file_fsync")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         if fault is not None:
-            fault("before_file_fsync")
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    if fault is not None:
-        fault("after_file_fsync")
-        fault("before_rename")
-    try:
-        _rename_noreplace(temporary, target)
-    except FileExistsError:
-        temporary.unlink(missing_ok=True)
-        existing = target.read_bytes()
-        if existing != data:
-            raise ControlProtocolError(f"immutable control artefact differs: {target}")
+            fault("after_file_fsync")
+            fault("before_rename")
+        try:
+            _rename_noreplace(temporary, target)
+        except FileExistsError:
+            temporary.unlink(missing_ok=True)
+            existing = target.read_bytes()
+            if existing != data:
+                raise ControlProtocolError(f"immutable control artefact differs: {target}")
+            _fsync_directory(target.parent)
+            return sha256_bytes(existing)
+        if fault is not None:
+            fault("after_rename")
+            fault("before_parent_fsync")
         _fsync_directory(target.parent)
-        return sha256_bytes(existing)
-    if fault is not None:
-        fault("after_rename")
-        fault("before_parent_fsync")
-    _fsync_directory(target.parent)
-    if fault is not None:
-        fault("after_parent_fsync")
-    return sha256_bytes(data)
+        if fault is not None:
+            fault("after_parent_fsync")
+        return sha256_bytes(data)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 @contextmanager
 def _lease(path: Path, *, exclusive: bool, create: bool = True) -> Iterator[int]:
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if create:
+        target.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDWR | (os.O_CREAT if create else 0)
     try:
         descriptor = os.open(target, flags, 0o640)
+    except FileNotFoundError as exc:
+        if not create:
+            raise ControlProtocolError(
+                f"analysis schedule lease is missing: {target}; "
+                "republish the plan snapshot to reinstate it"
+            ) from exc
+        raise ControlBusyError(f"cannot open lease {target}: {exc}") from exc
     except OSError as exc:
         raise ControlBusyError(f"cannot open lease {target}: {exc}") from exc
     try:
@@ -313,6 +325,30 @@ def ensure_analysis_schedule_lease(root: Path) -> Path:
         os.close(descriptor)
     _fsync_directory(target_root)
     return target
+
+
+def require_analysis_schedule_lease(root: Path) -> Path:
+    """Fail closed when an existing plan lost its durable schedule inode."""
+
+    target = analysis_schedule_lease(Path(root))
+    if not target.is_file():
+        raise ControlProtocolError(
+            f"analysis schedule lease is missing: {target}; "
+            "republish the plan snapshot to reinstate it"
+        )
+    return target
+
+
+def cleanup_target_temp_orphans(*targets: Path) -> None:
+    """Remove only stale temp names for the exact control records being resumed."""
+
+    for target in targets:
+        target = Path(target)
+        if not target.parent.is_dir():
+            continue
+        for orphan in target.parent.glob(f".{target.name}.tmp.*"):
+            if orphan.is_file():
+                orphan.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -810,6 +846,8 @@ def _intent_payload(
     observed_previous_closed_path: str | None,
     observed_pointer_sha256: str | None,
     staging_id: str,
+    todo_rows: int | None,
+    canonical_task_rows_sha256: str | None,
 ) -> dict[str, object]:
     return {
         "intent_format_version": INTENT_FORMAT_VERSION,
@@ -829,6 +867,8 @@ def _intent_payload(
         "prep_token": target.prep_token,
         "staging_id": staging_id,
         "canonical_generation_path": str(generation_dir(root, target).resolve()),
+        "todo_rows": todo_rows,
+        "canonical_task_rows_sha256": canonical_task_rows_sha256,
     }
 
 
@@ -1058,7 +1098,14 @@ def publish_no_generation_outcome(
         return outcome_path(root, target)
 
 
-def publish_activation_intent(root: Path, target: ActivationTarget, *, lease_held: bool = False) -> Path:
+def publish_activation_intent(
+    root: Path,
+    target: ActivationTarget,
+    *,
+    todo_rows: int | None = None,
+    canonical_task_rows_sha256: str | None = None,
+    lease_held: bool = False,
+) -> Path:
     """Durably reserve one exact activation target before any generation file.
 
     The returned intent is deliberately the only authority for a subsequent
@@ -1067,6 +1114,10 @@ def publish_activation_intent(root: Path, target: ActivationTarget, *, lease_hel
     """
 
     target.validate()
+    if (todo_rows is None) != (canonical_task_rows_sha256 is None):
+        raise ControlProtocolError("activation intent todo rows and digest must be supplied together")
+    if todo_rows is not None and (todo_rows < 1 or not canonical_task_rows_sha256):
+        raise ControlProtocolError("activation intent todo contents are invalid")
     root = Path(root)
     lease = nullcontext() if lease_held else _lease(analysis_schedule_lease(root), exclusive=True)
     with lease:
@@ -1080,6 +1131,11 @@ def publish_activation_intent(root: Path, target: ActivationTarget, *, lease_hel
             existing = _load_canonical_json(existing_target, label="activation intent")
             if existing.get("intent_format_version") != INTENT_FORMAT_VERSION or not _target_matches_payload(existing, target):
                 raise ControlProtocolError("existing activation intent identity mismatch")
+            if (
+                existing.get("todo_rows") != todo_rows
+                or existing.get("canonical_task_rows_sha256") != canonical_task_rows_sha256
+            ):
+                raise ControlProtocolError("existing activation intent todo contents differ from recovery")
             current_sha = None if raw_pointer is None else sha256_bytes(raw_pointer)
             if existing.get("observed_pointer_sha256_or_null") != current_sha:
                 if pointer is not None and int(pointer["pointer_version"]) > target.expected_pointer_version:
@@ -1117,6 +1173,8 @@ def publish_activation_intent(root: Path, target: ActivationTarget, *, lease_hel
             observed_previous_closed_path=predecessor_path,
             observed_pointer_sha256=None if raw_pointer is None else sha256_bytes(raw_pointer),
             staging_id=target.submission_generation,
+            todo_rows=todo_rows,
+            canonical_task_rows_sha256=canonical_task_rows_sha256,
         )
         _write_temp_fsync_rename(existing_target, intent)
         return existing_target
@@ -1237,25 +1295,29 @@ def activate_generation(
         }
         pointer_bytes = canonical_json_bytes(pointer_payload) + b"\n"
         temporary = pointer_path(root).with_name(f".active-generation.json.tmp.{uuid.uuid4().hex}")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
         try:
-            _write_all(descriptor, pointer_bytes)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+            try:
+                _write_all(descriptor, pointer_bytes)
+                if fault is not None:
+                    fault("pointer_before_file_fsync")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
             if fault is not None:
-                fault("pointer_before_file_fsync")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        if fault is not None:
-            fault("pointer_after_file_fsync")
-            fault("pointer_before_replace")
-        os.replace(temporary, pointer_path(root))
-        if fault is not None:
-            fault("pointer_after_replace")
-            fault("pointer_before_root_fsync")
-        _fsync_directory(root)
-        if fault is not None:
-            fault("pointer_after_root_fsync")
-        return canonical_activation
+                fault("pointer_after_file_fsync")
+                fault("pointer_before_replace")
+            os.replace(temporary, pointer_path(root))
+            if fault is not None:
+                fault("pointer_after_replace")
+                fault("pointer_before_root_fsync")
+            _fsync_directory(root)
+            if fault is not None:
+                fault("pointer_after_root_fsync")
+            return canonical_activation
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
 
 def seal_generation(

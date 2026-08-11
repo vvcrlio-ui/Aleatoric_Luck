@@ -56,11 +56,13 @@ from .generation_control import (
     activate_generation,
     classify_exact_afterany_target_read_only,
     closed_path,
+    cleanup_target_temp_orphans,
     frozen_sealed_history,
     frozen_history_from_closed,
     generation_dir,
     intent_path,
     outcome_path,
+    pointer_path,
     predecessor_gate,
     publish_activation_intent,
     publish_no_generation_outcome,
@@ -68,6 +70,7 @@ from .generation_control import (
     seal_generation,
     schedule_transaction,
     ensure_analysis_schedule_lease,
+    require_analysis_schedule_lease,
     validate_exact_verification_receipt,
     verification_path,
 )
@@ -744,6 +747,11 @@ def recover_generation_activation(
         validate_task_table=False,
     )
     root = Path(str(snapshot["output_dir"]))
+    directory = generation_dir(root, target)
+    cleanup_target_temp_orphans(
+        pointer_path(root), intent_path(root, target), outcome_path(root, target),
+        directory / "generation.prepared.json", directory / "generation.activation.json",
+    )
     dispatch = classify_exact_afterany_target_read_only(root, target)
     if dispatch.kind in {"no-generation", "sealed-generation", "active-generation"}:
         return Path(dispatch.outcome_path or dispatch.closed_path or dispatch.activation_path)
@@ -751,7 +759,6 @@ def recover_generation_activation(
         raise ControlSupersededError("activation recovery target was superseded")
     if dispatch.exit_code == PROTOCOL_EXIT_CODE:
         raise ControlProtocolError("activation recovery target has a protocol conflict")
-    directory = generation_dir(root, target)
     staging = directory.parent / f".{directory.name}.staging"
     if directory.exists() and staging.exists():
         raise ControlProtocolError("activation recovery found both canonical and staging directories")
@@ -876,6 +883,7 @@ def _load_contract_chain(
         raise ValueError("dynamic snapshot task table path mismatch")
     if validate_task_table and execution.payload.get("task_table_file_sha256") != sha256_file(table_path):
         raise ValueError("dynamic snapshot task table checksum mismatch")
+    require_analysis_schedule_lease(Path(str(snapshot["output_dir"])))
     return analysis, execution
 
 
@@ -1396,6 +1404,23 @@ def _stage_queue_todo(
     return todo_index
 
 
+def _staged_todo_digest(connection: sqlite3.Connection) -> str:
+    """Hash the exact ordered todo stream frozen by an activation intent."""
+
+    rows = (
+        TaskRow(
+            row_id=str(row_id), seed=int(seed), draw=int(draw),
+            n_samples=int(n_samples), k_features=int(k_features), group=str(group_name),
+            models=tuple(str(model) for model in json.loads(models_json)),
+        )
+        for row_id, seed, draw, n_samples, k_features, group_name, models_json in connection.execute(
+            "SELECT row_id, seed, draw, N, K, group_name, models_json "
+            "FROM todo ORDER BY todo_index"
+        )
+    )
+    return task_row_digest(rows)
+
+
 def _write_assignment_from_queue_index(
     path: Path, connection: sqlite3.Connection, *, workers: int,
 ) -> tuple[Path, list[int], list[dict[str, object]]]:
@@ -1500,6 +1525,11 @@ def prepare_round(
                 expected_previous_round_index=target.expected_previous_round_index,
                 fault=fault,
             )
+    directory = generation_dir(output_dir, target)
+    cleanup_target_temp_orphans(
+        pointer_path(output_dir), intent_path(output_dir, target), outcome_path(output_dir, target),
+        directory / "generation.prepared.json", directory / "generation.activation.json",
+    )
     table_path = Path(str(payload["task_table"]))
     predecessor_kind, predecessor = predecessor_gate(output_dir, target)
     if predecessor_kind == "no-generation":
@@ -1526,6 +1556,7 @@ def prepare_round(
             raise ControlProtocolError("durable TASK_ABORTED exists; refusing to publish a new ready assignment")
         _queue_incomplete_rows(connection)
         todo_rows = _stage_queue_todo(connection, table_path, workers=workers)
+        todo_digest = _staged_todo_digest(connection) if todo_rows else None
         completed_model_keys = int(connection.execute("SELECT COUNT(*) FROM completed").fetchone()[0])
         crashed = _queue_row_ids(connection, "crashed_rows")
         too_long = _queue_row_ids(connection, "too_long_rows")
@@ -1540,7 +1571,13 @@ def prepare_round(
             # The intent is the first durable generation artefact.  Build all
             # mutable preparation output in a private sibling and promote it
             # only after every immutable child has been fsynced.
-            intent_file = publish_activation_intent(output_dir, target, lease_held=True)
+            intent_file = publish_activation_intent(
+                output_dir,
+                target,
+                todo_rows=todo_rows,
+                canonical_task_rows_sha256=todo_digest,
+                lease_held=True,
+            )
             if fault is not None:
                 fault("after_intent")
             if directory.exists():

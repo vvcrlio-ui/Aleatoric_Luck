@@ -21,6 +21,7 @@ from aleatoric_nk_grid.nk_grid import (
     NKGridConfig,
     NKGridExecutionSession,
     SplitIndexManager,
+    external_test_split,
     split_frame,
     run_nk_grid,
 )
@@ -225,6 +226,10 @@ def test_split_index_manager_matches_materialized_mixed_dtype_content_and_dtype(
     if external:
         external_frame = train.iloc[:20].copy()
         external_frame.index = pd.Index(np.arange(2000, 2020), name="row_id")
+        # Keep missing outcomes away from frame boundaries so the external
+        # index oracle exercises the actual filtering branch.
+        train.loc[[1013, 1046], "y"] = np.nan
+        external_frame.loc[[2005, 2014], "y"] = np.nan
     manager = SplitIndexManager(
         frame=train, external_frame=external_frame,
         predictors=["continuous", "integer", "label"], outcome="y",
@@ -232,15 +237,18 @@ def test_split_index_manager_matches_materialized_mixed_dtype_content_and_dtype(
     )
     observed = manager.for_seed(seed)
     if external:
-        expected_train = train.dropna(subset=["y"])
-        expected_test = external_frame.dropna(subset=["y"])
+        expected = external_test_split(
+            train, external_frame, ["continuous", "integer", "label"], "y",
+        )
         assert observed.external_test is True
-        assert tuple(observed.train_index) == tuple(expected_train.index)
-        assert tuple(observed.test_index) == tuple(expected_test.index)
+        assert tuple(observed.train_index) == tuple(expected.X_train.index)
+        assert tuple(observed.test_index) == tuple(expected.X_test.index)
+        assert {1013, 1046}.isdisjoint(observed.train_index)
+        assert {2005, 2014}.isdisjoint(observed.test_index)
         observed_train = train.loc[observed.train_index, ["continuous", "integer", "label"]]
         observed_test = external_frame.loc[observed.test_index, ["continuous", "integer", "label"]]
-        expected_train_values = expected_train.loc[:, ["continuous", "integer", "label"]]
-        expected_test_values = expected_test.loc[:, ["continuous", "integer", "label"]]
+        expected_train_values = expected.X_train
+        expected_test_values = expected.X_test
     else:
         expected = split_frame(
             train, ["continuous", "integer", "label"], "y",
@@ -257,6 +265,16 @@ def test_split_index_manager_matches_materialized_mixed_dtype_content_and_dtype(
     pd.testing.assert_frame_equal(observed_test, expected_test_values, check_exact=True)
     assert observed_train.dtypes.equals(expected_train_values.dtypes)
     assert observed_test.dtypes.equals(expected_test_values.dtypes)
+
+
+def test_split_index_manager_external_frame_missing_predictor_raises_key_error():
+    train = pd.DataFrame({"x": [1.0, 2.0], "y": [3.0, 4.0]})
+    external = pd.DataFrame({"y": [5.0, 6.0]})
+    with pytest.raises(KeyError, match="Predictor not found in test data: x"):
+        SplitIndexManager(
+            frame=train, external_frame=external, predictors=["x"], outcome="y",
+            test_size=0.25, task="regression",
+        )
 
 
 def test_cell_group_metrics_exactly_match_model_at_a_time_execution(tmp_path):

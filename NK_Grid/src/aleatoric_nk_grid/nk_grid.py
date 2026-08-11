@@ -395,11 +395,10 @@ class SplitIndexManager:
         self.task = str(task)
         self._cache: dict[int, SplitIndexes] = {}
         if external_frame is not None:
-            train_complete = frame.dropna(subset=[outcome])
-            test_complete = external_frame.dropna(subset=[outcome])
+            fixed = external_test_split(frame, external_frame, self.predictors, self.outcome)
             self._external = SplitIndexes(
-                train_index=train_complete.index.copy(),
-                test_index=test_complete.index.copy(),
+                train_index=fixed.X_train.index.copy(),
+                test_index=fixed.X_test.index.copy(),
                 external_test=True,
             )
         else:
