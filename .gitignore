@@ -68,3 +68,6 @@ htmlcov/
 core
 core.[0-9]*
 joblib_memmapping_folder_*/
+
+# Calibration scratch bundles (regenerable, can be >10MB)
+**/calibration/_scratch/
