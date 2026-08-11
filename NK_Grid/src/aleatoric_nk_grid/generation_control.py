@@ -9,7 +9,9 @@ stable analysis schedule lease.
 
 from __future__ import annotations
 
+import ctypes
 import errno
+import sys
 import fcntl
 import hashlib
 import json
@@ -109,6 +111,13 @@ class GenerationValidationCache:
 
     def __init__(self) -> None:
         self._sealed: dict[tuple[Path, ActivationTarget], SealedGenerationValidation] = {}
+        self._activation: dict[tuple[Path, ActivationTarget], tuple[Path, dict[str, object], str]] = {}
+
+    def get_activation(self, root: Path, target: ActivationTarget) -> tuple[Path, dict[str, object], str] | None:
+        return self._activation.get((Path(root).resolve(), target))
+
+    def put_activation(self, root: Path, target: ActivationTarget, value: tuple[Path, dict[str, object], str]) -> None:
+        self._activation[(Path(root).resolve(), target)] = value
 
     def get(self, root: Path, target: ActivationTarget) -> SealedGenerationValidation | None:
         return self._sealed.get((Path(root).resolve(), target))
@@ -157,6 +166,38 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _rename_noreplace(source: Path, target: Path) -> None:
+    """Atomically publish a filename only if it does not yet exist.
+
+    Plain POSIX ``rename`` replaces an existing target, so it cannot publish
+    immutable control records.  Linux has ``renameat2(RENAME_NOREPLACE)`` and
+    macOS has ``renamex_np(RENAME_EXCL)``; unsupported filesystems fail closed
+    instead of silently falling back to link/unlink or replace semantics.
+    """
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    target_bytes = os.fsencode(target)
+    if sys.platform == "darwin":
+        operation = getattr(libc, "renamex_np", None)
+        if operation is None:
+            raise ControlProtocolError("atomic no-replace rename is unavailable")
+        result = operation(source_bytes, target_bytes, 0x00000004)  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        operation = getattr(libc, "renameat2", None)
+        if operation is None:
+            raise ControlProtocolError("atomic no-replace rename is unavailable")
+        result = operation(-100, source_bytes, -100, target_bytes, 1)  # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise ControlProtocolError("atomic no-replace rename is unavailable")
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), target)
+    raise ControlProtocolError(f"atomic no-replace rename failed for {target}: {os.strerror(error)}")
+
+
 def _write_all(descriptor: int, payload: bytes) -> None:
     """Write a control record fully before the associated fsync boundary."""
 
@@ -199,19 +240,8 @@ def _write_temp_fsync_rename(
     if fault is not None:
         fault("after_file_fsync")
         fault("before_rename")
-    # Control records are published by one schedule transaction, so an
-    # existing target is evidence rather than a normal race winner.  Use the
-    # required same-directory rename boundary instead of link/unlink: link
-    # has a second visible mutation and does not model the protocol's crash
-    # point.  Never replace an existing immutable target.
-    if target.exists():
-        temporary.unlink(missing_ok=True)
-        existing = target.read_bytes()
-        if existing != data:
-            raise ControlProtocolError(f"immutable control artefact differs: {target}")
-        return sha256_bytes(existing)
     try:
-        os.rename(temporary, target)
+        _rename_noreplace(temporary, target)
     except FileExistsError:
         temporary.unlink(missing_ok=True)
         existing = target.read_bytes()
@@ -381,7 +411,13 @@ def _outcome_conflicts_with_generation(root: Path, target: ActivationTarget) -> 
     return intent_path(root, target).exists() or directory.exists() or staging.exists()
 
 
-def _validate_activation(root: Path, target: ActivationTarget) -> tuple[Path, dict[str, object], str] | None:
+def _validate_activation(
+    root: Path, target: ActivationTarget, *, cache: GenerationValidationCache | None = None,
+) -> tuple[Path, dict[str, object], str] | None:
+    if cache is not None:
+        cached = cache.get_activation(root, target)
+        if cached is not None:
+            return cached
     path = activation_path(root, target)
     if not path.exists():
         return None
@@ -462,7 +498,10 @@ def _validate_activation(root: Path, target: ActivationTarget) -> tuple[Path, di
         raise ControlProtocolError("generation activation lease path is not canonical")
     if not (generation / "generation.lease").is_file():
         raise ControlProtocolError("generation activation lease inode is missing")
-    return path, payload, _sha(path)
+    result = (path, payload, _sha(path))
+    if cache is not None:
+        cache.put_activation(root, target, result)
+    return result
 
 
 def _validate_closed(
@@ -594,7 +633,7 @@ def classify_exact_afterany_target_read_only(
     target.validate()
     root = Path(root)
     outcome = _validate_outcome(root, target)
-    activation = _validate_activation(root, target)
+    activation = _validate_activation(root, target, cache=cache)
     if outcome is not None and _outcome_conflicts_with_generation(root, target):
         return Dispatch("protocol", PROTOCOL_EXIT_CODE)
     pointer, raw_pointer = _pointer(root)

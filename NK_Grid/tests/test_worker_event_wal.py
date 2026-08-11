@@ -453,3 +453,33 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
     assert prepared["todo_rows"] == 100
     assert opens == 1
     assert len(scan_wal(wal).records) == 200
+
+
+def test_malformed_session_row_is_durably_aborted_not_interrupted(tmp_path: Path, monkeypatch):
+    frame = pd.DataFrame({"x": np.arange(30, dtype=float), "y": np.arange(30, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1, n_sizes_k=1,
+        max_n=10, max_k=1, batch_size=1, n_jobs=1, repeat_plan=((1, 0),), min_n=2,
+    )
+    plan = build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(workers=1, rounds=1, partition="test", time_limit="01:00:00", account="test", constraint="none"),
+        table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    prepare_round(tmp_path / "snapshot.json", round_index=1, prep_token="job", prep_job_id="job", submission_generation="g1", expected_pointer_version=0)
+
+    class MalformedSession:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def run_cell_group(self, **kwargs): return [None]
+
+    monkeypatch.setattr(NKGridExecutionSession, "open", staticmethod(lambda *args, **kwargs: MalformedSession()))
+    with pytest.raises(ControlProtocolError, match="PUBLIC_SCHEMA_MISMATCH"):
+        run_slice(tmp_path / "snapshot.json", round_index=1, worker_index=0, expected_prep_token="job", prep_job_id="job", submission_generation="g1", expected_pointer_version=0)
+    generation = tmp_path / "out" / "executions" / str(plan["execution_plan_id"]) / "round-1" / "generation-g1"
+    scan = scan_wal(generation / "worker-0.events.wal")
+    assert [record.event_type for record in scan.records] == ["TASK_STARTED", TASK_ABORTED]
+    assert json.loads(scan.records[-1].payload.decode("utf-8"))["reason_code"] == "PUBLIC_SCHEMA_MISMATCH"

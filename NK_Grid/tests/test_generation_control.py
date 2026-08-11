@@ -16,6 +16,7 @@ from aleatoric_nk_grid.generation_control import (
     publish_activation_intent,
     publish_no_generation_outcome,
     seal_generation,
+    _write_temp_fsync_rename,
 )
 from aleatoric_nk_grid.execution_contract import canonical_json_bytes
 
@@ -142,3 +143,15 @@ def test_pre_cas_activation_keeps_the_only_unresolved_intent_slot(tmp_path: Path
     second = _target(generation="g2")
     with pytest.raises(ControlSupersededError, match="another frozen target"):
         publish_activation_intent(tmp_path, second)
+
+
+def test_immutable_publish_never_replaces_a_between_check_and_rename_conflict(tmp_path: Path):
+    target = tmp_path / "control.json"
+
+    def inject_competing_target(boundary: str) -> None:
+        if boundary == "before_rename":
+            target.write_bytes(b"conflict\n")
+
+    with pytest.raises(ControlProtocolError, match="immutable control artefact differs"):
+        _write_temp_fsync_rename(target, {"value": 1}, fault=inject_competing_target)
+    assert target.read_bytes() == b"conflict\n"

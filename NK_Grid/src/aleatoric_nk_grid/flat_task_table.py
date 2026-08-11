@@ -666,6 +666,8 @@ def run_slice(
                     try:
                         if not isinstance(computed_rows, list) or not computed_rows:
                             raise ResultProjectionError("session returned no result rows")
+                        if any(not isinstance(item, Mapping) for item in computed_rows):
+                            raise PublicSchemaMismatchError("session rows must be mappings")
                         if {str(item.get("model")) for item in computed_rows} != set(row.models):
                             raise ResultKeySetError("session model set differs from assignment")
                         if any((int(item.get("seed", -1)), int(item.get("draw", -1)), int(item.get("N", -1)), int(item.get("K", -1))) != (row.seed, row.draw, row.n_samples, row.k_features) for item in computed_rows):
@@ -758,7 +760,7 @@ def close_generation(
                 continue
             wal_inventory.append({
                 "worker": worker, "wal_state": "present", "path": str(wal.resolve()),
-                "size": wal.stat().st_size, "sha256": sha256_file(wal),
+                "size": scan.file_size, "sha256": scan.file_sha256,
                 "last_committed_offset": scan.committed_offset,
                 "last_commit_trailer_digest": scan.trailer_digest,
                 "uncommitted_tail": scan.has_uncommitted_tail,
