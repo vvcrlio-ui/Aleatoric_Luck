@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import json
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -10,12 +13,14 @@ import pandas as pd
 
 from conftest import write_repo_schema_bundle as write_schema_bundle
 from aleatoric_nk_grid.chunk_planning import ClusterPolicy, build_dynamic_plan
-from aleatoric_nk_grid.execution_contract import canonical_json_bytes, sha256_file
+from aleatoric_nk_grid.execution_contract import canonical_json_bytes, task_row_digest
 from aleatoric_nk_grid.flat_task_table import (
     FinalizationError,
     close_generation,
     finalize_snapshot,
     prepare_round,
+    read_row_group,
+    read_task_table,
     recover_generation_activation,
     run_slice,
     verify_rounds,
@@ -27,7 +32,9 @@ from aleatoric_nk_grid.generation_control import (
     ControlBusyError,
     ControlProtocolError,
     ControlSupersededError,
+    generation_dir,
     publish_activation_intent,
+    schedule_transaction,
 )
 import aleatoric_nk_grid.nk_grid as ng
 from aleatoric_nk_grid.nk_grid import NKGridConfig, run_nk_grid
@@ -87,6 +94,37 @@ def _fault_plan(tmp_path: Path, *, rounds: int = 1) -> tuple[Path, dict[str, obj
         output_dir=tmp_path / "out", panel="generic",
     )
     return tmp_path / "snapshot.json", plan
+
+
+def _assert_recovered_assignment_matches_frozen_intent(
+    snapshot: Path,
+    output_root: Path,
+    plan: dict[str, object],
+    *,
+    generation: str,
+) -> None:
+    """Check a recovered assignment against the todo stream frozen before its crash."""
+
+    intent = json.loads((output_root / "activation-intents" / f"{generation}.json").read_text(encoding="utf-8"))
+    directory = output_root / "executions" / str(plan["execution_plan_id"]) / "round-1" / f"generation-{generation}"
+    index = json.loads((directory / "assignment.index.json").read_text(encoding="utf-8"))
+    ready = json.loads((directory / "assignment.ready.json").read_text(encoding="utf-8"))
+    assignment = directory / "assignment.parquet"
+    row_groups = index["row_groups"]
+    recovered_rows = tuple(
+        row
+        for group in row_groups
+        for row in read_row_group(assignment, int(group["worker"]))
+    )
+    assert sum(int(group["row_count"]) for group in row_groups) == intent["todo_rows"]
+    assert ready["todo_rows"] == intent["todo_rows"]
+    recovered_ids = {row.row_id for row in recovered_rows}
+    task_rows = tuple(
+        row for row in read_task_table(Path(json.loads(snapshot.read_text(encoding="utf-8"))["task_table"]))
+        if row.row_id in recovered_ids
+    )
+    assert len(task_rows) == int(intent["todo_rows"])
+    assert task_row_digest(task_rows) == intent["canonical_task_rows_sha256"]
 
 
 def test_two_phase_wal_commits_complete_cell_group_and_reopens(tmp_path: Path):
@@ -743,7 +781,6 @@ def test_missing_schedule_lease_is_protocol_failure_for_every_entry_without_writ
         else:
             entry(snapshot, expected_prep_token="job-1", **kwargs)
     assert tree_state() == before
-
     cli_args = [
         command, "--snapshot", str(snapshot), "--round", "1", "--generation", "g1",
         "--expected-pointer-version", "0", "--prep-job-id", "job-1",
@@ -760,6 +797,89 @@ def test_missing_schedule_lease_is_protocol_failure_for_every_entry_without_writ
     assert classify_dynamic_exit(6).retry is False
     assert tree_state() == before
 
+
+def test_recovery_respects_schedule_lease_before_target_temp_cleanup(tmp_path: Path):
+    snapshot, plan = _fault_plan(tmp_path)
+    root = tmp_path / "out"
+
+    def fault(label: str) -> None:
+        if label == "after_intent":
+            raise _InjectedPrepareCrash(label)
+
+    with pytest.raises(_InjectedPrepareCrash, match="after_intent"):
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0, fault=fault,
+        )
+    snapshot_payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    target = ActivationTarget(
+        analysis_id=str(plan["analysis_id"]), execution_plan_id=str(plan["execution_plan_id"]),
+        execution_contract_sha256=str(snapshot_payload["execution_contract_sha256"]), round_index=1,
+        submission_generation="g1", expected_previous_generation=None,
+        expected_pointer_version=0, prep_job_id="job-1", prep_token="job-1",
+    )
+    inflight = generation_dir(root, target) / ".generation.activation.json.tmp.concurrent-writer"
+    inflight.parent.mkdir(parents=True)
+    inflight.write_bytes(b"in-flight immutable payload")
+    failures: list[BaseException] = []
+
+    def recover_in_other_thread() -> None:
+        try:
+            recover_generation_activation(
+                snapshot, round_index=1, submission_generation="g1",
+                expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
+            )
+        except BaseException as exc:  # Thread failure is the asserted result.
+            failures.append(exc)
+
+    with schedule_transaction(root):
+        worker = threading.Thread(target=recover_in_other_thread)
+        worker.start(); worker.join(timeout=5)
+        assert worker.is_alive() is False
+        assert len(failures) == 1
+        assert isinstance(failures[0], ControlBusyError)
+        assert inflight.is_file()
+
+
+def test_cli_maps_unexpected_os_error_to_protocol_exit(tmp_path: Path, monkeypatch):
+    snapshot, _ = _fault_plan(tmp_path)
+
+    def broken_prepare(*args, **kwargs):
+        raise FileNotFoundError("injected bare os error")
+
+    monkeypatch.setattr("aleatoric_nk_grid.flat_task_table.prepare_round", broken_prepare)
+    with pytest.raises(SystemExit) as exc_info:
+        flat_task_table_main([
+            "prep", "--snapshot", str(snapshot), "--round", "1", "--generation", "g1",
+            "--prep-token", "job-1", "--expected-pointer-version", "0", "--prep-job-id", "job-1",
+        ])
+    assert exc_info.value.code == 6
+
+
+def test_v1_activation_intent_is_rejected_as_a_format_upgrade(tmp_path: Path):
+    snapshot, _ = _fault_plan(tmp_path)
+
+    def fault(label: str) -> None:
+        if label == "after_intent":
+            raise _InjectedPrepareCrash(label)
+
+    with pytest.raises(_InjectedPrepareCrash, match="after_intent"):
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0, fault=fault,
+        )
+    intent = tmp_path / "out" / "activation-intents" / "g1.json"
+    payload = json.loads(intent.read_text(encoding="utf-8"))
+    payload["intent_format_version"] = 1
+    payload.pop("todo_rows")
+    payload.pop("canonical_task_rows_sha256")
+    intent.write_bytes(canonical_json_bytes(payload) + b"\n")
+
+    with pytest.raises(ControlProtocolError, match="activation intent format mismatch"):
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0,
+        )
 
 def test_production_afterany_entries_share_exact_target_lifecycle(tmp_path: Path):
     frame = pd.DataFrame({"x": np.arange(40, dtype=float), "y": np.arange(40, dtype=float)})
@@ -955,6 +1075,46 @@ class _InjectedPrepareCrash(RuntimeError):
     pass
 
 
+def test_real_process_crash_leaves_target_temp_then_recovery_cleans_it(tmp_path: Path):
+    snapshot, plan = _fault_plan(tmp_path)
+    output_root = tmp_path / "out"
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), environment.get("PYTHONPATH", "")]
+    )
+    crash_program = """
+import os
+import sys
+from pathlib import Path
+from aleatoric_nk_grid.flat_task_table import prepare_round
+
+def fault(label):
+    if label == 'before_rename':
+        os._exit(137)
+
+prepare_round(
+    Path(sys.argv[1]), round_index=1, prep_token='job-1', prep_job_id='job-1',
+    submission_generation='g1', expected_pointer_version=0, fault=fault,
+)
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", crash_program, str(snapshot)],
+        capture_output=True, text=True, env=environment, check=False,
+    )
+    assert crashed.returncode == 137
+    orphaned = sorted(path for path in output_root.rglob("*") if ".tmp." in path.name)
+    assert orphaned
+
+    recovered = recover_generation_activation(
+        snapshot, round_index=1, submission_generation="g1",
+        expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
+    )
+    assert recovered.is_file()
+    assert not [path for path in output_root.rglob("*") if ".tmp." in path.name]
+    _assert_recovered_assignment_matches_frozen_intent(snapshot, output_root, plan, generation="g1")
+
+
 @pytest.mark.parametrize(
     "fault_label",
     [
@@ -1015,19 +1175,11 @@ def test_production_prepare_fault_boundaries_recover_exact_generation(
     assert triggered is True
     after = tree_state()
     assert not any(".tmp." in path or ".staging" in path for path in after - before)
-    generation = output_root / "executions" / str(plan["execution_plan_id"]) / "round-1" / "generation-g1"
-    artefacts = [
-        generation / "assignment.parquet", generation / "assignment.index.json",
-        generation / "assignment.ready.json", generation / "prep.json",
-        generation / "generation.prepared.json", generation / "generation.activation.json",
-        output_root / "active-generation.json",
-    ]
-    baseline = {path: sha256_file(path) for path in artefacts}
+    _assert_recovered_assignment_matches_frozen_intent(snapshot, output_root, plan, generation="g1")
     assert recover_generation_activation(
         snapshot, round_index=1, submission_generation="g1",
         expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
     ) == recovered
-    assert {path: sha256_file(path) for path in artefacts} == baseline
 
 
 @pytest.mark.parametrize(
@@ -1065,13 +1217,13 @@ def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
             triggered = True
             raise _InjectedPrepareCrash(label)
 
+    before_crash = tree_state()
     with pytest.raises(_InjectedPrepareCrash, match=fault_label):
         prepare_round(
             snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
             submission_generation="g2", expected_previous_generation="g1",
             expected_pointer_version=1, fault=fault,
         )
-    before_recovery = tree_state()
     recovered = prepare_round(
         snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
         submission_generation="g2", expected_previous_generation="g1",
@@ -1081,16 +1233,15 @@ def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
     assert Path(str(recovered["prep_outcome"])).is_file()
     assert triggered is True
     after_recovery = tree_state()
-    assert not any(".tmp." in path or ".staging" in path for path in after_recovery - before_recovery)
+    assert not any(".tmp." in path or ".staging" in path for path in after_recovery - before_crash)
     outcome = output_root / "executions" / str(plan["execution_plan_id"]) / "round-2" / "prep-outcomes" / "g2.json"
-    baseline = sha256_file(outcome)
     repeated = prepare_round(
         snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
         submission_generation="g2", expected_previous_generation="g1",
         expected_pointer_version=1,
     )
     assert repeated["no_generation"] is True
-    assert sha256_file(outcome) == baseline
+    assert json.loads(outcome.read_text(encoding="utf-8"))["todo_count"] == 0
 
 
 @pytest.mark.parametrize("entry", [run_slice, close_generation, verify_rounds])

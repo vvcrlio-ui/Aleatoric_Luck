@@ -222,6 +222,8 @@ def test_split_index_manager_matches_materialized_mixed_dtype_content_and_dtype(
         },
         index=pd.Index(np.arange(1000, 1080), name="row_id"),
     )
+    # Keep the internal-split matrix on the missing-outcome path as well.
+    train.loc[[1031], "y"] = np.nan
     external_frame = None
     if external:
         external_frame = train.iloc[:20].copy()

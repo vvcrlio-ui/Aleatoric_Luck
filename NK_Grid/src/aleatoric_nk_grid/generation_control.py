@@ -34,7 +34,7 @@ RETRYABLE_EXIT_CODE = 7
 SUPERSEDED_EXIT_CODE = 8
 
 POINTER_FORMAT_VERSION = 1
-INTENT_FORMAT_VERSION = 1
+INTENT_FORMAT_VERSION = 2
 PREPARED_FORMAT_VERSION = 1
 ACTIVATION_FORMAT_VERSION = 1
 CLOSED_FORMAT_VERSION = 1
@@ -267,7 +267,13 @@ def _write_temp_fsync_rename(
 
 
 @contextmanager
-def _lease(path: Path, *, exclusive: bool, create: bool = True) -> Iterator[int]:
+def _lease(
+    path: Path,
+    *,
+    exclusive: bool,
+    create: bool = True,
+    artefact_kind: str = "lease",
+) -> Iterator[int]:
     target = Path(path)
     if create:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -276,9 +282,12 @@ def _lease(path: Path, *, exclusive: bool, create: bool = True) -> Iterator[int]
         descriptor = os.open(target, flags, 0o640)
     except FileNotFoundError as exc:
         if not create:
+            recovery = (
+                "; republish the plan snapshot to reinstate it"
+                if artefact_kind == "analysis schedule lease" else ""
+            )
             raise ControlProtocolError(
-                f"analysis schedule lease is missing: {target}; "
-                "republish the plan snapshot to reinstate it"
+                f"{artefact_kind} is missing: {target}{recovery}"
             ) from exc
         raise ControlBusyError(f"cannot open lease {target}: {exc}") from exc
     except OSError as exc:
@@ -361,7 +370,12 @@ def schedule_transaction(root: Path) -> Iterator[None]:
     not compose a series of short independent leases.
     """
 
-    with _lease(analysis_schedule_lease(Path(root)), exclusive=True, create=False):
+    with _lease(
+        analysis_schedule_lease(Path(root)),
+        exclusive=True,
+        create=False,
+        artefact_kind="analysis schedule lease",
+    ):
         yield
 
 
@@ -504,7 +518,9 @@ def _validate_activation(
         raise ControlProtocolError("generation activation path is not canonical")
     intent_file = intent_path(root, target)
     intent = _load_canonical_json(intent_file, label="activation intent")
-    if intent.get("intent_format_version") != INTENT_FORMAT_VERSION or not _target_matches_payload(intent, target):
+    if intent.get("intent_format_version") != INTENT_FORMAT_VERSION:
+        raise ControlProtocolError("activation intent format mismatch")
+    if not _target_matches_payload(intent, target):
         raise ControlProtocolError("activation intent identity mismatch")
     if payload.get("intent_sha256") != _sha(intent_file):
         raise ControlProtocolError("generation activation intent checksum mismatch")
@@ -1129,7 +1145,9 @@ def publish_activation_intent(
         existing_target = intent_path(root, target)
         if existing_target.exists():
             existing = _load_canonical_json(existing_target, label="activation intent")
-            if existing.get("intent_format_version") != INTENT_FORMAT_VERSION or not _target_matches_payload(existing, target):
+            if existing.get("intent_format_version") != INTENT_FORMAT_VERSION:
+                raise ControlProtocolError("activation intent format mismatch")
+            if not _target_matches_payload(existing, target):
                 raise ControlProtocolError("existing activation intent identity mismatch")
             if (
                 existing.get("todo_rows") != todo_rows
@@ -1218,7 +1236,9 @@ def activate_generation(
         if not existing_intent.exists():
             raise ControlBusyError("activation intent has not been durably published")
         intent = _load_canonical_json(existing_intent, label="activation intent")
-        if intent.get("intent_format_version") != INTENT_FORMAT_VERSION or not _target_matches_payload(intent, target):
+        if intent.get("intent_format_version") != INTENT_FORMAT_VERSION:
+            raise ControlProtocolError("activation intent format mismatch")
+        if not _target_matches_payload(intent, target):
             raise ControlProtocolError("published activation intent identity mismatch")
         predecessor_sha = intent.get("observed_previous_closed_sha256_or_null")
         predecessor_path = intent.get("observed_previous_closed_path_or_null")
@@ -1344,8 +1364,18 @@ def seal_generation(
         raise ControlBusyError("target activation is not ready to seal")
     assert dispatch.activation_path is not None and dispatch.activation_sha256 is not None
     generation_lease = generation_dir(root, target) / "generation.lease"
-    with _lease(analysis_schedule_lease(root), exclusive=False, create=False):
-        with _lease(generation_lease, exclusive=True, create=False):
+    with _lease(
+        analysis_schedule_lease(root),
+        exclusive=False,
+        create=False,
+        artefact_kind="analysis schedule lease",
+    ):
+        with _lease(
+            generation_lease,
+            exclusive=True,
+            create=False,
+            artefact_kind="generation activation lease",
+        ):
             rechecked = classify_exact_afterany_target_read_only(root, target)
             if rechecked.kind == "sealed-generation":
                 return Path(rechecked.closed_path)

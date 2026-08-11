@@ -16,6 +16,7 @@ from aleatoric_nk_grid.generation_control import (
     ControlSupersededError,
     activate_generation,
     classify_exact_afterany_target_read_only,
+    cleanup_target_temp_orphans,
     publish_activation_intent,
     publish_no_generation_outcome,
     publish_verification_receipt,
@@ -83,6 +84,26 @@ def test_missing_exact_target_is_recovery_required_without_writes(tmp_path: Path
     dispatch = classify_exact_afterany_target_read_only(tmp_path, _target())
     assert dispatch.exit_code == RETRYABLE_EXIT_CODE
     assert tuple(tmp_path.rglob("*")) == before
+
+
+def test_cleanup_target_temp_orphans_stays_at_the_exact_target_file(tmp_path: Path):
+    target = tmp_path / "generation.activation.json"
+    orphan = tmp_path / ".generation.activation.json.tmp.crashed"
+    neighbour = tmp_path / ".other.json.tmp.crashed"
+    same_named_directory = tmp_path / ".generation.activation.json.tmp.directory"
+    nested_orphan = tmp_path / "nested" / ".generation.activation.json.tmp.crashed"
+    orphan.write_bytes(b"orphan")
+    neighbour.write_bytes(b"neighbour")
+    same_named_directory.mkdir()
+    nested_orphan.parent.mkdir()
+    nested_orphan.write_bytes(b"nested")
+
+    cleanup_target_temp_orphans(target)
+
+    assert not orphan.exists()
+    assert neighbour.read_bytes() == b"neighbour"
+    assert same_named_directory.is_dir()
+    assert nested_orphan.read_bytes() == b"nested"
 
 
 def test_no_generation_outcome_is_only_todo_zero_success(tmp_path: Path):

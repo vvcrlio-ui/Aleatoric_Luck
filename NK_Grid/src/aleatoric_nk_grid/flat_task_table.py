@@ -738,7 +738,7 @@ def recover_generation_activation(
     """Resume one exact prepared activation; never select a latest target."""
 
     snapshot = _load_snapshot(snapshot_path)
-    analysis, execution, target = _exact_target(
+    _analysis, _execution, target = _exact_target(
         snapshot, round_index=round_index, submission_generation=submission_generation,
         prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
         expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
@@ -747,9 +747,43 @@ def recover_generation_activation(
         validate_task_table=False,
     )
     root = Path(str(snapshot["output_dir"]))
+    # Recovery owns the same exclusive schedule transaction as preparation.
+    # In particular, temp cleanup must never race an in-flight immutable write.
+    with schedule_transaction(root):
+        return _recover_generation_activation_locked(
+            snapshot_path,
+            root=root,
+            target=target,
+            round_index=round_index,
+            submission_generation=submission_generation,
+            expected_prep_token=expected_prep_token,
+            expected_previous_generation=expected_previous_generation,
+            expected_pointer_version=expected_pointer_version,
+            prep_job_id=prep_job_id,
+            expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+            expected_previous_round_index=expected_previous_round_index,
+        )
+
+
+def _recover_generation_activation_locked(
+    snapshot_path: Path,
+    *,
+    root: Path,
+    target: ActivationTarget,
+    round_index: int,
+    submission_generation: str,
+    expected_prep_token: str,
+    expected_previous_generation: str | None,
+    expected_pointer_version: int | None,
+    prep_job_id: str | None,
+    expected_previous_execution_plan_id: str | None,
+    expected_previous_round_index: int | None,
+) -> Path:
+    """Recover an exact target while the caller holds the schedule lease."""
+
     directory = generation_dir(root, target)
     cleanup_target_temp_orphans(
-        pointer_path(root), intent_path(root, target), outcome_path(root, target),
+        intent_path(root, target), outcome_path(root, target),
         directory / "generation.prepared.json", directory / "generation.activation.json",
     )
     dispatch = classify_exact_afterany_target_read_only(root, target)
@@ -776,6 +810,7 @@ def recover_generation_activation(
                 prep_job_id=prep_job_id,
                 expected_previous_execution_plan_id=expected_previous_execution_plan_id,
                 expected_previous_round_index=expected_previous_round_index,
+                _schedule_locked=True,
             )
             activation_value = resumed.get("activation")
             if not isinstance(activation_value, str):
@@ -802,6 +837,7 @@ def recover_generation_activation(
             prep_job_id=prep_job_id,
             expected_previous_execution_plan_id=expected_previous_execution_plan_id,
             expected_previous_round_index=expected_previous_round_index,
+            _schedule_locked=True,
         )
         activation_value = resumed.get("activation")
         if not isinstance(activation_value, str):
@@ -824,6 +860,7 @@ def recover_generation_activation(
             ready_path=Path(str(prepared["ready_path"])), ready_sha256=str(prepared["ready_sha256"]),
             prep_path=Path(str(prepared["prep_path"])), prep_sha256=str(prepared["prep_sha256"]),
             worker_count=int(prepared["worker_count"]),
+            lease_held=True,
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ControlProtocolError("activation recovery prepared record is invalid") from exc
@@ -1654,6 +1691,7 @@ def prepare_round(
         "submission_generation": target.submission_generation, "assignment": str(canonical_assignment.resolve()),
         "assignment_sha256": assignment_sha, "assignment_index": str(canonical_index.resolve()),
         "assignment_index_sha256": index_sha, "prep_token": prep_token, "prep_job_id": target.prep_job_id,
+        "todo_rows": todo_rows,
     }
     immutable_json_bytes(ready, ready_payload)
     if fault is not None:
@@ -2465,6 +2503,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ControlSupersededError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(SUPERSEDED_EXIT_CODE) from exc
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(PROTOCOL_EXIT_CODE) from exc
 
 
 if __name__ == "__main__":
