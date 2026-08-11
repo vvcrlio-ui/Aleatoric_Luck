@@ -57,5 +57,5 @@ fi
 CALIBRATION_ARGS+=(--out-dir "$CALIBRATION_OUT_DIR")
 
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-echo "host=$(hostname -s) arch=${BMRC_GCC_NATIVE_ARCH:-${BMRC_GCC_ARCH_NATIVE:-?}} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV calibration_job=$CALIBRATION_JOB_NAME"
+echo "host=$(hostname -s) arch=${BMRC_GCC_NATIVE_ARCH:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV calibration_job=$CALIBRATION_JOB_NAME"
 "$PYTHON" -m aleatoric_nk_grid.calibrate_cost "${CALIBRATION_ARGS[@]}"

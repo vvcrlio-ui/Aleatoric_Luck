@@ -157,7 +157,7 @@ def test_dynamic_worker_uses_venv_python_and_skips_module_when_unset(tmp_path):
 def test_dynamic_worker_reports_architecture_without_mislabeling_install(tmp_path):
     fake_python = tmp_path / "python"
     _write_executable(fake_python, "#!/bin/bash\necho 'Illegal instruction' >&2\nexit 132\n")
-    environment = _worker_environment(tmp_path, fake_python); environment.update({"BMRC_GCC_ARCH_NATIVE": "native", "MODULE_CPU_TYPE": "cpu"})
+    environment = _worker_environment(tmp_path, fake_python); environment.update({"BMRC_GCC_NATIVE_ARCH": "native", "MODULE_CPU_TYPE": "cpu"})
     completed = subprocess.run(["bash", str(WORKER), "/frozen/snapshot.json", "1", "98765", "generation", "", "0"], env=environment, check=False, capture_output=True, text=True)
     assert completed.returncode != 0
     assert "CPU architecture" in completed.stderr
@@ -239,10 +239,8 @@ fi'''
         actual_block = text[start:start + len(module_block)]
         block_md5s.add(hashlib.md5(actual_block.encode("utf-8")).hexdigest())
         assert 'venv is incompatible with this node CPU architecture' in text
-        # BMRC documents the variable as BMRC_GCC_NATIVE_ARCH.  The previous
-        # spelling is kept as a fallback so the diagnostic still reports an
-        # architecture whichever name the cluster actually exports.
-        assert 'BMRC_GCC_NATIVE_ARCH=${BMRC_GCC_NATIVE_ARCH:-${BMRC_GCC_ARCH_NATIVE:-?}}' in text
+        # BMRC documents this variable as BMRC_GCC_NATIVE_ARCH.
+        assert 'BMRC_GCC_NATIVE_ARCH=${BMRC_GCC_NATIVE_ARCH:-?}' in text
         assert 'grep -qi "Illegal instruction"' not in text
         assert "python=$PYTHON" in text
     assert len(block_md5s) == 1

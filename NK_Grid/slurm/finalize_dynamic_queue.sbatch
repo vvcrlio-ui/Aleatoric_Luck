@@ -41,7 +41,7 @@ else
   IMPORT_STATUS=$?
   if [ "$IMPORT_STATUS" = "132" ] || [ "$IMPORT_STATUS" = "134" ] || [ "$IMPORT_STATUS" = "139" ]; then
     echo "venv is incompatible with this node CPU architecture" >&2
-    echo "BMRC_GCC_NATIVE_ARCH=${BMRC_GCC_NATIVE_ARCH:-${BMRC_GCC_ARCH_NATIVE:-?}} MODULE_CPU_TYPE=${MODULE_CPU_TYPE:-?} VENV=$VENV" >&2
+    echo "BMRC_GCC_NATIVE_ARCH=${BMRC_GCC_NATIVE_ARCH:-?} MODULE_CPU_TYPE=${MODULE_CPU_TYPE:-?} VENV=$VENV" >&2
     echo "Use --constraint to select a compatible architecture or create a venv for this architecture." >&2
     cat "$IMPORT_STDERR" >&2
     rm -f "$IMPORT_STDERR"
@@ -55,7 +55,7 @@ else
     exit 1
   fi
 fi
-echo "host=$(hostname -s) arch=${BMRC_GCC_NATIVE_ARCH:-${BMRC_GCC_ARCH_NATIVE:-?}} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND generation=$GENERATION phase=finalize"
+echo "host=$(hostname -s) arch=${BMRC_GCC_NATIVE_ARCH:-?} cpu_type=${MODULE_CPU_TYPE:-?} python=$PYTHON venv=$VENV round=$ROUND generation=$GENERATION phase=finalize"
 FINALIZE_ARGS=(finalize --snapshot "$SNAPSHOT" --round "$ROUND" --generation "$GENERATION" --expected-prep-token "$PREP_JOB" --prep-job-id "$PREP_JOB" --expected-pointer-version "$EXPECTED_POINTER_VERSION")
 if [ -n "$EXPECTED_PREVIOUS" ]; then FINALIZE_ARGS+=(--expected-previous-generation "$EXPECTED_PREVIOUS"); fi
 if [ -n "$EXPECTED_PREVIOUS_PLAN" ] && [ -n "$EXPECTED_PREVIOUS_ROUND" ]; then FINALIZE_ARGS+=(--expected-previous-execution-plan-id "$EXPECTED_PREVIOUS_PLAN" --expected-previous-round "$EXPECTED_PREVIOUS_ROUND"); fi

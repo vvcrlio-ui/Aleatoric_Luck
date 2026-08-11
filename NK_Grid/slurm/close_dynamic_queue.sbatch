@@ -29,7 +29,7 @@ else
   IMPORT_STATUS=$?
   if [ "$IMPORT_STATUS" = "132" ] || [ "$IMPORT_STATUS" = "134" ] || [ "$IMPORT_STATUS" = "139" ]; then
     echo "venv is incompatible with this node CPU architecture" >&2
-    echo "BMRC_GCC_NATIVE_ARCH=${BMRC_GCC_NATIVE_ARCH:-${BMRC_GCC_ARCH_NATIVE:-?}} MODULE_CPU_TYPE=${MODULE_CPU_TYPE:-?} VENV=$VENV" >&2
+    echo "BMRC_GCC_NATIVE_ARCH=${BMRC_GCC_NATIVE_ARCH:-?} MODULE_CPU_TYPE=${MODULE_CPU_TYPE:-?} VENV=$VENV" >&2
     cat "$IMPORT_STDERR" >&2; rm -f "$IMPORT_STDERR"; exit 1
   fi
   rm -f "$IMPORT_STDERR"
