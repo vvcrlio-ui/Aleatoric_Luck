@@ -53,7 +53,13 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[2]
 
 from .evaluation import r2_against_training_mean
-from .execution_contract import CellExecutionSpec, ContractError, sha256_file
+from .execution_contract import (
+    CellExecutionSpec,
+    ContractError,
+    git_repository_root,
+    resolve_repo_locator,
+    sha256_file,
+)
 from .experiment import (
     CHECKPOINT_COMPACTION_LOOSE_PARTS,
     CHECKPOINT_KEY_COLUMNS,
@@ -241,6 +247,50 @@ def execution_groups_for_models(models: Sequence[str]) -> tuple[tuple[str, tuple
         for name, group in (("imputed_core", imputed), ("passthrough", passthrough))
         if group
     )
+
+
+def _frozen_input_provenance_for_schema(schema: Any) -> dict[str, dict[str, str]]:
+    """Freeze numeric inputs with the same fields used by dynamic planning."""
+
+    definition_value = Path(str(schema.feature_universe["definition_file"]))
+    definition = definition_value if definition_value.is_absolute() else (schema.path.parent / definition_value).resolve()
+    candidates = {
+        "training_table": schema.table,
+        "external_test_table": schema.test_table,
+        "feature_manifest": schema.feature_manifest,
+        "feature_universe_definition": definition,
+        "provenance": schema.table.parent / "provenance.json",
+    }
+    frozen: dict[str, dict[str, str]] = {}
+    for name, candidate in candidates.items():
+        if candidate is None:
+            continue
+        path = Path(candidate).resolve()
+        if name == "provenance" and not path.exists():
+            continue
+        if not path.is_file():
+            raise ContractError(f"numeric input provenance file is missing: {name}={path}")
+        frozen[name] = {"path": str(path), "sha256": sha256_file(path)}
+    if not frozen:
+        raise ContractError("CellExecutionSpec found no numeric input provenance")
+    return frozen
+
+
+def _local_cell_spec_root(config: NKGridConfig, provenance: Mapping[str, Mapping[str, str]]) -> Path:
+    """Use the Git root for real runs; retain test-only local fixture roots."""
+
+    repository = git_repository_root(ROOT)
+    candidates = [Path(config.schema).resolve(), Path(config.model_params).resolve()]
+    candidates.extend(Path(str(entry["path"])).resolve() for entry in provenance.values())
+    try:
+        for candidate in candidates:
+            candidate.relative_to(repository)
+    except ValueError:
+        # Unit fixtures deliberately reside in pytest's temporary directory.
+        # The local runner has no portable contract artefact; dynamic plans
+        # always use the real Git root above.
+        return Path(os.path.commonpath([str(candidate) for candidate in candidates])).resolve()
+    return repository
 
 
 def project_public_result(row: Mapping[str, object], *, header: Sequence[str]) -> dict[str, object]:
@@ -1567,6 +1617,7 @@ class NKGridExecutionSession:
         *,
         config: NKGridConfig,
         spec: CellExecutionSpec | None,
+        repo_root: Path | None = None,
         loaded: LoadedInput,
         source_definitions: Sequence[SourceGroup],
         selected_model_params: Mapping[str, Mapping[str, object]],
@@ -1574,6 +1625,7 @@ class NKGridExecutionSession:
     ) -> None:
         self.config = config
         self.spec = spec
+        self.repo_root = Path(repo_root).resolve() if repo_root is not None else git_repository_root(ROOT)
         self.loaded = loaded
         self.source_definitions = tuple(source_definitions)
         self.schema = loaded.schema
@@ -1647,7 +1699,10 @@ class NKGridExecutionSession:
         self._validate_spec()
 
     @classmethod
-    def _open_config(cls, config: NKGridConfig, *, spec: CellExecutionSpec | None = None) -> "NKGridExecutionSession":
+    def _open_config(
+        cls, config: NKGridConfig, *, spec: CellExecutionSpec | None = None,
+        repo_root: Path | None = None,
+    ) -> "NKGridExecutionSession":
         _validate_config(config)
         raw_loaded = load_input(config.schema, config.outcome)
         if raw_loaded.schema.split_mode == "internal_random" and not 0.0 < config.test_size < 1.0:
@@ -1658,21 +1713,22 @@ class NKGridExecutionSession:
         )
         selected_model_params = load_model_params(config.model_params, task=loaded.schema.task, models=config.models)
         return cls(
-            config=config, spec=spec, loaded=loaded, source_definitions=source_definitions,
+            config=config, spec=spec, repo_root=repo_root, loaded=loaded, source_definitions=source_definitions,
             selected_model_params=selected_model_params,
             algorithm_version=load_algorithm_version(config.model_params),
         )
 
     @classmethod
-    def open(cls, spec: CellExecutionSpec, *, repo_root: Path = ROOT) -> "NKGridExecutionSession":
+    def open(cls, spec: CellExecutionSpec, *, repo_root: Path | None = None) -> "NKGridExecutionSession":
         """Open a session from the session-only canonical execution spec."""
 
         spec = CellExecutionSpec.from_payload(spec.payload)
-        schema, model_params = spec.resolve_inputs(repo_root=repo_root)
+        root = git_repository_root(ROOT) if repo_root is None else git_repository_root(repo_root)
+        schema, model_params = spec.resolve_inputs(repo_root=root)
         value = spec.payload
         config = NKGridConfig(
             schema=schema,
-            out=Path(repo_root) / ".nk-grid-session-no-output.csv",
+            out=root / ".nk-grid-session-no-output.csv",
             outcome=str(value["outcome"]),
             models=tuple(str(item) for item in value["models"]),
             seed=int(value["split_seed"]),
@@ -1697,7 +1753,7 @@ class NKGridExecutionSession:
             n_grid=tuple(int(item) for item in value["resolved_n_grid"]),
             k_grid=tuple(int(item) for item in value["resolved_k_grid"]),
         )
-        return cls._open_config(config, spec=spec)
+        return cls._open_config(config, spec=spec, repo_root=root)
 
     @classmethod
     def open_from_config(cls, config: NKGridConfig) -> "NKGridExecutionSession":
@@ -1742,11 +1798,12 @@ class NKGridExecutionSession:
             raise ContractError("CellExecutionSpec execution groups mismatch")
         for name, entry in dict(value["input_provenance"]).items():
             try:
-                actual = sha256_file(Path(str(entry["path"])))
+                resolve_repo_locator(
+                    str(entry["path"]), str(entry["sha256"]),
+                    repo_root=self.repo_root,
+                )
             except (OSError, ContractError) as exc:
                 raise ContractError(f"CellExecutionSpec provenance input is unavailable: {name}") from exc
-            if actual != entry["sha256"]:
-                raise ContractError(f"CellExecutionSpec provenance checksum mismatch: {name}")
 
     def _orders(self, seed: int, draw: int, train_index: pd.Index) -> DrawOrders:
         key = (int(seed), int(draw))
@@ -2025,18 +2082,6 @@ def _run_nk_grid_locked(
     )
     resolved_selected_model_params = resolved_model_params(selected_model_params)
     algorithm_version = load_algorithm_version(model_params_path)
-    # The local orchestration owns manifests/checkpoints, but the numerical
-    # cell primitive is the same long-lived session used by queue workers.
-    # Reuse the already validated input/model state here: no second load or
-    # validation is introduced by the extraction.
-    execution_session = NKGridExecutionSession(
-        config=config,
-        spec=None,
-        loaded=loaded,
-        source_definitions=source_definitions,
-        selected_model_params=selected_model_params,
-        algorithm_version=algorithm_version,
-    )
     log_progress(
         "loaded data "
         f"path={data_path} rows={len(frame)} sources={len(feature_units)} "
@@ -2117,6 +2162,36 @@ def _run_nk_grid_locked(
         f"seeds={split_seeds} repeat_pairs={list(execution_pairs)} models={list(config.models)}"
     )
 
+    state = git_state(ROOT)
+    if not isinstance(state.get("commit"), str) or len(str(state["commit"])) != 40:
+        raise ContractError("local CellExecutionSpec requires a resolvable immutable Git commit")
+    if config.preset == "production" and state.get("dirty") is not False:
+        raise ValueError(
+            "Production runs require a clean Git worktree; commit or stash changes first."
+        )
+    local_provenance = _frozen_input_provenance_for_schema(schema)
+    local_root = _local_cell_spec_root(config, local_provenance)
+    local_spec = CellExecutionSpec.from_config(
+        config,
+        repo_root=local_root,
+        resolved_n_grid=tuple(int(value) for value in n_grid),
+        resolved_k_grid=tuple(int(value) for value in k_grid),
+        resolved_repeat_plan=repeat_pairs,
+        model_n_jobs=config.n_jobs,
+        git_commit=str(state["commit"]),
+        algorithm_version=algorithm_version,
+        resolved_model_params=resolved_selected_model_params,
+        environment_overrides=model_run_settings(config.models),
+        execution_groups=[
+            {"k_features": int(k_features), "groups": [
+                {"group": group, "models": list(models)}
+                for group, models in execution_groups_for_models(config.models)
+            ]}
+            for k_features in k_grid
+        ],
+        input_provenance=local_provenance,
+        require_clean_worktree=config.preset == "production",
+    )
     jobs = [
         (model_name, seed, draw, int(n_samples), int(k_features))
         for seed, draw in execution_pairs
@@ -2129,11 +2204,6 @@ def _run_nk_grid_locked(
         raise ValueError(
             f"Large run requires --allow-large-run: {expected_rows:,} top-level model "
             f"cells exceeds the {LARGE_RUN_THRESHOLD:,} safety threshold."
-        )
-    state = git_state(ROOT)
-    if config.preset == "production" and state.get("dirty") is not False:
-        raise ValueError(
-            "Production runs require a clean Git worktree; commit or stash changes first."
         )
 
     out_path = (
@@ -2582,6 +2652,24 @@ def _run_nk_grid_locked(
             preparation_errors.clear()
             del X_sub_raw, y_sub, X_test_raw
 
+    # Open the native runner only after all manifest/checkpoint-resume work
+    # has succeeded.  From here every cell and checkpoint failure closes it
+    # before escaping this function.
+    execution_session = NKGridExecutionSession(
+        config=config, spec=local_spec, loaded=loaded,
+        repo_root=local_root,
+        source_definitions=source_definitions,
+        selected_model_params=selected_model_params,
+        algorithm_version=algorithm_version,
+    )
+
+    def write_session_checkpoint(rows: list[dict]) -> Path | None:
+        try:
+            return write_checkpoint_part(rows, out_path)
+        except BaseException:
+            execution_session.close()
+            raise
+
     pending_cell_groups: dict[
         tuple[int, int, int, int], list[tuple[str, int, int, int, int]]
     ] = {}
@@ -2620,7 +2708,7 @@ def _run_nk_grid_locked(
                 f"batch {checkpoint_batch_index}/{total_batches} starting "
                 f"jobs={len(batch_rows)}"
             )
-            part = write_checkpoint_part(batch_rows, out_path)
+            part = write_session_checkpoint(batch_rows)
             ok_count = sum(row.get("status") == "ok" for row in batch_rows)
             failed_count = sum(
                 row.get("status") == "failed" for row in batch_rows
@@ -2664,7 +2752,7 @@ def _run_nk_grid_locked(
             f"batch {checkpoint_batch_index}/{total_batches} starting "
             f"jobs={len(batch_rows)}"
         )
-        part = write_checkpoint_part(batch_rows, out_path)
+        part = write_session_checkpoint(batch_rows)
         ok_count = sum(row.get("status") == "ok" for row in batch_rows)
         failed_count = sum(row.get("status") == "failed" for row in batch_rows)
         skipped_count = sum(row.get("status") == "skipped" for row in batch_rows)

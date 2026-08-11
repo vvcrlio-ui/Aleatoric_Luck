@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -140,6 +141,22 @@ def canonical_repo_locator(path: Path | str, *, repo_root: Path) -> tuple[str, s
     return relative.as_posix(), sha256_file(resolved)
 
 
+def git_repository_root(path: Path | str) -> Path:
+    """Return the real Git top-level that owns all contract locators."""
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=Path(path),
+            check=True, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ContractError(f"cannot resolve Git repository root for {path}") from exc
+    root = Path(result.stdout.strip()).resolve()
+    if not root.is_dir():
+        raise ContractError("Git repository root is not a directory")
+    return root
+
+
 def resolve_repo_locator(locator: str, expected_sha256: str, *, repo_root: Path) -> Path:
     resolved = _inside_root(Path(locator), Path(repo_root))
     actual = sha256_file(resolved)
@@ -191,6 +208,9 @@ class CellExecutionSpec:
         for name, entry in provenance.items():
             if not isinstance(name, str) or not name or not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str) or not isinstance(entry.get("sha256"), str):
                 raise ContractError("cell execution spec provenance entry is invalid")
+            locator = Path(str(entry["path"]))
+            if locator.is_absolute() or ".." in locator.parts or locator.as_posix() != str(entry["path"]):
+                raise ContractError("cell execution spec provenance locator is not canonical")
         if not isinstance(value.get("require_clean_worktree"), bool):
             raise ContractError("cell execution spec requires clean-worktree policy")
         return cls(value)
@@ -244,10 +264,15 @@ class CellExecutionSpec:
         if not isinstance(input_provenance, Mapping) or not input_provenance:
             raise ContractError("CellExecutionSpec requires frozen input provenance")
         groups = [dict(group) for group in execution_groups]
-        provenance = {str(name): dict(value) for name, value in input_provenance.items()}
-        for name, entry in provenance.items():
+        provenance: dict[str, dict[str, str]] = {}
+        for name, value in input_provenance.items():
+            entry = dict(value)
             if not name or not isinstance(entry.get("path"), str) or not isinstance(entry.get("sha256"), str):
                 raise ContractError("CellExecutionSpec provenance entry is invalid")
+            locator, digest = canonical_repo_locator(str(entry["path"]), repo_root=repo_root)
+            if digest != str(entry["sha256"]):
+                raise ContractError(f"CellExecutionSpec provenance checksum changed while freezing: {name}")
+            provenance[str(name)] = {"path": locator, "sha256": digest}
         payload: dict[str, object] = {
             "cell_spec_format_version": CELL_SPEC_FORMAT_VERSION,
             "panel_id": None if panel_id is None else str(panel_id),

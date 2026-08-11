@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -108,3 +109,16 @@ def write_schema_bundle(
         json.dumps(schema, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return schema_path
+
+
+def write_repo_schema_bundle(_temporary_root: Path, train: pd.DataFrame, **kwargs) -> Path:
+    """Create a disposable schema below the actual repository root.
+
+    Dynamic contracts intentionally reject host-absolute external locators.
+    These fixtures live in the ignored pytest cache so the production planner
+    can exercise the same canonical repo-relative codec as a real run.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    root = repo_root / ".pytest_cache" / "nk-grid-inputs" / uuid.uuid4().hex
+    return write_schema_bundle(root, train, **kwargs)

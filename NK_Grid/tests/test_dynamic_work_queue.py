@@ -7,7 +7,7 @@ import pytest
 import numpy as np
 import pandas as pd
 
-from conftest import write_schema_bundle
+from conftest import write_repo_schema_bundle as write_schema_bundle
 
 from aleatoric_nk_grid.chunk_planning import (
     MEMORY_FRAME_COPIES,
@@ -19,6 +19,13 @@ from aleatoric_nk_grid.chunk_planning import (
     peak_memory_bytes,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
+from aleatoric_nk_grid.flat_task_table import (
+    PublicSchemaMismatchError,
+    ResultKeySetError,
+    ResultProjectionError,
+    _aborted_reason,
+)
+from aleatoric_nk_grid.worker_event_wal import WALFrameTooLarge
 
 
 def _schema(path: Path) -> Path:
@@ -59,6 +66,15 @@ def test_memory_formula_and_probe_fail_closed_above_twelve_copies():
     assert implied_frame_copies(measured, n_samples=100, expanded_columns=6) == MEMORY_FRAME_COPIES
     with pytest.raises(RuntimeError, match="report and stop"):
         check_memory_measurement(peak_memory_bytes(100, 6, frame_copies=13), n_samples=100, expanded_columns=6)
+
+
+def test_aborted_reason_mapping_is_typed_and_exhaustive():
+    assert _aborted_reason(WALFrameTooLarge("x")) == "RESULT_FRAME_TOO_LARGE"
+    assert _aborted_reason(PublicSchemaMismatchError("x")) == "PUBLIC_SCHEMA_MISMATCH"
+    assert _aborted_reason(ResultProjectionError("x")) == "RESULT_PROJECTION_FAILED"
+    assert _aborted_reason(ResultKeySetError("x")) == "RESULT_KEY_SET_MISMATCH"
+    assert _aborted_reason(UnicodeError("x")) == "RESULT_ENCODING_FAILED"
+    assert _aborted_reason(RuntimeError("RESULT_KEY_SET_MISMATCH")) == "RESULT_PROTOCOL_VIOLATION"
 
 
 def test_plan_requires_account_and_never_splits_super_learner(tmp_path):

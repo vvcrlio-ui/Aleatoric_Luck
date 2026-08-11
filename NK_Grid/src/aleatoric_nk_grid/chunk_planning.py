@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -28,6 +27,7 @@ from .execution_contract import (
     AnalysisContract,
     CellExecutionSpec,
     DynamicExecutionContract,
+    git_repository_root,
     immutable_json_bytes,
 )
 from .experiment import git_state, model_run_settings
@@ -207,13 +207,10 @@ def build_dynamic_plan(
         raise ValueError("Production dynamic planning requires a clean Git worktree")
     # ``CellExecutionSpec`` deliberately freezes dynamic workers at one model
     # job; the local config remains untouched and keeps its original n_jobs.
-    # Production schemas/parameters live under the repository root.  Unit
-    # tests intentionally use temporary generic schemas, for which their
-    # common immutable-input root is still a strict relative-locator root.
-    repo_root = Path(os.path.commonpath([
-        str(Path(worker_config.schema).resolve()),
-        str(Path(worker_config.model_params).resolve()),
-    ])).resolve()
+    # Contracts have one locator root: the real Git top-level.  Using a
+    # common parent of inputs makes the same repository acquire a different
+    # identity at another mount point and permits locator-root drift.
+    repo_root = git_repository_root(engine_root)
     input_schema = load_schema(worker_config.schema)
     selected_params = load_model_params(
         worker_config.model_params, task=input_schema.task, models=worker_config.models,

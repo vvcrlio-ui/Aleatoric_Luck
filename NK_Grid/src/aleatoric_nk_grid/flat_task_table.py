@@ -47,6 +47,7 @@ from .generation_control import (
     ControlBusyError,
     ControlProtocolError,
     ControlSupersededError,
+    GenerationValidationCache,
     PROTOCOL_EXIT_CODE,
     RETRYABLE_EXIT_CODE,
     SUCCESS_EXIT_CODE,
@@ -106,6 +107,34 @@ TASK_TABLE_ROWS_PER_GROUP_MAX = 100_000
 
 class FinalizationError(ValueError):
     """A fail-closed dynamic-result validation or publication error."""
+
+
+class ResultProjectionError(ValueError):
+    """The session result cannot be projected into the frozen public schema."""
+
+
+class ResultKeySetError(ValueError):
+    """The session result does not exactly match its assigned cell group."""
+
+
+class PublicSchemaMismatchError(ValueError):
+    """The projected result count/schema differs from the public contract."""
+
+
+def _aborted_reason(exc: BaseException) -> str:
+    """Map only typed production failures to the fixed WAL reason enum."""
+
+    if isinstance(exc, WALFrameTooLarge):
+        return "RESULT_FRAME_TOO_LARGE"
+    if isinstance(exc, PublicSchemaMismatchError):
+        return "PUBLIC_SCHEMA_MISMATCH"
+    if isinstance(exc, ResultProjectionError):
+        return "RESULT_PROJECTION_FAILED"
+    if isinstance(exc, ResultKeySetError):
+        return "RESULT_KEY_SET_MISMATCH"
+    if isinstance(exc, (UnicodeError, csv.Error, TypeError)):
+        return "RESULT_ENCODING_FAILED"
+    return "RESULT_PROTOCOL_VIOLATION"
 
 
 @contextmanager
@@ -636,28 +665,24 @@ def run_slice(
                     computed_rows = session.run_cell_group(seed=row.seed, draw=row.draw, n_samples=row.n_samples, k_features=row.k_features, models=row.models)
                     try:
                         if not isinstance(computed_rows, list) or not computed_rows:
-                            raise WALProtocolError("RESULT_PROJECTION_FAILED")
+                            raise ResultProjectionError("session returned no result rows")
                         if {str(item.get("model")) for item in computed_rows} != set(row.models):
-                            raise WALProtocolError("RESULT_KEY_SET_MISMATCH")
+                            raise ResultKeySetError("session model set differs from assignment")
                         if any((int(item.get("seed", -1)), int(item.get("draw", -1)), int(item.get("N", -1)), int(item.get("K", -1))) != (row.seed, row.draw, row.n_samples, row.k_features) for item in computed_rows):
-                            raise WALProtocolError("RESULT_KEY_SET_MISMATCH")
-                        raw_rows = [
-                            project_public_result(item, header=public_schema)
-                            for item in computed_rows
-                            if isinstance(item, Mapping)
-                        ]
+                            raise ResultKeySetError("session cell key differs from assignment")
+                        try:
+                            raw_rows = [
+                                project_public_result(item, header=public_schema)
+                                for item in computed_rows
+                                if isinstance(item, Mapping)
+                            ]
+                        except (KeyError, TypeError, ValueError) as exc:
+                            raise ResultProjectionError("public result projection failed") from exc
                         if len(raw_rows) != len(computed_rows):
-                            raise WALProtocolError("PUBLIC_SCHEMA_MISMATCH")
+                            raise PublicSchemaMismatchError("session rows are not public-schema mappings")
                         wal.commit_result(sequence=sequence, row_id=row.row_id, public_rows=raw_rows, header=public_schema)
                     except (WALFrameTooLarge, WALProtocolError, UnicodeError, csv.Error, ValueError, TypeError) as exc:
-                        if isinstance(exc, WALFrameTooLarge):
-                            reason = "RESULT_FRAME_TOO_LARGE"
-                        elif "PUBLIC_SCHEMA_MISMATCH" in str(exc):
-                            reason = "PUBLIC_SCHEMA_MISMATCH"
-                        elif isinstance(exc, (UnicodeError, csv.Error, TypeError)):
-                            reason = "RESULT_ENCODING_FAILED"
-                        else:
-                            reason = "RESULT_PROTOCOL_VIOLATION"
+                        reason = _aborted_reason(exc)
                         wal.commit_aborted(sequence=sequence, row_id=row.row_id, payload=bounded_abort_payload(reason_code=reason, exception=exc, diagnostic=str(exc)))
                         raise ControlProtocolError(f"durable TASK_ABORTED: {reason}") from exc
     return wal_path
@@ -1167,6 +1192,7 @@ def _index_queue_attempts(connection: sqlite3.Connection, output_dir: Path) -> N
 def _iter_sealed_wal_scans(
     output_dir: Path, *, analysis: AnalysisContract,
     frozen_frontier: Sequence[Mapping[str, object]] | None = None,
+    validation_cache: GenerationValidationCache | None = None,
 ):
     """Yield only fully validated, shared-locked WALs behind closed markers."""
 
@@ -1177,6 +1203,7 @@ def _iter_sealed_wal_scans(
         markers = sorted(root.glob("*/round-*/generation-*/generation.closed.json"))
     else:
         markers = [Path(str(item["closed_path"])) for item in frozen_frontier]
+    validation_cache = validation_cache or GenerationValidationCache()
     for marker in markers:
         if not marker.is_file():
             raise ControlProtocolError(f"sealed generation marker is missing: {marker}")
@@ -1224,7 +1251,9 @@ def _iter_sealed_wal_scans(
             or contract.payload.get("analysis_contract_sha256") != analysis.sha256
         ):
             raise ControlProtocolError("sealed generation execution contract scope mismatch")
-        dispatch = classify_exact_afterany_target_read_only(Path(output_dir), target)
+        dispatch = classify_exact_afterany_target_read_only(
+            Path(output_dir), target, cache=validation_cache,
+        )
         if dispatch.kind != "sealed-generation" or dispatch.closed_path is None:
             raise ControlProtocolError("closed marker is not an exact sealed generation")
         if dispatch.closed_path.resolve() != marker.resolve():
@@ -1233,7 +1262,10 @@ def _iter_sealed_wal_scans(
             expected_sha = next((item.get("closed_sha256") for item in frozen_frontier if Path(str(item.get("closed_path"))).resolve() == marker.resolve()), None)
             if expected_sha != sha256_file(marker):
                 raise ControlProtocolError("frozen sealed marker checksum mismatch")
-        inventory = closed.get("inventory")
+        validation = validation_cache.get(Path(output_dir), target)
+        if validation is None:
+            raise ControlProtocolError("sealed generation validation cache is missing")
+        inventory = validation.closed_payload.get("inventory")
         if not isinstance(inventory, Mapping) or not isinstance(inventory.get("workers"), list):
             raise ControlProtocolError("sealed generation has no immutable inventory")
         assignment = Path(str(inventory["assignment_path"])); index = Path(str(inventory["assignment_index_path"]))
@@ -1250,25 +1282,16 @@ def _iter_sealed_wal_scans(
                 continue
             if item.get("wal_state") != "present" or worker not in groups:
                 raise ControlProtocolError("sealed worker inventory scope is invalid")
-            group = groups[worker]
-            expected_identity = {
-                "wal_format": WAL_FORMAT, "analysis_id": target.analysis_id,
-                "execution_plan_id": target.execution_plan_id,
-                "execution_contract_sha256": target.execution_contract_sha256,
-                "round": target.round_index, "submission_generation": target.submission_generation,
-                "worker": worker, "workers": len(groups),
-                "assignment_path": str(assignment.resolve()), "assignment_sha256": inventory["assignment_sha256"],
-                "assignment_index_path": str(index.resolve()), "assignment_index_sha256": inventory["assignment_index_sha256"],
-                "assignment_row_group": worker, "assignment_row_count": int(group["row_count"]),
-                "assignment_row_group_digest": group["canonical_task_rows_sha256"],
-            }
-            scan = WorkerEventLog.open_shared(wal_path, expected_identity=expected_identity)
+            scan = validation.wal_scans.get(worker)
+            if scan is None:
+                raise ControlProtocolError("sealed generation WAL scan is missing")
             yield marker, wal_path, scan
 
 
 def _index_queue_wals(
     connection: sqlite3.Connection, output_dir: Path, *, analysis: AnalysisContract,
     frozen_frontier: Sequence[Mapping[str, object]] | None = None,
+    validation_cache: GenerationValidationCache | None = None,
 ) -> None:
     """Stream durable WAL facts into the existing local-only SQLite index."""
 
@@ -1284,6 +1307,7 @@ def _index_queue_wals(
     attempt_insert = "INSERT INTO attempts (execution_plan_id, round_index, submission_generation, worker_index, sequence, row_id) VALUES (?, ?, ?, ?, ?, ?)"
     for marker, wal_path, scan in _iter_sealed_wal_scans(
         output_dir, analysis=analysis, frozen_frontier=frozen_frontier,
+        validation_cache=validation_cache,
     ) or ():
         identity = scan.identity or {}
         try:
@@ -1502,8 +1526,7 @@ def _write_assignment_from_queue_index(
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.unlink(missing_ok=True)
+    temporary = path.parent / f".{path.name}.tmp.{uuid.uuid4().hex}"
     writer = pq.ParquetWriter(temporary, _empty_arrow_table().schema, compression="zstd")
     assigned_rows: list[int] = []
     row_groups: list[dict[str, object]] = []
@@ -1528,7 +1551,15 @@ def _write_assignment_from_queue_index(
             writer.write_table(_arrow_table(rows) if rows else _empty_arrow_table())
     finally:
         writer.close()
-    _durable_replace(temporary, path)
+    if path.exists():
+        # A staging child may only be resumed when it is exactly the
+        # deterministic assignment derived from the frozen todo index.  Do
+        # not overwrite a crash/corruption witness with a fresh Parquet file.
+        if sha256_file(path) != sha256_file(temporary):
+            raise ControlProtocolError("activation staging assignment differs from frozen todo")
+        temporary.unlink()
+    else:
+        _durable_replace(temporary, path)
     os.chmod(path, 0o444)
     return path, assigned_rows, row_groups
 
@@ -1865,7 +1896,8 @@ def verify_rounds(
         expected_previous_round_index=expected_previous_round_index,
     )
     output_dir = Path(str(payload["output_dir"])); table_path = Path(str(payload["task_table"]))
-    dispatch = classify_exact_afterany_target_read_only(output_dir, target)
+    validation_cache = GenerationValidationCache()
+    dispatch = classify_exact_afterany_target_read_only(output_dir, target, cache=validation_cache)
     if dispatch.kind not in {"sealed-generation", "no-generation"}:
         if dispatch.exit_code == SUPERSEDED_EXIT_CODE:
             raise ControlSupersededError("verify target was superseded")
@@ -1879,6 +1911,7 @@ def verify_rounds(
         _index_queue_wals(
             connection, output_dir, analysis=analysis,
             frozen_frontier=frozen_frontier,
+            validation_cache=validation_cache,
         )
         _index_completed_rows(connection); _classify_queue_attempts(connection)
         completed_model_keys = int(connection.execute("SELECT COUNT(*) FROM completed").fetchone()[0])
@@ -2269,6 +2302,7 @@ def _write_final_csv(
 def _write_sealed_wal_csv(
     output: Path, *, history_root: Path, analysis: AnalysisContract,
     frozen_frontier: Sequence[Mapping[str, object]],
+    validation_cache: GenerationValidationCache | None = None,
 ) -> tuple[Path, int]:
     """Materialize one local temporary CSV from sealed WAL RESULT payloads."""
 
@@ -2279,6 +2313,7 @@ def _write_sealed_wal_csv(
         writer: csv.DictWriter | None = None
         for _, _, scan in _iter_sealed_wal_scans(
             history_root, analysis=analysis, frozen_frontier=frozen_frontier,
+            validation_cache=validation_cache,
         ) or ():
             for record in scan.records:
                 if record.event_type != TASK_RESULT:
@@ -2330,7 +2365,8 @@ def finalize_snapshot(
             expected_previous_execution_plan_id=expected_previous_execution_plan_id,
             expected_previous_round_index=expected_previous_round_index,
         )
-        dispatch = classify_exact_afterany_target_read_only(output_dir, target)
+        validation_cache = GenerationValidationCache()
+        dispatch = classify_exact_afterany_target_read_only(output_dir, target, cache=validation_cache)
         if dispatch.kind not in {"sealed-generation", "no-generation"}:
             raise FinalizationError("finalizer target is not exact sealed/no-generation dispatch")
         frozen_frontier = frozen_sealed_history(output_dir, target, dispatch)
@@ -2357,6 +2393,7 @@ def finalize_snapshot(
             wal_csv, wal_rows = _write_sealed_wal_csv(
                 run_dir / "sealed-results.csv", history_root=output_dir,
                 analysis=analysis, frozen_frontier=frozen_frontier,
+                validation_cache=validation_cache,
             )
             shards = (wal_csv,)
         connection = sqlite3.connect(database)

@@ -94,6 +94,29 @@ class Dispatch:
     outcome_sha256: str | None = None
 
 
+@dataclass(frozen=True)
+class SealedGenerationValidation:
+    """One immutable sealed-generation read, reusable by a phase consumer."""
+
+    closed_path: Path
+    closed_payload: Mapping[str, object]
+    closed_sha256: str
+    wal_scans: Mapping[int, object]
+
+
+class GenerationValidationCache:
+    """Phase-local cache: each present WAL is opened and scanned once."""
+
+    def __init__(self) -> None:
+        self._sealed: dict[tuple[Path, ActivationTarget], SealedGenerationValidation] = {}
+
+    def get(self, root: Path, target: ActivationTarget) -> SealedGenerationValidation | None:
+        return self._sealed.get((Path(root).resolve(), target))
+
+    def put(self, root: Path, target: ActivationTarget, value: SealedGenerationValidation) -> None:
+        self._sealed[(Path(root).resolve(), target)] = value
+
+
 def _sha(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -176,9 +199,19 @@ def _write_temp_fsync_rename(
     if fault is not None:
         fault("after_file_fsync")
         fault("before_rename")
+    # Control records are published by one schedule transaction, so an
+    # existing target is evidence rather than a normal race winner.  Use the
+    # required same-directory rename boundary instead of link/unlink: link
+    # has a second visible mutation and does not model the protocol's crash
+    # point.  Never replace an existing immutable target.
+    if target.exists():
+        temporary.unlink(missing_ok=True)
+        existing = target.read_bytes()
+        if existing != data:
+            raise ControlProtocolError(f"immutable control artefact differs: {target}")
+        return sha256_bytes(existing)
     try:
-        os.link(temporary, target)
-        temporary.unlink()
+        os.rename(temporary, target)
     except FileExistsError:
         temporary.unlink(missing_ok=True)
         existing = target.read_bytes()
@@ -419,10 +452,10 @@ def _validate_activation(root: Path, target: ActivationTarget) -> tuple[Path, di
             raise ControlProtocolError(f"generation {stem} path is not canonical")
         if not actual.is_file():
             raise ControlProtocolError(f"generation {stem} file is missing")
-        # Dynamic workers deliberately validate only their assigned Parquet
-        # row group.  The full assignment hash is made at prep/close and by
-        # sealed-history readers once per generation, never by every worker.
-        actual_sha = declared_sha if stem == "assignment" else _sha(actual)
+        # A sealed consumer verifies every frozen artefact exactly once per
+        # generation.  Workers validate their own row group separately, but
+        # that does not relax the sealed control-plane integrity boundary.
+        actual_sha = _sha(actual)
         if not isinstance(declared_sha, str) or declared_sha != prepared_sha or actual_sha != declared_sha:
             raise ControlProtocolError(f"generation {stem} checksum mismatch")
     if payload.get("generation_lease_path") != str((generation / "generation.lease")):
@@ -432,7 +465,14 @@ def _validate_activation(root: Path, target: ActivationTarget) -> tuple[Path, di
     return path, payload, _sha(path)
 
 
-def _validate_closed(root: Path, target: ActivationTarget, activation_sha256: str) -> tuple[Path, dict[str, object], str] | None:
+def _validate_closed(
+    root: Path, target: ActivationTarget, activation_sha256: str,
+    *, cache: GenerationValidationCache | None = None,
+) -> tuple[Path, dict[str, object], str] | None:
+    if cache is not None:
+        cached = cache.get(root, target)
+        if cached is not None:
+            return cached.closed_path, dict(cached.closed_payload), cached.closed_sha256
     path = closed_path(root, target)
     if not path.exists():
         return None
@@ -475,6 +515,7 @@ def _validate_closed(root: Path, target: ActivationTarget, activation_sha256: st
     actual_wals = set(generation.glob("worker-*.events.wal"))
     if actual_wals != expected_wals.intersection(actual_wals):
         raise ControlProtocolError("sealed generation has inventory-external WAL")
+    scans: dict[int, object] = {}
     for item in workers:
         if not isinstance(item, Mapping):
             raise ControlProtocolError("closed inventory worker entry is invalid")
@@ -527,17 +568,23 @@ def _validate_closed(root: Path, target: ActivationTarget, activation_sha256: st
             raise ControlProtocolError("sealed WAL identity mismatch")
         expected = {
             "worker": worker, "wal_state": "present", "path": str(wal),
-            "size": wal.stat().st_size, "sha256": _sha(wal),
+            "size": scan.file_size, "sha256": scan.file_sha256,
             "last_committed_offset": scan.committed_offset,
             "last_commit_trailer_digest": scan.trailer_digest,
             "uncommitted_tail": scan.has_uncommitted_tail,
         }
         if dict(item) != expected:
             raise ControlProtocolError("sealed WAL inventory differs from committed file")
-    return path, payload, _sha(path)
+        scans[worker] = scan
+    digest = _sha(path)
+    if cache is not None:
+        cache.put(root, target, SealedGenerationValidation(path, dict(payload), digest, scans))
+    return path, payload, digest
 
 
-def classify_exact_afterany_target_read_only(root: Path, target: ActivationTarget) -> Dispatch:
+def classify_exact_afterany_target_read_only(
+    root: Path, target: ActivationTarget, *, cache: GenerationValidationCache | None = None,
+) -> Dispatch:
     """Map durable facts to the shared 0/6/7/8 afterany protocol.
 
     This function performs no repair, locking, WAL creation, or control-plane
@@ -556,7 +603,7 @@ def classify_exact_afterany_target_read_only(root: Path, target: ActivationTarge
         return Dispatch("no-generation", SUCCESS_EXIT_CODE, outcome_path=path, outcome_sha256=digest)
     if activation is not None:
         current_path, current, digest = activation
-        closed = _validate_closed(root, target, digest)
+        closed = _validate_closed(root, target, digest, cache=cache)
         if closed is not None:
             closed_file, _, closed_digest = closed
             return Dispatch(

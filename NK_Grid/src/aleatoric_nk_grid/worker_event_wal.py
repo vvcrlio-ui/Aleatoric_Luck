@@ -77,6 +77,30 @@ class WALScan:
     committed_offset: int
     has_uncommitted_tail: bool
     trailer_digest: str | None
+    file_size: int
+    file_sha256: str
+
+
+class _HashingReader:
+    """Account for every byte consumed by a WAL scan."""
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+        self._digest = hashlib.sha256()
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        value = self._handle.read(size)
+        self._digest.update(value)
+        self.bytes_read += len(value)
+        return value
+
+    def tell(self) -> int:
+        return self._handle.tell()
+
+    @property
+    def sha256(self) -> str:
+        return self._digest.hexdigest()
 
 
 def _sync_fd(descriptor: int) -> None:
@@ -251,7 +275,8 @@ def scan_wal(path: Path, *, allow_uncommitted_tail: bool = True) -> WALScan:
     trailer_digest: str | None = None
     has_tail = False
     try:
-        with target.open("rb") as handle:
+        with target.open("rb") as raw_handle:
+            handle = _HashingReader(raw_handle)
             while True:
                 frame_offset = handle.tell()
                 magic = handle.read(len(PREPARE_MAGIC))
@@ -335,9 +360,19 @@ def scan_wal(path: Path, *, allow_uncommitted_tail: bool = True) -> WALScan:
                     records.append(record)
                 committed_offset = end_offset
                 trailer_digest = sha256_bytes(raw_commit)
+            # A sealed WAL's inventory hash must come from this same physical
+            # read.  If parsing stopped at a recoverable tail, drain it rather
+            # than issuing a second full-file checksum pass.
+            while handle.read(1024 * 1024):
+                pass
+            file_size = handle.bytes_read
+            file_sha256 = handle.sha256
     except OSError as exc:
         raise WALProtocolError(f"cannot scan WAL {target}: {exc}") from exc
-    return WALScan(identity, tuple(records), committed_offset, has_tail, trailer_digest)
+    return WALScan(
+        identity, tuple(records), committed_offset, has_tail, trailer_digest,
+        file_size, file_sha256,
+    )
 
 
 def _validate_event_state(records: Iterable[WALRecord]) -> None:
@@ -470,7 +505,7 @@ class WorkerEventLog:
                     (sync or _sync_fd)(descriptor)
                 writer = cls.__new__(cls)
                 writer.path = target; writer._descriptor = descriptor; writer.identity = canonical_identity
-                writer._scan = WALScan(None, (), 0, False, None); writer._next_sequence = 0; writer._started = set(); writer._terminal = set(); writer._closed = False
+                writer._scan = WALScan(None, (), 0, False, None, 0, sha256_bytes(b"")); writer._next_sequence = 0; writer._started = set(); writer._terminal = set(); writer._closed = False
                 writer._commit(IDENTITY, -1, None, canonical_json_bytes(canonical_identity), sync=sync)
                 if created:
                     _fsync_parent(target)
