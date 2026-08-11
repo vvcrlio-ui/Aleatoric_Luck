@@ -20,7 +20,7 @@ source .venv/bin/activate
 # calibrate_cost spawns its own workers; pin BLAS/OpenMP to avoid oversubscription
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-echo "host=$(hostname -s) arch=${BMRC_GCC_ARCH_NATIVE:-?} python=$(which python)"
+echo "host=$(hostname -s) arch=${BMRC_GCC_NATIVE_ARCH:-${BMRC_GCC_ARCH_NATIVE:-?}} python=$(which python)"
 echo "started $(date)"
 
 CELLS="ols:1000:497,ridge:1000:497,lasso:1000:497,random_forest:1000:497,extra_trees:1000:497,shallow_neural_network:1000:497,lightgbm:1000:497,xgboost:1000:497"

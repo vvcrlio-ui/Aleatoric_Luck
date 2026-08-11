@@ -239,7 +239,10 @@ fi'''
         actual_block = text[start:start + len(module_block)]
         block_md5s.add(hashlib.md5(actual_block.encode("utf-8")).hexdigest())
         assert 'venv is incompatible with this node CPU architecture' in text
-        assert 'BMRC_GCC_ARCH_NATIVE=${BMRC_GCC_ARCH_NATIVE:-?}' in text
+        # BMRC documents the variable as BMRC_GCC_NATIVE_ARCH.  The previous
+        # spelling is kept as a fallback so the diagnostic still reports an
+        # architecture whichever name the cluster actually exports.
+        assert 'BMRC_GCC_NATIVE_ARCH=${BMRC_GCC_NATIVE_ARCH:-${BMRC_GCC_ARCH_NATIVE:-?}}' in text
         assert 'grep -qi "Illegal instruction"' not in text
         assert "python=$PYTHON" in text
     assert len(block_md5s) == 1
