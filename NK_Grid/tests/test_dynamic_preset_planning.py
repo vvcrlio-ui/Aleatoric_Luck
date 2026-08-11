@@ -34,6 +34,7 @@ REPO_ROOT = ENGINE_DIR.parent
 MANIFEST = REPO_ROOT / "FFCWS" / "panels.yaml"
 PANEL = "ffc_median_mode_gpa"
 SUBMITTER = ENGINE_DIR / "slurm" / "submit_flat_task_table.sh"
+pytestmark = pytest.mark.skipif(not (REPO_ROOT / "FFCWS" / "data" / "ard" / PANEL / "data.parquet").is_file(), reason="FFCWS data is unavailable")
 
 
 def _tree_state(root: Path) -> tuple[tuple[str, int, bytes | None], ...]:

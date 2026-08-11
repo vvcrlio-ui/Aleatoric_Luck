@@ -248,10 +248,6 @@ def resolved_panels(
         if preset is not None:
             values["preset"] = preset
         panels.append(resolve_panel(values, Path(manifest_path).parent))
-    if only is not None:
-        missing = sorted(only - {name for name, _ in panels})
-        if missing:
-            raise ValueError(f"Unknown panel(s): {', '.join(missing)}")
     return panels
 
 
