@@ -34,11 +34,32 @@ from .experiment import git_state, model_run_settings
 from .ingest import load_schema
 from .model_registry import load_algorithm_version, load_model_params, resolved_model_params
 from .nk_grid import LARGE_RUN_THRESHOLD, NKGridConfig, _validate_config, public_result_columns, resolve_repeat_pairs
+from . import run_panels
 
 
 ENGINE_VALUE_BYTES = 8
 MEMORY_BASE_BYTES = int(1.25 * 1024 ** 3)
 MEMORY_FRAME_COPIES = 12
+
+
+# Dynamic presets deliberately contain only dynamic scheduling/grid controls.
+# Dataset semantics continue to come from the tracked panel manifest.
+DYNAMIC_PRESETS: dict[str, dict[str, object]] = {
+    "pilot": {
+        "n_grid": [100, 200, 400],
+        "k_grid": [10, 25],
+        "workers": 32,
+        "rounds": 2,
+        "time_limit": "01:00:00",
+    },
+    "dev-dynamic": {
+        "n_grid": [100],
+        "k_grid": [10],
+        "workers": 2,
+        "rounds": 2,
+        "time_limit": "00:30:00",
+    },
+}
 
 
 def _frozen_input_provenance(schema_path: Path) -> dict[str, dict[str, str]]:
@@ -398,19 +419,141 @@ def _cluster_from_payload(payload: Mapping[str, object]) -> ClusterPolicy:
         raise ValueError(f"invalid cluster policy in planning request: {exc}") from exc
 
 
+def _dynamic_preset(preset: str) -> Mapping[str, object]:
+    """Return one preset only when both planning layers declare it."""
+
+    common = sorted(set(run_panels.PRESETS) & set(DYNAMIC_PRESETS))
+    if preset not in run_panels.PRESETS or preset not in DYNAMIC_PRESETS:
+        names = ", ".join(common) or "(none)"
+        raise ValueError(
+            f"Unknown or incomplete dynamic preset {preset!r}; "
+            f"available dynamic presets: {names}"
+        )
+    return DYNAMIC_PRESETS[preset]
+
+
+def _empty_dynamic_root(root: Path) -> None:
+    """Refuse roots that could combine two independent execution plans."""
+
+    conflicts = [root / name for name in ("snapshot.json", "tasks.parquet", "out") if (root / name).exists()]
+    if conflicts:
+        raise ValueError(
+            "dynamic plan root is already in use "
+            f"({', '.join(str(path) for path in conflicts)}); please use a new empty directory"
+        )
+
+
+def request_from_preset(
+    manifest_path: Path,
+    *,
+    panel: str,
+    preset: str,
+    root: Path,
+    account: str,
+    partition: str,
+    constraint: str,
+    workers: int | None = None,
+    rounds: int | None = None,
+    time_limit: str | None = None,
+    models: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Build the legacy request payload from tracked panel and preset data."""
+
+    dynamic = _dynamic_preset(preset)
+    root = Path(root)
+    _empty_dynamic_root(root)
+    manifest = run_panels.load_manifest(Path(manifest_path))
+    available_panels = sorted(
+        str(value["name"])
+        for value in manifest["panels"]
+        if isinstance(value, Mapping) and isinstance(value.get("name"), str)
+    )
+    if panel not in available_panels:
+        names = ", ".join(available_panels) or "(none)"
+        raise ValueError(f"Unknown panel {panel!r}; available panels: {names}")
+    resolved = run_panels.resolved_panels(
+        Path(manifest_path), only={panel}, preset=preset,
+    )
+    _, config = resolved[0]
+    config_payload = run_panels.config_to_json(config)
+    if models is not None:
+        selected_models = [str(model) for model in models]
+        if not selected_models:
+            raise ValueError("--models must name at least one model")
+        config_payload["models"] = selected_models
+    config_payload["out"] = str(root / "final.csv")
+    config_payload["n_jobs"] = 1
+    panel_family = manifest.get("panel_family")
+    if panel_family is None:
+        panel_family = Path(manifest_path).parent.name.lower()
+    if not isinstance(panel_family, str) or not panel_family:
+        raise ValueError("panel_family must be a non-empty string when declared")
+    return {
+        "config": config_payload,
+        "n_grid": list(dynamic["n_grid"]),
+        "k_grid": list(dynamic["k_grid"]),
+        "cluster": {
+            "workers": int(dynamic["workers"] if workers is None else workers),
+            "rounds": int(dynamic["rounds"] if rounds is None else rounds),
+            "partition": partition,
+            "time_limit": str(dynamic["time_limit"] if time_limit is None else time_limit),
+            "account": account,
+            "constraint": constraint,
+        },
+        "task_table": str(root / "tasks.parquet"),
+        "snapshot": str(root / "snapshot.json"),
+        "output_dir": str(root / "out"),
+        "panel": panel_family,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Build a dynamic NK-grid work-queue plan")
-    parser.add_argument("--request", type=Path, required=True)
-    parser.add_argument("--plan-out", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--request", type=Path)
+    source.add_argument("--manifest", type=Path)
+    parser.add_argument("--panel")
+    parser.add_argument("--preset")
+    parser.add_argument("--account")
+    parser.add_argument("--partition")
+    parser.add_argument("--constraint")
+    parser.add_argument("--root", type=Path)
+    parser.add_argument("--models")
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--rounds", type=int, default=None)
+    parser.add_argument("--time-limit", default=None)
+    parser.add_argument("--plan-out", type=Path, default=None)
     args = parser.parse_args(argv)
-    payload = json.loads(args.request.read_text(encoding="utf-8"))
+    if args.request is not None:
+        if args.plan_out is None:
+            parser.error("--plan-out is required with --request")
+        payload = json.loads(args.request.read_text(encoding="utf-8"))
+        plan_out = args.plan_out
+    else:
+        required = ("panel", "preset", "account", "partition", "constraint", "root")
+        missing = [f"--{name.replace('_', '-')}" for name in required if getattr(args, name) is None]
+        if missing:
+            parser.error(f"the following arguments are required with --manifest: {', '.join(missing)}")
+        models = None if args.models is None else tuple(
+            model.strip() for model in args.models.split(",") if model.strip()
+        )
+        try:
+            payload = request_from_preset(
+                args.manifest,
+                panel=str(args.panel), preset=str(args.preset), root=args.root,
+                account=str(args.account), partition=str(args.partition), constraint=str(args.constraint),
+                workers=args.workers, rounds=args.rounds, time_limit=args.time_limit, models=models,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        plan_out = args.plan_out or args.root / "plan.json"
     plan = build_dynamic_plan(
         _config_from_json(payload["config"]), n_grid=[int(value) for value in payload["n_grid"]],
         k_grid=[int(value) for value in payload["k_grid"]], cluster=_cluster_from_payload(payload["cluster"]),
         table_path=payload["task_table"], snapshot_path=payload["snapshot"],
         output_dir=payload["output_dir"], panel=str(payload["panel"]),
     )
-    args.plan_out.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    plan_out.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(plan["memory"], sort_keys=True))
 
 

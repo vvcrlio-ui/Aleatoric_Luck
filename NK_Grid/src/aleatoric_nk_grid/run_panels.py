@@ -58,6 +58,24 @@ PRESETS: dict[str, dict[str, int]] = {
         # 1,000 cells after a forced requeue.
         "batch_size": 20,
     },
+    "pilot": {
+        "n_seeds": 84,
+        "n_draws": 1,
+        "n_sizes_n": 3,
+        "n_sizes_k": 2,
+        "min_n": 10,
+        "max_n": 400,
+        "max_k": 25,
+    },
+    "dev-dynamic": {
+        "n_seeds": 3,
+        "n_draws": 1,
+        "n_sizes_n": 1,
+        "n_sizes_k": 1,
+        "min_n": 10,
+        "max_n": 100,
+        "max_k": 10,
+    },
 }
 DEFAULTS: dict[str, Any] = {
     "seed": 12345,
@@ -200,12 +218,16 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
 
 
 def resolved_panels(
-    manifest_path: Path, only: set[str] | None = None
+    manifest_path: Path, only: set[str] | None = None, *, preset: str | None = None,
 ) -> list[tuple[str, NKGridConfig]]:
+    """Resolve selected panels, optionally through one declared preset."""
+
+    if preset is not None and preset not in PRESETS:
+        raise ValueError(f"Unknown preset: {preset}")
     manifest = load_manifest(manifest_path)
     allowed_root = {
         "panels", "model_params", "preset", "experiment_id", "data_version",
-        "model_spec_version", "repeat_plan", "n_grid", "k_grid",
+        "model_spec_version", "repeat_plan", "n_grid", "k_grid", "panel_family",
     }
     root_unknown = sorted(set(manifest) - allowed_root)
     if root_unknown:
@@ -218,11 +240,14 @@ def resolved_panels(
         )
         if key in manifest
     }
-    panels = [
-        resolve_panel({**shared, **panel}, Path(manifest_path).parent)
-        for panel in manifest["panels"]
-        if only is None or panel.get("name") in only
-    ]
+    panels = []
+    for panel in manifest["panels"]:
+        if only is not None and panel.get("name") not in only:
+            continue
+        values = {**shared, **panel}
+        if preset is not None:
+            values["preset"] = preset
+        panels.append(resolve_panel(values, Path(manifest_path).parent))
     if only is not None:
         missing = sorted(only - {name for name, _ in panels})
         if missing:
