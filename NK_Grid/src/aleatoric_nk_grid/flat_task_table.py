@@ -48,6 +48,7 @@ from .generation_control import (
     ControlProtocolError,
     ControlSupersededError,
     GenerationValidationCache,
+    INCOMPLETE_EXIT_CODE,
     PROTOCOL_EXIT_CODE,
     RETRYABLE_EXIT_CODE,
     SUCCESS_EXIT_CODE,
@@ -58,6 +59,7 @@ from .generation_control import (
     frozen_sealed_history,
     frozen_history_from_closed,
     generation_dir,
+    intent_path,
     outcome_path,
     predecessor_gate,
     publish_activation_intent,
@@ -65,6 +67,7 @@ from .generation_control import (
     publish_verification_receipt,
     seal_generation,
     schedule_transaction,
+    ensure_analysis_schedule_lease,
     validate_exact_verification_receipt,
     verification_path,
 )
@@ -93,7 +96,6 @@ from .worker_event_wal import (
 
 TABLE_FORMAT_VERSION = 2
 TABLE_COLUMNS = ("row_id", "seed", "draw", "N", "K", "group", "models")
-VERIFY_INCOMPLETE_EXIT_CODE = 3
 FINALIZATION_FORMAT_VERSION = 1
 FINALIZATION_BATCH_ROWS = 4_096
 FINALIZATION_MIN_TEMP_BYTES = 64 * 1024**2
@@ -781,6 +783,28 @@ def recover_generation_activation(
                 os.close(parent_fd)
         except OSError as exc:
             raise ControlBusyError(f"activation staging promotion is indeterminate: {exc}") from exc
+    elif not directory.exists() and intent_path(root, target).exists():
+        # A crash after the durable intent but before staging creation is
+        # recoverable only by resuming this exact target.  No latest-directory
+        # or mutable-pointer lookup is permitted here.
+        resumed = prepare_round(
+            snapshot_path, round_index=round_index, prep_token=expected_prep_token,
+            submission_generation=submission_generation,
+            expected_previous_generation=expected_previous_generation,
+            expected_pointer_version=expected_pointer_version,
+            prep_job_id=prep_job_id,
+            expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+            expected_previous_round_index=expected_previous_round_index,
+        )
+        activation_value = resumed.get("activation")
+        if not isinstance(activation_value, str):
+            raise ControlProtocolError("activation recovery resumed to a non-generation outcome")
+        return Path(activation_value)
+    elif directory.exists() and not staging.exists():
+        # A crash may have happened immediately after the staging rename and
+        # before its parent directory fsync.  Repeating the directory fsync is
+        # the recovery-side durability completion before activation CAS.
+        _fsync_directory(directory.parent)
     prepared_path = directory / "generation.prepared.json"
     if not prepared_path.is_file():
         raise ControlBusyError("activation recovery needs a complete prepared record")
@@ -1432,6 +1456,7 @@ def prepare_round(
     prep_job_id: str | None = None,
     expected_previous_execution_plan_id: str | None = None,
     expected_previous_round_index: int | None = None,
+    fault: Callable[[str], None] | None = None,
     _schedule_locked: bool = False,
 ) -> dict[str, object]:
     """Prepare one immutable generation, or publish the exact todo=0 outcome."""
@@ -1473,6 +1498,7 @@ def prepare_round(
                 prep_job_id=target.prep_job_id, _schedule_locked=True,
                 expected_previous_execution_plan_id=target.expected_previous_execution_plan_id,
                 expected_previous_round_index=target.expected_previous_round_index,
+                fault=fault,
             )
     table_path = Path(str(payload["task_table"]))
     predecessor_kind, predecessor = predecessor_gate(output_dir, target)
@@ -1515,6 +1541,8 @@ def prepare_round(
             # mutable preparation output in a private sibling and promote it
             # only after every immutable child has been fsynced.
             intent_file = publish_activation_intent(output_dir, target, lease_held=True)
+            if fault is not None:
+                fault("after_intent")
             if directory.exists():
                 raise ControlProtocolError("generation directory already exists before immutable activation")
             stage_directory = directory.parent / f".{directory.name}.staging"
@@ -1533,12 +1561,18 @@ def prepare_round(
                 os.fsync(lease_descriptor)
             finally:
                 os.close(lease_descriptor)
+            if fault is not None:
+                fault("after_staging_lease_fsync")
             _fsync_directory(stage_directory)
+            if fault is not None:
+                fault("after_staging_parent_fsync")
             assignment, assigned_rows, row_groups = _write_assignment_from_queue_index(
                 stage_directory / "assignment.parquet", connection, workers=workers,
             )
+            if fault is not None:
+                fault("after_assignment_publish")
     if todo_rows == 0:
-        receipt = publish_no_generation_outcome(output_dir, target, lease_held=True)
+        receipt = publish_no_generation_outcome(output_dir, target, lease_held=True, fault=fault)
         return {
             "round": round_index, "todo_rows": 0, "no_generation": True,
             "prep_outcome": str(receipt), "submission_generation": target.submission_generation,
@@ -1562,6 +1596,8 @@ def prepare_round(
         "row_groups": row_groups,
     }
     immutable_json_bytes(index, index_payload)
+    if fault is not None:
+        fault("after_index_publish")
     index_sha = sha256_file(index)
     stats: dict[str, object] = {
         "round": round_index, "workers": workers, "todo_rows": todo_rows,
@@ -1572,6 +1608,8 @@ def prepare_round(
         "prep_job_id": target.prep_job_id,
     }
     prep = stage_directory / "prep.json"; immutable_json_bytes(prep, stats)
+    if fault is not None:
+        fault("after_prep_publish")
     ready = stage_directory / "assignment.ready.json"
     ready_payload = {
         "format_version": TABLE_FORMAT_VERSION, "execution_plan_id": execution.execution_plan_id,
@@ -1581,6 +1619,8 @@ def prepare_round(
         "assignment_index_sha256": index_sha, "prep_token": prep_token, "prep_job_id": target.prep_job_id,
     }
     immutable_json_bytes(ready, ready_payload)
+    if fault is not None:
+        fault("after_ready_publish")
     ready_sha = sha256_file(ready)
     # ``prepared`` is part of the immutable staging directory, not a record
     # synthesized after canonical promotion.  ``activate_generation`` will
@@ -1605,17 +1645,27 @@ def prepare_round(
         "worker_count": workers,
     }
     immutable_json_bytes(prepared, prepared_payload)
+    if fault is not None:
+        fault("after_prepared_publish")
     # Directory rename is the generation-artifact publication boundary.  The
     # parent fsync makes it durable before the prepared/activation records.
     try:
+        if fault is not None:
+            fault("before_generation_rename")
         os.rename(stage_directory, directory)
     except FileExistsError as exc:
         raise ControlBusyError("canonical generation appeared while staging") from exc
+    if fault is not None:
+        fault("after_generation_rename")
     parent_fd = os.open(directory.parent, os.O_RDONLY)
     try:
+        if fault is not None:
+            fault("before_generation_parent_fsync")
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
+    if fault is not None:
+        fault("after_generation_parent_fsync")
     assignment = directory / stage_assignment.name
     index = directory / index.name
     prep = directory / prep.name
@@ -1625,7 +1675,7 @@ def prepare_round(
         output_dir, target, assignment_path=assignment, assignment_sha256=assignment_sha,
         assignment_index_path=index, assignment_index_sha256=index_sha, ready_path=ready,
         ready_sha256=ready_sha, prep_path=prep, prep_sha256=prep_sha, worker_count=workers,
-        lease_held=True,
+        lease_held=True, fault=fault,
     )
     stats["activation"] = str(activation)
     return stats
@@ -1681,7 +1731,7 @@ def verify_rounds(
             "interrupted_row_ids": _queue_row_ids(connection, "crashed_rows"),
             "too_long_row_ids": _queue_row_ids(connection, "too_long_rows"),
         }
-    exit_code = PROTOCOL_EXIT_CODE if result["aborted_tasks"] else (VERIFY_INCOMPLETE_EXIT_CODE if result["missing_model_keys"] or result["interrupted_row_ids"] or result["too_long_row_ids"] else SUCCESS_EXIT_CODE)
+    exit_code = PROTOCOL_EXIT_CODE if result["aborted_tasks"] else (INCOMPLETE_EXIT_CODE if result["missing_model_keys"] or result["interrupted_row_ids"] or result["too_long_row_ids"] else SUCCESS_EXIT_CODE)
     result.update({"complete": exit_code == SUCCESS_EXIT_CODE, "exit_code": exit_code, "sealed_history_digest_sha256": history_digest, "dispatch_kind": dispatch.kind})
     receipt = publish_verification_receipt(
         output_dir, target, dispatch=dispatch, sealed_history_digest_sha256=history_digest,
@@ -2251,6 +2301,7 @@ def write_work_snapshot(
         )
     if execution_contract.payload.get("analysis_id") != analysis_contract.analysis_id:
         raise ValueError("execution contract does not bind analysis contract")
+    ensure_analysis_schedule_lease(Path(output_dir))
     payload["analysis_id"] = analysis_contract.analysis_id
     payload["analysis_contract_sha256"] = analysis_contract.sha256
     payload["analysis_contract"] = str((Path(output_dir) / "analysis-contract.json").resolve())

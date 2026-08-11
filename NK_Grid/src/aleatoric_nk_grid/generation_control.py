@@ -290,6 +290,31 @@ def analysis_schedule_lease(root: Path) -> Path:
     return Path(root) / ".analysis-schedule.lease"
 
 
+def ensure_analysis_schedule_lease(root: Path) -> Path:
+    """Create the analysis schedule lease during plan publication.
+
+    Preparation and recovery must lock an existing identity-scoped inode.  In
+    particular, a failed next-round predecessor check must not create a new
+    control artefact merely to report code 7.
+    """
+
+    target_root = Path(root)
+    target_root.mkdir(parents=True, exist_ok=True)
+    target = analysis_schedule_lease(target_root)
+    try:
+        descriptor = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o640)
+    except FileExistsError:
+        if not target.is_file():
+            raise ControlProtocolError("analysis schedule lease is not a regular file")
+        return target
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(target_root)
+    return target
+
+
 @contextmanager
 def schedule_transaction(root: Path) -> Iterator[None]:
     """Hold the one analysis schedule lease for a full prep transaction.
@@ -300,7 +325,7 @@ def schedule_transaction(root: Path) -> Iterator[None]:
     not compose a series of short independent leases.
     """
 
-    with _lease(analysis_schedule_lease(Path(root)), exclusive=True):
+    with _lease(analysis_schedule_lease(Path(root)), exclusive=True, create=False):
         yield
 
 

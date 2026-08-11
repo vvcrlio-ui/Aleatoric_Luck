@@ -28,7 +28,6 @@ from aleatoric_nk_grid.flat_task_table import (
     ResourceRequest,
     TaskRow,
     FinalizationError,
-    VERIFY_INCOMPLETE_EXIT_CODE,
     assign_rows_modulo,
     build_rows,
     expected_model_keys,
@@ -39,6 +38,7 @@ from aleatoric_nk_grid.flat_task_table import (
     write_task_table,
 )
 from aleatoric_nk_grid.nk_grid import NKGridConfig
+from aleatoric_nk_grid.generation_control import INCOMPLETE_EXIT_CODE
 
 
 def _config(tmp_path: Path, *, models: tuple[str, ...] = ("ols",)) -> NKGridConfig:
@@ -263,7 +263,7 @@ def test_verify_cli_writes_json_then_uses_stable_incomplete_exit_code(
             )
     with pytest.raises(SystemExit) as stopped:
         legacy_main(["verify", "--snapshot", str(snapshot)])
-    assert stopped.value.code == VERIFY_INCOMPLETE_EXIT_CODE
+    assert stopped.value.code == INCOMPLETE_EXIT_CODE
     captured = capsys.readouterr()
     result = json.loads(captured.out)
     persisted = json.loads((output_dir / "verification.json").read_text())

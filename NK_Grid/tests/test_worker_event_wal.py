@@ -10,7 +10,16 @@ import pandas as pd
 
 from conftest import write_repo_schema_bundle as write_schema_bundle
 from aleatoric_nk_grid.chunk_planning import ClusterPolicy, build_dynamic_plan
-from aleatoric_nk_grid.flat_task_table import close_generation, finalize_snapshot, prepare_round, recover_generation_activation, run_slice, verify_rounds
+from aleatoric_nk_grid.execution_contract import canonical_json_bytes
+from aleatoric_nk_grid.flat_task_table import (
+    FinalizationError,
+    close_generation,
+    finalize_snapshot,
+    prepare_round,
+    recover_generation_activation,
+    run_slice,
+    verify_rounds,
+)
 from aleatoric_nk_grid.generation_control import (
     ActivationTarget,
     ControlBusyError,
@@ -55,6 +64,27 @@ def _identity() -> dict[str, object]:
 
 def _row() -> dict[str, object]:
     return {"model": "ols", "seed": 1, "draw": 0, "N": 10, "K": 1, "status": "ok", "error": ""}
+
+
+def _fault_plan(tmp_path: Path, *, rounds: int = 1) -> tuple[Path, dict[str, object]]:
+    frame = pd.DataFrame({"x": np.arange(30, dtype=float), "y": np.arange(30, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1,
+        n_sizes_k=1, max_n=10, max_k=1, batch_size=1, n_jobs=1,
+        repeat_plan=((1, 0),), min_n=2,
+    )
+    plan = build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(
+            workers=1, rounds=rounds, partition="test", time_limit="01:00:00",
+            account="test", constraint="none",
+        ),
+        table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    return tmp_path / "snapshot.json", plan
 
 
 def test_two_phase_wal_commits_complete_cell_group_and_reopens(tmp_path: Path):
@@ -541,12 +571,33 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
     snapshot = json.loads((tmp_path / "snapshot.json").read_text(encoding="utf-8"))
     opens = 0
     fit_calls = 0
+    init_counts = {"load_input": 0, "validate_input": 0, "load_model_params": 0, "native_runner": 0}
     original_init = NKGridExecutionSession.__init__
+    original_load_input = ng.load_input
+    original_validate_input = ng.validate_input
+    original_load_model_params = ng.load_model_params
+    original_runner_init = ng.IsolatedProcessRunner.__init__
 
     def counted_init(session, *args, **kwargs):
         nonlocal opens
         opens += 1
         return original_init(session, *args, **kwargs)
+
+    def counted_load_input(*args, **kwargs):
+        init_counts["load_input"] += 1
+        return original_load_input(*args, **kwargs)
+
+    def counted_validate_input(*args, **kwargs):
+        init_counts["validate_input"] += 1
+        return original_validate_input(*args, **kwargs)
+
+    def counted_load_model_params(*args, **kwargs):
+        init_counts["load_model_params"] += 1
+        return original_load_model_params(*args, **kwargs)
+
+    def counted_runner_init(runner, *args, **kwargs):
+        init_counts["native_runner"] += 1
+        return original_runner_init(runner, *args, **kwargs)
 
     def deterministic_fit(**kwargs):
         nonlocal fit_calls
@@ -564,6 +615,10 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
         }
 
     monkeypatch.setattr(ng.NKGridExecutionSession, "__init__", counted_init)
+    monkeypatch.setattr(ng, "load_input", counted_load_input)
+    monkeypatch.setattr(ng, "validate_input", counted_validate_input)
+    monkeypatch.setattr(ng, "load_model_params", counted_load_model_params)
+    monkeypatch.setattr(ng.IsolatedProcessRunner, "__init__", counted_runner_init)
     monkeypatch.setattr(ng, "_fit_predict_model_cell", deterministic_fit)
     run_slice(
         tmp_path / "snapshot.json", round_index=1, worker_index=0, expected_prep_token="job-1",
@@ -573,6 +628,10 @@ def test_worker_opens_one_execution_session_for_many_tasks(tmp_path: Path, monke
     assert prepared["todo_rows"] == 100
     assert opens == 1
     assert fit_calls == 100
+    assert init_counts == {
+        "load_input": 1, "validate_input": 1,
+        "load_model_params": 1, "native_runner": 1,
+    }
     assert len(scan_wal(wal).records) == 200
 
 
@@ -636,6 +695,239 @@ def test_production_afterany_entries_share_exact_target_lifecycle(tmp_path: Path
         expected_previous_round_index=1,
     )
     assert next_prep["no_generation"] is True
+
+
+def test_next_prep_missing_predecessor_is_a_zero_write_failure(tmp_path: Path):
+    frame = pd.DataFrame({"x": np.arange(30, dtype=float), "y": np.arange(30, dtype=float)})
+    schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
+    config = NKGridConfig(
+        schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
+        seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1,
+        n_sizes_k=1, max_n=10, max_k=1, batch_size=1, n_jobs=1,
+        repeat_plan=((1, 0),), min_n=2,
+    )
+    build_dynamic_plan(
+        config, n_grid=(10,), k_grid=(1,),
+        cluster=ClusterPolicy(
+            workers=1, rounds=2, partition="test", time_limit="01:00:00",
+            account="test", constraint="none",
+        ),
+        table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json",
+        output_dir=tmp_path / "out", panel="generic",
+    )
+    root = tmp_path / "out"
+
+    def tree_state() -> dict[str, tuple[str, int, bytes | None]]:
+        state: dict[str, tuple[str, int, bytes | None]] = {}
+        for path in sorted(root.rglob("*")):
+            relative = str(path.relative_to(root))
+            if path.is_dir():
+                state[relative] = ("dir", path.stat().st_ino, None)
+            else:
+                state[relative] = ("file", path.stat().st_ino, path.read_bytes())
+        return state
+
+    before = tree_state()
+    with pytest.raises(ControlBusyError, match="predecessor pointer is absent"):
+        prepare_round(
+            tmp_path / "snapshot.json", round_index=2, prep_token="job-2",
+            prep_job_id="job-2", submission_generation="g2",
+            expected_previous_generation="g1", expected_pointer_version=1,
+        )
+    assert tree_state() == before
+
+
+@pytest.mark.parametrize(
+    "fact,expected_error",
+    [
+        ("missing", ControlBusyError),
+        ("superseded", ControlSupersededError),
+        ("corruption", ControlProtocolError),
+    ],
+)
+def test_next_prep_non_normal_facts_are_zero_write(
+    tmp_path: Path, fact: str, expected_error: type[Exception],
+):
+    snapshot, _ = _fault_plan(tmp_path, rounds=2)
+    root = tmp_path / "out"
+    if fact == "superseded":
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="other", expected_pointer_version=0,
+        )
+    elif fact == "corruption":
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0,
+        )
+        pointer = root / "active-generation.json"
+        pointer_payload = json.loads(pointer.read_text(encoding="utf-8"))
+        pointer_payload["generation_activation_sha256"] = "0" * 64
+        pointer.write_bytes(canonical_json_bytes(pointer_payload) + b"\n")
+
+    def tree_state() -> dict[str, tuple[str, int, bytes | None]]:
+        state: dict[str, tuple[str, int, bytes | None]] = {}
+        for path in sorted(root.rglob("*")):
+            relative = str(path.relative_to(root))
+            state[relative] = (
+                "dir", path.stat().st_ino, None,
+            ) if path.is_dir() else (
+                "file", path.stat().st_ino, path.read_bytes(),
+            )
+        return state
+
+    before = tree_state()
+    with pytest.raises(expected_error):
+        prepare_round(
+            snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
+            submission_generation="g2", expected_previous_generation="g1",
+            expected_pointer_version=1,
+        )
+    assert tree_state() == before
+
+
+@pytest.mark.parametrize("fact", ["missing", "superseded", "corruption"])
+def test_finalizer_non_normal_exact_target_is_zero_write(tmp_path: Path, fact: str):
+    snapshot, _ = _fault_plan(tmp_path)
+    root = tmp_path / "out"
+    if fact == "superseded":
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="other", expected_pointer_version=0,
+        )
+    elif fact == "corruption":
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0,
+        )
+        pointer = root / "active-generation.json"
+        pointer_payload = json.loads(pointer.read_text(encoding="utf-8"))
+        pointer_payload["generation_activation_sha256"] = "0" * 64
+        pointer.write_bytes(canonical_json_bytes(pointer_payload) + b"\n")
+
+    def tree_state() -> dict[str, tuple[str, int, bytes | None]]:
+        state: dict[str, tuple[str, int, bytes | None]] = {}
+        for path in sorted(root.rglob("*")):
+            relative = str(path.relative_to(root))
+            state[relative] = ("dir", path.stat().st_ino, None) if path.is_dir() else (
+                "file", path.stat().st_ino, path.read_bytes(),
+            )
+        return state
+
+    before = tree_state()
+    with pytest.raises(FinalizationError):
+        finalize_snapshot(
+            snapshot, round_index=1, submission_generation="g1",
+            expected_prep_token="job-1", prep_job_id="job-1",
+            expected_pointer_version=0, tmp_dir=tmp_path / "final-scratch",
+        )
+    assert tree_state() == before
+    assert not (tmp_path / "final-scratch").exists()
+
+
+class _InjectedPrepareCrash(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    "fault_label",
+    [
+        "after_intent",
+        "after_staging_lease_fsync",
+        "after_staging_parent_fsync",
+        "after_assignment_publish",
+        "after_index_publish",
+        "after_prep_publish",
+        "after_ready_publish",
+        "after_prepared_publish",
+        "before_generation_rename",
+        "after_generation_rename",
+        "before_generation_parent_fsync",
+        "after_generation_parent_fsync",
+        "before_file_fsync",
+        "after_file_fsync",
+        "before_rename",
+        "after_rename",
+        "before_parent_fsync",
+        "after_parent_fsync",
+        "pointer_before_file_fsync",
+        "pointer_after_file_fsync",
+        "pointer_before_replace",
+        "pointer_after_replace",
+        "pointer_before_root_fsync",
+        "pointer_after_root_fsync",
+    ],
+)
+def test_production_prepare_fault_boundaries_recover_exact_generation(
+    tmp_path: Path, fault_label: str,
+):
+    snapshot, _ = _fault_plan(tmp_path)
+    triggered = False
+
+    def fault(label: str) -> None:
+        nonlocal triggered
+        if label == fault_label and not triggered:
+            triggered = True
+            raise _InjectedPrepareCrash(label)
+
+    with pytest.raises(_InjectedPrepareCrash, match=fault_label):
+        prepare_round(
+            snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+            submission_generation="g1", expected_pointer_version=0, fault=fault,
+        )
+    recovered = recover_generation_activation(
+        snapshot, round_index=1, submission_generation="g1",
+        expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
+    )
+    assert recovered.is_file()
+    assert triggered is True
+
+
+@pytest.mark.parametrize(
+    "fault_label",
+    [
+        "before_file_fsync", "after_file_fsync", "before_rename",
+        "after_rename", "before_parent_fsync", "after_parent_fsync",
+    ],
+)
+def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
+    tmp_path: Path, fault_label: str,
+):
+    snapshot, _ = _fault_plan(tmp_path, rounds=2)
+    prepare_round(
+        snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
+        submission_generation="g1", expected_pointer_version=0,
+    )
+    run_slice(
+        snapshot, round_index=1, worker_index=0, expected_prep_token="job-1",
+        prep_job_id="job-1", submission_generation="g1", expected_pointer_version=0,
+    )
+    close_generation(
+        snapshot, round_index=1, submission_generation="g1",
+        expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
+    )
+    triggered = False
+
+    def fault(label: str) -> None:
+        nonlocal triggered
+        if label == fault_label and not triggered:
+            triggered = True
+            raise _InjectedPrepareCrash(label)
+
+    with pytest.raises(_InjectedPrepareCrash, match=fault_label):
+        prepare_round(
+            snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
+            submission_generation="g2", expected_previous_generation="g1",
+            expected_pointer_version=1, fault=fault,
+        )
+    recovered = prepare_round(
+        snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
+        submission_generation="g2", expected_previous_generation="g1",
+        expected_pointer_version=1,
+    )
+    assert recovered["no_generation"] is True
+    assert Path(str(recovered["prep_outcome"])).is_file()
+    assert triggered is True
 
 
 @pytest.mark.parametrize("entry", [run_slice, close_generation, verify_rounds])

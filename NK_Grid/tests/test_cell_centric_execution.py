@@ -182,39 +182,81 @@ def test_split_index_memory_is_bounded_across_many_seeds(tmp_path):
     assert len(manager._cache) == 100
 
 
-def test_persistent_session_revisiting_a_cell_matches_fresh_session(
-    tmp_path, monkeypatch,
-):
+def test_persistent_session_revisiting_a_cell_matches_fresh_session(tmp_path):
     frame = _frame(rows=64, features=2)
     schema = write_schema_bundle(tmp_path / "input", frame, predictors=["X_000", "X_001"])
     config = _config(
-        schema, tmp_path / "out.csv", models=("super_learner",),
+        schema, tmp_path / "out.csv", models=("lightgbm",),
         n_jobs=1, n_grid=(10, 12), k_grid=(1,),
     )
-    runners = []
-
-    def fake_native(runner, *, fit_arguments, **_):
-        if not runners or runners[-1] is not runner:
-            runners.append(runner)
-        y_train = np.asarray(fit_arguments["y_train"], dtype=float)
-        return {
-            "predictions": np.full(len(fit_arguments["X_test"]), float(y_train.mean())),
-            "fit_seconds": 0.0, "best_rounds": None, "converged": True,
-            "solver": "test-native", "iterations": None, "alpha": None,
-            "peak_rss_bytes": 0,
-        }
-
-    monkeypatch.setattr("aleatoric_nk_grid.nk_grid._run_native_model_cell_locked", fake_native)
     with NKGridExecutionSession.open_from_config(config) as session:
-        first = session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("super_learner",))
-        session.run_cell_group(seed=321, draw=0, n_samples=12, k_features=1, models=("super_learner",))
-        revisited = session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("super_learner",))
+        first = session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("lightgbm",))
+        first_pid = session._runner._process.pid if session._runner._process is not None else None
+        middle = session.run_cell_group(seed=321, draw=0, n_samples=12, k_features=1, models=("lightgbm",))
+        middle_pid = session._runner._process.pid if session._runner._process is not None else None
+        revisited = session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("lightgbm",))
+        revisited_pid = session._runner._process.pid if session._runner._process is not None else None
     with NKGridExecutionSession.open_from_config(config) as fresh_session:
-        fresh = fresh_session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("super_learner",))
+        fresh = fresh_session.run_cell_group(seed=321, draw=0, n_samples=10, k_features=1, models=("lightgbm",))
+        fresh_pid = fresh_session._runner._process.pid if fresh_session._runner._process is not None else None
     stable = lambda rows: [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]
     assert stable(revisited) == stable(first) == stable(fresh)
-    assert len(runners) == 2
-    assert runners[0] is not runners[1]
+    assert stable(middle)
+    assert first_pid is not None
+    assert first_pid == middle_pid == revisited_pid
+    assert fresh_pid is not None and fresh_pid != first_pid
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("seed", [0, 7, 23])
+def test_split_index_manager_matches_materialized_mixed_dtype_content_and_dtype(
+    tmp_path, external: bool, seed: int,
+):
+    train = pd.DataFrame(
+        {
+            "continuous": pd.Series(np.linspace(0.0, 1.0, 80), dtype="float64"),
+            "integer": pd.Series(np.arange(80), dtype="Int64"),
+            "label": pd.Series(["a", "b"] * 40, dtype="string"),
+            "y": pd.Series(np.arange(80, dtype=float), dtype="float64"),
+        },
+        index=pd.Index(np.arange(1000, 1080), name="row_id"),
+    )
+    external_frame = None
+    if external:
+        external_frame = train.iloc[:20].copy()
+        external_frame.index = pd.Index(np.arange(2000, 2020), name="row_id")
+    manager = SplitIndexManager(
+        frame=train, external_frame=external_frame,
+        predictors=["continuous", "integer", "label"], outcome="y",
+        test_size=0.25, task="regression",
+    )
+    observed = manager.for_seed(seed)
+    if external:
+        expected_train = train.dropna(subset=["y"])
+        expected_test = external_frame.dropna(subset=["y"])
+        assert observed.external_test is True
+        assert tuple(observed.train_index) == tuple(expected_train.index)
+        assert tuple(observed.test_index) == tuple(expected_test.index)
+        observed_train = train.loc[observed.train_index, ["continuous", "integer", "label"]]
+        observed_test = external_frame.loc[observed.test_index, ["continuous", "integer", "label"]]
+        expected_train_values = expected_train.loc[:, ["continuous", "integer", "label"]]
+        expected_test_values = expected_test.loc[:, ["continuous", "integer", "label"]]
+    else:
+        expected = split_frame(
+            train, ["continuous", "integer", "label"], "y",
+            test_size=0.25, seed=seed, task="regression",
+        )
+        assert observed.external_test is False
+        assert tuple(observed.train_index) == tuple(expected.X_train.index)
+        assert tuple(observed.test_index) == tuple(expected.X_test.index)
+        observed_train = train.loc[observed.train_index, ["continuous", "integer", "label"]]
+        observed_test = train.loc[observed.test_index, ["continuous", "integer", "label"]]
+        expected_train_values = expected.X_train
+        expected_test_values = expected.X_test
+    pd.testing.assert_frame_equal(observed_train, expected_train_values, check_exact=True)
+    pd.testing.assert_frame_equal(observed_test, expected_test_values, check_exact=True)
+    assert observed_train.dtypes.equals(expected_train_values.dtypes)
+    assert observed_test.dtypes.equals(expected_test_values.dtypes)
 
 
 def test_cell_group_metrics_exactly_match_model_at_a_time_execution(tmp_path):
