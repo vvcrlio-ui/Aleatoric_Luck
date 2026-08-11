@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import os
+import errno
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -13,7 +14,7 @@ import pandas as pd
 
 from conftest import write_repo_schema_bundle as write_schema_bundle
 from aleatoric_nk_grid.chunk_planning import ClusterPolicy, build_dynamic_plan
-from aleatoric_nk_grid.execution_contract import canonical_json_bytes, task_row_digest
+from aleatoric_nk_grid.execution_contract import canonical_json_bytes, sha256_file, task_row_digest
 from aleatoric_nk_grid.flat_task_table import (
     FinalizationError,
     close_generation,
@@ -75,19 +76,24 @@ def _row() -> dict[str, object]:
     return {"model": "ols", "seed": 1, "draw": 0, "N": 10, "K": 1, "status": "ok", "error": ""}
 
 
-def _fault_plan(tmp_path: Path, *, rounds: int = 1) -> tuple[Path, dict[str, object]]:
-    frame = pd.DataFrame({"x": np.arange(30, dtype=float), "y": np.arange(30, dtype=float)})
+def _fault_plan(
+    tmp_path: Path, *, rounds: int = 1, rows: int = 1, workers: int = 1,
+) -> tuple[Path, dict[str, object]]:
+    if rows < 1 or workers < 1:
+        raise ValueError("fault plans require at least one row and one worker")
+    frame_size = max(30, rows + 10)
+    frame = pd.DataFrame({"x": np.arange(frame_size, dtype=float), "y": np.arange(frame_size, dtype=float)})
     schema = write_schema_bundle(tmp_path / "input", frame, predictors=["x"])
     config = NKGridConfig(
         schema=schema, out=tmp_path / "final.csv", outcome="y", models=("ols",),
         seed=1, test_size=0.2, n_seeds=1, n_draws=1, n_sizes_n=1,
         n_sizes_k=1, max_n=10, max_k=1, batch_size=1, n_jobs=1,
-        repeat_plan=((1, 0),), min_n=2,
+        repeat_plan=tuple((seed, 0) for seed in range(1, rows + 1)), min_n=2,
     )
     plan = build_dynamic_plan(
         config, n_grid=(10,), k_grid=(1,),
         cluster=ClusterPolicy(
-            workers=1, rounds=rounds, partition="test", time_limit="01:00:00",
+            workers=workers, rounds=rounds, partition="test", time_limit="01:00:00",
             account="test", constraint="none",
         ),
         table_path=tmp_path / "tasks.parquet", snapshot_path=tmp_path / "snapshot.json",
@@ -108,16 +114,17 @@ def _assert_recovered_assignment_matches_frozen_intent(
     intent = json.loads((output_root / "activation-intents" / f"{generation}.json").read_text(encoding="utf-8"))
     directory = output_root / "executions" / str(plan["execution_plan_id"]) / "round-1" / f"generation-{generation}"
     index = json.loads((directory / "assignment.index.json").read_text(encoding="utf-8"))
-    ready = json.loads((directory / "assignment.ready.json").read_text(encoding="utf-8"))
     assignment = directory / "assignment.parquet"
     row_groups = index["row_groups"]
-    recovered_rows = tuple(
-        row
+    row_group_rows = [
+        tuple(read_row_group(assignment, int(group["worker"])))
         for group in row_groups
-        for row in read_row_group(assignment, int(group["worker"]))
-    )
+    ]
+    for group, rows in zip(row_groups, row_group_rows, strict=True):
+        assert len(rows) == int(group["row_count"])
+        assert task_row_digest(rows) == group["canonical_task_rows_sha256"]
+    recovered_rows = tuple(row for rows in row_group_rows for row in rows)
     assert sum(int(group["row_count"]) for group in row_groups) == intent["todo_rows"]
-    assert ready["todo_rows"] == intent["todo_rows"]
     recovered_ids = {row.row_id for row in recovered_rows}
     task_rows = tuple(
         row for row in read_task_table(Path(json.loads(snapshot.read_text(encoding="utf-8"))["task_table"]))
@@ -557,7 +564,7 @@ def test_exact_prep_preserves_conflicting_staging_assignment_evidence(tmp_path: 
 
 
 def test_intent_only_recovery_rejects_changed_todo_contents(tmp_path: Path):
-    snapshot, plan = _fault_plan(tmp_path)
+    snapshot, plan = _fault_plan(tmp_path, rows=12, workers=3)
 
     def crash_after_intent(label: str) -> None:
         if label == "after_intent":
@@ -572,9 +579,9 @@ def test_intent_only_recovery_rejects_changed_todo_contents(tmp_path: Path):
         tmp_path / "out" / "activation-intents" / "g1.json"
     )
     payload = json.loads(intent.read_text(encoding="utf-8"))
-    assert payload["todo_rows"] == 1
+    assert payload["todo_rows"] == 12
     assert isinstance(payload["canonical_task_rows_sha256"], str)
-    payload["canonical_task_rows_sha256"] = "0" * 64
+    payload["todo_rows"] = 11
     intent.chmod(0o644)
     intent.write_bytes(canonical_json_bytes(payload) + b"\n")
     intent.chmod(0o444)
@@ -841,11 +848,29 @@ def test_recovery_respects_schedule_lease_before_target_temp_cleanup(tmp_path: P
         assert inflight.is_file()
 
 
-def test_cli_maps_unexpected_os_error_to_protocol_exit(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("transient_errno", [errno.EAGAIN, errno.EBUSY, errno.EINTR, errno.ESTALE, errno.ETIMEDOUT])
+def test_cli_maps_transient_os_errors_to_retryable_exit(tmp_path: Path, monkeypatch, transient_errno: int):
     snapshot, _ = _fault_plan(tmp_path)
 
     def broken_prepare(*args, **kwargs):
-        raise FileNotFoundError("injected bare os error")
+        raise OSError(transient_errno, "injected transient os error")
+
+    monkeypatch.setattr("aleatoric_nk_grid.flat_task_table.prepare_round", broken_prepare)
+    with pytest.raises(SystemExit) as exc_info:
+        flat_task_table_main([
+            "prep", "--snapshot", str(snapshot), "--round", "1", "--generation", "g1",
+            "--prep-token", "job-1", "--expected-pointer-version", "0", "--prep-job-id", "job-1",
+        ])
+    assert exc_info.value.code == 7
+    assert classify_dynamic_exit(7).retry is True
+
+
+@pytest.mark.parametrize("error", [OSError(None, "injected errno-less os error"), FileNotFoundError("injected terminal os error")])
+def test_cli_maps_terminal_os_errors_to_protocol_exit(tmp_path: Path, monkeypatch, error: OSError):
+    snapshot, _ = _fault_plan(tmp_path)
+
+    def broken_prepare(*args, **kwargs):
+        raise error
 
     monkeypatch.setattr("aleatoric_nk_grid.flat_task_table.prepare_round", broken_prepare)
     with pytest.raises(SystemExit) as exc_info:
@@ -854,6 +879,7 @@ def test_cli_maps_unexpected_os_error_to_protocol_exit(tmp_path: Path, monkeypat
             "--prep-token", "job-1", "--expected-pointer-version", "0", "--prep-job-id", "job-1",
         ])
     assert exc_info.value.code == 6
+    assert classify_dynamic_exit(6).retry is False
 
 
 def test_v1_activation_intent_is_rejected_as_a_format_upgrade(tmp_path: Path):
@@ -1076,7 +1102,7 @@ class _InjectedPrepareCrash(RuntimeError):
 
 
 def test_real_process_crash_leaves_target_temp_then_recovery_cleans_it(tmp_path: Path):
-    snapshot, plan = _fault_plan(tmp_path)
+    snapshot, plan = _fault_plan(tmp_path, rows=12, workers=3)
     output_root = tmp_path / "out"
     source_root = Path(__file__).resolve().parents[1] / "src"
     environment = dict(os.environ)
@@ -1147,7 +1173,7 @@ prepare_round(
 def test_production_prepare_fault_boundaries_recover_exact_generation(
     tmp_path: Path, fault_label: str,
 ):
-    snapshot, plan = _fault_plan(tmp_path)
+    snapshot, plan = _fault_plan(tmp_path, rows=12, workers=3)
     output_root = tmp_path / "out"
 
     def tree_state() -> set[str]:
@@ -1192,7 +1218,7 @@ def test_production_prepare_fault_boundaries_recover_exact_generation(
 def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
     tmp_path: Path, fault_label: str,
 ):
-    snapshot, plan = _fault_plan(tmp_path, rounds=2)
+    snapshot, plan = _fault_plan(tmp_path, rounds=2, rows=12, workers=3)
     output_root = tmp_path / "out"
 
     def tree_state() -> set[str]:
@@ -1201,10 +1227,11 @@ def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
         snapshot, round_index=1, prep_token="job-1", prep_job_id="job-1",
         submission_generation="g1", expected_pointer_version=0,
     )
-    run_slice(
-        snapshot, round_index=1, worker_index=0, expected_prep_token="job-1",
-        prep_job_id="job-1", submission_generation="g1", expected_pointer_version=0,
-    )
+    for worker_index in range(3):
+        run_slice(
+            snapshot, round_index=1, worker_index=worker_index, expected_prep_token="job-1",
+            prep_job_id="job-1", submission_generation="g1", expected_pointer_version=0,
+        )
     close_generation(
         snapshot, round_index=1, submission_generation="g1",
         expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
@@ -1235,6 +1262,7 @@ def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
     after_recovery = tree_state()
     assert not any(".tmp." in path or ".staging" in path for path in after_recovery - before_crash)
     outcome = output_root / "executions" / str(plan["execution_plan_id"]) / "round-2" / "prep-outcomes" / "g2.json"
+    baseline = sha256_file(outcome)
     repeated = prepare_round(
         snapshot, round_index=2, prep_token="job-2", prep_job_id="job-2",
         submission_generation="g2", expected_previous_generation="g1",
@@ -1242,6 +1270,7 @@ def test_production_todo_zero_outcome_fault_boundaries_recover_exact_receipt(
     )
     assert repeated["no_generation"] is True
     assert json.loads(outcome.read_text(encoding="utf-8"))["todo_count"] == 0
+    assert sha256_file(outcome) == baseline
 
 
 @pytest.mark.parametrize("entry", [run_slice, close_generation, verify_rounds])

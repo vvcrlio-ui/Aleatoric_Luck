@@ -15,7 +15,6 @@ from aleatoric_nk_grid import calibrate_cost as cc
 _WORKER = r"""
 import json
 import resource
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -36,16 +35,11 @@ test = session.split.X_test.loc[:, columns]
 function = _preprocess_cell_reference if mode == "reference" else preprocess_cell
 peak_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 if mode == "vectorized":
-    # Exclude first-allocation noise from the scaling estimate. The reference
-    # measurement remains one call because it is deliberately minutes long.
+    # Exclude first-allocation noise from every independently spawned sample.
     function(train, test, groups, session.imputation, model_name="ols")
-repetitions = 7 if mode == "vectorized" else 1
-times = []
-for _ in range(repetitions):
-    started = time.perf_counter()
-    result = function(train, test, groups, session.imputation, model_name="ols")
-    times.append(time.perf_counter() - started)
-seconds = statistics.median(times)
+started = time.perf_counter()
+result = function(train, test, groups, session.imputation, model_name="ols")
+seconds = time.perf_counter() - started
 peak_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 print(json.dumps({
     "mode": mode,
@@ -53,7 +47,7 @@ print(json.dumps({
     "n": len(train),
     "columns": len(columns),
     "seconds": seconds,
-    "seconds_samples": times,
+    "seconds_samples": [seconds],
     "peak_rss_before": peak_before,
     "peak_rss_after": peak_after,
     "peak_rss_delta": max(0, peak_after - peak_before),
@@ -98,11 +92,16 @@ def test_preprocess_cell_scaling_and_peak_memory_benchmark(tmp_path, record_prop
             seed=0,
         ),
     )
-    measurements = [
-        _measure(schema_path, k, mode)
-        for k in (1000, 3125, 8053)
-        for mode in ("reference", "vectorized")
-    ]
+    measurements = []
+    for k in (1000, 3125, 8053):
+        for mode in ("reference", "vectorized"):
+            samples = [_measure(schema_path, k, mode) for _ in range(3)]
+            best = min(samples, key=lambda measurement: float(measurement["seconds"]))
+            # The minimum of independently spawned wall-clock samples is the
+            # least disturbed estimate of this deterministic operation.  Keep
+            # all samples alongside the selected value for post-run diagnosis.
+            best["seconds_samples"] = [float(sample["seconds"]) for sample in samples]
+            measurements.append(best)
     record_property("preprocess_cell_benchmark", json.dumps(measurements))
 
     optimized = {

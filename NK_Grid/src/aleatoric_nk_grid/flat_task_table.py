@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import fcntl
 import hashlib
 import json
@@ -98,6 +99,13 @@ from .worker_event_wal import (
 
 
 TABLE_FORMAT_VERSION = 2
+_TRANSIENT_ERRNOS = frozenset({
+    errno.EAGAIN,
+    errno.EBUSY,
+    errno.EINTR,
+    errno.ESTALE,
+    errno.ETIMEDOUT,
+})
 TABLE_COLUMNS = ("row_id", "seed", "draw", "N", "K", "group", "models")
 FINALIZATION_FORMAT_VERSION = 1
 FINALIZATION_BATCH_ROWS = 4_096
@@ -1691,7 +1699,6 @@ def prepare_round(
         "submission_generation": target.submission_generation, "assignment": str(canonical_assignment.resolve()),
         "assignment_sha256": assignment_sha, "assignment_index": str(canonical_index.resolve()),
         "assignment_index_sha256": index_sha, "prep_token": prep_token, "prep_job_id": target.prep_job_id,
-        "todo_rows": todo_rows,
     }
     immutable_json_bytes(ready, ready_payload)
     if fault is not None:
@@ -2505,7 +2512,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(SUPERSEDED_EXIT_CODE) from exc
     except OSError as exc:
         print(str(exc), file=sys.stderr)
-        raise SystemExit(PROTOCOL_EXIT_CODE) from exc
+        raise SystemExit(
+            RETRYABLE_EXIT_CODE if exc.errno in _TRANSIENT_ERRNOS else PROTOCOL_EXIT_CODE
+        ) from exc
 
 
 if __name__ == "__main__":
