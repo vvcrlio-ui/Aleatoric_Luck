@@ -129,6 +129,7 @@ PANEL_FIELDS = frozenset(
         "repeat_plan",
         "n_grid",
         "k_grid",
+        "prediction_export_cells",
     }
 )
 CONFIG_FIELDS = set(NKGridConfig.__dataclass_fields__)
@@ -211,6 +212,22 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
             if not isinstance(values[grid_name], list) or not values[grid_name]:
                 raise ValueError(f"Panel {name} {grid_name} must be a non-empty list")
             values[grid_name] = tuple(int(value) for value in values[grid_name])
+    export_cells = values.get("prediction_export_cells", ())
+    if not isinstance(export_cells, (list, tuple)):
+        raise ValueError(
+            f"Panel {name} prediction_export_cells must be a list"
+        )
+    normalized_export_cells: list[tuple[str, int, int]] = []
+    for entry in export_cells:
+        if not isinstance(entry, dict) or set(entry) != {"model", "N", "K"}:
+            raise ValueError(
+                f"Panel {name} prediction_export_cells entries require exactly "
+                "model, N and K"
+            )
+        normalized_export_cells.append(
+            (str(entry["model"]), int(entry["N"]), int(entry["K"]))
+        )
+    values["prediction_export_cells"] = tuple(normalized_export_cells)
     extra = sorted(set(values) - CONFIG_FIELDS)
     if extra:
         raise ValueError(f"Panel {name} did not resolve cleanly: {extra}")

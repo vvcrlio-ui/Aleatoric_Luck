@@ -116,6 +116,29 @@ aleatoric-nk-grid-panels \
   --allow-large-run
 ```
 
+### Optional per-row prediction export
+
+A local panel can request test-row predictions for exact `(model, N, K)`
+combinations:
+
+```yaml
+prediction_export_cells:
+  - {model: ridge, N: 100, K: 25}
+  - {model: super_learner, N: 100, K: 25}
+```
+
+The field is disabled when absent or empty. Every entry requires all three
+fields and uses exact matching; wildcards are not supported. Enabling it also
+requires the schema to declare a non-missing, unique `id_column`. Successful
+selected cells are published separately as `<output>.predictions.parquet`
+with `row_id`, `y_true`, and the same `y_pred` consumed by the metric layer.
+Per-cell Parquet parts are retained beside the output so interrupted local
+runs can resume missing exports without changing the main CSV.
+
+This option is currently local-only. Dynamic queue/WAL planning rejects it
+explicitly; that persistence protocol is outside the prediction-export
+contract.
+
 ## Slurm execution
 
 Before submission:
