@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 
 from aleatoric_nk_grid import nk_grid
@@ -14,8 +15,10 @@ from aleatoric_nk_grid.flat_task_table import _config_from_json
 from aleatoric_nk_grid.nk_grid import NKGridConfig, run_nk_grid
 from aleatoric_nk_grid.prediction_export import (
     PREDICTION_EXPORT_COLUMNS,
+    materialize_prediction_export_atomic,
     prediction_export_parts_dir,
     prediction_export_path,
+    prediction_export_schema,
     write_prediction_part_atomic,
 )
 from aleatoric_nk_grid.run_panels import resolve_panel
@@ -163,7 +166,7 @@ def test_exact_whitelist_exports_ids_truth_predictions_and_preserves_main_csv(
         models=("ols", "ridge"),
         n_grid=(20, 24),
         k_grid=(1, 2),
-        export_cells=(("ols", 20, 1), ("ridge", 24, 2), ("ridge", 999, 2)),
+        export_cells=(("ols", 20, 1), ("ridge", 24, 2)),
     )
 
     run_nk_grid(disabled)
@@ -331,6 +334,30 @@ def test_panel_mapping_resolves_to_exact_model_n_k_keys(tmp_path: Path) -> None:
     )
 
 
+def test_unmatched_whitelist_entries_fail_before_creating_output(
+    tmp_path: Path,
+) -> None:
+    schema, _ = _external_schema(tmp_path / "input")
+    config = _config(
+        schema,
+        tmp_path / "result.csv",
+        models=("ols", "ridge"),
+        n_grid=(20, 24),
+        k_grid=(1, 2),
+        export_cells=(("ols", 999, 1), ("ridge", 20, 8)),
+    )
+    with pytest.raises(ValueError) as error:
+        run_nk_grid(config)
+    message = str(error.value)
+    assert "do not match the resolved N/K grid" in message
+    assert "(model='ols', N=999, K=1)" in message
+    assert "(model='ridge', N=20, K=8)" in message
+    assert "resolved N=[20, 24], K=[1, 2]" in message
+    assert not config.out.exists()
+    assert not config.out.with_suffix(".manifest.json").exists()
+    assert not prediction_export_path(config.out).exists()
+
+
 def test_changed_whitelist_rematerializes_sidecar_without_stale_cells(
     tmp_path: Path,
 ) -> None:
@@ -395,12 +422,12 @@ def test_part_write_failure_is_failed_checkpoint_and_resume_recomputes_cell(
     real_writer = nk_grid.write_prediction_part_atomic
     attempts = 0
 
-    def fail_once(rows, target):
+    def fail_once(rows, target, *, schema):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise OSError("injected prediction part failure")
-        return real_writer(rows, target)
+        return real_writer(rows, target, schema=schema)
 
     monkeypatch.setattr(nk_grid, "write_prediction_part_atomic", fail_once)
     run_nk_grid(config)
@@ -446,11 +473,11 @@ def test_atomic_part_failure_leaves_neither_target_nor_temporary_file(
 ) -> None:
     target = tmp_path / "parts" / "cell.parquet"
 
-    def partial_then_fail(frame, path, **_kwargs):
+    def partial_then_fail(table, path, **_kwargs):
         Path(path).write_bytes(b"partial")
         raise OSError("injected partial parquet write")
 
-    monkeypatch.setattr(pd.DataFrame, "to_parquet", partial_then_fail)
+    monkeypatch.setattr(pq, "write_table", partial_then_fail)
     rows = [
         {
             "dataset": "synthetic",
@@ -464,7 +491,44 @@ def test_atomic_part_failure_leaves_neither_target_nor_temporary_file(
             "y_pred": 0.75,
         }
     ]
+    schema = prediction_export_schema(pd.Series(["row-1"]))
     with pytest.raises(OSError, match="partial parquet"):
-        write_prediction_part_atomic(rows, target)
+        write_prediction_part_atomic(rows, target, schema=schema)
     assert not target.exists()
     assert list(target.parent.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pd.Series([101, 102], dtype="int64"),
+        pd.Series(["row-101", "row-102"], dtype="string"),
+    ],
+)
+def test_empty_and_populated_exports_share_the_exact_parquet_schema(
+    tmp_path: Path, row_ids: pd.Series
+) -> None:
+    schema = prediction_export_schema(row_ids)
+    rows = [
+        {
+            "dataset": "synthetic",
+            "model": "ols",
+            "seed": 1,
+            "draw": 0,
+            "N": 10,
+            "K": 1,
+            "row_id": row_ids.iloc[0],
+            "y_true": 1.0,
+            "y_pred": 0.75,
+        }
+    ]
+    part = tmp_path / "populated.prediction-parts" / "cell.parquet"
+    write_prediction_part_atomic(rows, part, schema=schema)
+    populated_out = tmp_path / "populated.csv"
+    empty_out = tmp_path / "empty.csv"
+    populated = materialize_prediction_export_atomic(
+        [part], populated_out, schema=schema
+    )
+    empty = materialize_prediction_export_atomic([], empty_out, schema=schema)
+
+    assert pq.read_schema(populated) == pq.read_schema(empty) == schema

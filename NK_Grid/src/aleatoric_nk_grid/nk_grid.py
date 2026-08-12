@@ -107,6 +107,7 @@ from .prediction_export import (
     prediction_export_part_path,
     prediction_export_parts_dir,
     prediction_export_path,
+    prediction_export_schema,
     write_prediction_part_atomic,
 )
 from .validate_input import REGRESSION_CV_MIN_N, validate_input
@@ -1255,6 +1256,33 @@ def reject_dynamic_prediction_export(config: NKGridConfig) -> None:
         raise ValueError(PREDICTION_EXPORT_DYNAMIC_ERROR)
 
 
+def validate_prediction_export_grid(
+    config: NKGridConfig,
+    *,
+    n_grid: Sequence[int],
+    k_grid: Sequence[int],
+) -> None:
+    """Reject every exact export selector absent from the resolved design."""
+
+    resolved_n = {int(value) for value in n_grid}
+    resolved_k = {int(value) for value in k_grid}
+    unmatched = [
+        (model, int(n_samples), int(k_features))
+        for model, n_samples, k_features in config.prediction_export_cells
+        if int(n_samples) not in resolved_n or int(k_features) not in resolved_k
+    ]
+    if unmatched:
+        entries = ", ".join(
+            f"(model={model!r}, N={n_samples}, K={k_features})"
+            for model, n_samples, k_features in unmatched
+        )
+        raise ValueError(
+            "prediction_export_cells contains entries that do not match the "
+            f"resolved N/K grid: {entries}; resolved N={sorted(resolved_n)}, "
+            f"K={sorted(resolved_k)}"
+        )
+
+
 def _validate_config(config: NKGridConfig) -> None:
     """Reject invalid run controls before dry-run arithmetic or data loading."""
 
@@ -2382,6 +2410,15 @@ def _run_nk_grid_locked(
         min_size=config.min_n,
     )
     k_grid = np.asarray(config.k_grid, dtype=int) if config.k_grid else log2_size_grid(len(feature_units), config.n_sizes_k, config.max_k)
+    validate_prediction_export_grid(config, n_grid=n_grid, k_grid=k_grid)
+    prediction_sidecar_schema = None
+    if prediction_export_enabled(config):
+        assert schema.id_column is not None
+        id_frame = loaded.test if split_mode == "external_test" else frame
+        assert id_frame is not None
+        prediction_sidecar_schema = prediction_export_schema(
+            id_frame[schema.id_column]
+        )
     log_progress(
         "grid "
         f"N={n_grid.tolist()} K={k_grid.tolist()} "
@@ -2612,7 +2649,12 @@ def _run_nk_grid_locked(
                             "successful selected cell returned no prediction rows"
                         )
                     write_started = time.perf_counter()
-                    write_prediction_part_atomic(export_rows, part_path)
+                    assert prediction_sidecar_schema is not None
+                    write_prediction_part_atomic(
+                        export_rows,
+                        part_path,
+                        schema=prediction_sidecar_schema,
+                    )
                     prediction_write_seconds += time.perf_counter() - write_started
                     prediction_parts_written += 1
                 except Exception as exc:
@@ -2778,7 +2820,9 @@ def _run_nk_grid_locked(
                 missing_parts.append(job)
         merge_started = time.perf_counter()
         prediction_path = materialize_prediction_export_atomic(
-            authoritative_parts, out_path
+            authoritative_parts,
+            out_path,
+            schema=prediction_sidecar_schema,
         )
         prediction_merge_seconds = time.perf_counter() - merge_started
         try:

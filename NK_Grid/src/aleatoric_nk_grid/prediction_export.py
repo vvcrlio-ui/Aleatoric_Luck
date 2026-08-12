@@ -23,6 +23,30 @@ PREDICTION_EXPORT_COLUMNS = (
 )
 
 
+def prediction_export_schema(row_ids: pd.Series):
+    """Return the one Arrow schema shared by empty and populated exports."""
+
+    try:
+        import pyarrow as pa
+    except ImportError as exc:
+        raise ImportError("Prediction export requires the NK Grid parquet extra") from exc
+
+    row_id_type = pa.array(row_ids).type
+    return pa.schema(
+        [
+            pa.field("dataset", pa.string(), nullable=True),
+            pa.field("model", pa.string(), nullable=True),
+            pa.field("seed", pa.int64(), nullable=True),
+            pa.field("draw", pa.int64(), nullable=True),
+            pa.field("N", pa.int64(), nullable=True),
+            pa.field("K", pa.int64(), nullable=True),
+            pa.field("row_id", row_id_type, nullable=True),
+            pa.field("y_true", pa.float64(), nullable=True),
+            pa.field("y_pred", pa.float64(), nullable=True),
+        ]
+    )
+
+
 def prediction_export_path(out_path: Path) -> Path:
     """Return the final Parquet sidecar derived from the main CSV path."""
 
@@ -70,28 +94,34 @@ def _publish_temporary(temporary: Path, target: Path) -> Path:
 
 
 def write_prediction_part_atomic(
-    rows: Sequence[Mapping[str, object]], target: Path
+    rows: Sequence[Mapping[str, object]], target: Path, *, schema
 ) -> Path:
     """Publish a complete per-cell Parquet part or leave no partial target."""
 
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    frame = pd.DataFrame(rows, columns=PREDICTION_EXPORT_COLUMNS)
     temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
     try:
-        frame.to_parquet(temporary, index=False)
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError(
+                "Prediction export requires the NK Grid parquet extra"
+            ) from exc
+        table = pa.Table.from_pylist([dict(row) for row in rows], schema=schema)
+        pq.write_table(table, temporary)
         return _publish_temporary(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def materialize_prediction_export_atomic(
-    part_paths: Iterable[Path], out_path: Path
+    part_paths: Iterable[Path], out_path: Path, *, schema
 ) -> Path:
     """Stream authoritative cell parts into one atomically published sidecar."""
 
     try:
-        import pyarrow as pa
         import pyarrow.parquet as pq
     except ImportError as exc:
         raise ImportError("Prediction export requires the NK Grid parquet extra") from exc
@@ -103,30 +133,16 @@ def materialize_prediction_export_atomic(
     try:
         for part_path in part_paths:
             table = pq.read_table(Path(part_path))
-            if tuple(table.column_names) != PREDICTION_EXPORT_COLUMNS:
+            if table.schema != schema:
                 raise ValueError(
                     f"Prediction part has an unexpected schema: {part_path}"
                 )
             if writer is None:
-                writer = pq.ParquetWriter(temporary, table.schema)
-            elif table.schema != writer.schema:
-                table = table.cast(writer.schema)
+                writer = pq.ParquetWriter(temporary, schema)
             writer.write_table(table)
         if writer is None:
-            empty = pa.table(
-                {
-                    "dataset": pa.array([], type=pa.string()),
-                    "model": pa.array([], type=pa.string()),
-                    "seed": pa.array([], type=pa.int64()),
-                    "draw": pa.array([], type=pa.int64()),
-                    "N": pa.array([], type=pa.int64()),
-                    "K": pa.array([], type=pa.int64()),
-                    "row_id": pa.array([], type=pa.string()),
-                    "y_true": pa.array([], type=pa.float64()),
-                    "y_pred": pa.array([], type=pa.float64()),
-                }
-            )
-            writer = pq.ParquetWriter(temporary, empty.schema)
+            empty = schema.empty_table()
+            writer = pq.ParquetWriter(temporary, schema)
             writer.write_table(empty)
         writer.close()
         writer = None
