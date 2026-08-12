@@ -33,7 +33,14 @@ from .execution_contract import (
 from .experiment import git_state, model_run_settings
 from .ingest import load_schema
 from .model_registry import load_algorithm_version, load_model_params, resolved_model_params
-from .nk_grid import LARGE_RUN_THRESHOLD, NKGridConfig, _validate_config, public_result_columns, resolve_repeat_pairs
+from .nk_grid import (
+    LARGE_RUN_THRESHOLD,
+    NKGridConfig,
+    _validate_config,
+    public_result_columns,
+    reject_dynamic_prediction_export,
+    resolve_repeat_pairs,
+)
 from . import run_panels
 
 
@@ -205,6 +212,7 @@ def build_dynamic_plan(
     panel: str,
 ) -> dict[str, object]:
     """Freeze one cost-free table, one worker request, and the round count."""
+    reject_dynamic_prediction_export(config)
     cluster.validate()
     resolved_n_grid = tuple(sorted({int(value) for value in n_grid}))
     resolved_k_grid = tuple(sorted({int(value) for value in k_grid}))

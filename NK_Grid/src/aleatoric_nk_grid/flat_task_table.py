@@ -80,6 +80,7 @@ from .nk_grid import (
     _process_peak_rss_bytes,
     execution_groups_for_models,
     project_public_result,
+    reject_dynamic_prediction_export,
     resolve_repeat_pairs,
 )
 from .worker_event_wal import (
@@ -505,6 +506,7 @@ def run_slice(
 ) -> Path:
     """Run one WAL-owned worker slice; no output CSV/checkpoint path is opened."""
     payload = _load_snapshot(snapshot_path)
+    reject_dynamic_prediction_export(_config_from_json(payload["config"]))
     analysis, execution = _load_contract_chain(payload, validate_task_table=False)
     workers = int(payload["workers"])
     if not 0 <= worker_index < workers:
@@ -2279,6 +2281,11 @@ def _config_from_json(payload: Mapping[str, object]) -> NKGridConfig:
     if values.get("repeat_plan") is not None:
         values["repeat_plan"] = tuple(
             (int(pair[0]), int(pair[1])) for pair in values["repeat_plan"]
+        )
+    if values.get("prediction_export_cells") is not None:
+        values["prediction_export_cells"] = tuple(
+            (str(cell[0]), int(cell[1]), int(cell[2]))
+            for cell in values["prediction_export_cells"]
         )
     return NKGridConfig(**values)
 

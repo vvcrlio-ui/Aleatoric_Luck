@@ -102,10 +102,21 @@ from .preprocessing import (
     count_unobserved_sources,
     preprocess_cell,
 )
+from .prediction_export import (
+    materialize_prediction_export_atomic,
+    prediction_export_part_path,
+    prediction_export_parts_dir,
+    prediction_export_path,
+    write_prediction_part_atomic,
+)
 from .validate_input import REGRESSION_CV_MIN_N, validate_input
 
 
 LARGE_RUN_THRESHOLD = 250_000
+PREDICTION_EXPORT_DYNAMIC_ERROR = (
+    "Per-row prediction export is not supported by the dynamic queue/WAL "
+    "path; see plans/per-row-prediction-export.md"
+)
 
 # Row-level metadata is deliberately scalar-only. The complete artifact-level
 # identity and semantic contract belong in the sidecar manifest, where
@@ -343,6 +354,7 @@ class NKGridConfig:
     repeat_plan: tuple[tuple[int, int], ...] | None = None
     n_grid: tuple[int, ...] | None = None
     k_grid: tuple[int, ...] | None = None
+    prediction_export_cells: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -351,6 +363,8 @@ class SplitData:
     X_test: pd.DataFrame
     y_train: pd.Series
     y_test: pd.Series
+    train_ids: pd.Series | None = None
+    test_ids: pd.Series | None = None
 
 
 @dataclass(frozen=True)
@@ -366,6 +380,8 @@ class SplitIndexes:
     train_index: pd.Index
     test_index: pd.Index
     external_test: bool
+    train_ids: pd.Series | None = None
+    test_ids: pd.Series | None = None
 
 
 class SplitIndexManager:
@@ -386,6 +402,7 @@ class SplitIndexManager:
         outcome: str,
         test_size: float,
         task: str,
+        id_column: str | None = None,
     ) -> None:
         self.frame = frame
         self.external_frame = external_frame
@@ -393,13 +410,22 @@ class SplitIndexManager:
         self.outcome = str(outcome)
         self.test_size = float(test_size)
         self.task = str(task)
+        self.id_column = id_column
         self._cache: dict[int, SplitIndexes] = {}
         if external_frame is not None:
-            fixed = external_test_split(frame, external_frame, self.predictors, self.outcome)
+            fixed = external_test_split(
+                frame,
+                external_frame,
+                self.predictors,
+                self.outcome,
+                id_column=self.id_column,
+            )
             self._external = SplitIndexes(
                 train_index=fixed.X_train.index.copy(),
                 test_index=fixed.X_test.index.copy(),
                 external_test=True,
+                train_ids=fixed.train_ids,
+                test_ids=fixed.test_ids,
             )
         else:
             self._external = None
@@ -417,7 +443,21 @@ class SplitIndexManager:
             random_state=int(seed),
             stratify=target if self.task == "classification" else None,
         )
-        frozen = SplitIndexes(pd.Index(train_index), pd.Index(test_index), False)
+        frozen = SplitIndexes(
+            pd.Index(train_index),
+            pd.Index(test_index),
+            False,
+            (
+                self.frame.loc[train_index, self.id_column]
+                if self.id_column is not None
+                else None
+            ),
+            (
+                self.frame.loc[test_index, self.id_column]
+                if self.id_column is not None
+                else None
+            ),
+        )
         self._cache[int(seed)] = frozen
         return frozen
 
@@ -504,6 +544,7 @@ def split_frame(
     test_size: float,
     seed: int,
     task: str = "regression",
+    id_column: str | None = None,
 ) -> SplitData:
     y = frame[outcome]
     X_train, X_test, y_train, y_test = train_test_split(
@@ -513,7 +554,14 @@ def split_frame(
         random_state=seed,
         stratify=y if task == "classification" else None,
     )
-    return SplitData(X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test)
+    return SplitData(
+        X_train=X_train,
+        X_test=X_test,
+        y_train=y_train,
+        y_test=y_test,
+        train_ids=(frame.loc[X_train.index, id_column] if id_column else None),
+        test_ids=(frame.loc[X_test.index, id_column] if id_column else None),
+    )
 
 
 def external_test_split(
@@ -521,6 +569,8 @@ def external_test_split(
     test_frame: pd.DataFrame,
     predictors: Sequence[str],
     outcome: str,
+    *,
+    id_column: str | None = None,
 ) -> SplitData:
     for label, frame in (("training data", train_frame), ("test data", test_frame)):
         if outcome not in frame:
@@ -537,6 +587,8 @@ def external_test_split(
         X_test=test_complete.loc[:, predictor_list],
         y_train=train_complete[outcome],
         y_test=test_complete[outcome],
+        train_ids=(train_complete[id_column] if id_column else None),
+        test_ids=(test_complete[id_column] if id_column else None),
     )
 
 
@@ -920,6 +972,73 @@ def _completed_jobs_for_experiment(existing: pd.DataFrame, experiment_id: str) -
     )
 
 
+def _completed_job_statuses_for_experiment(
+    existing: pd.DataFrame, experiment_id: str
+) -> dict[tuple[str, int, int, int, int], str]:
+    current = rows_for_experiment(existing, experiment_id)
+    if current.empty:
+        return {}
+    if "status" not in current:
+        return {
+            (str(row.model), int(row.seed), int(row.draw), int(row.N), int(row.K)): "ok"
+            for row in current.itertuples(index=False)
+        }
+    return {
+        (str(row.model), int(row.seed), int(row.draw), int(row.N), int(row.K)): str(row.status)
+        for row in current.itertuples(index=False)
+        if str(row.status) in {"ok", "skipped"}
+    }
+
+
+def _prediction_part_for_job(out_path: Path, job: tuple) -> Path:
+    model, seed, draw, n_samples, k_features = job
+    return prediction_export_part_path(
+        out_path,
+        model=str(model),
+        seed=int(seed),
+        draw=int(draw),
+        n_samples=int(n_samples),
+        k_features=int(k_features),
+    )
+
+
+def _selected_prediction_job(config: NKGridConfig, job: tuple) -> bool:
+    return prediction_export_selected(
+        config,
+        model=str(job[0]),
+        n_samples=int(job[3]),
+        k_features=int(job[4]),
+    )
+
+
+def _prediction_export_is_complete(
+    config: NKGridConfig,
+    out_path: Path,
+    jobs: Sequence[tuple],
+    completed_statuses: Mapping[tuple, str],
+) -> bool:
+    if not prediction_export_enabled(config):
+        return True
+    if not prediction_export_path(out_path).is_file():
+        return False
+    try:
+        prior = json.loads(manifest_path(out_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    expected_cells = [
+        {"model": model, "N": int(n_samples), "K": int(k_features)}
+        for model, n_samples, k_features in config.prediction_export_cells
+    ]
+    prior_export = prior.get("prediction_export") if isinstance(prior, dict) else None
+    if not isinstance(prior_export, dict) or prior_export.get("cells") != expected_cells:
+        return False
+    return all(
+        completed_statuses.get(job) != "ok" or _prediction_part_for_job(out_path, job).is_file()
+        for job in jobs
+        if _selected_prediction_job(config, job)
+    )
+
+
 def _checkpoint_index_exactly_matches_jobs(
     existing: pd.DataFrame,
     experiment_id: str,
@@ -1115,6 +1234,27 @@ def estimate_run_size(config: NKGridConfig) -> dict[str, int | str]:
     }
 
 
+def prediction_export_enabled(config: NKGridConfig) -> bool:
+    return bool(config.prediction_export_cells)
+
+
+def prediction_export_selected(
+    config: NKGridConfig,
+    *,
+    model: str,
+    n_samples: int,
+    k_features: int,
+) -> bool:
+    return (str(model), int(n_samples), int(k_features)) in set(
+        config.prediction_export_cells
+    )
+
+
+def reject_dynamic_prediction_export(config: NKGridConfig) -> None:
+    if prediction_export_enabled(config):
+        raise ValueError(PREDICTION_EXPORT_DYNAMIC_ERROR)
+
+
 def _validate_config(config: NKGridConfig) -> None:
     """Reject invalid run controls before dry-run arithmetic or data loading."""
 
@@ -1139,6 +1279,31 @@ def _validate_config(config: NKGridConfig) -> None:
     unknown_models = sorted(set(config.models) - set(SUPPORTED_MODEL_NAMES))
     if unknown_models:
         raise ValueError(f"Unknown model(s): {', '.join(unknown_models)}")
+    seen_export_cells: set[tuple[str, int, int]] = set()
+    for entry in config.prediction_export_cells:
+        if (
+            not isinstance(entry, tuple)
+            or len(entry) != 3
+            or not isinstance(entry[0], str)
+            or not entry[0]
+            or isinstance(entry[1], bool)
+            or not isinstance(entry[1], int)
+            or isinstance(entry[2], bool)
+            or not isinstance(entry[2], int)
+        ):
+            raise ValueError(
+                "prediction_export_cells entries must be (model, N, K) tuples"
+            )
+        model, n_samples, k_features = entry
+        if model not in config.models:
+            raise ValueError(
+                f"prediction_export_cells model {model!r} is not in configured models"
+            )
+        if n_samples < 1 or k_features < 1:
+            raise ValueError("prediction_export_cells N and K must be positive")
+        if entry in seen_export_cells:
+            raise ValueError("prediction_export_cells must not contain duplicates")
+        seen_export_cells.add(entry)
     if config.failed_abs_threshold < 0:
         raise ValueError("failed_abs_threshold must be non-negative")
     if not 0.0 <= config.failed_ratio_threshold <= 1.0:
@@ -1293,10 +1458,32 @@ def _manifest_payload(
             "resolved": resolved_model_params(selected_model_params),
         },
         "environment": core_environment(),
+        **(
+            {
+                "prediction_export": {
+                    "cells": [
+                        {"model": model, "N": int(n_samples), "K": int(k_features)}
+                        for model, n_samples, k_features in config.prediction_export_cells
+                    ]
+                }
+            }
+            if prediction_export_enabled(config)
+            else {}
+        ),
         "output": {
             "csv": out_path.name,
             "parts_directory": checkpoint_parts_dir(out_path).name,
             "checkpoint_parts_deleted": False,
+            **(
+                {
+                    "predictions_parquet": prediction_export_path(out_path).name,
+                    "prediction_parts_directory": prediction_export_parts_dir(
+                        out_path
+                    ).name,
+                }
+                if prediction_export_enabled(config)
+                else {}
+            ),
         },
         "completion": {
             "expected_rows": int(expected_rows),
@@ -1646,6 +1833,11 @@ class NKGridExecutionSession:
             outcome=config.outcome,
             test_size=config.test_size,
             task=self.task,
+            id_column=(
+                self.schema.id_column
+                if prediction_export_enabled(config)
+                else None
+            ),
         )
         self.repeat_pairs = resolve_repeat_pairs(config)
         first_split = self.split_manager.for_seed(self.repeat_pairs[0][0])
@@ -1708,6 +1900,7 @@ class NKGridExecutionSession:
         loaded, source_definitions = validate_input(
             raw_loaded, config.outcome, models=config.models, min_n=config.min_n,
             test_size=config.test_size, seed=config.seed,
+            require_id=prediction_export_enabled(config),
         )
         selected_model_params = load_model_params(config.model_params, task=loaded.schema.task, models=config.models)
         return cls(
@@ -1857,7 +2050,8 @@ class NKGridExecutionSession:
                 rows.append(self._run_model(
                     model_name=model_name, position=position, seed=int(seed), draw=int(draw),
                     n_samples=int(n_samples), k_features=int(k_features), X_sub_raw=X_sub_raw,
-                    y_sub=y_sub, X_test_raw=X_test_raw, y_test=y_test, selected_groups=selected_groups,
+                    y_sub=y_sub, X_test_raw=X_test_raw, y_test=y_test,
+                    test_ids=indexes.test_ids, selected_groups=selected_groups,
                     unobserved=unobserved, slice_seconds=slice_seconds, prepared=prepared,
                     preparation_errors=preparation_errors, n_train_total=len(indexes.train_index),
                     n_test_total=len(indexes.test_index),
@@ -1884,7 +2078,7 @@ class NKGridExecutionSession:
             result.append(add_metadata({**row, **metrics, **diagnostics, **({"task": self.task} if self.task == "classification" else {}), "status": "failed", "error": f"{type(exc).__name__}: {exc}"}, self.row_metadata))
         return result
 
-    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> dict[str, object]:
+    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, test_ids: pd.Series | None, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> dict[str, object]:
         model_started = time.perf_counter()
         row = self._base(model_name=model_name, seed=seed, draw=draw, n_samples=n_samples, k_features=k_features, n_train_total=n_train_total, n_test_total=n_test_total)
         row["K_expanded"] = X_sub_raw.shape[1]; row["K_unobserved"] = unobserved
@@ -1936,7 +2130,39 @@ class NKGridExecutionSession:
             predictions = np.asarray(fit["predictions"])
             diagnostics["_fit_seconds"] = fit["fit_seconds"]; diagnostics["_best_rounds"] = fit["best_rounds"]; diagnostics["converged"] = fit["converged"]; diagnostics["constant_prediction"] = _constant_prediction(predictions)
             metrics = compute_classification_metrics(y_test, predictions, y_sub) if self.task == "classification" else compute_regression_metrics(y_test, predictions, y_sub)
-            return result(metrics, status="ok", error="", peak=int(fit["peak_rss_bytes"]))
+            completed = result(
+                metrics, status="ok", error="", peak=int(fit["peak_rss_bytes"])
+            )
+            if prediction_export_selected(
+                self.config,
+                model=model_name,
+                n_samples=n_samples,
+                k_features=k_features,
+            ):
+                if test_ids is None:
+                    raise RuntimeError(
+                        "Prediction export selected a cell without test-row IDs"
+                    )
+                completed["_prediction_export_rows"] = [
+                    {
+                        "dataset": self.dataset,
+                        "model": model_name,
+                        "seed": int(seed),
+                        "draw": int(draw),
+                        "N": int(n_samples),
+                        "K": int(k_features),
+                        "row_id": row_id,
+                        "y_true": y_true,
+                        "y_pred": y_pred,
+                    }
+                    for row_id, y_true, y_pred in zip(
+                        test_ids.to_numpy(),
+                        y_test.to_numpy(),
+                        predictions,
+                        strict=True,
+                    )
+                ]
+            return completed
         except Exception as exc:
             return result(empty_metrics, status="failed", error=f"{type(exc).__name__}: {exc}")
 
@@ -2060,6 +2286,7 @@ def _run_nk_grid_locked(
         min_n=config.min_n,
         test_size=config.test_size,
         seed=config.seed,
+        require_id=prediction_export_enabled(config),
     )
     schema = loaded.schema
     task = schema.task
@@ -2091,7 +2318,11 @@ def _run_nk_grid_locked(
                 "test split is fixed by schema.test_table"
             )
         fixed_split = external_test_split(
-            frame, loaded.test, predictors, config.outcome
+            frame,
+            loaded.test,
+            predictors,
+            config.outcome,
+            id_column=(schema.id_column if prediction_export_enabled(config) else None),
         )
         log_progress(
             "loaded external test data "
@@ -2139,6 +2370,7 @@ def _run_nk_grid_locked(
             first_seed: split_frame(
                 frame, predictors, config.outcome, test_size=config.test_size,
                 seed=first_seed, task=task,
+                id_column=(schema.id_column if prediction_export_enabled(config) else None),
             )
         }
     else:
@@ -2231,12 +2463,25 @@ def _run_nk_grid_locked(
         existing_index,
         metadata["experiment_id"],
     )
+    completed_statuses = _completed_job_statuses_for_experiment(
+        existing_index,
+        metadata["experiment_id"],
+    )
+    prediction_jobs = [
+        job for job in jobs if _selected_prediction_job(config, job)
+    ]
     if (
         not config.rerun_completed
         and _verified_complete_artifacts(
             out_path,
             metadata["experiment_id"],
             expected_rows,
+        )
+        and _prediction_export_is_complete(
+            config,
+            out_path,
+            jobs,
+            completed_statuses,
         )
     ):
         if not _checkpoint_index_exactly_matches_jobs(
@@ -2265,7 +2510,16 @@ def _run_nk_grid_locked(
     # every metric column for a multi-million-row checkpoint.
     existing = existing_index
     completed = _completed_jobs_for_experiment(existing, metadata["experiment_id"])
-    pending = [job for job in jobs if job not in completed]
+    pending = [
+        job
+        for job in jobs
+        if job not in completed
+        or (
+            _selected_prediction_job(config, job)
+            and completed_statuses.get(job) == "ok"
+            and not _prediction_part_for_job(out_path, job).is_file()
+        )
+    ]
     if max_jobs is not None:
         pending = pending[: int(max_jobs)]
     if pending and not existing.empty and not checkpoint_parts(out_path):
@@ -2315,7 +2569,7 @@ def _run_nk_grid_locked(
     # projected index and completed-key set before model fitting so a resumed
     # production task does not retain several duplicate multi-million-cell
     # structures for the lifetime of the run.
-    del existing_index, indexed_completed, existing, completed, jobs
+    del existing_index, indexed_completed, completed_statuses, existing, completed, jobs
 
     # Open the native runner only after all manifest/checkpoint-resume work
     # has succeeded.  From here every cell and checkpoint failure closes it
@@ -2329,8 +2583,49 @@ def _run_nk_grid_locked(
     )
 
     try:
+        prediction_parts_written = 0
+        prediction_write_seconds = 0.0
+
         def write_session_checkpoint(rows: list[dict]) -> Path | None:
             return write_checkpoint_part(rows, out_path)
+
+        def persist_cell_predictions(rows: list[dict[str, object]]) -> None:
+            nonlocal prediction_parts_written, prediction_write_seconds
+            for row in rows:
+                export_rows = row.pop("_prediction_export_rows", None)
+                job = (
+                    str(row["model"]),
+                    int(row["seed"]),
+                    int(row["draw"]),
+                    int(row["N"]),
+                    int(row["K"]),
+                )
+                if not _selected_prediction_job(config, job):
+                    continue
+                part_path = _prediction_part_for_job(out_path, job)
+                try:
+                    part_path.unlink(missing_ok=True)
+                    if row.get("status") != "ok":
+                        continue
+                    if not isinstance(export_rows, list):
+                        raise ValueError(
+                            "successful selected cell returned no prediction rows"
+                        )
+                    write_started = time.perf_counter()
+                    write_prediction_part_atomic(export_rows, part_path)
+                    prediction_write_seconds += time.perf_counter() - write_started
+                    prediction_parts_written += 1
+                except Exception as exc:
+                    row["status"] = "failed"
+                    row["error"] = (
+                        "prediction_export: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    log_progress(
+                        "prediction export part failed; cell remains resumable "
+                        f"model={job[0]} seed={job[1]} draw={job[2]} "
+                        f"N={job[3]} K={job[4]} error={exc}"
+                    )
 
         pending_cell_groups: dict[
             tuple[int, int, int, int], list[tuple[str, int, int, int, int]]
@@ -2357,6 +2652,7 @@ def _run_nk_grid_locked(
                 k_features=k_features,
                 models=tuple(job[0] for job in cell_jobs),
             )
+            persist_cell_predictions(cell_rows)
             checkpoint_buffer.extend(cell_rows)
             while len(checkpoint_buffer) >= config.batch_size:
                 checkpoint_batch_index += 1
@@ -2464,6 +2760,51 @@ def _run_nk_grid_locked(
         )
         results = None
         result_summary = materialization.summary
+    prediction_export_summary: dict[str, object] | None = None
+    if prediction_export_enabled(config) and not materialization_deferred:
+        prediction_index = load_checkpoint_index(out_path)
+        prediction_statuses = _completed_job_statuses_for_experiment(
+            prediction_index, metadata["experiment_id"]
+        )
+        authoritative_parts: list[Path] = []
+        missing_parts: list[tuple] = []
+        for job in prediction_jobs:
+            if prediction_statuses.get(job) != "ok":
+                continue
+            part_path = _prediction_part_for_job(out_path, job)
+            if part_path.is_file():
+                authoritative_parts.append(part_path)
+            else:
+                missing_parts.append(job)
+        merge_started = time.perf_counter()
+        prediction_path = materialize_prediction_export_atomic(
+            authoritative_parts, out_path
+        )
+        prediction_merge_seconds = time.perf_counter() - merge_started
+        try:
+            import pyarrow.parquet as pq
+
+            prediction_rows = int(
+                pq.ParquetFile(prediction_path).metadata.num_rows
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "Prediction export requires the NK Grid parquet extra"
+            ) from exc
+        prediction_export_summary = {
+            "cells": [
+                {"model": model, "N": int(n_samples), "K": int(k_features)}
+                for model, n_samples, k_features in config.prediction_export_cells
+            ],
+            "requested_cells": len(prediction_jobs),
+            "materialized_cells": len(authoritative_parts),
+            "missing_parts": len(missing_parts),
+            "rows": prediction_rows,
+            "bytes": prediction_path.stat().st_size,
+            "part_write_seconds": prediction_write_seconds,
+            "parts_written_this_invocation": prediction_parts_written,
+            "merge_seconds": prediction_merge_seconds,
+        }
     final_manifest = _manifest_payload(
         config=config,
         metadata=metadata,
@@ -2490,6 +2831,10 @@ def _run_nk_grid_locked(
         seed_shard_execution=shard_execution_requested,
     )
     _preserve_prior_timings(final_manifest, prior_manifest)
+    if prediction_export_summary is not None:
+        final_manifest["prediction_export"] = prediction_export_summary
+        if prediction_export_summary["missing_parts"]:
+            final_manifest["completion"]["status"] = "incomplete"
     if materialization_deferred:
         final_manifest["output"]["csv_materialization_deferred"] = True
         final_manifest["diagnostics"] = {
@@ -2569,11 +2914,32 @@ def parse_args() -> NKGridConfig:
         ),
     )
     parser.add_argument(
+        "--prediction-export-cell",
+        action="append",
+        default=[],
+        metavar="MODEL,N,K",
+        help=(
+            "Export per-row predictions for one exact model,N,K combination; "
+            "repeat for additional cells."
+        ),
+    )
+    parser.add_argument(
         "--n-jobs",
         type=int,
         default=int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
     )
     args = parser.parse_args()
+    prediction_export_cells: list[tuple[str, int, int]] = []
+    for value in args.prediction_export_cell:
+        fields = value.split(",")
+        if len(fields) != 3:
+            parser.error("--prediction-export-cell requires MODEL,N,K")
+        try:
+            prediction_export_cells.append(
+                (fields[0], int(fields[1]), int(fields[2]))
+            )
+        except ValueError:
+            parser.error("--prediction-export-cell N and K must be integers")
     return NKGridConfig(
         schema=args.schema,
         out=args.out,
@@ -2598,6 +2964,7 @@ def parse_args() -> NKGridConfig:
         allow_large_run=args.allow_large_run,
         dry_run=args.dry_run,
         rerun_completed=args.rerun_completed,
+        prediction_export_cells=tuple(prediction_export_cells),
     )
 
 

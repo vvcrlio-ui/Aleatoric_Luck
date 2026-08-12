@@ -200,6 +200,15 @@ def _validate_ids(train: pd.DataFrame, test: pd.DataFrame, id_column: str) -> No
         )
 
 
+def _validate_single_frame_ids(
+    frame: pd.DataFrame, id_column: str, *, label: str
+) -> None:
+    if frame[id_column].isna().any():
+        raise ValueError(f"{label} id_column {id_column!r} contains missing IDs")
+    if frame[id_column].duplicated().any():
+        raise ValueError(f"{label} id_column {id_column!r} contains duplicate IDs")
+
+
 def _validate_typed_values(
     frame: pd.DataFrame, groups: Sequence[SourceGroup], label: str
 ) -> None:
@@ -315,10 +324,16 @@ def validate_input(
     min_n: int,
     test_size: float,
     seed: int,
+    require_id: bool = False,
 ) -> tuple[LoadedInput, tuple[SourceGroup, ...]]:
     """Validate all global contracts before sampling creates any model cell."""
 
     schema = loaded.schema
+    if require_id and schema.id_column is None:
+        raise ValueError(
+            "Per-row prediction export requires schema.id_column; "
+            "index fallback is not supported"
+        )
     groups = source_groups(
         loaded.predictors, loaded.manifest, schema.continuous_priors
     )
@@ -332,6 +347,11 @@ def validate_input(
         # ID integrity is a whole-table contract and must not depend on which
         # rows survive the selected outcome's missing-value deletion.
         _validate_ids(loaded.train, loaded.test, schema.id_column)
+    elif require_id:
+        assert schema.id_column is not None
+        _validate_single_frame_ids(
+            loaded.train, schema.id_column, label="training data"
+        )
     train = _outcome_observed(
         loaded.train,
         outcome,
