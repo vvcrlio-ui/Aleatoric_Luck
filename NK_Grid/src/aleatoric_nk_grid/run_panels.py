@@ -94,7 +94,7 @@ DEFAULTS: dict[str, Any] = {
     "rerun_completed": True,
     "experiment_id": "nkgrid-dev-v1",
     "data_version": "dev-data-v1",
-    "model_spec_version": "nkgrid-models-v2",
+    "model_spec_version": "nkgrid-models-v3",
 }
 PANEL_FIELDS = frozenset(
     {

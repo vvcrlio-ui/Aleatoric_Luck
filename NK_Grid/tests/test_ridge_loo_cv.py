@@ -26,7 +26,7 @@ def _synthetic(n: int, p: int, seed: int = 20260808):
     [
         (12, 6, 1e-4),  # n > p, lower end of the declared alpha grid
         (6, 12, 1.0),  # n < p
-        (9, 9, 1e4),  # n == p, upper end of the declared alpha grid
+        (9, 9, 1e6),  # n == p, upper end of the declared alpha grid
     ],
 )
 def test_adaptive_ridge_uses_exact_leave_one_out_errors(
@@ -74,7 +74,7 @@ def test_adaptive_ridge_keeps_configured_scoring():
 
 def test_analytic_leave_one_out_is_at_least_five_times_faster_than_five_fold():
     X, y = _synthetic(300, 150)
-    alphas = np.logspace(-4, 4, 50)
+    alphas = np.logspace(-4, 6, 63)
     started = perf_counter()
     SklearnRidgeCV(
         alphas=alphas, cv=5, scoring="neg_mean_squared_error"
@@ -83,8 +83,8 @@ def test_analytic_leave_one_out_is_at_least_five_times_faster_than_five_fold():
     started = perf_counter()
     AdaptiveRidgeCV(
         alpha_log10_min=-4,
-        alpha_log10_max=4,
-        n_alphas=50,
+        alpha_log10_max=6,
+        n_alphas=63,
         scoring="neg_mean_squared_error",
     ).fit(X, y)
     loo_seconds = perf_counter() - started
@@ -97,14 +97,14 @@ def test_ridge_requires_two_rows_but_accepts_two_rows():
     with pytest.raises(ValueError, match="Ridge requires at least two training rows."):
         AdaptiveRidgeCV(
             alpha_log10_min=-4,
-            alpha_log10_max=4,
+            alpha_log10_max=6,
             n_alphas=2,
             scoring="neg_mean_squared_error",
         ).fit([[1.0]], [1.0])
     X, y = _synthetic(2, 1)
     assert AdaptiveRidgeCV(
         alpha_log10_min=-4,
-        alpha_log10_max=4,
+        alpha_log10_max=6,
         n_alphas=2,
         scoring="neg_mean_squared_error",
     ).fit(X, y).predict(X).shape == (2,)

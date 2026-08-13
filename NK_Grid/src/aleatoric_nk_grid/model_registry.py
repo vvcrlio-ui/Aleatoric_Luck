@@ -85,6 +85,8 @@ MODEL_PARAM_KEYS = {
         "super_learner": {
             "cv", "passthrough", "n_estimators", "max_features",
             "min_samples_leaf", "hidden_layer_sizes", "alpha",
+            "ridge_alpha_log10_min", "ridge_alpha_log10_max",
+            "ridge_n_alphas", "ridge_scoring",
             "learning_rate_init", "max_iter", "positive",
             "lgbm_n_estimators", "lgbm_learning_rate", "lgbm_num_leaves",
             "lgbm_min_data_in_leaf",
@@ -148,13 +150,16 @@ def _validated_params(
             f"Invalid parameters for {task} model '{model_name}': "
             f"{', '.join(unknown)}"
         )
-    if task == "regression" and model_name in {"xgboost", "lightgbm"}:
+    if task == "regression" and model_name in {
+        "xgboost", "lightgbm", "super_learner",
+    }:
         missing = sorted(allowed - set(params))
         if missing:
             raise ValueError(
                 f"Missing required parameters for {task} model '{model_name}': "
                 f"{', '.join(missing)}"
             )
+    if task == "regression" and model_name in {"xgboost", "lightgbm"}:
         metric_field = "eval_metric" if model_name == "xgboost" else "metric"
         if params[metric_field] != "rmse":
             raise ValueError(
@@ -603,6 +608,10 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         min_samples_leaf: int,
         hidden_layer_sizes: Sequence[int],
         alpha: float,
+        ridge_alpha_log10_min: float,
+        ridge_alpha_log10_max: float,
+        ridge_n_alphas: int,
+        ridge_scoring: str,
         learning_rate_init: float,
         max_iter: int,
         positive: bool,
@@ -620,6 +629,10 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         self.min_samples_leaf = min_samples_leaf
         self.hidden_layer_sizes = hidden_layer_sizes
         self.alpha = alpha
+        self.ridge_alpha_log10_min = ridge_alpha_log10_min
+        self.ridge_alpha_log10_max = ridge_alpha_log10_max
+        self.ridge_n_alphas = ridge_n_alphas
+        self.ridge_scoring = ridge_scoring
         self.learning_rate_init = learning_rate_init
         self.max_iter = max_iter
         self.positive = positive
@@ -645,7 +658,14 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                 make_pipeline(
                     SimpleImputer(strategy="median"),
                     StandardScaler(),
-                    RidgeCV(alphas=np.logspace(-4, 4, 50)),
+                    RidgeCV(
+                        alphas=np.logspace(
+                            self.ridge_alpha_log10_min,
+                            self.ridge_alpha_log10_max,
+                            self.ridge_n_alphas,
+                        ),
+                        scoring=self.ridge_scoring,
+                    ),
                 ),
             ),
             (
