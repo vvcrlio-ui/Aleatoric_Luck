@@ -24,6 +24,7 @@ from .common.io import (
 from .common.manifests import (
     kept_source_order,
     source_manifest_frame,
+    validate_cross_strategy_sources,
     validate_feature_manifest,
 )
 from .common.schema import FFC_MISSING_CODES, SchemaConfig, build_shared_schema
@@ -121,9 +122,6 @@ def run_pipeline(
         config=schema_config,
     )
     source_manifest = source_manifest_frame(schema)
-    output_root.mkdir(parents=True, exist_ok=True)
-    write_frame(output_root / "source_manifest.csv", source_manifest)
-    write_json(output_root / "schema.json", schema.to_dict())
 
     results = []
     for strategy in selected:
@@ -137,6 +135,10 @@ def run_pipeline(
             result.features, result.feature_manifest, id_column=id_column
         )
         results.append(result)
+    validate_cross_strategy_sources(results)
+    output_root.mkdir(parents=True, exist_ok=True)
+    write_frame(output_root / "source_manifest.csv", source_manifest)
+    write_json(output_root / "schema.json", schema.to_dict())
     input_paths = {
         "background": background_path,
         "train": train_path,

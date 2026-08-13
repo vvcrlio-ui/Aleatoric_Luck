@@ -238,6 +238,9 @@ applies:
 3. **Audit rows must be recorded**, meaning rows with `keep=false`. Such rows
    exist only in the manifest; their columns need not appear in the ARD and do
    not participate in modeling.
+4. **One sampling source contains multiple preprocessing groups**, for example
+   a value representation plus separately typed missingness indicators that
+   must follow the parent variable into or out of the model.
 
 A `continuous` or `ordinal` source must correspond to exactly one `keep=true`
 column. Therefore, one source can span multiple columns only through a
@@ -245,10 +248,11 @@ column. Therefore, one source can span multiple columns only through a
 
 | Column | Description |
 |---|---|
-| `source_column` | Name of the raw variable to which this column belongs; use the same value for multiple columns from the same variable. |
+| `source_column` | Identity of the preprocessing group. Use the same value for columns that require joint preprocessing, such as one-hot columns from one categorical variable. |
+| `sampling_source` | Optional identity of the atomic \(K\)-axis sampling unit. If the column is absent, it defaults to `source_column`. A blank `keep=false` audit cell inherits the value from kept rows in the same `source_column` group; an audit-only group falls back to `source_column`. Every `keep=true` cell must be non-empty. Give several preprocessing groups the same value when they must enter or leave the model together. |
 | `feature_name` | Column name in the ARD. |
 | `keep` | `true` to include in modeling; `false` for auditing only. |
-| `source_order` | Order among sources: an integer starting at 0 and identical within a source. |
+| `source_order` | Order among preprocessing groups: an integer starting at 0 and identical within a `source_column` group. |
 | `feature_order` | Order within a source: starts at 0 and is contiguous. |
 | `unit_type` | `continuous`, `ordinal`, or `onehot_group`. |
 | `drop_first` | Used only for one-hot rows and identical within a source; use `False` for other rows. |
@@ -260,6 +264,14 @@ column. Therefore, one source can span multiple columns only through a
 
 Leave inapplicable cells empty. Order fields need only be stable and valid; they
 do not carry substantive research meaning.
+
+`sampling_source` separates sampling from preprocessing. For example, a raw
+variable's value columns can form one `onehot_group`, while each missingness
+indicator remains a one-column `continuous` group. Assigning all of those groups
+the raw variable's `sampling_source` makes the engine count them once in \(K\)
+and select them together. `source_column` must remain distinct because groups
+with different `unit_type` or imputation behavior cannot be preprocessed as one
+group.
 
 `source_prior` is the fallback value used when a source is entirely missing from
 a training subsample. If not declared, the default is `0` for continuous sources,

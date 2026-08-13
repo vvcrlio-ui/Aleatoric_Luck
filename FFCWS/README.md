@@ -45,8 +45,11 @@ descriptive representation names in the first column.
 The analysis repeatedly varies \(N\) and \(K\), fits each model on the selected
 training data, and evaluates predictions on the predefined test sample. A
 categorical variable's encoded columns are selected together and count as one
-predictor variable. In the missingness-indicator representation, each declared
-indicator is an additional predictor variable.
+predictor variable. In the missingness-indicator representation, each retained
+indicator follows its parent source into or out of the model and does not count
+separately toward \(K\). All three representations therefore sample the same
+3,400 source variables for a given seed, draw, and \(K\), even though they
+expand those sources into different numbers of model-matrix columns.
 
 ## Reproduction
 

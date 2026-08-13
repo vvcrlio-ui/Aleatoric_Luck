@@ -139,6 +139,19 @@ This option is currently local-only. Dynamic queue/WAL planning rejects it
 explicitly; that persistence protocol is outside the prediction-export
 contract.
 
+### Result diagnostics
+
+`K_unobserved` counts selected sampling sources whose primary value
+representation has no observed value in the cell's training sample. When it
+equals `K`, the engine skips the cell as `all_selected_sources_unobserved` so
+the same gate applies across alternative representations of those sources.
+
+`K_varying` has a different definition: it counts a sampling source when any
+model-matrix column belonging to that source varies after preprocessing,
+including derived missingness-indicator columns. A source can therefore count
+as both unobserved and varying when its primary value representation is entirely
+missing but a derived indicator varies.
+
 ## Slurm execution
 
 Before submission:
@@ -205,6 +218,17 @@ tail -f NK_Grid/logs/al-nk-publish-JOB_ID_ARRAY_INDEX.out
 ```
 
 Execution records and Slurm logs are written below `NK_Grid/logs/`.
+
+The finalizer/publish command exit codes mean: `0` completed successfully
+(`missing` also returns `0` when its JSON reports missing work); `1` is an
+invalid design, duplicate/out-of-design key, identity/semantic-contract error,
+or other program failure; `3` means a shard or per-model final is
+missing/incomplete and recovery can recreate it; `4` is an environment I/O
+failure such as no space, permissions, or storage errors; `5` means another
+process already held the publication lease for that output, so this task
+published nothing. Exit code `5` is usually a duplicate submission for the same
+target and is harmless: confirm the output and its manifest exist, and rerun
+the command if they do not.
 
 In `squeue`, seed arrays are named `al-nk-grid-parallel`,
 `al-nk-grid-serial`, or `al-nk-grid-super_learner`; they are followed by

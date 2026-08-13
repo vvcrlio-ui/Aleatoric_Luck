@@ -91,10 +91,7 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(kept_source_order(results[0].feature_manifest), expected)
         self.assertEqual(kept_source_order(results[2].feature_manifest), expected)
         indicator_sources = kept_source_order(results[1].feature_manifest)
-        self.assertTrue(set(expected).issubset(indicator_sources))
-        self.assertTrue(
-            any(source.startswith("continuous__missing__") for source in indicator_sources)
-        )
+        self.assertEqual(indicator_sources, expected)
         self.assertTrue(pd.isna(results[0].features.loc[0, "X_continuous"]))
         self.assertFalse(
             any(column.startswith("M_") for column in results[0].features)
@@ -127,6 +124,9 @@ class StrategyContractTest(unittest.TestCase):
         self.assertTrue(numeric_indicators["keep"].astype(bool).all())
         self.assertTrue(numeric_indicators["unit_type"].eq("continuous").all())
         self.assertEqual(numeric_indicators["source_column"].nunique(), 2)
+        self.assertTrue(
+            numeric_indicators["sampling_source"].eq("continuous").all()
+        )
         self.assertIn("M_category__neg_1__not_asked", result.features)
         self.assertIn("M_category__neg_2__refused", result.features)
         self.assertEqual(result.features["M_category__neg_1__not_asked"].sum(), 1)

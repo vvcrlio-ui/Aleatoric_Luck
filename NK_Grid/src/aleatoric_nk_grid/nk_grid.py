@@ -100,7 +100,9 @@ from .native_process import IsolatedProcessRunner
 from .preprocessing import (
     SourceGroup,
     count_unobserved_sources,
+    count_varying_sources,
     preprocess_cell,
+    sampling_units,
 )
 from .prediction_export import (
     materialize_prediction_export_atomic,
@@ -1849,9 +1851,10 @@ class NKGridExecutionSession:
         self.frame = loaded.train
         self.external_frame = loaded.test
         self.predictors = tuple(loaded.predictors)
-        self.feature_units = tuple(group.name for group in self.source_definitions)
-        self.feature_groups = {group.name: tuple(group.features) for group in self.source_definitions}
-        self.groups_by_name = {group.name: group for group in self.source_definitions}
+        units = sampling_units(self.source_definitions)
+        self.feature_units = tuple(unit.name for unit in units)
+        self.feature_groups = {unit.name: unit.features for unit in units}
+        self.groups_by_unit = {unit.name: unit.groups for unit in units}
         self.selected_model_params = dict(selected_model_params)
         self.algorithm_version = algorithm_version
         self.split_manager = SplitIndexManager(
@@ -2053,7 +2056,11 @@ class NKGridExecutionSession:
         selected_rows = orders.row_index[: int(n_samples)]
         selected_units = [str(unit) for unit in orders.feature_names[: int(k_features)]]
         selected_cols = [feature for unit in selected_units for feature in self.feature_groups[unit]]
-        selected_groups = [self.groups_by_name[unit] for unit in selected_units]
+        selected_groups = [
+            group
+            for unit in selected_units
+            for group in self.groups_by_unit[unit]
+        ]
         test_frame = self.external_frame if indexes.external_test else self.frame
         if test_frame is None:
             raise RuntimeError("validated external test frame is missing")
@@ -2140,7 +2147,9 @@ class NKGridExecutionSession:
             prepared_cell = prepared[mode]
             diagnostics["_preprocess_vectorized"] = bool(prepared_cell.X_train.attrs.get("_preprocess_vectorized", False))
             X_prepared = prepared_cell.X_train; X_test_prepared = prepared_cell.X_test
-            diagnostics["K_varying"] = int(sum(X_prepared.loc[:, list(group.features)].nunique(dropna=True).gt(1).any() for group in selected_groups))
+            diagnostics["K_varying"] = count_varying_sources(
+                X_prepared, selected_groups
+            )
             diagnostics["underdetermined"] = bool(self.task == "regression" and model_name == "ols" and _ols_is_underdetermined(X_prepared))
             if self.task == "classification" and len(np.unique(y_sub)) < 2:
                 return result(empty_metrics, status="skipped", error="single-class training sample for classification")
@@ -2323,7 +2332,7 @@ def _run_nk_grid_locked(
     test_path = schema.test_table
     frame = loaded.train
     predictors = list(loaded.predictors)
-    feature_units = [group.name for group in source_definitions]
+    feature_units = [unit.name for unit in sampling_units(source_definitions)]
     selected_model_params = load_model_params(
         model_params_path,
         task=task,

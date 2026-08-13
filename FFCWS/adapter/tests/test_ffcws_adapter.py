@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -17,10 +18,91 @@ ADAPTER_ROOT = Path(__file__).resolve().parents[1]
 PROCESSOR_SRC = ADAPTER_ROOT / "src"
 sys.path.insert(0, str(PROCESSOR_SRC))
 
+import ffcws_data_processor.pipeline as pipeline_module
+from ffcws_data_processor.common.manifests import EncodedResult
 from ffcws_data_processor.pipeline import DEFAULT_OUTCOMES, run_pipeline
 
 
 class PipelineTest(unittest.TestCase):
+    def test_cross_strategy_source_mismatch_fails_before_writes(self):
+        n = 24
+        ids = list(range(3000, 3000 + n))
+        background = pd.DataFrame(
+            {"challengeID": ids, "continuous": np.arange(n, dtype=float)}
+        )
+        train = pd.DataFrame({"challengeID": ids[:18]})
+        test = pd.DataFrame({"challengeID": ids[18:]})
+        for outcome in DEFAULT_OUTCOMES:
+            if outcome in {"eviction", "layoff", "jobTraining"}:
+                train[outcome] = np.arange(len(train)) % 2
+                test[outcome] = np.arange(len(test)) % 2
+            else:
+                train[outcome] = np.arange(len(train), dtype=float)
+                test[outcome] = np.arange(len(test), dtype=float)
+
+        def encoded(strategy: str, source: str) -> EncodedResult:
+            features = pd.DataFrame(
+                {
+                    "challengeID": ids,
+                    "X_feature": np.arange(n, dtype=float),
+                }
+            )
+            manifest = pd.DataFrame(
+                {
+                    "source_column": [source],
+                    "sampling_source": [source],
+                    "feature_name": ["X_feature"],
+                    "keep": [True],
+                    "source_order": [0],
+                    "feature_order": [0],
+                    "unit_type": ["continuous"],
+                    "drop_first": [False],
+                    "is_reference": [False],
+                    "reference_level": [np.nan],
+                    "level_value": [np.nan],
+                    "ordinal_levels": [np.nan],
+                    "source_prior": [0.0],
+                }
+            )
+            return EncodedResult(strategy, features, manifest)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            background_path = root / "background.dta"
+            train_path = root / "train.csv"
+            test_path = root / "test.csv"
+            config_path = root / "config.yaml"
+            background.to_stata(background_path, write_index=False)
+            train.to_csv(train_path, index=False)
+            test.to_csv(test_path, index=False)
+            config = {
+                "contract_version": "ffcws-adapter-v1",
+                "split_mode": "external_test",
+                "feature_universe_mode": "train_pool_screened",
+                "paths": {
+                    "background": str(background_path),
+                    "train": str(train_path),
+                    "test": str(test_path),
+                    "output_root": str(root / "output"),
+                },
+                "id_column": "challengeID",
+                "outcomes": list(DEFAULT_OUTCOMES),
+                "strategies": ["first", "second"],
+                "missing_value_codes": list(range(-9, 0)),
+                "exchangeability_justification": "Synthetic source-order check.",
+                "schema": {},
+                "unknown_rate_threshold": 0.95,
+            }
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            strategies = {
+                "first": lambda *_args, **_kwargs: encoded("first", "left"),
+                "second": lambda *_args, **_kwargs: encoded("second", "right"),
+            }
+            with patch.object(pipeline_module, "STRATEGIES", strategies):
+                with self.assertRaisesRegex(ValueError, "different canonical source"):
+                    run_pipeline(config_path)
+            self.assertFalse((root / "output").exists())
+
     def test_end_to_end_outputs_and_content_identity_are_deterministic(self):
         n = 120
         ids = list(range(2000, 2000 + n))
@@ -131,6 +213,10 @@ class PipelineTest(unittest.TestCase):
                 )
                 expected_sources = 4 if strategy == "median_missing_indicator" else 2
                 self.assertEqual(len(groups), expected_sources)
+                self.assertEqual(
+                    len({group.sampling_source or group.name for group in groups}),
+                    2,
+                )
                 self.assertEqual(len(validated.train), 99)
                 self.assertEqual(len(validated.test), 19)
                 self.assertIn("gpa", validated.train)

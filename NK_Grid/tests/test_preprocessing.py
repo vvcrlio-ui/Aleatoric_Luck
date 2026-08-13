@@ -8,8 +8,11 @@ import pytest
 
 import aleatoric_nk_grid.preprocessing as preprocessing
 from aleatoric_nk_grid.preprocessing import (
+    SamplingUnit,
     SourceGroup,
+    count_varying_sources,
     preprocess_cell,
+    sampling_units,
     source_groups,
     validate_onehot_states,
 )
@@ -149,6 +152,85 @@ def test_fully_unobserved_source_forces_same_prior_on_train_and_test():
     assert result.X_test["x"].tolist() == [10.0, 10.0]
 
 
+def _derived_source_groups() -> tuple[SourceGroup, ...]:
+    return (
+        SourceGroup(
+            "value", ("x",), 0, "continuous", source_prior=10.0,
+            sampling_source="value",
+        ),
+        SourceGroup(
+            "value__missing", ("m",), 1, "continuous", source_prior=0.0,
+            sampling_source="value",
+        ),
+    )
+
+
+def test_sampling_unit_primary_requires_named_parent_group():
+    groups = _derived_source_groups()
+    unit = SamplingUnit("value", groups)
+    assert unit.primary is groups[0]
+    with pytest.raises(ValueError, match="has no primary group"):
+        SamplingUnit("missing", groups[1:]).primary
+
+
+def test_derived_indicator_follows_parent_sampling_source():
+    groups = _derived_source_groups()
+    units = sampling_units(groups)
+    assert [(unit.name, unit.features) for unit in units] == [
+        ("value", ("x", "m"))
+    ]
+
+    train = pd.DataFrame({"x": [np.nan, np.nan], "m": [1.0, 1.0]})
+    test = pd.DataFrame({"x": [999.0, np.nan], "m": [0.0, 1.0]})
+    result = preprocess_cell(train, test, groups, IMPUTATION, model_name="ols")
+    assert result.K_unobserved == 1
+    assert result.X_train["x"].tolist() == [10.0, 10.0]
+    assert result.X_test["x"].tolist() == [10.0, 10.0]
+    assert result.X_test["m"].tolist() == [0.0, 1.0]
+    assert count_varying_sources(result.X_test, groups) == 1
+
+
+def test_derived_source_k_unobserved_matches_all_preprocessing_paths():
+    groups = _derived_source_groups()
+    train = pd.DataFrame(
+        {"x": [np.nan, np.nan], "m": [0.0, 1.0]}, dtype=float
+    )
+    test = pd.DataFrame({"x": [999.0], "m": [0.0]}, dtype=float)
+    reference = preprocessing._preprocess_cell_reference(
+        train, test, groups, IMPUTATION, model_name="ols"
+    )
+    vectorized = preprocessing._preprocess_cell_vectorized(
+        train, test, groups, IMPUTATION
+    )
+    pd.testing.assert_frame_equal(
+        vectorized.X_train, reference.X_train, check_exact=True
+    )
+    pd.testing.assert_frame_equal(
+        vectorized.X_test, reference.X_test, check_exact=True
+    )
+
+    mixed_train = train.astype({"m": "int8"})
+    mixed_test = test.astype({"m": "int8"})
+    mixed_reference = preprocessing._preprocess_cell_reference(
+        mixed_train, mixed_test, groups, IMPUTATION, model_name="ols"
+    )
+    mixed = preprocessing._preprocess_cell_vectorized_mixed(
+        mixed_train, mixed_test, groups, IMPUTATION
+    )
+    pd.testing.assert_frame_equal(
+        mixed.X_train, mixed_reference.X_train, check_exact=True
+    )
+    pd.testing.assert_frame_equal(
+        mixed.X_test, mixed_reference.X_test, check_exact=True
+    )
+    assert {
+        reference.K_unobserved,
+        vectorized.K_unobserved,
+        mixed_reference.K_unobserved,
+        mixed.K_unobserved,
+    } == {1}
+
+
 def test_passthrough_forces_both_sides_to_nan_for_unobserved_source():
     groups = source_groups(["x"], _manifest().iloc[[0]].copy())
     train = pd.DataFrame({"x": [np.nan, np.nan]})
@@ -230,6 +312,66 @@ def test_manifest_source_order_and_type_must_be_consistent():
     manifest.loc[3, "unit_type"] = "continuous"
     with pytest.raises(ValueError, match="inconsistent unit_type"):
         source_groups(["x", "o", "c0", "c1"], manifest)
+
+
+def test_manifest_sampling_source_must_be_nonempty_and_consistent():
+    manifest = _manifest()
+    manifest["sampling_source"] = manifest["source_column"]
+    manifest.loc[0, "sampling_source"] = np.nan
+    with pytest.raises(ValueError, match="sampling_source must not be empty"):
+        source_groups(["x", "o", "c0", "c1"], manifest)
+
+    manifest = _manifest()
+    manifest["sampling_source"] = manifest["source_column"]
+    manifest.loc[3, "sampling_source"] = "other"
+    with pytest.raises(ValueError, match="inconsistent sampling_source"):
+        source_groups(["x", "o", "c0", "c1"], manifest)
+
+
+def test_manifest_sampling_source_rejects_orphan_parent():
+    manifest = _manifest()
+    manifest["sampling_source"] = manifest["source_column"]
+    manifest.loc[0, "sampling_source"] = "missing_parent"
+    with pytest.raises(ValueError, match="missing_parent"):
+        source_groups(["x", "o", "c0", "c1"], manifest)
+
+
+def test_audit_sampling_source_may_be_empty():
+    kept = _manifest().iloc[[0]].copy()
+    kept["sampling_source"] = kept["source_column"]
+    audit = kept.copy()
+    audit.loc[:, "source_column"] = "audit_only"
+    audit.loc[:, "sampling_source"] = np.nan
+    audit.loc[:, "feature_name"] = "audit_feature"
+    audit.loc[:, "keep"] = False
+    audit.loc[:, "source_order"] = 1
+    groups = source_groups(["x"], pd.concat([kept, audit], ignore_index=True))
+    assert [group.name for group in groups] == ["continuous"]
+
+
+def test_audit_sampling_source_inherits_kept_group_parent():
+    parent = _manifest().iloc[[0]].copy()
+    parent.loc[:, "source_column"] = "parent"
+    parent.loc[:, "sampling_source"] = "parent"
+    parent.loc[:, "feature_name"] = "x"
+
+    derived = parent.copy()
+    derived.loc[:, "source_column"] = "parent__missing"
+    derived.loc[:, "sampling_source"] = "parent"
+    derived.loc[:, "feature_name"] = "m"
+    derived.loc[:, "source_order"] = 1
+
+    audit = derived.copy()
+    audit.loc[:, "sampling_source"] = np.nan
+    audit.loc[:, "feature_name"] = "m_audit"
+    audit.loc[:, "keep"] = False
+    audit.loc[:, "feature_order"] = 1
+
+    groups = source_groups(
+        ["x", "m"], pd.concat([parent, derived, audit], ignore_index=True)
+    )
+    assert [group.name for group in groups] == ["parent", "parent__missing"]
+    assert groups[1].sampling_source == "parent"
 
 
 def _equivalence_groups(k: int) -> tuple[SourceGroup, ...]:

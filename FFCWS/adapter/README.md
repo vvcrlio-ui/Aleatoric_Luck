@@ -21,7 +21,7 @@ discarding a family merely because another outcome is unavailable.
 | Representation used in research text | Configuration ID | Definition |
 |---|---|---|
 | One-hot representation with within-sample imputation | `median_mode` | Continuous variables remain numeric. Each categorical variable becomes a grouped set of indicator columns. Imputation values are estimated within each selected training sample. |
-| One-hot representation with missingness indicators | `median_missing_indicator` | Uses the same value representation and adds screened binary indicators for missing source values. Each declared missingness indicator counts as a separate predictor variable. |
+| One-hot representation with missingness indicators | `median_missing_indicator` | Uses the same value representation and adds screened binary indicators for missing source values. Each indicator follows its parent source and does not count separately toward \(K\). |
 | Ordinal representation for categorical variables | `tree_ordinal` | Continuous variables remain numeric. Categorical values receive stable integer codes learned from the predefined training sample. |
 
 The configuration IDs are used in file and command names only. Manuscripts and
@@ -34,10 +34,11 @@ exclusively from the training sample.
 
 For both one-hot representations, all columns derived from one categorical
 variable enter or leave the analysis together. They therefore count as one
-predictor variable in \(K\). The missingness-indicator representation counts
-each separately declared indicator as one additional predictor variable.
-Consequently, equal values of \(K\) may represent different source information
-across the three representations.
+predictor variable in \(K\). Missingness indicators also enter or leave with
+their parent source. Consequently, the three representations use the same
+3,400 source-variable sampling units, and equal values of \(K\) select the same
+underlying source information for a given seed and draw. The resulting model
+matrices can still contain different numbers of expanded columns.
 
 ## Inputs and generated files
 

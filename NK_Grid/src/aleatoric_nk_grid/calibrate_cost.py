@@ -50,7 +50,7 @@ from .nk_grid import (
     draw_orders,
     split_frame,
 )
-from .preprocessing import preprocess_cell, source_groups
+from .preprocessing import preprocess_cell, sampling_units, source_groups
 from .validate_input import canonical_feature_universe, validate_input
 
 
@@ -780,7 +780,7 @@ class CalibrationSession:
     groups: tuple[Any, ...]
     feature_units: tuple[str, ...]
     feature_groups: dict[str, tuple[str, ...]]
-    groups_by_name: dict[str, Any]
+    groups_by_unit: dict[str, tuple[Any, ...]]
     imputation: Mapping[str, Any]
     split: SplitData
     model_params: dict[str, dict[str, Any]]
@@ -831,9 +831,10 @@ def build_session(
     )
     task = loaded.schema.task
     predictors = list(loaded.predictors)
-    feature_units = tuple(group.name for group in groups)
-    feature_groups = {group.name: tuple(group.features) for group in groups}
-    groups_by_name = {group.name: group for group in groups}
+    units = sampling_units(groups)
+    feature_units = tuple(unit.name for unit in units)
+    feature_groups = {unit.name: unit.features for unit in units}
+    groups_by_unit = {unit.name: unit.groups for unit in units}
     split = split_frame(
         loaded.train, predictors, outcome, test_size=test_size, seed=seed, task=task
     )
@@ -852,7 +853,7 @@ def build_session(
         groups=groups,
         feature_units=feature_units,
         feature_groups=feature_groups,
-        groups_by_name=groups_by_name,
+        groups_by_unit=groups_by_unit,
         imputation=loaded.schema.imputation,
         split=split,
         model_params=model_params,
@@ -884,7 +885,11 @@ def _measure_one_cell_in_process(
         for unit in selected_units
         for feature in session.feature_groups[unit]
     ]
-    selected_groups = [session.groups_by_name[unit] for unit in selected_units]
+    selected_groups = [
+        group
+        for unit in selected_units
+        for group in session.groups_by_unit[unit]
+    ]
 
     X_sub_raw = session.split.X_train.loc[selected_rows, selected_cols]
     y_sub = session.split.y_train.loc[selected_rows]

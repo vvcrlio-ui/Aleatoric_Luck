@@ -91,6 +91,41 @@ class SourceGroup:
     level_values: tuple[Any, ...] = ()
     ordinal_levels: tuple[Any, ...] = ()
     source_prior: Any = None
+    sampling_source: str | None = None
+
+
+@dataclass(frozen=True)
+class SamplingUnit:
+    """One K-axis unit containing all preprocessing groups from one source."""
+
+    name: str
+    groups: tuple[SourceGroup, ...]
+
+    @property
+    def primary(self) -> SourceGroup:
+        for group in self.groups:
+            if group.name == self.name:
+                return group
+        raise ValueError(f"sampling source {self.name!r} has no primary group")
+
+    @property
+    def features(self) -> tuple[str, ...]:
+        return tuple(
+            feature for group in self.groups for feature in group.features
+        )
+
+
+def sampling_units(groups: Sequence[SourceGroup]) -> tuple[SamplingUnit, ...]:
+    """Bundle derived columns that must enter whenever their source is sampled."""
+
+    bundled: dict[str, list[SourceGroup]] = {}
+    for group in sorted(groups, key=lambda item: item.source_order):
+        source = group.sampling_source or group.name
+        bundled.setdefault(source, []).append(group)
+    return tuple(
+        SamplingUnit(name=source, groups=tuple(source_groups))
+        for source, source_groups in bundled.items()
+    )
 
 
 def source_groups(
@@ -116,9 +151,18 @@ def source_groups(
     if missing:
         raise ValueError(f"Feature manifest is missing columns: {missing}")
     normalized = manifest.copy()
+    if "sampling_source" not in normalized:
+        normalized["sampling_source"] = normalized["source_column"]
     keep = normalized["keep"].map(
         lambda value: _as_bool(value, "manifest.keep")
     )
+    sampling_source = normalized["sampling_source"]
+    kept_sampling_source = sampling_source.loc[keep]
+    if (
+        kept_sampling_source.isna().any()
+        or kept_sampling_source.astype(str).str.strip().eq("").any()
+    ):
+        raise ValueError("manifest.sampling_source must not be empty")
     for field in ("source_order", "feature_order"):
         normalized[field] = pd.to_numeric(
             normalized[field], errors="raise"
@@ -126,6 +170,20 @@ def source_groups(
         if (normalized[field] < 0).any():
             raise ValueError(f"manifest.{field} must be non-negative")
     kept_sources = set(normalized.loc[keep, "source_column"].astype(str))
+    audit_missing = (~keep) & (
+        sampling_source.isna()
+        | sampling_source.astype(str).str.strip().eq("")
+    )
+    for source, audit_rows in normalized.loc[audit_missing].groupby(
+        "source_column", sort=False
+    ):
+        kept_rows = normalized.loc[
+            keep & normalized["source_column"].eq(source), "sampling_source"
+        ]
+        normalized.loc[audit_rows.index, "sampling_source"] = (
+            kept_rows.iloc[0] if not kept_rows.empty else source
+        )
+    normalized["sampling_source"] = normalized["sampling_source"].astype(str)
     source_order_owners: dict[int, str] = {}
     for source, all_rows in normalized.groupby("source_column", sort=False):
         source = str(source)
@@ -143,6 +201,9 @@ def source_groups(
         source_order_owners[order] = source
         if len(all_rows["unit_type"].astype(str).unique()) != 1:
             raise ValueError(f"source {source!r} has inconsistent unit_type")
+        sampling_sources = all_rows["sampling_source"].astype(str).unique()
+        if len(sampling_sources) != 1:
+            raise ValueError(f"source {source!r} has inconsistent sampling_source")
         drop_values = all_rows["drop_first"].map(
             lambda value: _as_bool(value, "manifest.drop_first")
         )
@@ -307,6 +368,7 @@ def source_groups(
                 features=features,
                 source_order=source_order,
                 unit_type=unit_type,
+                sampling_source=str(rows["sampling_source"].iloc[0]),
                 drop_first=drop_first,
                 reference_feature=reference_feature,
                 reference_level=reference_level,
@@ -316,6 +378,15 @@ def source_groups(
             )
         )
     groups.sort(key=lambda group: group.source_order)
+    names = {group.name for group in groups}
+    orphans = sorted(
+        {group.sampling_source for group in groups if group.sampling_source}
+        - names
+    )
+    if orphans:
+        raise ValueError(
+            f"manifest.sampling_source has no kept source_column: {orphans[0]!r}"
+        )
     return tuple(groups)
 
 
@@ -355,9 +426,30 @@ def _source_observed(frame: pd.DataFrame, group: SourceGroup) -> pd.Series:
 def count_unobserved_sources(
     frame: pd.DataFrame, groups: Sequence[SourceGroup]
 ) -> int:
-    """Count selected sources with no observation in one training cell."""
+    """Count sampled sources whose own value representation is unobserved."""
 
-    return int(sum(not _source_observed(frame, group).any() for group in groups))
+    return int(
+        sum(
+            not _source_observed(frame, unit.primary).any()
+            for unit in sampling_units(groups)
+        )
+    )
+
+
+def count_varying_sources(
+    frame: pd.DataFrame, groups: Sequence[SourceGroup]
+) -> int:
+    """Count sampled sources with variation in at least one derived column."""
+
+    return int(
+        sum(
+            frame.loc[:, list(unit.features)]
+            .nunique(dropna=True)
+            .gt(1)
+            .any()
+            for unit in sampling_units(groups)
+        )
+    )
 
 
 def _reference_vector(group: SourceGroup) -> np.ndarray:
@@ -457,7 +549,8 @@ def _preprocess_cell_reference(
     for group in groups:
         observed = _source_observed(train, group)
         if not observed.any():
-            unobserved += 1
+            if (group.sampling_source or group.name) == group.name:
+                unobserved += 1
             if passthrough:
                 train.loc[:, list(group.features)] = np.nan
                 test.loc[:, list(group.features)] = np.nan
@@ -615,7 +708,8 @@ def _preprocess_cell_vectorized(
         missing = np.isnan(train_group).all(axis=1)
         observed = ~missing
         if not observed.any():
-            unobserved += 1
+            if (group.sampling_source or group.name) == group.name:
+                unobserved += 1
             if group.unit_type == "onehot_group":
                 prior = _reference_vector(group)
                 train_values[:, group_positions] = prior
@@ -706,7 +800,8 @@ def _preprocess_cell_vectorized_mixed(
         missing = pd.isna(train_group).all(axis=1)
         observed = ~missing
         if not observed.any():
-            unobserved += 1
+            if (group.sampling_source or group.name) == group.name:
+                unobserved += 1
             if group.unit_type == "onehot_group":
                 fill = _reference_vector(group)
                 for feature, value in zip(features, fill):

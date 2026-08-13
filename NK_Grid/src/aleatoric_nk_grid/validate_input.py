@@ -34,6 +34,12 @@ def canonical_feature_universe(
         "sources": [
             {
                 "source": group.name,
+                **(
+                    {"sampling_source": group.sampling_source}
+                    if group.sampling_source
+                    and group.sampling_source != group.name
+                    else {}
+                ),
                 "source_order": group.source_order,
                 "unit_type": group.unit_type,
                 "features": [
@@ -90,6 +96,12 @@ def canonical_feature_universe(
             result["audit_features"] = [
                 {
                     "source": str(row.source_column),
+                    **(
+                        {"sampling_source": str(row.sampling_source)}
+                        if hasattr(row, "sampling_source")
+                        and str(row.sampling_source) != str(row.source_column)
+                        else {}
+                    ),
                     "feature": str(row.feature_name),
                     "source_order": int(row.source_order),
                     "feature_order": int(row.feature_order),
