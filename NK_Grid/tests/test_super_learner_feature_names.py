@@ -70,12 +70,13 @@ def _data(task: str) -> tuple[pd.DataFrame, np.ndarray]:
 @pytest.mark.parametrize("task", ["regression", "classification"])
 def test_super_learner_lightgbm_uses_feature_names_consistently(task):
     X, y = _data(task)
+    params = _super_learner_params(task)
     model = make_model(
         "super_learner",
         seed=17,
         n_jobs=1,
         task=task,
-        params=_super_learner_params(task),
+        params=params,
     )
 
     with warnings.catch_warnings(record=True) as caught:
@@ -86,6 +87,18 @@ def test_super_learner_lightgbm_uses_feature_names_consistently(task):
         else:
             model.predict(X.iloc[:6])
             model.predict_proba(X.iloc[:6])
+
+    if task == "regression":
+        fitted_ridge = model.model_.named_estimators_["ridge"].named_steps["ridgecv"]
+        np.testing.assert_allclose(
+            fitted_ridge.alphas,
+            np.logspace(
+                params["ridge_alpha_log10_min"],
+                params["ridge_alpha_log10_max"],
+                params["ridge_n_alphas"],
+            ),
+        )
+        assert fitted_ridge.scoring == params["ridge_scoring"]
 
     target = [
         item

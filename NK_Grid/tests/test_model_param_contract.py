@@ -25,6 +25,18 @@ MODEL_PARAM_PATHS = (
 )
 REMOVED_MODELS = tuple(sorted(REMOVED_MODEL_NAMES))
 EXPECTED_REMOVED_MODEL_COUNT = 2
+EXPECTED_RIDGE_GRID = {
+    "alpha_log10_min": -4,
+    "alpha_log10_max": 6,
+    "n_alphas": 63,
+    "scoring": "neg_mean_squared_error",
+}
+EXPECTED_SUPER_LEARNER_RIDGE_GRID = {
+    "ridge_alpha_log10_min": -4,
+    "ridge_alpha_log10_max": 6,
+    "ridge_n_alphas": 63,
+    "ridge_scoring": "neg_mean_squared_error",
+}
 
 
 def _document() -> dict:
@@ -55,6 +67,18 @@ def test_cv_regressor_missing_required_parameter_fails_at_load_time(tmp_path):
         load_model_params(path, task="regression", models=("xgboost",))
 
 
+def test_super_learner_missing_ridge_grid_fails_at_load_time(tmp_path):
+    document = _document()
+    document["regression"]["super_learner"].pop("ridge_n_alphas")
+    path = tmp_path / "params.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match=r"Missing required parameters.*ridge_n_alphas",
+    ):
+        load_model_params(path, task="regression", models=("super_learner",))
+
+
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
 def test_ridge_rejects_removed_max_cv_folds_at_load_time(tmp_path, params_path):
     document = yaml.safe_load(params_path.read_text(encoding="utf-8"))
@@ -78,7 +102,7 @@ def test_locked_cv_regression_parameters_load_with_rmse():
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
 @pytest.mark.parametrize("task", ["regression", "classification"])
 def test_model_param_contract_covers_model_space_exactly(params_path, task):
-    assert load_algorithm_version(params_path) == "nk-grid-v5-adapter-5"
+    assert load_algorithm_version(params_path) == "nk-grid-v5-adapter-6"
     document = yaml.safe_load(params_path.read_text(encoding="utf-8"))
     assert set(document[task]) == set(SUPPORTED_MODEL_NAMES)
     selected = load_model_params(
@@ -88,6 +112,20 @@ def test_model_param_contract_covers_model_space_exactly(params_path, task):
     )
     assert len(MODEL_NAMES) == 9
     assert set(selected) == set(MODEL_NAMES)
+
+
+@pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
+def test_regression_ridge_grids_are_consistent_across_parameter_files(params_path):
+    selected = load_model_params(
+        params_path,
+        task="regression",
+        models=("ridge", "super_learner"),
+    )
+    assert selected["ridge"] == EXPECTED_RIDGE_GRID
+    assert {
+        key: selected["super_learner"][key]
+        for key in EXPECTED_SUPER_LEARNER_RIDGE_GRID
+    } == EXPECTED_SUPER_LEARNER_RIDGE_GRID
 
 
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)

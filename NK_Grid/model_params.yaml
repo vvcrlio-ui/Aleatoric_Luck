@@ -1,12 +1,12 @@
-algorithm_version: nk-grid-v5-adapter-5
+algorithm_version: nk-grid-v5-adapter-6
 
 regression:
   ols:
     fit_intercept: true
   ridge:
     alpha_log10_min: -4
-    alpha_log10_max: 4
-    n_alphas: 50
+    alpha_log10_max: 6
+    n_alphas: 63
     scoring: neg_mean_squared_error
   lasso:
     alpha_log10_min: -4
@@ -37,6 +37,10 @@ regression:
   super_learner:
     cv: 5
     passthrough: false
+    ridge_alpha_log10_min: -4
+    ridge_alpha_log10_max: 6
+    ridge_n_alphas: 63
+    ridge_scoring: neg_mean_squared_error
     n_estimators: 500
     max_features: sqrt
     min_samples_leaf: 5

@@ -141,10 +141,10 @@ def test_explicit_identity_versions_prevent_checkpoint_aliasing(tmp_path):
     )
     first = replace(
         _config(schema, tmp_path / "one.csv"),
-        model_spec_version="nkgrid-models-v1",
+        model_spec_version="nkgrid-models-v2",
     )
     run_nk_grid(first)
-    second = replace(first, model_spec_version="nkgrid-models-v2")
+    second = replace(first, model_spec_version="nkgrid-models-v3")
     with pytest.raises(ValueError, match=r"identity\.model_spec_version"):
         run_nk_grid(second)
 

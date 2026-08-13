@@ -56,7 +56,7 @@ model_params: model_params.yaml
 preset: dev
 experiment_id: smr-smoke-v1
 data_version: smr-ard-v1
-model_spec_version: nkgrid-models-v1
+model_spec_version: nkgrid-models-v3
 
 panels:
   - name: smr_smoke
