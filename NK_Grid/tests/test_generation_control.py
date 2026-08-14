@@ -24,7 +24,7 @@ from aleatoric_nk_grid.generation_control import (
     validate_exact_verification_receipt,
     _write_temp_fsync_rename,
 )
-from aleatoric_nk_grid.execution_contract import canonical_json_bytes
+from aleatoric_nk_grid.execution_contract import canonical_json_bytes, sha256_bytes
 
 
 def _target(*, generation: str = "g1", pointer_version: int = 0) -> ActivationTarget:
@@ -364,6 +364,37 @@ def test_exact_verification_receipt_rejects_every_stale_or_tampered_binding(
             expected_dispatch=dispatch,
             sealed_history_digest_sha256=history_digest,
         )
+
+
+def test_immutable_publish_creates_missing_target_and_returns_content_sha256(tmp_path: Path, monkeypatch):
+    target = tmp_path / "control.json"
+    payload = {"value": 1}
+    data = canonical_json_bytes(payload) + b"\n"
+    calls: list[Path] = []
+    module = __import__(
+        "aleatoric_nk_grid.generation_control", fromlist=["_fsync_directory"]
+    )
+    original = module._fsync_directory
+
+    def counted(directory: Path) -> None:
+        calls.append(Path(directory))
+        original(directory)
+
+    monkeypatch.setattr(module, "_fsync_directory", counted)
+
+    assert _write_temp_fsync_rename(target, payload) == sha256_bytes(data)
+    assert target.read_bytes() == data
+    assert calls == [target.parent]
+    assert not list(tmp_path.glob(".*.tmp.*"))
+
+
+def test_immutable_publish_same_payload_is_idempotent(tmp_path: Path):
+    target = tmp_path / "control.json"
+    payload = {"value": 1}
+    expected = _write_temp_fsync_rename(target, payload)
+
+    assert _write_temp_fsync_rename(target, payload) == expected
+    assert target.read_bytes() == canonical_json_bytes(payload) + b"\n"
 
 
 def test_immutable_publish_never_replaces_a_between_check_and_rename_conflict(tmp_path: Path):
