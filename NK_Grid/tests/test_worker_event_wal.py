@@ -1141,6 +1141,52 @@ prepare_round(
     _assert_recovered_assignment_matches_frozen_intent(snapshot, output_root, plan, generation="g1")
 
 
+def test_real_process_crash_after_parent_fsync_leaves_target_and_temp_then_recovery_cleans_it(
+    tmp_path: Path,
+):
+    snapshot, plan = _fault_plan(tmp_path, rows=12, workers=3)
+    output_root = tmp_path / "out"
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), environment.get("PYTHONPATH", "")]
+    )
+    crash_program = """
+import os
+import sys
+from pathlib import Path
+from aleatoric_nk_grid.flat_task_table import prepare_round
+
+def fault(label):
+    if label == 'after_parent_fsync':
+        os._exit(137)
+
+prepare_round(
+    Path(sys.argv[1]), round_index=1, prep_token='job-1', prep_job_id='job-1',
+    submission_generation='g1', expected_pointer_version=0, fault=fault,
+)
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", crash_program, str(snapshot)],
+        capture_output=True, text=True, env=environment, check=False,
+    )
+    assert crashed.returncode == 137
+    orphaned = sorted(path for path in output_root.rglob("*") if ".tmp." in path.name)
+    assert orphaned
+    for orphan in orphaned:
+        target_name = orphan.name[1:].split(".tmp.", 1)[0]
+        assert (orphan.parent / target_name).is_file()
+
+    recovered = recover_generation_activation(
+        snapshot, round_index=1, submission_generation="g1",
+        expected_prep_token="job-1", prep_job_id="job-1", expected_pointer_version=0,
+    )
+    assert recovered.is_file()
+    assert not [path for path in output_root.rglob("*") if ".tmp." in path.name]
+    assert not [path for path in output_root.rglob("*") if ".staging" in path.name]
+    _assert_recovered_assignment_matches_frozen_intent(snapshot, output_root, plan, generation="g1")
+
+
 @pytest.mark.parametrize(
     "fault_label",
     [

@@ -9,9 +9,7 @@ stable analysis schedule lease.
 
 from __future__ import annotations
 
-import ctypes
 import errno
-import sys
 import fcntl
 import hashlib
 import json
@@ -166,36 +164,17 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _rename_noreplace(source: Path, target: Path) -> None:
-    """Atomically publish a filename only if it does not yet exist.
+def _link_noreplace(source: Path, target: Path) -> None:
+    """Atomically publish target without replacing an existing entry.
 
-    Plain POSIX ``rename`` replaces an existing target, so it cannot publish
-    immutable control records.  Linux has ``renameat2(RENAME_NOREPLACE)`` and
-    macOS has ``renamex_np(RENAME_EXCL)``; unsupported filesystems fail closed
-    instead of silently falling back to link/unlink or replace semantics.
+    POSIX ``link()`` creates the new directory entry atomically and fails with
+    ``EEXIST`` when the name already exists, which is exactly the immutable-
+    record guarantee this module needs.  ``renameat2(RENAME_NOREPLACE)`` has
+    the same semantics but requires filesystem support that GPFS does not
+    provide.
     """
 
-    libc = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source)
-    target_bytes = os.fsencode(target)
-    if sys.platform == "darwin":
-        operation = getattr(libc, "renamex_np", None)
-        if operation is None:
-            raise ControlProtocolError("atomic no-replace rename is unavailable")
-        result = operation(source_bytes, target_bytes, 0x00000004)  # RENAME_EXCL
-    elif sys.platform.startswith("linux"):
-        operation = getattr(libc, "renameat2", None)
-        if operation is None:
-            raise ControlProtocolError("atomic no-replace rename is unavailable")
-        result = operation(-100, source_bytes, -100, target_bytes, 1)  # AT_FDCWD, RENAME_NOREPLACE
-    else:
-        raise ControlProtocolError("atomic no-replace rename is unavailable")
-    if result == 0:
-        return
-    error = ctypes.get_errno()
-    if error == errno.EEXIST:
-        raise FileExistsError(error, os.strerror(error), target)
-    raise ControlProtocolError(f"atomic no-replace rename failed for {target}: {os.strerror(error)}")
+    os.link(source, target)
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -218,7 +197,22 @@ def _write_temp_fsync_rename(
     *,
     fault: Callable[[str], None] | None = None,
 ) -> str:
-    """Publish one immutable canonical JSON record, preserving crash evidence."""
+    """Publish one immutable canonical JSON record, preserving crash evidence.
+
+    ``link()`` publishes the target while retaining the temporary directory
+    entry until the parent directory has been fsynced.  A crash in that small
+    window can therefore leave both names visible.  Prep/activation recovery
+    removes those exact temporary names before classification.  Closed and
+    verification records have no corresponding recovery cleanup entry, so a
+    crash in the same window can leave a hidden ``.<name>.tmp.<uuid>`` file;
+    this is accepted because it matches neither ``glob("*.json")`` nor
+    ``glob("*/round-*/generation-*/generation.closed.json")`` nor
+    ``glob("worker-*.events.wal")``, does not participate in protocol
+    decisions, is outside finalization's temporary directory accounting, and
+    is only a few hundred bytes.  A future policy forbidding every ``.tmp.*``
+    residue would need a separate cleanup design that respects the close and
+    verification lock boundaries.
+    """
 
     target = Path(path)
     data = canonical_json_bytes(dict(payload)) + b"\n"
@@ -246,7 +240,7 @@ def _write_temp_fsync_rename(
             fault("after_file_fsync")
             fault("before_rename")
         try:
-            _rename_noreplace(temporary, target)
+            _link_noreplace(temporary, target)
         except FileExistsError:
             temporary.unlink(missing_ok=True)
             existing = target.read_bytes()
@@ -260,6 +254,7 @@ def _write_temp_fsync_rename(
         _fsync_directory(target.parent)
         if fault is not None:
             fault("after_parent_fsync")
+        temporary.unlink(missing_ok=True)
         return sha256_bytes(data)
     except BaseException:
         temporary.unlink(missing_ok=True)
