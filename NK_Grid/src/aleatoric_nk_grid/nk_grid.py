@@ -511,7 +511,12 @@ def log2_size_grid(
     *,
     min_size: int = 1,
 ) -> np.ndarray:
-    """Return unique integer sizes on the shared base-2 log grid."""
+    """Return exactly ``n_sizes`` distinct integer sizes spanning ``[min_size, upper]``.
+
+    Sizes follow a base-2 log grid; rounding collisions are shifted to the nearest
+    free integer, both endpoints are exact, and an interval too small to hold
+    ``n_sizes`` distinct integers raises ``ValueError``.
+    """
 
     if total < 1:
         raise ValueError("total must be at least 1")
@@ -526,17 +531,21 @@ def log2_size_grid(
         )
     if n_sizes == 1:
         return np.array([upper], dtype=int)
-    return np.unique(
-        np.clip(
-            np.round(
-                np.logspace(
-                    np.log2(min_size), np.log2(upper), num=n_sizes, base=2
-                )
-            ).astype(int),
-            min_size,
-            upper,
+    if upper - min_size + 1 < n_sizes:
+        raise ValueError(
+            f"cannot place {n_sizes} distinct integer sizes in [{min_size}, {upper}]"
         )
-    )
+    ideal = np.round(
+        np.logspace(np.log2(min_size), np.log2(upper), num=n_sizes, base=2)
+    ).astype(int)
+    out = ideal.copy()
+    out[0] = min_size
+    for i in range(1, n_sizes):
+        out[i] = max(ideal[i], out[i - 1] + 1)
+    out[-1] = upper
+    for i in range(n_sizes - 2, -1, -1):
+        out[i] = min(out[i], out[i + 1] - 1)
+    return out
 
 
 def split_frame(
