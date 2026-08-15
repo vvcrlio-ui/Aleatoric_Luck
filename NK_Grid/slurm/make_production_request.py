@@ -69,6 +69,11 @@ def main(argv: list[str]) -> None:
     config_json = run_panels.config_to_json(config)
     config_json["out"] = str(root_path / "final.csv")
     config_json["n_jobs"] = 1
+    # The production design is ~17.1M model cells against a 250,000 guard
+    # (nk_grid.LARGE_RUN_THRESHOLD).  The guard fires only after the task table
+    # has already been written, so leaving it unset wastes the whole planning
+    # job before failing.  This script exists to authorize exactly that size.
+    config_json["allow_large_run"] = True
 
     schema_path = Path(str(config_json["schema"]))
     if not schema_path.is_absolute():
