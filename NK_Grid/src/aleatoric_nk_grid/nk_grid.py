@@ -1,6 +1,7 @@
 """Joint N x K sweeps for long-format prediction quality tables."""
 
 from __future__ import annotations
+from .grid_contract import validate_size_grid
 
 import argparse
 import json
@@ -1297,6 +1298,9 @@ def validate_prediction_export_grid(
 def _validate_config(config: NKGridConfig) -> None:
     """Reject invalid run controls before dry-run arithmetic or data loading."""
 
+    for name in ("n_grid", "k_grid"):
+        if getattr(config, name) is not None:
+            validate_size_grid(getattr(config, name), name)
     for field in (
         "n_seeds",
         "n_draws",
@@ -1828,6 +1832,26 @@ def _fit_predict_model_cell(
     }
 
 
+def resolve_input_grids(config, loaded, source_definitions):
+    """Resolve the design against validated outcome-specific split capacities."""
+    manager = SplitIndexManager(
+        frame=loaded.train, external_frame=loaded.test if loaded.schema.split_mode == "external_test" else None,
+        predictors=loaded.predictors, outcome=config.outcome,
+        test_size=config.test_size, task=loaded.schema.task, id_column=None,
+    )
+    seeds = tuple(dict.fromkeys(seed for seed, _ in resolve_repeat_pairs(config)))
+    capacity = len(manager.for_seed(seeds[0]).train_index)
+    units = sampling_units(source_definitions)
+    n_grid = config.n_grid if config.n_grid is not None else log2_size_grid(
+        capacity, config.n_sizes_n, config.max_n, min_size=config.min_n)
+    k_grid = config.k_grid if config.k_grid is not None else log2_size_grid(
+        len(units), config.n_sizes_k, config.max_k)
+    for seed in seeds:
+        validate_size_grid(n_grid, f"N (seed={seed})", len(manager.for_seed(seed).train_index))
+    validate_size_grid(k_grid, "K", len(units))
+    return np.asarray(n_grid, dtype=int), np.asarray(k_grid, dtype=int)
+
+
 class NKGridExecutionSession:
     """One validated input/model/native-runner lifetime for many cell groups.
 
@@ -1880,17 +1904,7 @@ class NKGridExecutionSession:
             ),
         )
         self.repeat_pairs = resolve_repeat_pairs(config)
-        first_split = self.split_manager.for_seed(self.repeat_pairs[0][0])
-        self.n_grid = (
-            np.asarray(config.n_grid, dtype=int)
-            if config.n_grid else log2_size_grid(
-                len(first_split.train_index), config.n_sizes_n, config.max_n, min_size=config.min_n,
-            )
-        )
-        self.k_grid = (
-            np.asarray(config.k_grid, dtype=int)
-            if config.k_grid else log2_size_grid(len(self.feature_units), config.n_sizes_k, config.max_k)
-        )
+        self.n_grid, self.k_grid = resolve_input_grids(config, loaded, source_definitions)
         self.semantic_contract = {
             "kind": "nk_grid" if self.task == "regression" else "nk_grid_classification",
             "algorithm_version": algorithm_version,
@@ -2053,6 +2067,8 @@ class NKGridExecutionSession:
 
         if self._closed:
             raise RuntimeError("NKGridExecutionSession is closed")
+        validate_size_grid((n_samples,), "N")
+        validate_size_grid((k_features,), "K", len(self.feature_units))
         frozen_models = tuple(str(model) for model in models)
         if not frozen_models or len(frozen_models) != len(set(frozen_models)) or not set(frozen_models).issubset(self.config.models):
             raise ValueError("cell group models must be a unique subset of the frozen model list")
@@ -2061,9 +2077,12 @@ class NKGridExecutionSession:
         if int(n_samples) not in set(map(int, self.n_grid)) or int(k_features) not in set(map(int, self.k_grid)):
             raise ValueError("cell group N/K is outside the frozen resolved grid")
         indexes = self.split_manager.for_seed(int(seed))
+        validate_size_grid((n_samples,), "N", len(indexes.train_index))
         orders = self._orders(int(seed), int(draw), indexes.train_index)
         selected_rows = orders.row_index[: int(n_samples)]
         selected_units = [str(unit) for unit in orders.feature_names[: int(k_features)]]
+        if len(selected_rows) != n_samples or len(selected_units) != k_features:
+            raise ValueError("sampled N/K does not match declared N/K")
         selected_cols = [feature for unit in selected_units for feature in self.feature_groups[unit]]
         selected_groups = [
             group
@@ -2123,6 +2142,10 @@ class NKGridExecutionSession:
         return result
 
     def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, test_ids: pd.Series | None, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> dict[str, object]:
+        if len(X_sub_raw) != n_samples or len(y_sub) != n_samples or len(sampling_units(selected_groups)) != k_features:
+            raise ValueError("fit input does not match declared N/K")
+        if X_sub_raw.shape[1] != sum(len(g.features) for g in selected_groups):
+            raise ValueError("fit input does not match expanded feature count")
         model_started = time.perf_counter()
         row = self._base(model_name=model_name, seed=seed, draw=draw, n_samples=n_samples, k_features=k_features, n_train_total=n_train_total, n_test_total=n_test_total)
         row["K_expanded"] = X_sub_raw.shape[1]; row["K_unobserved"] = unobserved
@@ -2421,13 +2444,7 @@ def _run_nk_grid_locked(
         }
     else:
         splits = {split_seeds[0]: fixed_split}
-    n_grid = np.asarray(config.n_grid, dtype=int) if config.n_grid else log2_size_grid(
-        len(next(iter(splits.values())).X_train),
-        config.n_sizes_n,
-        config.max_n,
-        min_size=config.min_n,
-    )
-    k_grid = np.asarray(config.k_grid, dtype=int) if config.k_grid else log2_size_grid(len(feature_units), config.n_sizes_k, config.max_k)
+    n_grid, k_grid = resolve_input_grids(config, loaded, source_definitions)
     validate_prediction_export_grid(config, n_grid=n_grid, k_grid=k_grid)
     prediction_sidecar_schema = None
     if prediction_export_enabled(config):

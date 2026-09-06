@@ -6,6 +6,10 @@ limit, not a prediction: durable cell shards make repeated rounds safe.
 """
 
 from __future__ import annotations
+from .grid_contract import validate_size_grid
+from .ingest import load_input
+from .validate_input import validate_input
+from .nk_grid import resolve_input_grids
 
 import argparse
 import json
@@ -214,8 +218,8 @@ def build_dynamic_plan(
     """Freeze one cost-free table, one worker request, and the round count."""
     reject_dynamic_prediction_export(config)
     cluster.validate()
-    resolved_n_grid = tuple(sorted({int(value) for value in n_grid}))
-    resolved_k_grid = tuple(sorted({int(value) for value in k_grid}))
+    resolved_n_grid = validate_size_grid(n_grid, "N")
+    resolved_k_grid = validate_size_grid(k_grid, "K")
     if not resolved_n_grid or not resolved_k_grid:
         raise ValueError("dynamic planning requires non-empty resolved N and K grids")
     worker_config = replace(
@@ -228,6 +232,12 @@ def build_dynamic_plan(
         n_draws=1,
     )
     _validate_config(worker_config)
+    loaded, groups = validate_input(
+        load_input(worker_config.schema, worker_config.outcome), worker_config.outcome,
+        models=worker_config.models, min_n=worker_config.min_n,
+        test_size=worker_config.test_size, seed=worker_config.seed,
+    )
+    resolve_input_grids(worker_config, loaded, groups)
     engine_root = Path(__file__).resolve().parents[2]
     source_state = git_state(engine_root)
     if not isinstance(source_state.get("commit"), str) or len(str(source_state["commit"])) != 40:
@@ -556,8 +566,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser.error(str(exc))
         plan_out = args.plan_out or args.root / "plan.json"
     plan = build_dynamic_plan(
-        _config_from_json(payload["config"]), n_grid=[int(value) for value in payload["n_grid"]],
-        k_grid=[int(value) for value in payload["k_grid"]], cluster=_cluster_from_payload(payload["cluster"]),
+        _config_from_json(payload["config"]), n_grid=payload["n_grid"],
+        k_grid=payload["k_grid"], cluster=_cluster_from_payload(payload["cluster"]),
         table_path=payload["task_table"], snapshot_path=payload["snapshot"],
         output_dir=payload["output_dir"], panel=str(payload["panel"]),
     )

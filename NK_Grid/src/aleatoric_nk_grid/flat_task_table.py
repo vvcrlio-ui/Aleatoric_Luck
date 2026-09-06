@@ -7,6 +7,7 @@ derives its work solely from those durable artefacts.
 """
 
 from __future__ import annotations
+from .grid_contract import validate_size_grid
 
 import argparse
 import csv
@@ -2277,7 +2278,7 @@ def _config_from_json(payload: Mapping[str, object]) -> NKGridConfig:
     values["models"] = tuple(str(value) for value in values["models"])
     for field in ("n_grid", "k_grid"):
         if values.get(field) is not None:
-            values[field] = tuple(int(value) for value in values[field])
+            values[field] = validate_size_grid(values[field], field)
     if values.get("repeat_plan") is not None:
         values["repeat_plan"] = tuple(
             (int(pair[0]), int(pair[1])) for pair in values["repeat_plan"]
