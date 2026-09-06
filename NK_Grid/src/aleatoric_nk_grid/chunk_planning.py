@@ -103,7 +103,7 @@ def _frozen_input_provenance(schema_path: Path) -> dict[str, dict[str, str]]:
 
 
 def expanded_columns_for_k(schema_path: Path | str, k_features: int) -> int:
-    """Return the expanded-column count of the first K schema feature units."""
+    """Upper bound for any K subset, bundling derived columns by parent."""
     if k_features < 1:
         raise ValueError("k_features must be positive")
     try:
@@ -123,17 +123,26 @@ def expanded_columns_for_k(schema_path: Path | str, k_features: int) -> int:
         raise ValueError(f"invalid feature-universe schema: {schema_path}") from exc
     if not isinstance(sources, list) or k_features > len(sources):
         raise ValueError("k_features exceeds schema feature-unit count")
-    widths: list[int] = []
-    for source in sources[:k_features]:
+    widths: dict[str, int] = {}
+    for source in sources:
         features = source.get("features") if isinstance(source, Mapping) else None
         if not isinstance(features, list) or not features:
             raise ValueError("schema source has no expanded features")
-        widths.append(len(features))
-    return sum(widths)
+        parent = source.get("sampling_source") or source.get("source")
+        if not isinstance(parent, str) or not parent:
+            raise ValueError("schema source has no sampling identity")
+        widths[parent] = widths.get(parent, 0) + len(features)
+    validate_size_grid((k_features,), "K", len(widths))
+    return sum(sorted(widths.values(), reverse=True)[:k_features])
 
 
 def peak_memory_bytes(n_samples: int, expanded_columns: int, *, frame_copies: int = MEMORY_FRAME_COPIES) -> int:
-    """Conservative one-worker frame formula, expressed in byte units."""
+    """Heuristic worker estimate, not an RSS upper bound.
+
+    Base allowance covers resident input; the multiplier approximates slices,
+    preprocessing copies and native training. Allocator caches and process-tree
+    peaks require target-environment measurement.
+    """
     if n_samples < 1 or expanded_columns < 1 or frame_copies < 1:
         raise ValueError("n_samples, expanded_columns, and frame_copies must be positive")
     return MEMORY_BASE_BYTES + int(frame_copies) * int(n_samples) * int(expanded_columns) * ENGINE_VALUE_BYTES
