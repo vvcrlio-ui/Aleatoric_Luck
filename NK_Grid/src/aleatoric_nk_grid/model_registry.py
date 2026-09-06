@@ -9,7 +9,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 import yaml
-from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import (
     ExtraTreesClassifier,
@@ -138,6 +138,15 @@ def _validated_params(
 ) -> dict[str, Any]:
     reject_removed_model(model_name)
     allowed = MODEL_PARAM_KEYS.get(task, {}).get(model_name)
+    if task == "regression" and model_name == "super_learner":
+        allowed = allowed | {"mlp_batch_size", "diagnostics"}
+        params = {"mlp_batch_size": "auto", "diagnostics": False, **params}
+        batch = params["mlp_batch_size"]
+        if not ((isinstance(batch, str) and batch in {"auto", "full"}) or
+                (type(batch) is int and batch > 0)):
+            raise ValueError("mlp_batch_size must be auto, full, or a positive integer")
+        if type(params["diagnostics"]) is not bool:
+            raise ValueError("diagnostics must be boolean")
     if allowed is None:
         reject_removed_model(model_name)
         raise ValueError(
@@ -615,6 +624,21 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
         return self.model_.predict(np.asarray(X, dtype=float))
 
 
+class FitBatchMLPRegressor(MLPRegressor):
+    """Resolve full at each actual fit; retain constructor policy for clone."""
+
+    def fit(self, X, y, sample_weight=None):
+        policy = self.batch_size
+        self.fit_n_ = len(y)
+        self.effective_batch_size_ = min(200, len(y)) if policy == "auto" else (
+            len(y) if policy == "full" else min(policy, len(y)))
+        self.batch_size = len(y) if policy == "full" else policy
+        try:
+            return super().fit(X, y, sample_weight=sample_weight)
+        finally:
+            self.batch_size = policy
+
+
 class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
     """Compact Super Learner with out-of-fold base-model predictions."""
 
@@ -641,6 +665,8 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         lgbm_learning_rate: float,
         lgbm_num_leaves: int,
         lgbm_min_data_in_leaf: int,
+        mlp_batch_size: str | int = "auto",
+        diagnostics: bool = False,
     ):
         self.seed = seed
         self.n_jobs = n_jobs
@@ -662,6 +688,8 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         self.lgbm_learning_rate = lgbm_learning_rate
         self.lgbm_num_leaves = lgbm_num_leaves
         self.lgbm_min_data_in_leaf = lgbm_min_data_in_leaf
+        self.mlp_batch_size = mlp_batch_size
+        self.diagnostics = diagnostics
 
     def fit(self, X, y):
         if self.passthrough and np.asarray(pd.isna(X)).any():
@@ -726,7 +754,8 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                     SimpleImputer(strategy="median"),
                     StandardScaler(),
                     TransformedTargetRegressor(
-                        regressor=MLPRegressor(
+                        regressor=FitBatchMLPRegressor(
+                            batch_size=self.mlp_batch_size,
                             hidden_layer_sizes=tuple(self.hidden_layer_sizes),
                             alpha=self.alpha,
                             learning_rate_init=self.learning_rate_init,
@@ -745,6 +774,30 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
             passthrough=self.passthrough,
             n_jobs=self.n_jobs,
         ).fit(X, y)
+        if self.diagnostics:
+            # Explicit diagnostic runs replay deterministic folds to inspect
+            # fitted estimators; this extra work is never enabled by default.
+            records = []
+            target = np.asarray(y)
+            for fold, (train_rows, valid_rows) in enumerate(KFold(cv).split(X)):
+                train_X = X.iloc[train_rows] if hasattr(X, "iloc") else X[train_rows]
+                valid_X = X.iloc[valid_rows] if hasattr(X, "iloc") else X[valid_rows]
+                for name, estimator in estimators:
+                    fitted = clone(estimator).fit(train_X, target[train_rows])
+                    record = {"phase": "oof", "fold": fold, "model": name, "N": len(train_rows),
+                              "mse": float(np.mean((fitted.predict(valid_X) - target[valid_rows]) ** 2))}
+                    if name == "shallow_nn":
+                        mlp = fitted.steps[-1][1].regressor_
+                        record.update(batch=mlp.effective_batch_size_, iterations=mlp.n_iter_,
+                                      reached_max_iter=mlp.n_iter_ >= mlp.max_iter)
+                    records.append(record)
+            mlp = self.model_.named_estimators_["shallow_nn"].steps[-1][1].regressor_
+            records.append({"phase": "full", "model": "shallow_nn", "N": mlp.fit_n_,
+                            "batch": mlp.effective_batch_size_, "iterations": mlp.n_iter_,
+                            "reached_max_iter": mlp.n_iter_ >= mlp.max_iter})
+            self.diagnostics_ = {"fits": records, "coefficients": self.model_.final_estimator_.coef_.tolist(),
+                                 "intercept": float(self.model_.final_estimator_.intercept_),
+                                 "note": "diagnostic fold replay; epochs do not imply equal optimizer steps"}
         return self
 
     def predict(self, X):
