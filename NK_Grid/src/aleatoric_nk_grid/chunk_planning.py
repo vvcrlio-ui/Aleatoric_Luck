@@ -8,6 +8,8 @@ limit, not a prediction: durable cell shards make repeated rounds safe.
 from __future__ import annotations
 from .phase_timing import timed_phase
 from .grid_contract import validate_size_grid
+from .config import NKGridConfig, config_from_json, config_to_json, resolve_repeat_pairs
+from .resources import ResourceRequest, sbatch_resource_args
 from .ingest import load_input
 from .validate_input import validate_input
 from .nk_grid import resolve_input_grids
@@ -19,14 +21,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .flat_task_table import (
-    ResourceRequest,
-    _config_from_json,
+from .task_table import (
     execution_groups,
     iter_task_rows_canonical,
-    sbatch_resource_args,
     write_task_table_streaming,
-    write_work_snapshot,
 )
 from .execution_contract import (
     AnalysisContract,
@@ -40,11 +38,9 @@ from .ingest import load_schema
 from .model_registry import load_algorithm_version, load_model_params, resolved_model_params
 from .nk_grid import (
     LARGE_RUN_THRESHOLD,
-    NKGridConfig,
     _validate_config,
     public_result_columns,
     reject_dynamic_prediction_export,
-    resolve_repeat_pairs,
 )
 from . import run_panels
 
@@ -58,8 +54,8 @@ MEMORY_FRAME_COPIES = 12
 # Dataset semantics continue to come from the tracked panel manifest.
 DYNAMIC_PRESETS: dict[str, dict[str, object]] = {
     "pilot": {
-        "n_grid": [100, 200, 400],
-        "k_grid": [10, 25],
+        # Grid values come from the panel's production grid, through the
+        # shared engine resolver; keep only scheduling defaults here.
         "workers": 32,
         "rounds": 2,
         "time_limit": "01:00:00",
@@ -250,7 +246,10 @@ def build_dynamic_plan(
         models=worker_config.models, min_n=worker_config.min_n,
         test_size=worker_config.test_size, seed=worker_config.seed,
     )
-    resolve_input_grids(worker_config, loaded, groups)
+    selected_n, selected_k = resolve_input_grids(worker_config, loaded, groups)
+    resolved_n_grid = tuple(map(int, selected_n))
+    resolved_k_grid = tuple(map(int, selected_k))
+    worker_config = replace(worker_config, n_grid=resolved_n_grid, k_grid=resolved_k_grid)
     engine_root = Path(__file__).resolve().parents[2]
     source_state = git_state(engine_root)
     if not isinstance(source_state.get("commit"), str) or len(str(source_state["commit"])) != 40:
@@ -388,6 +387,10 @@ def build_dynamic_plan(
         output_root / "execution-contracts" / f"{execution_contract.execution_plan_id}.json",
         execution_contract.to_payload(),
     )
+    # Publishing a work snapshot also creates the durable schedule lease.
+    # Keep that control-protocol boundary in the execution layer.
+    from .flat_task_table import write_work_snapshot
+
     snapshot = write_work_snapshot(
         Path(snapshot_path), table_path=table, panel=panel, config=worker_config,
         output_dir=Path(output_dir), workers=cluster.workers,
@@ -515,7 +518,7 @@ def request_from_preset(
         Path(manifest_path), only={panel}, preset=preset,
     )
     _, config = resolved[0]
-    config_payload = run_panels.config_to_json(config)
+    config_payload = config_to_json(config)
     if models is not None:
         selected_models = [str(model) for model in models]
         if not selected_models:
@@ -523,6 +526,18 @@ def request_from_preset(
         config_payload["models"] = selected_models
     config_payload["out"] = str(root / "final.csv")
     config_payload["n_jobs"] = 1
+    if preset == "pilot":
+        resolved_config = config_from_json(config_payload, strict=True)
+        loaded, groups = validate_input(
+            load_input(resolved_config.schema, resolved_config.outcome), resolved_config.outcome,
+            models=resolved_config.models, min_n=resolved_config.min_n,
+            test_size=resolved_config.test_size, seed=resolved_config.seed,
+        )
+        n_grid, k_grid = resolve_input_grids(resolved_config, loaded, groups)
+        config_payload["n_grid"] = n_grid.tolist()
+        config_payload["k_grid"] = k_grid.tolist()
+    else:
+        n_grid, k_grid = dynamic["n_grid"], dynamic["k_grid"]
     panel_family = manifest.get("panel_family")
     if panel_family is None:
         panel_family = Path(manifest_path).parent.name.lower()
@@ -530,8 +545,8 @@ def request_from_preset(
         raise ValueError("panel_family must be a non-empty string when declared")
     return {
         "config": config_payload,
-        "n_grid": list(dynamic["n_grid"]),
-        "k_grid": list(dynamic["k_grid"]),
+        "n_grid": list(map(int, n_grid)),
+        "k_grid": list(map(int, k_grid)),
         "cluster": {
             "workers": int(dynamic["workers"] if workers is None else workers),
             "rounds": int(dynamic["rounds"] if rounds is None else rounds),
@@ -588,7 +603,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser.error(str(exc))
         plan_out = args.plan_out or args.root / "plan.json"
     plan = build_dynamic_plan(
-        _config_from_json(payload["config"]), n_grid=payload["n_grid"],
+        config_from_json(payload["config"], strict=True), n_grid=payload["n_grid"],
         k_grid=payload["k_grid"], cluster=_cluster_from_payload(payload["cluster"]),
         table_path=payload["task_table"], snapshot_path=payload["snapshot"],
         output_dir=payload["output_dir"], panel=str(payload["panel"]),

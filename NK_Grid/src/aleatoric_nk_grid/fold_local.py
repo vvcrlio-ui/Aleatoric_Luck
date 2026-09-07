@@ -9,6 +9,8 @@ from sklearn.model_selection import KFold, LeaveOneOut
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .mlp_estimator import build_mlp_regressor
+
 
 class FoldLocalRidge(RegressorMixin, BaseEstimator):
     """Explicit complete-pipeline LOO; no N-dependent fold substitution."""
@@ -91,8 +93,7 @@ class FoldLocalMLP(RegressorMixin, BaseEstimator):
         self.params = params
 
     def _estimator(self, alpha):
-        from .model_registry import AdaptiveMLPRegressor
-        mlp = AdaptiveMLPRegressor(seed=self.seed, **self.params)._mlp(alpha)
+        mlp = build_mlp_regressor(seed=self.seed, alpha=alpha, params=self.params)
         return make_pipeline(clone(self.preprocessor), StandardScaler(),
                              TransformedTargetRegressor(regressor=mlp, transformer=StandardScaler()))
 
@@ -102,10 +103,9 @@ class FoldLocalMLP(RegressorMixin, BaseEstimator):
                        self.params.get('mlp_batch_candidates', (32, 64, 128, 256)),
                        self.params['max_cv_folds'])
         if self.params.get('mlp_batch_size', 'auto') == 'cv':
-            from .model_registry import AdaptiveMLPRegressor
             from .mlp_batch_cv import BatchSearchMLP
             self.search_ = BatchSearchMLP(
-                AdaptiveMLPRegressor(seed=self.seed, **self.params)._mlp(0.0),
+                build_mlp_regressor(seed=self.seed, alpha=0.0, params=self.params),
                 np.logspace(self.params['alpha_log10_min'], self.params['alpha_log10_max'], self.params['n_alphas']),
                 self.params.get('mlp_batch_candidates', (32, 64, 128, 256)),
                 self.params['max_cv_folds'], self.preprocessor).fit(X, y)

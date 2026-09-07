@@ -109,6 +109,21 @@ in `YourArticle/schema/`, use the following values:
 | `feature_manifest` | `../data/ard/my_dataset/feature_manifest.csv` |
 | `feature_universe.definition_file` | `my_dataset.feature_universe.json` |
 
+The bundled FFCWS and SMR adapters first generate and validate all selected
+inputs in a temporary directory. They then publish complete immutable bundles
+under `data/ard/<dataset>/.releases/<content-hash>/`, and feature universes under
+`schema/.universes/<content-hash>/`. The stable `schema/<dataset>.json` entry is
+replaced atomically only after its referenced files are complete. Read the paths
+from that schema; do not assume the older flat ARD layout shown in the example.
+
+A failed build leaves existing schema entries and their inputs unchanged.
+Publication switches each schema independently: interruption during the final
+switches may leave different panels on different complete versions, but never
+combines a new training table with an old test table within one schema. Previous
+versions are retained for readers that already loaded them; there is no automatic
+release cleanup. Existing frozen-run checks still reject a changed stable schema.
+The FFCWS work directory contains derived reports, not authoritative engine input.
+
 ### Provenance
 
 `provenance.json` is optional audit metadata. Its location is fixed by the

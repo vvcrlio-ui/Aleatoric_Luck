@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -21,7 +20,6 @@ from sklearn.ensemble import (
     StackingRegressor,
 )
 from sklearn.impute import SimpleImputer
-from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import (
     LassoCV,
     LinearRegression,
@@ -32,6 +30,10 @@ from sklearn.model_selection import KFold
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+
+# Keep the existing import path available for callers and older pickles.
+from .mlp_estimator import FitBatchMLPRegressor, build_mlp_regressor
+from .config import DEFAULT_MODEL_PARAMS_PATH
 
 MODEL_NAMES = (
     "ols",
@@ -49,8 +51,8 @@ MODEL_NAMES = (
 # hard error rather than a silent drop, so a stale panel fails loudly instead of
 # quietly producing results for one model fewer than it asked for.
 REMOVED_MODEL_NAMES = {
-    "bart": "BART was removed from the model space; see plans/remove-bart.md",
-    "elastic_net": "elastic_net was removed from the model space; see plans/remove-elastic-net.md",
+    "bart": "BART was removed from the model space; remove 'bart' from the requested models",
+    "elastic_net": "elastic_net was removed from the model space; remove 'elastic_net' from the requested models",
 }
 SUPPORTED_MODEL_NAMES = MODEL_NAMES
 
@@ -62,9 +64,6 @@ def reject_removed_model(name: str) -> None:
     if reason is not None:
         raise ValueError(reason)
 
-
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL_PARAMS_PATH = ROOT / "model_params.yaml"
 
 MODEL_PARAM_KEYS = {
     "regression": {
@@ -624,18 +623,8 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
         self.mlp_batch_candidates = mlp_batch_candidates
 
     def _mlp(self, alpha: float) -> MLPRegressor:
-        return FitBatchMLPRegressor(
-            batch_size=self.mlp_batch_size,
-            hidden_layer_sizes=tuple(self.hidden_layer_sizes),
-            activation=self.activation,
-            solver=self.solver,
-            alpha=alpha,
-            learning_rate_init=self.learning_rate_init,
-            max_iter=self.max_iter,
-            early_stopping=self.early_stopping,
-            validation_fraction=self.validation_fraction,
-            n_iter_no_change=self.n_iter_no_change,
-            random_state=self.seed,
+        return build_mlp_regressor(
+            seed=self.seed, alpha=alpha, params=self.get_params(deep=False),
         )
 
     def fit(self, X, y):
@@ -678,36 +667,6 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
 
     def predict(self, X):
         return self.model_.predict(np.asarray(X, dtype=float))
-
-
-class FitBatchMLPRegressor(MLPRegressor):
-    """Resolve full at each actual fit; retain constructor policy for clone."""
-
-    def fit(self, X, y, sample_weight=None):
-        policy = self.batch_size
-        self.fit_n_ = len(y)
-        # sklearn removes the early-stopping holdout before clipping batch size.
-        # This is diagnostic only; retain the historical constructor/fit policy.
-        optimizer_n = len(y)
-        if self.early_stopping and self.solver in {"adam", "sgd"}:
-            optimizer_n -= int(np.ceil(self.validation_fraction * len(y)))
-        if self.solver == "lbfgs":
-            # L-BFGS evaluates the full training objective; batch_size is ignored.
-            self.effective_batch_size_ = len(y)
-        else:
-            self.effective_batch_size_ = min(200, optimizer_n) if policy == "auto" else (
-                optimizer_n if policy == "full" else min(policy, optimizer_n))
-        self.batch_size = len(y) if policy == "full" else policy
-        try:
-            with warnings.catch_warnings(record=True) as captured:
-                warnings.simplefilter("always", ConvergenceWarning)
-                result = super().fit(X, y, sample_weight=sample_weight)
-            self.convergence_warnings_ = [str(w.message) for w in captured if issubclass(w.category, ConvergenceWarning)]
-            for warning in captured:
-                warnings.warn(warning.message, warning.category, stacklevel=2)
-            return result
-        finally:
-            self.batch_size = policy
 
 
 class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):

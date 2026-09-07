@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 from .phase_timing import timed_phase
-from .grid_contract import validate_size_grid
+from .grid_contract import select_grid_points, validate_size_grid
+from .config import (
+    DEFAULT_MODEL_PARAMS_PATH, NKGridConfig,
+    execution_groups_for_models, group_repeat_pairs_by_seed, resolve_repeat_pairs,
+)
 
 import argparse
 import json
@@ -73,7 +77,6 @@ from .experiment import (
     core_environment,
     diagnostics_summary,
     git_state,
-    load_checkpoint,  # compatibility alias; production resume uses projected index
     load_checkpoint_index,
     manifest_path,
     merge_checkpoint_parts,
@@ -90,7 +93,6 @@ from .experiment import (
 from .helpers_logging import log_progress
 from .ingest import LoadedInput, load_input
 from .model_registry import (
-    DEFAULT_MODEL_PARAMS_PATH,
     SUPPORTED_MODEL_NAMES,
     load_algorithm_version,
     load_model_params,
@@ -253,21 +255,6 @@ def public_result_columns(task: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((*ROW_METADATA_FIELDS, *BASE_RESULT_COLUMNS, *metrics, *STABLE_DIAGNOSTIC_RESULT_COLUMNS, *task_column, "status", "error")))
 
 
-def execution_groups_for_models(models: Sequence[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """Return the ordered preprocessing groups used by the task-table codec."""
-
-    selected = tuple(str(model) for model in models)
-    if not selected or len(selected) != len(set(selected)):
-        raise ValueError("models must be non-empty and unique")
-    passthrough = tuple(model for model in selected if model in {"lightgbm", "xgboost"})
-    imputed = tuple(model for model in selected if model not in passthrough)
-    return tuple(
-        (name, group)
-        for name, group in (("imputed_core", imputed), ("passthrough", passthrough))
-        if group
-    )
-
-
 def _frozen_input_provenance_for_schema(schema: Any) -> dict[str, dict[str, str]]:
     """Freeze numeric inputs with the same fields used by dynamic planning."""
 
@@ -328,45 +315,6 @@ def project_public_result(row: Mapping[str, object], *, header: Sequence[str]) -
     if missing:
         raise ValueError(f"computed result lacks public columns: {missing}")
     return {column: row[column] for column in columns}
-
-@dataclass(frozen=True)
-class NKGridConfig:
-    schema: Path
-    out: Path
-    outcome: str
-    models: tuple[str, ...]
-    seed: int
-    test_size: float
-    n_seeds: int
-    n_draws: int
-    n_sizes_n: int
-    n_sizes_k: int
-    max_n: int
-    max_k: int
-    batch_size: int
-    n_jobs: int
-    min_n: int = 10
-    model_params: Path = DEFAULT_MODEL_PARAMS_PATH
-    failed_abs_threshold: int = 50
-    failed_ratio_threshold: float = 0.05
-    native_process_max_attempts: int = 2
-    native_process_timeout_seconds: float = 21_600.0
-    preset: str | None = None
-    allow_large_run: bool = False
-    dry_run: bool = False
-    rerun_completed: bool = True
-    # Direct construction is used by the test/dev API. Production manifests
-    # always override these explicit values.
-    experiment_id: str = "nkgrid-test-v1"
-    data_version: str = "test-data-v1"
-    model_spec_version: str = "nkgrid-test-models-v1"
-    repeat_plan: tuple[tuple[int, int], ...] | None = None
-    n_grid: tuple[int, ...] | None = None
-    k_grid: tuple[int, ...] | None = None
-    prediction_export_cells: tuple[tuple[str, int, int], ...] = ()
-    # Compatibility default: local prunes verified-complete parts; dynamic keeps WAL.
-    checkpoint_retention: str = "default"
-
 
 @dataclass(frozen=True)
 class SplitData:
@@ -471,45 +419,6 @@ class SplitIndexManager:
         )
         self._cache[int(seed)] = frozen
         return frozen
-
-
-def resolve_repeat_pairs(config: NKGridConfig) -> tuple[tuple[int, int], ...]:
-    """Resolve legacy counts or explicit absolute pairs into one representation."""
-
-    if config.repeat_plan is not None:
-        if config.n_seeds != 1 or config.n_draws != 1:
-            raise ValueError("repeat_plan cannot be combined with n_seeds or n_draws")
-        pairs = tuple((seed, draw) for seed, draw in config.repeat_plan)
-    else:
-        pairs = tuple(
-            (config.seed + offset, draw)
-            for offset in range(config.n_seeds)
-            for draw in range(config.n_draws)
-        )
-    group_repeat_pairs_by_seed(pairs)
-    return tuple(sorted(pairs))
-
-
-def group_repeat_pairs_by_seed(
-    repeat_pairs: Sequence[tuple[int, int]],
-) -> dict[int, tuple[int, ...]]:
-    """Validate and group absolute repeat pairs without silently deduplicating."""
-
-    grouped: dict[int, list[int]] = {}
-    seen: set[tuple[int, int]] = set()
-    for pair in repeat_pairs:
-        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-            raise ValueError("repeat_plan entries must be (seed, draw) pairs")
-        seed, draw = pair
-        if isinstance(seed, bool) or isinstance(draw, bool) or not isinstance(seed, int) or not isinstance(draw, int) or seed < 0 or draw < 0:
-            raise ValueError("repeat_plan seed and draw must be non-negative integers")
-        if (seed, draw) in seen:
-            raise ValueError(f"repeat_plan contains duplicate pair ({seed}, {draw})")
-        seen.add((seed, draw))
-        grouped.setdefault(seed, []).append(draw)
-    if not grouped:
-        raise ValueError("repeat_plan must not be empty")
-    return {seed: tuple(sorted(draws)) for seed, draws in sorted(grouped.items())}
 
 
 def log2_size_grid(
@@ -1211,11 +1120,15 @@ def estimate_run_size(config: NKGridConfig) -> dict[str, int | str | None]:
     """Return a conservative pre-data estimate for panel dry-runs."""
 
     _validate_config(config)
+    n_count = len(config.n_grid) if config.n_grid is not None else config.n_sizes_n
+    k_count = len(config.k_grid) if config.k_grid is not None else config.n_sizes_k
+    if config.grid_selection == "min_middle_max":
+        n_count = k_count = 3
     top_level = (
         len(config.models)
         * len(resolve_repeat_pairs(config))
-        * len(config.n_grid or tuple(range(config.n_sizes_n)))
-        * len(config.k_grid or tuple(range(config.n_sizes_k)))
+        * n_count
+        * k_count
     )
     super_cells = (
         top_level // len(config.models)
@@ -1316,12 +1229,20 @@ def validate_prediction_export_grid(
 def _validate_config(config: NKGridConfig) -> None:
     """Reject invalid run controls before dry-run arithmetic or data loading."""
 
+    if config.grid_selection not in ("all", "min_middle_max"):
+        raise ValueError("grid_selection must be all or min_middle_max")
     if type(config.checkpoint_retention) is not str or config.checkpoint_retention not in {"default", "keep", "delete"}:
         raise ValueError("checkpoint_retention must be default, keep, or delete")
 
     for name in ("n_grid", "k_grid"):
         if getattr(config, name) is not None:
             validate_size_grid(getattr(config, name), name)
+    if config.grid_selection == "min_middle_max":
+        for grid_name, count_name in (("n_grid", "n_sizes_n"), ("k_grid", "n_sizes_k")):
+            values = getattr(config, grid_name)
+            count = len(values) if values is not None else getattr(config, count_name)
+            if count < 3:
+                raise ValueError(f"{grid_name} needs at least three production grid points for pilot")
     for field in (
         "n_seeds",
         "n_draws",
@@ -1911,6 +1832,8 @@ def resolve_input_grids(config, loaded, source_definitions):
     for seed in seeds:
         validate_size_grid(n_grid, f"N (seed={seed})", len(manager.for_seed(seed).train_index))
     validate_size_grid(k_grid, "K", len(units))
+    n_grid = select_grid_points(n_grid, config.grid_selection, "N")
+    k_grid = select_grid_points(k_grid, config.grid_selection, "K")
     return np.asarray(n_grid, dtype=int), np.asarray(k_grid, dtype=int)
 
 

@@ -12,11 +12,17 @@ import yaml
 
 from .helpers_logging import log_progress
 from .ingest import SCHEMA_FIELDS, load_schema
-from .model_registry import DEFAULT_MODEL_PARAMS_PATH
-from .nk_grid import NKGridConfig, estimate_run_size, run_nk_grid
+from .config import DEFAULT_MODEL_PARAMS_PATH, NKGridConfig, config_to_json
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PRODUCTION_GRID = {
+    "n_sizes_n": 20,
+    "n_sizes_k": 20,
+    "min_n": 10,
+    "max_n": 0,
+    "max_k": 0,
+}
 PRESETS: dict[str, dict[str, int]] = {
     "dev": {
         "n_seeds": 3,
@@ -49,11 +55,7 @@ PRESETS: dict[str, dict[str, int]] = {
     "production": {
         "n_seeds": 100,
         "n_draws": 50,
-        "n_sizes_n": 20,
-        "n_sizes_k": 20,
-        "min_n": 10,
-        "max_n": 0,
-        "max_k": 0,
+        **PRODUCTION_GRID,
         # Keep the checkpoint/signal boundary small. Automatic WAL compaction
         # controls the physical part count without making slow models redo
         # 1,000 cells after a forced requeue.
@@ -62,11 +64,9 @@ PRESETS: dict[str, dict[str, int]] = {
     "pilot": {
         "n_seeds": 84,
         "n_draws": 1,
-        "n_sizes_n": 3,
-        "n_sizes_k": 2,
-        "min_n": 10,
-        "max_n": 400,
-        "max_k": 25,
+        # Resolve the same source grid as production before selecting three
+        # existing points on each axis. Panel grid overrides apply to both.
+        **PRODUCTION_GRID,
     },
     "dev-dynamic": {
         "n_seeds": 3,
@@ -197,6 +197,7 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
     values["models"] = tuple(str(model) for model in values["models"])
     values["outcome"] = outcome
     values["preset"] = preset_name
+    values["grid_selection"] = "min_middle_max" if preset_name == "pilot" else "all"
     if "repeat_plan" in panel:
         if "n_seeds" in panel or "n_draws" in panel:
             raise ValueError(f"Panel {name} cannot combine repeat_plan with n_seeds/n_draws")
@@ -274,20 +275,9 @@ def resolved_panels(
     return panels
 
 
-def config_to_json(config: NKGridConfig) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for field in CONFIG_FIELDS:
-        value = getattr(config, field)
-        if isinstance(value, Path):
-            result[field] = str(value)
-        elif isinstance(value, tuple):
-            result[field] = list(value)
-        else:
-            result[field] = value
-    return {key: result[key] for key in sorted(result)}
-
-
 def main(argv: list[str] | None = None) -> None:
+    from .nk_grid import estimate_run_size, run_nk_grid
+
     parser = argparse.ArgumentParser(description="Run declared N×K grid panels.")
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--only", nargs="+", default=None)

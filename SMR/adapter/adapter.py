@@ -8,11 +8,13 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Sequence
 
 import pandas as pd
 
 from aleatoric_nk_grid.ingest import canonical_json, load_input
+from aleatoric_nk_grid.input_publication import publish_validated_inputs, validate_dataset_name
 from aleatoric_nk_grid.preprocessing import source_groups
 from aleatoric_nk_grid.validate_input import (
     canonical_feature_universe,
@@ -87,6 +89,7 @@ def _load_contract(path: Path) -> dict[str, Any]:
         raise ValueError(f"SMR feature contract is missing fields: {missing}")
     if contract["contract_version"] != 1:
         raise ValueError("SMR feature contract contract_version must be 1")
+    validate_dataset_name(contract["dataset"])
     if not str(contract["exchangeability_justification"]).strip():
         raise ValueError("SMR feature contract requires exchangeability justification")
     outcomes = contract["outcome_columns"]
@@ -257,6 +260,36 @@ def build_adapter(
     min_n: int = 10,
     test_size: float = 0.3,
     seed: int = 12345,
+) -> AdapterResult:
+    """Validate a complete staged build before switching its stable schema."""
+    article_root = Path(article_root).resolve()
+    article_root.mkdir(parents=True, exist_ok=True)
+    validation_models = tuple(validation_models)
+    with TemporaryDirectory(prefix=".adapter-staging-", dir=article_root) as temporary:
+        staged = _build_staged_adapter(
+            source, article_root=Path(temporary), contract_path=contract_path,
+            validation_models=validation_models, min_n=min_n,
+            test_size=test_size, seed=seed,
+        )
+        published = publish_validated_inputs(
+            [staged.schema_path], schema_root=article_root / "schema",
+            ard_root=article_root / "data" / "ard",
+        )
+        return AdapterResult(
+            schema_path=published[staged.schema_path],
+            predictor_count=staged.predictor_count, source_count=staged.source_count,
+        )
+
+
+def _build_staged_adapter(
+    source: Path,
+    *,
+    article_root: Path,
+    contract_path: Path,
+    validation_models: Sequence[str],
+    min_n: int,
+    test_size: float,
+    seed: int,
 ) -> AdapterResult:
     source = Path(source).resolve()
     article_root = Path(article_root).resolve()
