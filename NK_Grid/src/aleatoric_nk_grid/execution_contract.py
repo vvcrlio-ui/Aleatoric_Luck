@@ -10,6 +10,8 @@ different interpretation of JSON or paths.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
+import platform
 import json
 import os
 import subprocess
@@ -18,7 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-CELL_SPEC_FORMAT_VERSION = 1
+CELL_SPEC_FORMAT_VERSION = 2
 ANALYSIS_CONTRACT_FORMAT_VERSION = 1
 EXECUTION_CONTRACT_FORMAT_VERSION = 1
 PUBLIC_RESULT_SERIALIZER_VERSION = 2
@@ -26,6 +28,18 @@ PUBLIC_RESULT_SERIALIZER_VERSION = 2
 
 class ContractError(ValueError):
     """A contract, identity, or immutable-artifact validation error."""
+
+
+def runtime_environment():
+    versions = {"python": platform.python_version(), "system": platform.system(), "machine": platform.machine()}
+    for package in ("numpy", "scipy", "pandas", "scikit-learn", "lightgbm", "xgboost", "pyarrow", "joblib", "pyyaml"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = "not-installed"
+    versions["threads"] = {key: os.environ.get(key) for key in (
+        "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "BLIS_NUM_THREADS")}
+    return versions
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -184,6 +198,8 @@ class CellExecutionSpec:
         value = dict(payload)
         if value.get("cell_spec_format_version") != CELL_SPEC_FORMAT_VERSION:
             raise ContractError("unsupported cell execution spec format")
+        if value.get("runtime_environment") != runtime_environment():
+            raise ContractError("cell execution spec runtime environment mismatch; rebuild under the intended environment")
         if not isinstance(value.get("models"), list) or not value["models"]:
             raise ContractError("cell execution spec requires ordered models")
         model_n_jobs = value.get("model_n_jobs")
@@ -286,6 +302,7 @@ class CellExecutionSpec:
             "model_params_locator": params_locator,
             "model_params_sha256": params_sha256,
             "algorithm_version": algorithm_version,
+            "runtime_environment": runtime_environment(),
             "resolved_model_params": dict(resolved_model_params),
             "environment_overrides": dict(environment_overrides),
             "split_seed": int(config.seed),

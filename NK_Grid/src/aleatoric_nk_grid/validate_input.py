@@ -1,6 +1,7 @@
 """Fail-fast validation for adapter schemas and projected ARD tables."""
 
 from __future__ import annotations
+from .phase_timing import timed_phase
 
 import json
 from pathlib import Path
@@ -328,6 +329,7 @@ def _validate_provenance(schema: InputSchema) -> None:
         raise ValueError("provenance.json is invalid JSON") from exc
 
 
+@timed_phase("input.validate_and_hash")
 def validate_input(
     loaded: LoadedInput,
     outcome: str,

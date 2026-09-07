@@ -6,6 +6,7 @@ limit, not a prediction: durable cell shards make repeated rounds safe.
 """
 
 from __future__ import annotations
+from .phase_timing import timed_phase
 from .grid_contract import validate_size_grid
 from .ingest import load_input
 from .validate_input import validate_input
@@ -213,6 +214,7 @@ class ClusterPolicy:
                 raise ValueError(f"ClusterPolicy.{field} must be non-empty when set")
 
 
+@timed_phase("plan.total")
 def build_dynamic_plan(
     config: NKGridConfig,
     *,

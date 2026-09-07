@@ -1,6 +1,7 @@
 """Joint N x K sweeps for long-format prediction quality tables."""
 
 from __future__ import annotations
+from .phase_timing import timed_phase
 from .grid_contract import validate_size_grid
 
 import argparse
@@ -1837,6 +1838,7 @@ def _fit_predict_model_cell(
     }
 
 
+@timed_phase("input.resolve_grids")
 def resolve_input_grids(config, loaded, source_definitions):
     """Resolve the design against validated outcome-specific split capacities."""
     manager = SplitIndexManager(
