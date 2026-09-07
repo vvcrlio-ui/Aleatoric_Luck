@@ -401,7 +401,8 @@ class AnalysisContract:
         expected_sha = candidate.pop("analysis_contract_sha256", None)
         if candidate.get("analysis_contract_format_version") != ANALYSIS_CONTRACT_FORMAT_VERSION:
             raise ContractError("unsupported analysis contract format")
-        if candidate.get("serializer_version") != PUBLIC_RESULT_SERIALIZER_VERSION:
+        public_schema = candidate.get("public_result_schema")
+        if not isinstance(public_schema, Mapping) or public_schema.get("serializer_version") != PUBLIC_RESULT_SERIALIZER_VERSION:
             raise ContractError("unsupported public result serializer; do not mix metric schemas")
         spec = CellExecutionSpec.from_payload(candidate.get("cell_execution_spec", {}))
         if candidate.get("cell_spec_sha256") != spec.sha256:

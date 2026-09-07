@@ -43,3 +43,29 @@ def test_slurm_roles_share_declared_numerical_threads():
                          'NUMEXPR_NUM_THREADS', 'BLIS_NUM_THREADS'):
             assert f'{variable}=1' in text, (name, variable)
         assert text.index('OMP_NUM_THREADS=1') > text.index('module load'), name
+
+
+def test_e6_new_analysis_contract_roundtrip_and_nested_serializer_drift():
+    import json
+    import copy
+    spec = CellExecutionSpec.from_payload({
+        'cell_spec_format_version':CELL_SPEC_FORMAT_VERSION, 'runtime_environment':runtime_environment(),
+        'models':['ols'], 'model_n_jobs':1, 'resolved_n_grid':[10], 'resolved_k_grid':[1],
+        'resolved_repeat_plan':[[1,0]], 'git_commit':'d'*40, 'algorithm_version':'test-v1',
+        'resolved_model_params':{'ols':{}}, 'environment_overrides':{},
+        'execution_groups':[{'k_features':1,'groups':[]}],
+        'input_provenance':{'train':{'path':'train.csv','sha256':'a'*64}}, 'require_clean_worktree':False,
+    })
+    created = AnalysisContract.create(cell_execution_spec=spec, task_design_digest='b'*64,
+        expected_task_rows=1, expected_model_rows=1,
+        public_result_schema=['mse','null_mse_train_mean','test_target_variance','skill_train_mean','r2_test_mean','r2_test'])
+    payload = json.loads(json.dumps(created.to_payload()))
+    restored = AnalysisContract.from_payload(payload)
+    assert restored.to_payload() == payload
+    for version in (1, 2, 999, None):
+        bad = copy.deepcopy(payload)
+        bad['public_result_schema']['serializer_version'] = version
+        # No outer hash is supplied, so rejection must come from version semantics.
+        bad.pop('analysis_id'); bad.pop('analysis_contract_sha256')
+        with pytest.raises(ContractError, match='serializer'):
+            AnalysisContract.from_payload(bad)
