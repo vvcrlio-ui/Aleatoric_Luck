@@ -31,3 +31,15 @@ def test_timing_failure_does_not_swallow_exception(capsys):
 def test_e6_reject_old_serializer():
     with pytest.raises(ContractError, match='serializer'):
         AnalysisContract.from_payload({'analysis_contract_format_version': 1, 'serializer_version': 1})
+
+
+def test_slurm_roles_share_declared_numerical_threads():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / 'slurm'
+    for name in ('plan_production', 'prep_dynamic_queue', 'run_flat_task_table',
+                 'verify_dynamic_queue', 'close_dynamic_queue', 'finalize_dynamic_queue'):
+        text = (root / (name + '.sbatch')).read_text()
+        for variable in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                         'NUMEXPR_NUM_THREADS', 'BLIS_NUM_THREADS'):
+            assert f'{variable}=1' in text, (name, variable)
+        assert text.index('OMP_NUM_THREADS=1') > text.index('module load'), name

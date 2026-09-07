@@ -33,6 +33,9 @@ if [ -n "${PYTHON_MODULE:-}" ]; then
   module purge
   module load "$PYTHON_MODULE"
 fi
+# Match the numerical worker environment frozen into CellExecutionSpec.
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1
+
 [ -x "$PYTHON" ] || { echo "Python not found: $PYTHON" >&2; exit 1; }
 
 # Keep the streaming writer's SQLite scratch on node-local disk, not on GPFS.

@@ -16,7 +16,8 @@ def timed_phase(name):
                 status = 'ok'
                 return result
             finally:
-                print(json.dumps({'nkgrid_phase': name, 'seconds': time.perf_counter()-start,
+                phase = name + '.locked' if kwargs.get('_schedule_locked') else name
+                print(json.dumps({'nkgrid_phase': phase, 'seconds': time.perf_counter()-start,
                                   'status': status}), file=sys.stderr, flush=True)
         return measured
     return decorate
