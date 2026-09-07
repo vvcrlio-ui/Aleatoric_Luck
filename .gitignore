@@ -14,6 +14,9 @@
 __pycache__/
 *.py[cod]
 .venv/
+# Named local environments, including .venv-linux and .venv-remediation
+.venv-*/
+*.nkgrid-env.lock
 venv/
 .ipynb_checkpoints/
 dist/
@@ -36,9 +39,14 @@ datasets/
 results/
 runs/
 plans/
+/aleatoric-production/
+/aleatoric-pilot/
 reports/
 
 # Local implementation/review notes
+# Keep launch/ source tracked; docs/ is maintained locally only.
+/docs/
+/AGENTS.md
 NK_Grid/CODE_REVIEW_REPORT_*.md
 NK_Grid/ADAPTER_TO_NK_GRID_WORKFLOW_HARDENING_PROPOSAL_*.md
 NK_Grid/RISK_REMEDIATION_REVIEW_*.md
@@ -61,6 +69,7 @@ env/
 .tox/
 .nox/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
 

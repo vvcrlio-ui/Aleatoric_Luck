@@ -6,6 +6,11 @@ limit, not a prediction: durable cell shards make repeated rounds safe.
 """
 
 from __future__ import annotations
+from .phase_timing import timed_phase
+from .grid_contract import validate_size_grid
+from .ingest import load_input
+from .validate_input import validate_input
+from .nk_grid import resolve_input_grids
 
 import argparse
 import json
@@ -99,7 +104,7 @@ def _frozen_input_provenance(schema_path: Path) -> dict[str, dict[str, str]]:
 
 
 def expanded_columns_for_k(schema_path: Path | str, k_features: int) -> int:
-    """Return the expanded-column count of the first K schema feature units."""
+    """Upper bound for any K subset, bundling derived columns by parent."""
     if k_features < 1:
         raise ValueError("k_features must be positive")
     try:
@@ -119,20 +124,31 @@ def expanded_columns_for_k(schema_path: Path | str, k_features: int) -> int:
         raise ValueError(f"invalid feature-universe schema: {schema_path}") from exc
     if not isinstance(sources, list) or k_features > len(sources):
         raise ValueError("k_features exceeds schema feature-unit count")
-    widths: list[int] = []
-    for source in sources[:k_features]:
+    widths: dict[str, int] = {}
+    for source in sources:
         features = source.get("features") if isinstance(source, Mapping) else None
         if not isinstance(features, list) or not features:
             raise ValueError("schema source has no expanded features")
-        widths.append(len(features))
-    return sum(widths)
+        parent = source.get("sampling_source") or source.get("source")
+        if not isinstance(parent, str) or not parent:
+            raise ValueError("schema source has no sampling identity")
+        widths[parent] = widths.get(parent, 0) + len(features)
+    validate_size_grid((k_features,), "K", len(widths))
+    return sum(sorted(widths.values(), reverse=True)[:k_features])
 
 
-def peak_memory_bytes(n_samples: int, expanded_columns: int, *, frame_copies: int = MEMORY_FRAME_COPIES) -> int:
-    """Conservative one-worker frame formula, expressed in byte units."""
-    if n_samples < 1 or expanded_columns < 1 or frame_copies < 1:
+def peak_memory_bytes(n_samples: int, expanded_columns: int, *, frame_copies: int = MEMORY_FRAME_COPIES,
+                      resident_bytes: int = 0, test_rows: int = 0) -> int:
+    """Heuristic worker estimate, not an RSS upper bound.
+
+    Base allowance covers resident input; the multiplier approximates slices,
+    preprocessing copies and native training. Allocator caches and process-tree
+    peaks require target-environment measurement.
+    """
+    if n_samples < 1 or expanded_columns < 1 or frame_copies < 1 or resident_bytes < 0 or test_rows < 0:
         raise ValueError("n_samples, expanded_columns, and frame_copies must be positive")
-    return MEMORY_BASE_BYTES + int(frame_copies) * int(n_samples) * int(expanded_columns) * ENGINE_VALUE_BYTES
+    return (MEMORY_BASE_BYTES + int(resident_bytes) +
+            (int(frame_copies) * int(n_samples) + 2 * int(test_rows)) * int(expanded_columns) * ENGINE_VALUE_BYTES)
 
 
 def implied_frame_copies(measured_bytes: int, *, n_samples: int, expanded_columns: int) -> float:
@@ -200,6 +216,7 @@ class ClusterPolicy:
                 raise ValueError(f"ClusterPolicy.{field} must be non-empty when set")
 
 
+@timed_phase("plan.total")
 def build_dynamic_plan(
     config: NKGridConfig,
     *,
@@ -214,8 +231,8 @@ def build_dynamic_plan(
     """Freeze one cost-free table, one worker request, and the round count."""
     reject_dynamic_prediction_export(config)
     cluster.validate()
-    resolved_n_grid = tuple(sorted({int(value) for value in n_grid}))
-    resolved_k_grid = tuple(sorted({int(value) for value in k_grid}))
+    resolved_n_grid = validate_size_grid(n_grid, "N")
+    resolved_k_grid = validate_size_grid(k_grid, "K")
     if not resolved_n_grid or not resolved_k_grid:
         raise ValueError("dynamic planning requires non-empty resolved N and K grids")
     worker_config = replace(
@@ -228,6 +245,12 @@ def build_dynamic_plan(
         n_draws=1,
     )
     _validate_config(worker_config)
+    loaded, groups = validate_input(
+        load_input(worker_config.schema, worker_config.outcome), worker_config.outcome,
+        models=worker_config.models, min_n=worker_config.min_n,
+        test_size=worker_config.test_size, seed=worker_config.seed,
+    )
+    resolve_input_grids(worker_config, loaded, groups)
     engine_root = Path(__file__).resolve().parents[2]
     source_state = git_state(engine_root)
     if not isinstance(source_state.get("commit"), str) or len(str(source_state["commit"])) != 40:
@@ -285,7 +308,14 @@ def build_dynamic_plan(
     max_n = summary.max_n
     max_k = summary.max_k
     expanded = expanded_columns_for_k(config.schema, max_k)
-    formula_bytes = peak_memory_bytes(max_n, expanded)
+    resident_bytes = int(loaded.train.memory_usage(index=True, deep=True).sum())
+    if loaded.test is not None:
+        resident_bytes += int(loaded.test.memory_usage(index=True, deep=True).sum())
+        test_rows = len(loaded.test)
+    else:
+        # Conservative slice allowance; internal per-seed test counts may vary.
+        test_rows = len(loaded.train)
+    formula_bytes = peak_memory_bytes(max_n, expanded, resident_bytes=resident_bytes, test_rows=test_rows)
     request = ResourceRequest(
         cpus_per_task=1, partition=cluster.partition,
         memory=cluster.memory_override or format_slurm_memory(formula_bytes),
@@ -381,6 +411,8 @@ def build_dynamic_plan(
         "memory": {
             "max_n": max_n, "max_k": max_k, "expanded_columns": expanded,
             "formula_bytes": formula_bytes, "frame_copies": MEMORY_FRAME_COPIES,
+            "resident_input_bytes": resident_bytes, "test_slice_rows_allowance": test_rows,
+            "model": "base + resident input + 12 train/preprocess/native frames + 2 test slices; heuristic, not RSS bound",
             "request": request.memory,
         },
         "submission": {
@@ -556,8 +588,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser.error(str(exc))
         plan_out = args.plan_out or args.root / "plan.json"
     plan = build_dynamic_plan(
-        _config_from_json(payload["config"]), n_grid=[int(value) for value in payload["n_grid"]],
-        k_grid=[int(value) for value in payload["k_grid"]], cluster=_cluster_from_payload(payload["cluster"]),
+        _config_from_json(payload["config"]), n_grid=payload["n_grid"],
+        k_grid=payload["k_grid"], cluster=_cluster_from_payload(payload["cluster"]),
         table_path=payload["task_table"], snapshot_path=payload["snapshot"],
         output_dir=payload["output_dir"], panel=str(payload["panel"]),
     )

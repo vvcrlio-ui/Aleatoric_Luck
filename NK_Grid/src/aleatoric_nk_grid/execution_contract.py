@@ -8,8 +8,11 @@ different interpretation of JSON or paths.
 """
 
 from __future__ import annotations
+from .grid_contract import validate_size_grid
 
 import hashlib
+import importlib.metadata
+import platform
 import json
 import os
 import subprocess
@@ -18,14 +21,26 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-CELL_SPEC_FORMAT_VERSION = 1
+CELL_SPEC_FORMAT_VERSION = 2
 ANALYSIS_CONTRACT_FORMAT_VERSION = 1
 EXECUTION_CONTRACT_FORMAT_VERSION = 1
-PUBLIC_RESULT_SERIALIZER_VERSION = 1
+PUBLIC_RESULT_SERIALIZER_VERSION = 3
 
 
 class ContractError(ValueError):
     """A contract, identity, or immutable-artifact validation error."""
+
+
+def runtime_environment():
+    versions = {"python": platform.python_version(), "system": platform.system(), "machine": platform.machine()}
+    for package in ("numpy", "scipy", "pandas", "scikit-learn", "lightgbm", "xgboost", "pyarrow", "joblib", "pyyaml"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = "not-installed"
+    versions["threads"] = {key: os.environ.get(key) for key in (
+        "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "BLIS_NUM_THREADS")}
+    return versions
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -184,6 +199,8 @@ class CellExecutionSpec:
         value = dict(payload)
         if value.get("cell_spec_format_version") != CELL_SPEC_FORMAT_VERSION:
             raise ContractError("unsupported cell execution spec format")
+        if value.get("runtime_environment") != runtime_environment():
+            raise ContractError("cell execution spec runtime environment mismatch; rebuild under the intended environment")
         if not isinstance(value.get("models"), list) or not value["models"]:
             raise ContractError("cell execution spec requires ordered models")
         model_n_jobs = value.get("model_n_jobs")
@@ -192,6 +209,11 @@ class CellExecutionSpec:
         for name in ("resolved_n_grid", "resolved_k_grid", "resolved_repeat_plan"):
             if not isinstance(value.get(name), list) or not value[name]:
                 raise ContractError(f"cell execution spec requires frozen {name}")
+        for name in ("resolved_n_grid", "resolved_k_grid"):
+            try:
+                validate_size_grid(value[name], name)
+            except ValueError as exc:
+                raise ContractError(str(exc)) from exc
         if not isinstance(value.get("git_commit"), str) or len(str(value["git_commit"])) != 40:
             raise ContractError("cell execution spec requires a full git commit")
         if not isinstance(value.get("algorithm_version"), str) or not value["algorithm_version"]:
@@ -244,8 +266,8 @@ class CellExecutionSpec:
         job_count = int(config.n_jobs if model_n_jobs is None else model_n_jobs)
         if job_count < 1:
             raise ContractError("model_n_jobs must be positive")
-        n_grid = tuple(int(item) for item in (resolved_n_grid or config.n_grid or ()))
-        k_grid = tuple(int(item) for item in (resolved_k_grid or config.k_grid or ()))
+        n_grid = validate_size_grid(resolved_n_grid if resolved_n_grid is not None else (config.n_grid or ()), "N")
+        k_grid = validate_size_grid(resolved_k_grid if resolved_k_grid is not None else (config.k_grid or ()), "K")
         repeats = tuple((int(seed), int(draw)) for seed, draw in (resolved_repeat_plan or config.repeat_plan or ()))
         if not n_grid or not k_grid or not repeats:
             raise ContractError("CellExecutionSpec requires resolved grids and repeat plan")
@@ -286,6 +308,7 @@ class CellExecutionSpec:
             "model_params_locator": params_locator,
             "model_params_sha256": params_sha256,
             "algorithm_version": algorithm_version,
+            "runtime_environment": runtime_environment(),
             "resolved_model_params": dict(resolved_model_params),
             "environment_overrides": dict(environment_overrides),
             "split_seed": int(config.seed),
@@ -378,6 +401,9 @@ class AnalysisContract:
         expected_sha = candidate.pop("analysis_contract_sha256", None)
         if candidate.get("analysis_contract_format_version") != ANALYSIS_CONTRACT_FORMAT_VERSION:
             raise ContractError("unsupported analysis contract format")
+        public_schema = candidate.get("public_result_schema")
+        if not isinstance(public_schema, Mapping) or public_schema.get("serializer_version") != PUBLIC_RESULT_SERIALIZER_VERSION:
+            raise ContractError("unsupported public result serializer; do not mix metric schemas")
         spec = CellExecutionSpec.from_payload(candidate.get("cell_execution_spec", {}))
         if candidate.get("cell_spec_sha256") != spec.sha256:
             raise ContractError("analysis contract cell execution spec checksum mismatch")

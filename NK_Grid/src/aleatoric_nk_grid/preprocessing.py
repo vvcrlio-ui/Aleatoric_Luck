@@ -1,6 +1,7 @@
 """Source-aware, per-cell preprocessing for the shared engine."""
 
 from __future__ import annotations
+from sklearn.base import BaseEstimator, TransformerMixin
 
 import json
 from dataclasses import dataclass
@@ -122,10 +123,11 @@ def sampling_units(groups: Sequence[SourceGroup]) -> tuple[SamplingUnit, ...]:
     for group in sorted(groups, key=lambda item: item.source_order):
         source = group.sampling_source or group.name
         bundled.setdefault(source, []).append(group)
-    return tuple(
+    units = tuple(
         SamplingUnit(name=source, groups=tuple(source_groups))
         for source, source_groups in bundled.items()
     )
+    return tuple(sorted(units, key=lambda unit: unit.primary.source_order))
 
 
 def source_groups(
@@ -868,6 +870,44 @@ def _preprocess_cell_vectorized_mixed(
     train.attrs["_preprocess_vectorized"] = True
     test.attrs["_preprocess_vectorized"] = True
     return CellPreprocessingResult(train, test, unobserved, False)
+
+
+class FoldPreprocessor(TransformerMixin, BaseEstimator):
+    """Learn the existing typed fill/prior contract using training rows only."""
+
+    def __init__(self, groups, imputation, model_name):
+        self.groups = groups
+        self.imputation = imputation
+        self.model_name = model_name
+
+    def _fit_cell(self, X):
+        self.columns_ = tuple(X.columns)
+        probe = pd.DataFrame(np.nan, index=[0], columns=self.columns_)
+        result = preprocess_cell(X, probe, self.groups, self.imputation, model_name=self.model_name)
+        self.fill_ = result.X_test.iloc[0].copy()
+        self.unobserved_ = tuple(not _source_observed(X, group).any() for group in self.groups)
+        self.passthrough_ = result.passthrough
+        return result
+
+    def fit(self, X, y=None):
+        self._fit_cell(X)
+        return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        return self._fit_cell(X).X_train
+
+    def transform(self, X):
+        if tuple(X.columns) != self.columns_:
+            raise ValueError("fold preprocessing column order mismatch")
+        # Validated one-hot sources are either observed atomically or all NaN.
+        # Applying the learned fill row in one operation preserves that rule
+        # without repeated group-wise DataFrame indexing on every LOO fold.
+        result = X.copy() if self.passthrough_ else X.fillna(self.fill_)
+        forced = [feature for group, absent in zip(self.groups, self.unobserved_, strict=True)
+                  if absent for feature in group.features]
+        if forced:
+            result.loc[:, forced] = self.fill_.loc[forced].to_numpy()
+        return result
 
 
 def preprocess_cell(

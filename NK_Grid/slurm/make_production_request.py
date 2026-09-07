@@ -19,7 +19,10 @@ from pathlib import Path
 
 from aleatoric_nk_grid import run_panels
 from aleatoric_nk_grid.ingest import load_input
-from aleatoric_nk_grid.nk_grid import log2_size_grid
+from aleatoric_nk_grid.nk_grid import resolve_input_grids
+from aleatoric_nk_grid.flat_task_table import _config_from_json
+from aleatoric_nk_grid.validate_input import validate_input
+from aleatoric_nk_grid.preprocessing import sampling_units
 
 
 def resolved_grids(config_json: dict, schema_path: Path, outcome: str) -> tuple[list[int], list[int]]:
@@ -35,17 +38,14 @@ def resolved_grids(config_json: dict, schema_path: Path, outcome: str) -> tuple[
     # training rows are what log2_size_grid is given inside the engine.
     n_train = int(loaded.train[outcome].notna().sum())
 
-    definition = Path(str(schema.feature_universe["definition_file"]))
-    if not definition.is_absolute():
-        definition = (schema.path.parent / definition).resolve()
-    n_units = len(json.loads(definition.read_text(encoding="utf-8"))["sources"])
-
-    n_grid = [int(v) for v in log2_size_grid(
-        n_train, config_json["n_sizes_n"], config_json["max_n"], min_size=config_json["min_n"],
-    )]
-    k_grid = [int(v) for v in log2_size_grid(
-        n_units, config_json["n_sizes_k"], config_json["max_k"],
-    )]
+    config = _config_from_json(config_json)
+    loaded, groups = validate_input(
+        loaded, outcome, models=config.models, min_n=config.min_n,
+        test_size=config.test_size, seed=config.seed,
+    )
+    n_units = len(sampling_units(groups))
+    resolved_n, resolved_k = resolve_input_grids(config, loaded, groups)
+    n_grid, k_grid = resolved_n.tolist(), resolved_k.tolist()
     print(
         f"[grid] train_rows={n_train} feature_units={n_units} "
         f"N={len(n_grid)} points K={len(k_grid)} points",

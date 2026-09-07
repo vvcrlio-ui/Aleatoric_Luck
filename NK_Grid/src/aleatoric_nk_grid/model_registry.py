@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 import yaml
-from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import (
     ExtraTreesClassifier,
@@ -20,6 +21,7 @@ from sklearn.ensemble import (
     StackingRegressor,
 )
 from sklearn.impute import SimpleImputer
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import (
     LassoCV,
     LinearRegression,
@@ -138,6 +140,15 @@ def _validated_params(
 ) -> dict[str, Any]:
     reject_removed_model(model_name)
     allowed = MODEL_PARAM_KEYS.get(task, {}).get(model_name)
+    if task == "regression" and model_name == "super_learner":
+        allowed = allowed | {"mlp_batch_size", "diagnostics"}
+        params = {"mlp_batch_size": "auto", "diagnostics": False, **params}
+        batch = params["mlp_batch_size"]
+        if not ((isinstance(batch, str) and batch in {"auto", "full"}) or
+                (type(batch) is int and batch > 0)):
+            raise ValueError("mlp_batch_size must be auto, full, or a positive integer")
+        if type(params["diagnostics"]) is not bool:
+            raise ValueError("diagnostics must be boolean")
     if allowed is None:
         reject_removed_model(model_name)
         raise ValueError(
@@ -273,6 +284,20 @@ def _apply_environment_overrides(
     return result
 
 
+def _select_cv_round(curve, patience=None):
+    """First strict minimum, optionally replaying aggregate early stopping."""
+    values = np.asarray(curve, dtype=float)
+    if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
+        raise ValueError("CV requires a complete finite metric curve")
+    best = 0
+    for index in range(1, len(values)):
+        if values[index] < values[best]:
+            best = index
+        if patience is not None and patience > 0 and index - best >= patience:
+            break
+    return best + 1
+
+
 class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
     """Source-aligned XGBoost: depth 2, eta .3, CV-selected rounds <= 90.
 
@@ -292,6 +317,7 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
         eta: float,
         max_rounds: int,
         cv_folds: int,
+        preprocessor=None,
     ):
         self.seed = seed
         self.n_jobs = n_jobs
@@ -301,6 +327,7 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
         self.eta = eta
         self.max_rounds = max_rounds
         self.cv_folds = cv_folds
+        self.preprocessor = preprocessor
 
     def fit(self, X, y):
         import xgboost as xgb
@@ -329,23 +356,32 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
             )
             for fold in range(self.cv_folds)
         ]
-        cv = xgb.cv(
-            self.params_,
-            dtrain,
-            num_boost_round=self.max_rounds,
-            nfold=self.cv_folds,
-            seed=self.seed,
-            shuffle=True,
-            folds=folds,
-            verbose_eval=False,
-        )
-        metric_key = "test-rmse-mean"
-        if metric_key not in cv:
-            raise ValueError(
-                f"XGBoost CV did not return {metric_key!r}; "
-                f"available keys={list(cv.columns)}"
-            )
-        self.best_rounds_ = int(cv[metric_key].idxmin()) + 1
+        if len(y) < self.cv_folds:
+            raise ValueError("XGBoost requires at least cv_folds training rows")
+        curves = []
+        for train_index, valid_index in folds:
+            if self.preprocessor is None:
+                fold_train = dtrain.slice(train_index)
+                fold_valid = dtrain.slice(valid_index)
+            else:
+                process = clone(self.preprocessor).fit(X.iloc[train_index])
+                fold_train = xgb.DMatrix(process.transform(X.iloc[train_index]), label=np.asarray(y)[train_index])
+                fold_valid = xgb.DMatrix(process.transform(X.iloc[valid_index]), label=np.asarray(y)[valid_index])
+            booster = None
+            try:
+                history = {}
+                booster = xgb.train(
+                    self.params_, fold_train, num_boost_round=self.max_rounds,
+                    evals=[(fold_valid, "valid")], evals_result=history, verbose_eval=False,
+                )
+                curves.append(history["valid"]["rmse"])
+            finally:
+                del booster, fold_train, fold_valid
+        self.cv_curve_ = np.mean(np.asarray(curves, dtype=float), axis=0)
+        self.best_rounds_ = _select_cv_round(self.cv_curve_)
+        if self.preprocessor is not None:
+            self.preprocessor_ = clone(self.preprocessor).fit(X)
+            dtrain = xgb.DMatrix(self.preprocessor_.transform(X), label=np.asarray(y))
         self.model_ = xgb.train(
             self.params_, dtrain, num_boost_round=self.best_rounds_
         )
@@ -354,6 +390,8 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
     def predict(self, X):
         import xgboost as xgb
 
+        if self.preprocessor is not None:
+            X = self.preprocessor_.transform(X)
         return self.model_.predict(xgb.DMatrix(X))
 
 
@@ -374,6 +412,7 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
         max_rounds: int,
         cv_folds: int,
         early_stopping_rounds: int,
+        preprocessor=None,
     ):
         self.seed = seed
         self.n_jobs = n_jobs
@@ -386,6 +425,7 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
         self.max_rounds = max_rounds
         self.cv_folds = cv_folds
         self.early_stopping_rounds = early_stopping_rounds
+        self.preprocessor = preprocessor
 
     def fit(self, X, y):
         import lightgbm as lgb
@@ -401,31 +441,50 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
             "seed": self.seed,
             "verbosity": self.verbosity,
         }
-        cv = lgb.cv(
-            self.params_,
-            train,
-            num_boost_round=self.max_rounds,
-            nfold=self.cv_folds,
-            stratified=False,
-            seed=self.seed,
-            callbacks=[
-                lgb.early_stopping(self.early_stopping_rounds, verbose=False)
-            ],
-        )
-        metric_keys = [key for key in cv if key.endswith("rmse-mean")]
-        if len(metric_keys) != 1:
-            raise ValueError(
-                "LightGBM CV did not return one rmse-mean series; "
-                f"available keys={list(cv)}"
-            )
-        metric_key = metric_keys[0]
-        self.best_rounds_ = int(np.argmin(cv[metric_key])) + 1
+        if len(y) < self.cv_folds:
+            raise ValueError("LightGBM requires at least cv_folds training rows")
+        # Preserve 4.6.0 _make_n_folds, including its remainder behavior and
+        # full-data bin construction. Fold-local bins belong to M4, not M2.
+        if self.preprocessor is None:
+            train._update_params(self.params_).construct()
+        order = np.random.RandomState(self.seed).permutation(len(y))
+        step = len(y) // self.cv_folds
+        valid_indices = [order[i:i + step] for i in range(0, len(y), step)]
+        curves = []
+        for fold in range(self.cv_folds):
+            train_index = np.concatenate([valid_indices[i] for i in range(self.cv_folds) if i != fold])
+            if self.preprocessor is None:
+                fold_train = train.subset(sorted(train_index))
+                fold_valid = train.subset(sorted(valid_indices[fold]))
+            else:
+                train_index, valid_index = sorted(train_index), sorted(valid_indices[fold])
+                process = clone(self.preprocessor).fit(X.iloc[train_index])
+                fold_train = lgb.Dataset(process.transform(X.iloc[train_index]), label=np.asarray(y)[train_index])
+                fold_valid = lgb.Dataset(process.transform(X.iloc[valid_index]), label=np.asarray(y)[valid_index], reference=fold_train)
+            booster = None
+            try:
+                history = {}
+                booster = lgb.train(
+                    self.params_, fold_train, num_boost_round=self.max_rounds,
+                    valid_sets=[fold_valid], valid_names=["valid"],
+                    callbacks=[lgb.record_evaluation(history)],
+                )
+                curves.append(history["valid"]["rmse"])
+            finally:
+                del booster, fold_train, fold_valid
+        self.cv_curve_ = np.mean(np.asarray(curves, dtype=float), axis=0)
+        self.best_rounds_ = _select_cv_round(self.cv_curve_, self.early_stopping_rounds)
+        if self.preprocessor is not None:
+            self.preprocessor_ = clone(self.preprocessor).fit(X)
+            train = lgb.Dataset(self.preprocessor_.transform(X), label=np.asarray(y))
         self.model_ = lgb.train(
             self.params_, train, num_boost_round=self.best_rounds_
         )
         return self
 
     def predict(self, X):
+        if self.preprocessor is not None:
+            X = self.preprocessor_.transform(X)
         return np.asarray(self.model_.predict(X), dtype=float)
 
 
@@ -593,6 +652,27 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
         return self.model_.predict(np.asarray(X, dtype=float))
 
 
+class FitBatchMLPRegressor(MLPRegressor):
+    """Resolve full at each actual fit; retain constructor policy for clone."""
+
+    def fit(self, X, y, sample_weight=None):
+        policy = self.batch_size
+        self.fit_n_ = len(y)
+        self.effective_batch_size_ = min(200, len(y)) if policy == "auto" else (
+            len(y) if policy == "full" else min(policy, len(y)))
+        self.batch_size = len(y) if policy == "full" else policy
+        try:
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always", ConvergenceWarning)
+                result = super().fit(X, y, sample_weight=sample_weight)
+            self.convergence_warnings_ = [str(w.message) for w in captured if issubclass(w.category, ConvergenceWarning)]
+            for warning in captured:
+                warnings.warn(warning.message, warning.category, stacklevel=2)
+            return result
+        finally:
+            self.batch_size = policy
+
+
 class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
     """Compact Super Learner with out-of-fold base-model predictions."""
 
@@ -619,6 +699,9 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         lgbm_learning_rate: float,
         lgbm_num_leaves: int,
         lgbm_min_data_in_leaf: int,
+        mlp_batch_size: str | int = "auto",
+        diagnostics: bool = False,
+        preprocessor=None,
     ):
         self.seed = seed
         self.n_jobs = n_jobs
@@ -640,6 +723,9 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         self.lgbm_learning_rate = lgbm_learning_rate
         self.lgbm_num_leaves = lgbm_num_leaves
         self.lgbm_min_data_in_leaf = lgbm_min_data_in_leaf
+        self.mlp_batch_size = mlp_batch_size
+        self.diagnostics = diagnostics
+        self.preprocessor = preprocessor
 
     def fit(self, X, y):
         if self.passthrough and np.asarray(pd.isna(X)).any():
@@ -704,7 +790,8 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                     SimpleImputer(strategy="median"),
                     StandardScaler(),
                     TransformedTargetRegressor(
-                        regressor=MLPRegressor(
+                        regressor=FitBatchMLPRegressor(
+                            batch_size=self.mlp_batch_size,
                             hidden_layer_sizes=tuple(self.hidden_layer_sizes),
                             alpha=self.alpha,
                             learning_rate_init=self.learning_rate_init,
@@ -716,6 +803,13 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                 ),
             ),
         ]
+        if self.preprocessor is not None:
+            from .fold_local import FoldLocalRidge
+            estimators[0] = ("ridge", FoldLocalRidge(
+                clone(self.preprocessor), self.ridge_alpha_log10_min, self.ridge_alpha_log10_max,
+                self.ridge_n_alphas, self.ridge_scoring))
+            for _, estimator in estimators[1:]:
+                estimator.steps[0] = ("typed_preprocessing", clone(self.preprocessor))
         self.model_ = StackingRegressor(
             estimators=estimators,
             final_estimator=LinearRegression(positive=self.positive),
@@ -723,6 +817,32 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
             passthrough=self.passthrough,
             n_jobs=self.n_jobs,
         ).fit(X, y)
+        if self.diagnostics:
+            # Explicit diagnostic runs replay deterministic folds to inspect
+            # fitted estimators; this extra work is never enabled by default.
+            records = []
+            target = np.asarray(y)
+            for fold, (train_rows, valid_rows) in enumerate(KFold(cv).split(X)):
+                train_X = X.iloc[train_rows] if hasattr(X, "iloc") else X[train_rows]
+                valid_X = X.iloc[valid_rows] if hasattr(X, "iloc") else X[valid_rows]
+                for name, estimator in estimators:
+                    fitted = clone(estimator).fit(train_X, target[train_rows])
+                    record = {"phase": "oof", "fold": fold, "model": name, "N": len(train_rows),
+                              "mse": float(np.mean((fitted.predict(valid_X) - target[valid_rows]) ** 2))}
+                    if name == "shallow_nn":
+                        mlp = fitted.steps[-1][1].regressor_
+                        record.update(batch=mlp.effective_batch_size_, iterations=mlp.n_iter_, max_iter=mlp.max_iter,
+                                      convergence_warnings=mlp.convergence_warnings_,
+                                      reached_max_iter=mlp.n_iter_ >= mlp.max_iter)
+                    records.append(record)
+            mlp = self.model_.named_estimators_["shallow_nn"].steps[-1][1].regressor_
+            records.append({"phase": "full", "model": "shallow_nn", "N": mlp.fit_n_,
+                            "convergence_warnings": mlp.convergence_warnings_,
+                            "batch": mlp.effective_batch_size_, "iterations": mlp.n_iter_, "max_iter": mlp.max_iter,
+                            "reached_max_iter": mlp.n_iter_ >= mlp.max_iter})
+            self.diagnostics_ = {"fits": records, "coefficients": self.model_.final_estimator_.coef_.tolist(),
+                                 "intercept": float(self.model_.final_estimator_.intercept_),
+                                 "note": "diagnostic fold replay; epochs do not imply equal optimizer steps"}
         return self
 
     def predict(self, X):
@@ -751,6 +871,7 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         lgbm_learning_rate: float,
         lgbm_num_leaves: int,
         lgbm_min_data_in_leaf: int,
+        preprocessor=None,
     ):
         self.seed = seed
         self.n_jobs = n_jobs
@@ -768,6 +889,7 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         self.lgbm_learning_rate = lgbm_learning_rate
         self.lgbm_num_leaves = lgbm_num_leaves
         self.lgbm_min_data_in_leaf = lgbm_min_data_in_leaf
+        self.preprocessor = preprocessor
 
     def fit(self, X, y):
         if self.passthrough and np.asarray(pd.isna(X)).any():
@@ -837,6 +959,9 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
                 ),
             ),
         ]
+        if getattr(self, "preprocessor", None) is not None:
+            for _, estimator in estimators:
+                estimator.steps.insert(0, ("typed_preprocessing", clone(self.preprocessor)))
         self.model_ = StackingClassifier(
             estimators=estimators,
             final_estimator=LogisticRegression(
@@ -954,6 +1079,7 @@ def make_model(
     n_jobs: int = 1,
     task: str = "regression",
     params: Mapping[str, Any] | None = None,
+    preprocessor=None,
 ):
     """Construct one model using source-aligned or documented extension settings."""
 
@@ -971,6 +1097,25 @@ def make_model(
     resolved_params = _validated_params(task, name, params)
     resolved_params = _apply_environment_overrides(name, resolved_params)
 
+    if preprocessor is not None and task == "regression":
+        from .fold_local import FoldLocalRidge, FoldLocalLasso, FoldLocalMLP
+        if name == "ridge":
+            return FoldLocalRidge(preprocessor=preprocessor, **resolved_params)
+        if name == "lasso":
+            return FoldLocalLasso(preprocessor=preprocessor, seed=seed, n_jobs=n_jobs, **resolved_params)
+        if name == "shallow_neural_network":
+            return FoldLocalMLP(preprocessor, seed, resolved_params)
+        if name in {"xgboost", "lightgbm", "super_learner"}:
+            constructor = {"xgboost": XGBoostCVRegressor, "lightgbm": LightGBMCVRegressor,
+                           "super_learner": AdaptiveStackingRegressor}[name]
+            return constructor(seed=seed, n_jobs=n_jobs, preprocessor=preprocessor, **resolved_params)
+    if preprocessor is not None:
+        # Models without nested parameter selection fit this chain once.
+        estimator = make_model(name, seed, n_jobs, task, params)
+        if task == "classification" and name == "super_learner":
+            estimator.preprocessor = preprocessor
+            return estimator
+        return make_pipeline(clone(preprocessor), estimator)
     if task == "classification":
         return _make_classification_model(
             name,

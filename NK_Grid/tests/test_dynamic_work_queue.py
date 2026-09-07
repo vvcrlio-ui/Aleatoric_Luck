@@ -32,9 +32,9 @@ from aleatoric_nk_grid.worker_event_wal import WALFrameTooLarge
 
 def _schema(path: Path) -> Path:
     path.write_text(json.dumps({"sources": [
-        {"unit_type": "continuous", "features": [{"name": "x0"}]},
-        {"unit_type": "onehot_group", "features": [{"name": "x1a"}, {"name": "x1b"}, {"name": "x1c"}]},
-        {"unit_type": "continuous", "features": [{"name": "x2"}, {"name": "x3"}]},
+        {"source": "first", "unit_type": "continuous", "features": [{"name": "x0"}]},
+        {"source": "second", "unit_type": "onehot_group", "features": [{"name": "x1a"}, {"name": "x1b"}, {"name": "x1c"}]},
+        {"source": "third", "unit_type": "continuous", "features": [{"name": "x2"}, {"name": "x3"}]},
     ]}), encoding="utf-8")
     return path
 
@@ -57,7 +57,8 @@ def _cluster(**changes: object) -> ClusterPolicy:
 def test_expanded_columns_not_source_count_drives_memory(tmp_path):
     schema = _schema(tmp_path / "schema.json")
     expanded = expanded_columns_for_k(schema, 2)
-    assert expanded == 4
+    # Any random K=2 subset is permitted: widths 3+2, not the first two 1+3.
+    assert expanded == 5
     assert peak_memory_bytes(100, expanded) > peak_memory_bytes(100, 2)
 
 

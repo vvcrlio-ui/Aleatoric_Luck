@@ -1,6 +1,8 @@
 """Joint N x K sweeps for long-format prediction quality tables."""
 
 from __future__ import annotations
+from .phase_timing import timed_phase
+from .grid_contract import validate_size_grid
 
 import argparse
 import json
@@ -51,7 +53,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[2]
 
-from .evaluation import r2_against_training_mean
+from .evaluation import r2_against_training_mean, regression_denominators, METRIC_DEFINITION_VERSION
 from .execution_contract import (
     CellExecutionSpec,
     ContractError,
@@ -98,6 +100,7 @@ from .model_registry import (
 )
 from .native_process import IsolatedProcessRunner
 from .preprocessing import (
+    FoldPreprocessor,
     SourceGroup,
     count_unobserved_sources,
     count_varying_sources,
@@ -162,6 +165,7 @@ def _run_native_model_cell_locked(
 
 METRIC_COLUMNS = (
     "r2_test",
+    "mse", "null_mse_train_mean", "test_target_variance", "skill_train_mean", "r2_test_mean",
     "skill_score_pct",
     "rmse",
     "mae",
@@ -210,6 +214,7 @@ BASE_RESULT_COLUMNS = (
     "K_expanded", "n_expanded_features_total", "K_unobserved",
 )
 STABLE_DIAGNOSTIC_RESULT_COLUMNS = (
+    "mlp_diagnostics_json",
     "K_varying", "constant_prediction", "underdetermined", "converged",
     "_preprocess_vectorized",
 )
@@ -683,6 +688,7 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
     bottom_pred = preds <= np.quantile(preds, 0.10)
     return {
         "r2_test": r2_test,
+        **regression_denominators(y_true, preds, train),
         "skill_score_pct": 100.0 * r2_test,
         "rmse": rmse,
         "mae": mae,
@@ -799,8 +805,9 @@ def _empty_classification_metrics() -> dict[str, float]:
     return {column: np.nan for column in CLASSIFICATION_METRIC_COLUMNS}
 
 
-def _empty_diagnostics() -> dict[str, float | bool]:
+def _empty_diagnostics() -> dict[str, float | bool | str]:
     return {
+        "mlp_diagnostics_json": "",
         "K_varying": np.nan,
         "constant_prediction": False,
         "underdetermined": False,
@@ -1297,6 +1304,9 @@ def validate_prediction_export_grid(
 def _validate_config(config: NKGridConfig) -> None:
     """Reject invalid run controls before dry-run arithmetic or data loading."""
 
+    for name in ("n_grid", "k_grid"):
+        if getattr(config, name) is not None:
+            validate_size_grid(getattr(config, name), name)
     for field in (
         "n_seeds",
         "n_draws",
@@ -1799,6 +1809,7 @@ def _fit_predict_model_cell(
     y_train: pd.Series,
     X_test: pd.DataFrame,
     model_n_jobs: int = 1,
+    preprocessor=None,
 ) -> dict[str, Any]:
     """Fit and predict one cell; safe to execute in an isolated subprocess."""
 
@@ -1808,6 +1819,7 @@ def _fit_predict_model_cell(
         n_jobs=model_n_jobs,
         task=task,
         params=params,
+        preprocessor=preprocessor,
     )
     fit_started = time.perf_counter()
     model.fit(X_train, y_train)
@@ -1818,6 +1830,7 @@ def _fit_predict_model_cell(
     )
     return {
         "predictions": predictions,
+        "mlp_diagnostics_json": json.dumps(model.diagnostics_, sort_keys=True, separators=(",", ":"), allow_nan=False) if hasattr(model, "diagnostics_") else "",
         "fit_seconds": time.perf_counter() - fit_started,
         "best_rounds": _model_best_rounds(model),
         "converged": _model_converged(model),
@@ -1826,6 +1839,27 @@ def _fit_predict_model_cell(
         "alpha": _model_alpha(model),
         "peak_rss_bytes": _process_peak_rss_bytes(),
     }
+
+
+@timed_phase("input.resolve_grids")
+def resolve_input_grids(config, loaded, source_definitions):
+    """Resolve the design against validated outcome-specific split capacities."""
+    manager = SplitIndexManager(
+        frame=loaded.train, external_frame=loaded.test if loaded.schema.split_mode == "external_test" else None,
+        predictors=loaded.predictors, outcome=config.outcome,
+        test_size=config.test_size, task=loaded.schema.task, id_column=None,
+    )
+    seeds = tuple(dict.fromkeys(seed for seed, _ in resolve_repeat_pairs(config)))
+    capacity = len(manager.for_seed(seeds[0]).train_index)
+    units = sampling_units(source_definitions)
+    n_grid = config.n_grid if config.n_grid is not None else log2_size_grid(
+        capacity, config.n_sizes_n, config.max_n, min_size=config.min_n)
+    k_grid = config.k_grid if config.k_grid is not None else log2_size_grid(
+        len(units), config.n_sizes_k, config.max_k)
+    for seed in seeds:
+        validate_size_grid(n_grid, f"N (seed={seed})", len(manager.for_seed(seed).train_index))
+    validate_size_grid(k_grid, "K", len(units))
+    return np.asarray(n_grid, dtype=int), np.asarray(k_grid, dtype=int)
 
 
 class NKGridExecutionSession:
@@ -1880,18 +1914,9 @@ class NKGridExecutionSession:
             ),
         )
         self.repeat_pairs = resolve_repeat_pairs(config)
-        first_split = self.split_manager.for_seed(self.repeat_pairs[0][0])
-        self.n_grid = (
-            np.asarray(config.n_grid, dtype=int)
-            if config.n_grid else log2_size_grid(
-                len(first_split.train_index), config.n_sizes_n, config.max_n, min_size=config.min_n,
-            )
-        )
-        self.k_grid = (
-            np.asarray(config.k_grid, dtype=int)
-            if config.k_grid else log2_size_grid(len(self.feature_units), config.n_sizes_k, config.max_k)
-        )
+        self.n_grid, self.k_grid = resolve_input_grids(config, loaded, source_definitions)
         self.semantic_contract = {
+            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else "classification-v1",
             "kind": "nk_grid" if self.task == "regression" else "nk_grid_classification",
             "algorithm_version": algorithm_version,
             "dataset": self.dataset,
@@ -2053,6 +2078,8 @@ class NKGridExecutionSession:
 
         if self._closed:
             raise RuntimeError("NKGridExecutionSession is closed")
+        validate_size_grid((n_samples,), "N")
+        validate_size_grid((k_features,), "K", len(self.feature_units))
         frozen_models = tuple(str(model) for model in models)
         if not frozen_models or len(frozen_models) != len(set(frozen_models)) or not set(frozen_models).issubset(self.config.models):
             raise ValueError("cell group models must be a unique subset of the frozen model list")
@@ -2061,9 +2088,12 @@ class NKGridExecutionSession:
         if int(n_samples) not in set(map(int, self.n_grid)) or int(k_features) not in set(map(int, self.k_grid)):
             raise ValueError("cell group N/K is outside the frozen resolved grid")
         indexes = self.split_manager.for_seed(int(seed))
+        validate_size_grid((n_samples,), "N", len(indexes.train_index))
         orders = self._orders(int(seed), int(draw), indexes.train_index)
         selected_rows = orders.row_index[: int(n_samples)]
         selected_units = [str(unit) for unit in orders.feature_names[: int(k_features)]]
+        if len(selected_rows) != n_samples or len(selected_units) != k_features:
+            raise ValueError("sampled N/K does not match declared N/K")
         selected_cols = [feature for unit in selected_units for feature in self.feature_groups[unit]]
         selected_groups = [
             group
@@ -2123,6 +2153,10 @@ class NKGridExecutionSession:
         return result
 
     def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, test_ids: pd.Series | None, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> dict[str, object]:
+        if len(X_sub_raw) != n_samples or len(y_sub) != n_samples or len(sampling_units(selected_groups)) != k_features:
+            raise ValueError("fit input does not match declared N/K")
+        if X_sub_raw.shape[1] != sum(len(g.features) for g in selected_groups):
+            raise ValueError("fit input does not match expanded feature count")
         model_started = time.perf_counter()
         row = self._base(model_name=model_name, seed=seed, draw=draw, n_samples=n_samples, k_features=k_features, n_train_total=n_train_total, n_test_total=n_test_total)
         row["K_expanded"] = X_sub_raw.shape[1]; row["K_unobserved"] = unobserved
@@ -2166,14 +2200,17 @@ class NKGridExecutionSession:
                 return result(empty_metrics, status="skipped", error="below minimum per-class count for super_learner CV")
             if model_name in {"lightgbm", "super_learner"}:
                 log_progress(f"cell starting model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features}")
-            X_fit = X_prepared if model_name in SERIAL_OUTER_MODELS else X_prepared.copy(deep=True)
-            X_test_fit = X_test_prepared if model_name in SERIAL_OUTER_MODELS else X_test_prepared.copy(deep=True)
-            arguments = {"model_name": model_name, "model_seed": _model_seed(seed, draw, n_samples, k_features), "model_n_jobs": self.config.n_jobs if model_name == "super_learner" else 1, "task": self.task, "params": self.selected_model_params[model_name], "X_train": X_fit, "y_train": y_sub, "X_test": X_test_fit}
+            # The outer transformed matrices above are diagnostics only. CV
+            # must receive original missingness, including all-missing sources.
+            X_fit = X_sub_raw.copy(deep=True)
+            X_test_fit = X_test_raw.copy(deep=True)
+            arguments = {"model_name": model_name, "model_seed": _model_seed(seed, draw, n_samples, k_features), "model_n_jobs": self.config.n_jobs if model_name == "super_learner" else 1, "task": self.task, "params": self.selected_model_params[model_name], "X_train": X_fit, "y_train": y_sub, "X_test": X_test_fit, "preprocessor": FoldPreprocessor(tuple(selected_groups), self.schema.imputation, model_name)}
             if model_name in SERIAL_OUTER_MODELS:
                 fit = _run_native_model_cell_locked(self._runner, fit_arguments=arguments, on_native_crash=lambda attempt, exc: log_progress(f"native subprocess crashed attempt={attempt}/{self.config.native_process_max_attempts} model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features} error={exc}"), on_native_timeout=lambda attempt, exc: log_progress(f"native subprocess timed out attempt={attempt}/{self.config.native_process_max_attempts} model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features} error={exc}"))
             else:
                 fit = _fit_predict_model_cell(**arguments)
             predictions = np.asarray(fit["predictions"])
+            diagnostics["mlp_diagnostics_json"] = fit.get("mlp_diagnostics_json", "")
             diagnostics["_fit_seconds"] = fit["fit_seconds"]; diagnostics["_best_rounds"] = fit["best_rounds"]; diagnostics["converged"] = fit["converged"]; diagnostics["constant_prediction"] = _constant_prediction(predictions)
             metrics = compute_classification_metrics(y_test, predictions, y_sub) if self.task == "classification" else compute_regression_metrics(y_test, predictions, y_sub)
             completed = result(
@@ -2377,6 +2414,7 @@ def _run_nk_grid_locked(
         )
 
     semantic_contract = {
+        "metric_definition_version": METRIC_DEFINITION_VERSION if task == "regression" else "classification-v1",
         "kind": "nk_grid" if task == "regression" else "nk_grid_classification",
         "algorithm_version": algorithm_version,
         "dataset": dataset,
@@ -2421,13 +2459,7 @@ def _run_nk_grid_locked(
         }
     else:
         splits = {split_seeds[0]: fixed_split}
-    n_grid = np.asarray(config.n_grid, dtype=int) if config.n_grid else log2_size_grid(
-        len(next(iter(splits.values())).X_train),
-        config.n_sizes_n,
-        config.max_n,
-        min_size=config.min_n,
-    )
-    k_grid = np.asarray(config.k_grid, dtype=int) if config.k_grid else log2_size_grid(len(feature_units), config.n_sizes_k, config.max_k)
+    n_grid, k_grid = resolve_input_grids(config, loaded, source_definitions)
     validate_prediction_export_grid(config, n_grid=n_grid, k_grid=k_grid)
     prediction_sidecar_schema = None
     if prediction_export_enabled(config):

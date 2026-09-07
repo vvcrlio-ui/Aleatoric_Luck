@@ -7,6 +7,8 @@ derives its work solely from those durable artefacts.
 """
 
 from __future__ import annotations
+from .phase_timing import timed_phase
+from .grid_contract import validate_size_grid
 
 import argparse
 import csv
@@ -297,6 +299,7 @@ def _durable_replace(source: Path, target: Path) -> None:
         os.close(directory)
 
 
+@timed_phase("plan.enumerate_uniqueness_parquet")
 def write_task_table_streaming(
     rows: Iterable[TaskRow],
     path: Path,
@@ -325,13 +328,18 @@ def write_task_table_streaming(
     row_group_digests: list[dict[str, object]] = []
     task_rows = 0; model_rows = 0; max_n = 0; max_k = 0
     buffer: list[TaskRow] = []
+    sqlite_seconds = 0.0
+    parquet_seconds = 0.0
+    table_started = time.perf_counter()
 
     def flush() -> None:
-        nonlocal buffer
+        nonlocal buffer, parquet_seconds
         if not buffer:
             return
         assert writer is not None
+        write_started = time.perf_counter()
         writer.write_table(_arrow_table(buffer))
+        parquet_seconds += time.perf_counter() - write_started
         row_group_digests.append({
             "row_group": len(row_group_digests),
             "row_count": len(buffer),
@@ -345,6 +353,7 @@ def write_task_table_streaming(
         connection.execute("CREATE TABLE model_keys (model TEXT, seed INTEGER, draw INTEGER, N INTEGER, K INTEGER, PRIMARY KEY (model, seed, draw, N, K)) WITHOUT ROWID")
         writer = pq.ParquetWriter(temporary, _empty_arrow_table().schema, compression="zstd")
         for row in rows:
+            unique_started = time.perf_counter()
             try:
                 connection.execute("INSERT INTO rows VALUES (?)", (row.row_id,))
                 connection.executemany(
@@ -353,6 +362,8 @@ def write_task_table_streaming(
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError("streaming task planning found duplicate row ID or public model key") from exc
+            finally:
+                sqlite_seconds += time.perf_counter() - unique_started
             digest.update(canonical_json_bytes(canonical_task_row_payload(row))); digest.update(b"\n")
             task_rows += 1; model_rows += len(row.models)
             max_n = max(max_n, row.n_samples); max_k = max(max_k, row.k_features)
@@ -377,6 +388,10 @@ def write_task_table_streaming(
             logical_schema_fingerprint=_task_table_schema_fingerprint(),
         )
     finally:
+        print(json.dumps({"nkgrid_phase": "plan.detail", "task_rows": task_rows,
+                          "model_rows": model_rows, "sqlite_seconds": sqlite_seconds,
+                          "arrow_parquet_seconds": parquet_seconds,
+                          "total_seconds": time.perf_counter() - table_started}), file=sys.stderr, flush=True)
         if writer is not None:
             writer.close()
         if connection is not None:
@@ -1058,6 +1073,7 @@ def _queue_index(
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
+@timed_phase("queue.index_design")
 def _index_queue_expected_design(connection: sqlite3.Connection, table_path: Path) -> int:
     statement = f"INSERT INTO expected (row_id, {_QUEUE_KEY_SQL}) VALUES (?, ?, ?, ?, ?, ?)"
     expected_count = 0
@@ -1176,6 +1192,7 @@ def _iter_sealed_wal_scans(
             yield marker, wal_path, scan
 
 
+@timed_phase("queue.index_wals")
 def _index_queue_wals(
     connection: sqlite3.Connection, output_dir: Path, *, analysis: AnalysisContract,
     frozen_frontier: Sequence[Mapping[str, object]] | None = None,
@@ -1463,6 +1480,7 @@ def _validated_prep_token(value: str) -> str:
     return value
 
 
+@timed_phase("queue.prepare_total")
 def prepare_round(
     snapshot_path: Path, *, round_index: int, prep_token: str,
     tmp_dir: Path | None = None,
@@ -1709,6 +1727,7 @@ def prepare_round(
     return stats
 
 
+@timed_phase("queue.verify_total")
 def verify_rounds(
     snapshot_path: Path, *, tmp_dir: Path | None = None,
     round_index: int | None = None, submission_generation: str | None = None,
@@ -2127,6 +2146,7 @@ def _write_sealed_wal_csv(
     return target, count
 
 
+@timed_phase("queue.finalize_total")
 def finalize_snapshot(
     snapshot_path: Path, *, tmp_dir: Path | None = None,
     round_index: int | None = None, submission_generation: str | None = None,
@@ -2277,7 +2297,7 @@ def _config_from_json(payload: Mapping[str, object]) -> NKGridConfig:
     values["models"] = tuple(str(value) for value in values["models"])
     for field in ("n_grid", "k_grid"):
         if values.get(field) is not None:
-            values[field] = tuple(int(value) for value in values[field])
+            values[field] = validate_size_grid(values[field], field)
     if values.get("repeat_plan") is not None:
         values["repeat_plan"] = tuple(
             (int(pair[0]), int(pair[1])) for pair in values["repeat_plan"]

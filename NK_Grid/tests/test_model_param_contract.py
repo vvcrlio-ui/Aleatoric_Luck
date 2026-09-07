@@ -102,7 +102,7 @@ def test_locked_cv_regression_parameters_load_with_rmse():
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
 @pytest.mark.parametrize("task", ["regression", "classification"])
 def test_model_param_contract_covers_model_space_exactly(params_path, task):
-    assert load_algorithm_version(params_path) == "nk-grid-v5-adapter-6"
+    assert load_algorithm_version(params_path) == "nk-grid-v6-fold-local-1"
     document = yaml.safe_load(params_path.read_text(encoding="utf-8"))
     assert set(document[task]) == set(SUPPORTED_MODEL_NAMES)
     selected = load_model_params(
@@ -130,11 +130,13 @@ def test_regression_ridge_grids_are_consistent_across_parameter_files(params_pat
 
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
 def test_mlp_iteration_limit_distribution_is_locked(params_path):
-    values = [
-        line.strip() for line in params_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert values.count("max_iter: 500") == 3
-    assert values.count("max_iter: 2000") == 1
+    # Check model identity, not a count of identical YAML lines: swapped budgets
+    # must not pass. Regression stacking now receives the same ceiling as MLP.
+    for task, ceiling in (("regression", 2000), ("classification", 500)):
+        values = load_model_params(params_path, task=task,
+                                   models=("shallow_neural_network", "super_learner"))
+        assert values["shallow_neural_network"]["max_iter"] == ceiling
+        assert values["super_learner"]["max_iter"] == ceiling
 
 
 def test_removed_model_registry_covers_expected_retirements():
