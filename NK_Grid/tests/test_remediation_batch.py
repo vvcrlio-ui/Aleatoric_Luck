@@ -16,6 +16,10 @@ def test_c1_c2_actual_fit_and_clone(n, policy):
         assert model.effective_batch_size_ == (fit_n if policy == 'full' else min(200, fit_n))
         assert clone(model).batch_size == policy
         assert pickle.loads(pickle.dumps(model)).batch_size == policy
+        reference = MLPRegressor(hidden_layer_sizes=(2,), max_iter=1, random_state=8,
+                                 batch_size=fit_n if policy == 'full' else 'auto')
+        reference.fit(np.arange(fit_n).reshape(-1, 1) / fit_n, np.zeros(fit_n))
+        np.testing.assert_array_equal(model.predict([[.25]]), reference.predict([[.25]]))
 
 
 def test_c3_auto_compatibility():

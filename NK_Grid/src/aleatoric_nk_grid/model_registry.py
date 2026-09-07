@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +21,7 @@ from sklearn.ensemble import (
     StackingRegressor,
 )
 from sklearn.impute import SimpleImputer
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import (
     LassoCV,
     LinearRegression,
@@ -660,7 +662,13 @@ class FitBatchMLPRegressor(MLPRegressor):
             len(y) if policy == "full" else min(policy, len(y)))
         self.batch_size = len(y) if policy == "full" else policy
         try:
-            return super().fit(X, y, sample_weight=sample_weight)
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always", ConvergenceWarning)
+                result = super().fit(X, y, sample_weight=sample_weight)
+            self.convergence_warnings_ = [str(w.message) for w in captured if issubclass(w.category, ConvergenceWarning)]
+            for warning in captured:
+                warnings.warn(warning.message, warning.category, stacklevel=2)
+            return result
         finally:
             self.batch_size = policy
 
@@ -824,10 +832,12 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                     if name == "shallow_nn":
                         mlp = fitted.steps[-1][1].regressor_
                         record.update(batch=mlp.effective_batch_size_, iterations=mlp.n_iter_,
+                                      convergence_warnings=mlp.convergence_warnings_,
                                       reached_max_iter=mlp.n_iter_ >= mlp.max_iter)
                     records.append(record)
             mlp = self.model_.named_estimators_["shallow_nn"].steps[-1][1].regressor_
             records.append({"phase": "full", "model": "shallow_nn", "N": mlp.fit_n_,
+                            "convergence_warnings": mlp.convergence_warnings_,
                             "batch": mlp.effective_batch_size_, "iterations": mlp.n_iter_,
                             "reached_max_iter": mlp.n_iter_ >= mlp.max_iter})
             self.diagnostics_ = {"fits": records, "coefficients": self.model_.final_estimator_.coef_.tolist(),
@@ -861,6 +871,7 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         lgbm_learning_rate: float,
         lgbm_num_leaves: int,
         lgbm_min_data_in_leaf: int,
+        preprocessor=None,
     ):
         self.seed = seed
         self.n_jobs = n_jobs
@@ -871,7 +882,6 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         self.min_samples_leaf = min_samples_leaf
         self.hidden_layer_sizes = hidden_layer_sizes
         self.alpha = alpha
-        preprocessor=None,
         self.learning_rate_init = learning_rate_init
         self.max_iter = max_iter
         self.C = C
@@ -879,6 +889,7 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         self.lgbm_learning_rate = lgbm_learning_rate
         self.lgbm_num_leaves = lgbm_num_leaves
         self.lgbm_min_data_in_leaf = lgbm_min_data_in_leaf
+        self.preprocessor = preprocessor
 
     def fit(self, X, y):
         if self.passthrough and np.asarray(pd.isna(X)).any():
@@ -889,7 +900,6 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         _, counts = np.unique(np.asarray(y), return_counts=True)
         cv = min(self.cv, int(counts.min())) if len(counts) >= 2 else 0
         if cv < 2:
-        self.preprocessor = preprocessor
             raise ValueError(
                 "Super Learner classification requires at least two rows per class."
             )

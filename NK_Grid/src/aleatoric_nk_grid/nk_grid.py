@@ -214,6 +214,7 @@ BASE_RESULT_COLUMNS = (
     "K_expanded", "n_expanded_features_total", "K_unobserved",
 )
 STABLE_DIAGNOSTIC_RESULT_COLUMNS = (
+    "mlp_diagnostics_json",
     "K_varying", "constant_prediction", "underdetermined", "converged",
     "_preprocess_vectorized",
 )
@@ -806,6 +807,7 @@ def _empty_classification_metrics() -> dict[str, float]:
 
 def _empty_diagnostics() -> dict[str, float | bool]:
     return {
+        "mlp_diagnostics_json": "",
         "K_varying": np.nan,
         "constant_prediction": False,
         "underdetermined": False,
@@ -1828,6 +1830,7 @@ def _fit_predict_model_cell(
     )
     return {
         "predictions": predictions,
+        "mlp_diagnostics_json": json.dumps(model.diagnostics_, sort_keys=True, separators=(",", ":"), allow_nan=False) if hasattr(model, "diagnostics_") else "",
         "fit_seconds": time.perf_counter() - fit_started,
         "best_rounds": _model_best_rounds(model),
         "converged": _model_converged(model),
@@ -2207,6 +2210,7 @@ class NKGridExecutionSession:
             else:
                 fit = _fit_predict_model_cell(**arguments)
             predictions = np.asarray(fit["predictions"])
+            diagnostics["mlp_diagnostics_json"] = fit.get("mlp_diagnostics_json", "")
             diagnostics["_fit_seconds"] = fit["fit_seconds"]; diagnostics["_best_rounds"] = fit["best_rounds"]; diagnostics["converged"] = fit["converged"]; diagnostics["constant_prediction"] = _constant_prediction(predictions)
             metrics = compute_classification_metrics(y_test, predictions, y_sub) if self.task == "classification" else compute_regression_metrics(y_test, predictions, y_sub)
             completed = result(

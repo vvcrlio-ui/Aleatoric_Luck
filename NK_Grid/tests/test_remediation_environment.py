@@ -1,6 +1,6 @@
 import os
 import pytest
-from aleatoric_nk_grid.execution_contract import runtime_environment, CellExecutionSpec, ContractError, sha256_file, CELL_SPEC_FORMAT_VERSION
+from aleatoric_nk_grid.execution_contract import runtime_environment, CellExecutionSpec, AnalysisContract, ContractError, sha256_file, CELL_SPEC_FORMAT_VERSION
 from aleatoric_nk_grid.phase_timing import timed_phase
 
 
@@ -26,3 +26,8 @@ def test_timing_failure_does_not_swallow_exception(capsys):
     with pytest.raises(RuntimeError, match='controlled'):
         fail()
     assert '"status": "failed"' in capsys.readouterr().err
+
+
+def test_e6_reject_old_serializer():
+    with pytest.raises(ContractError, match='serializer'):
+        AnalysisContract.from_payload({'analysis_contract_format_version': 1, 'serializer_version': 1})

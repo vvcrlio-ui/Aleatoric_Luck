@@ -24,7 +24,7 @@ from typing import Any, Mapping, Sequence
 CELL_SPEC_FORMAT_VERSION = 2
 ANALYSIS_CONTRACT_FORMAT_VERSION = 1
 EXECUTION_CONTRACT_FORMAT_VERSION = 1
-PUBLIC_RESULT_SERIALIZER_VERSION = 2
+PUBLIC_RESULT_SERIALIZER_VERSION = 3
 
 
 class ContractError(ValueError):
@@ -401,6 +401,8 @@ class AnalysisContract:
         expected_sha = candidate.pop("analysis_contract_sha256", None)
         if candidate.get("analysis_contract_format_version") != ANALYSIS_CONTRACT_FORMAT_VERSION:
             raise ContractError("unsupported analysis contract format")
+        if candidate.get("serializer_version") != PUBLIC_RESULT_SERIALIZER_VERSION:
+            raise ContractError("unsupported public result serializer; do not mix metric schemas")
         spec = CellExecutionSpec.from_payload(candidate.get("cell_execution_spec", {}))
         if candidate.get("cell_spec_sha256") != spec.sha256:
             raise ContractError("analysis contract cell execution spec checksum mismatch")
