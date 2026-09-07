@@ -5,12 +5,40 @@ from aleatoric_nk_grid.phase_timing import timed_phase
 
 
 def test_f2_content_hash_ignores_mtime(tmp_path):
+    from aleatoric_nk_grid.execution_contract import resolve_repo_locator
     path = tmp_path/'data.csv'; path.write_bytes(b'1,2\n')
     before = path.stat(); digest = sha256_file(path)
     path.write_bytes(b'1,3\n'); os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
     assert path.stat().st_size == before.st_size
     assert path.stat().st_mtime_ns == before.st_mtime_ns
     assert sha256_file(path) != digest
+    with pytest.raises(ContractError, match='checksum mismatch'):
+        resolve_repo_locator('data.csv', digest, repo_root=tmp_path)
+
+
+def test_f6_sql_key_reducer_catches_duplicate_padding():
+    # Test the actual SQLite reduction without importing/faking POSIX locks.
+    # This does not certify the surrounding WAL or publication entry points.
+    import ast
+    from pathlib import Path
+    import sqlite3
+    import aleatoric_nk_grid
+    path = Path(aleatoric_nk_grid.__path__[0]) / 'flat_task_table.py'
+    nodes = [n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef)
+             and n.name in ('_queue_key_join', '_queue_missing_model_keys')]
+    scope = {'sqlite3':sqlite3, '_QUEUE_KEY_COLUMNS':('model','seed','draw','N','K')}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), scope)
+    with sqlite3.connect(':memory:') as connection:
+        for table in ('expected','completed'):
+            connection.execute(f'CREATE TABLE {table} (model TEXT, seed INTEGER, draw INTEGER, N INTEGER, K INTEGER)')
+        expected = [('ols',1,0,10,1), ('ols',1,0,11,1)]
+        for actual in (expected, [expected[0], expected[0]]):
+            connection.execute('DELETE FROM expected'); connection.execute('DELETE FROM completed')
+            connection.executemany('INSERT INTO expected VALUES (?,?,?,?,?)', expected)
+            connection.executemany('INSERT INTO completed VALUES (?,?,?,?,?)', actual)
+            assert len(actual) == len(expected)
+            oracle = len(set(expected) - set(actual))
+            assert scope['_queue_missing_model_keys'](connection) == oracle
 
 
 def test_f3_actual_environment_drift():
