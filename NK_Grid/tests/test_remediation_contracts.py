@@ -81,3 +81,37 @@ def test_a6_actual_session_rejects_before_slice():
     for n, k in ((4, 2), (3, 5)):
         with pytest.raises(ValueError, match='capacity'):
             session.run_cell_group(seed=1, draw=1, n_samples=n, k_features=k, models=('ols',))
+
+
+@pytest.mark.skipif(__import__('os').name == 'nt', reason='actual planner requires POSIX resource/fcntl')
+def test_a3_planner_capacity_failure_precedes_task_publication(tmp_path, monkeypatch):
+    import pandas as pd
+    from conftest import write_repo_schema_bundle
+    from aleatoric_nk_grid.nk_grid import NKGridConfig
+    from aleatoric_nk_grid import chunk_planning as planning
+    schema=write_repo_schema_bundle(tmp_path,pd.DataFrame({'x':range(10),'y':range(10)}))
+    config=NKGridConfig(schema=schema,out=tmp_path/'result.csv',outcome='y',models=('ols',),
+                       seed=1,test_size=.3,n_seeds=1,n_draws=1,n_sizes_n=1,n_sizes_k=1,
+                       max_n=10,max_k=1,batch_size=1,n_jobs=1,min_n=1)
+    monkeypatch.setattr(planning,'write_task_table_streaming',lambda *a,**kw:pytest.fail('invalid grid reached writer'))
+    table=tmp_path/'tasks.parquet'
+    with pytest.raises(ValueError,match='capacity'):
+        planning.build_dynamic_plan(config,n_grid=[8],k_grid=[1],
+            cluster=planning.ClusterPolicy(1,1,'test','00:10:00','test','none'),
+            table_path=table,snapshot_path=tmp_path/'snapshot.json',output_dir=tmp_path/'out',panel='test')
+    assert not table.exists()
+
+
+@pytest.mark.skipif(__import__('os').name == 'nt', reason='actual session requires POSIX resource/fcntl')
+def test_a5_missing_outcomes_reduce_training_capacity(tmp_path):
+    import pandas as pd
+    from conftest import write_schema_bundle
+    from aleatoric_nk_grid.nk_grid import NKGridConfig,NKGridExecutionSession
+    train=pd.DataFrame({'id':range(10),'x':range(10),'y':[0.,1.,2.,3.,4.,5.,6.,7.,np.nan,np.nan]})
+    test=pd.DataFrame({'id':[20,21],'x':[1,2],'y':[1.,2.]})
+    schema=write_schema_bundle(tmp_path,train,split_mode='external_test',test=test,id_column='id')
+    config=NKGridConfig(schema=schema,out=tmp_path/'result.csv',outcome='y',models=('ols',),
+                        seed=1,test_size=.3,n_seeds=1,n_draws=1,n_sizes_n=1,n_sizes_k=1,
+                        max_n=10,max_k=1,batch_size=1,n_jobs=1,min_n=1,n_grid=(9,),k_grid=(1,))
+    with pytest.raises(ValueError,match='capacity'):
+        NKGridExecutionSession._open_config(config)
