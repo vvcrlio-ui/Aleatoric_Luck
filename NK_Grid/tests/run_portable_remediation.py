@@ -7,6 +7,7 @@ import types
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(root))
 package = types.ModuleType('aleatoric_nk_grid')
 package.__path__ = [str(root / 'NK_Grid/src/aleatoric_nk_grid')]
 sys.modules['aleatoric_nk_grid'] = package
