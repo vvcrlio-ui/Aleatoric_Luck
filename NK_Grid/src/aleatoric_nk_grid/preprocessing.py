@@ -880,26 +880,33 @@ class FoldPreprocessor(TransformerMixin, BaseEstimator):
         self.imputation = imputation
         self.model_name = model_name
 
-    def fit(self, X, y=None):
+    def _fit_cell(self, X):
         self.columns_ = tuple(X.columns)
         probe = pd.DataFrame(np.nan, index=[0], columns=self.columns_)
         result = preprocess_cell(X, probe, self.groups, self.imputation, model_name=self.model_name)
         self.fill_ = result.X_test.iloc[0].copy()
         self.unobserved_ = tuple(not _source_observed(X, group).any() for group in self.groups)
         self.passthrough_ = result.passthrough
+        return result
+
+    def fit(self, X, y=None):
+        self._fit_cell(X)
         return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        return self._fit_cell(X).X_train
 
     def transform(self, X):
         if tuple(X.columns) != self.columns_:
             raise ValueError("fold preprocessing column order mismatch")
-        result = X.copy()
-        for group, unobserved in zip(self.groups, self.unobserved_, strict=True):
-            columns = list(group.features)
-            if unobserved:
-                result.loc[:, columns] = self.fill_.loc[columns].to_numpy()
-            elif not self.passthrough_:
-                missing = ~_source_observed(X, group)
-                result.loc[missing, columns] = self.fill_.loc[columns].to_numpy()
+        # Validated one-hot sources are either observed atomically or all NaN.
+        # Applying the learned fill row in one operation preserves that rule
+        # without repeated group-wise DataFrame indexing on every LOO fold.
+        result = X.copy() if self.passthrough_ else X.fillna(self.fill_)
+        forced = [feature for group, absent in zip(self.groups, self.unobserved_, strict=True)
+                  if absent for feature in group.features]
+        if forced:
+            result.loc[:, forced] = self.fill_.loc[forced].to_numpy()
         return result
 
 

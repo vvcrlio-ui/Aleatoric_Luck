@@ -871,6 +871,7 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         self.min_samples_leaf = min_samples_leaf
         self.hidden_layer_sizes = hidden_layer_sizes
         self.alpha = alpha
+        preprocessor=None,
         self.learning_rate_init = learning_rate_init
         self.max_iter = max_iter
         self.C = C
@@ -888,6 +889,7 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         _, counts = np.unique(np.asarray(y), return_counts=True)
         cv = min(self.cv, int(counts.min())) if len(counts) >= 2 else 0
         if cv < 2:
+        self.preprocessor = preprocessor
             raise ValueError(
                 "Super Learner classification requires at least two rows per class."
             )

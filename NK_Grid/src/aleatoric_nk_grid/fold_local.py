@@ -28,9 +28,17 @@ class FoldLocalRidge(RegressorMixin, BaseEstimator):
         for train, valid in LeaveOneOut().split(X):
             process = make_pipeline(clone(self.preprocessor), StandardScaler()).fit(X.iloc[train])
             train_X, valid_X = process.transform(X.iloc[train]), process.transform(X.iloc[valid])
-            for j, alpha in enumerate(self.alphas_):
-                fitted = Ridge(alpha=alpha).fit(train_X, y[train])
-                self.cv_predictions_[valid, j] = fitted.predict(valid_X)
+            # One fold-specific SVD serves the unchanged alpha grid. This is
+            # complete-pipeline LOO, not full-N analytic RidgeCV.
+            center = train_X.mean(axis=0)
+            target_mean = y[train].mean()
+            u, singular, vt = np.linalg.svd(train_X - center, full_matrices=False)
+            keep = singular > 1e-15  # sklearn Ridge's SVD rank cutoff
+            singular = singular[keep]
+            projection = (valid_X - center) @ vt[keep].T
+            target = u[:, keep].T @ (y[train] - target_mean)
+            factors = singular[:, None] / (singular[:, None] ** 2 + self.alphas_[None, :])
+            self.cv_predictions_[valid, :] = (projection * target) @ factors + target_mean
         self.cv_mse_ = np.mean((self.cv_predictions_ - y[:, None]) ** 2, axis=0)
         self.alpha_ = float(self.alphas_[np.argmin(self.cv_mse_)])
         self.model_ = make_pipeline(clone(self.preprocessor), StandardScaler(), Ridge(alpha=self.alpha_)).fit(X, y)
