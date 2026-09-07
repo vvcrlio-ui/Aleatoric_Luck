@@ -1,0 +1,53 @@
+{
+  "verification_commit": "e6b0a8c3cc8ba3d56772a104a3aa4605bf4ddb03",
+  "input_files": {
+    "data\\ICPSR_31622\\DS0015\\31622-0015-Zipped_package.zip": {
+      "sha256": "53c2d37fec35ddd564259a9d871043f857bf144c3c197e2d3898f375f8caf1ba",
+      "bytes": 77026848
+    },
+    "FFCWS\\data\\remediation_20260907\\background.dta": {
+      "sha256": "34370b7b53673591c80a28fd729a0648dad67e43190f513dadaf115f02e76712",
+      "bytes": 135344123
+    },
+    "FFCWS\\data\\remediation_20260907\\train.csv": {
+      "sha256": "6147a9079c53aa9e7786aba70395518c9c59cfbd49433381312796f0fd16271e",
+      "bytes": 55363
+    },
+    "FFCWS\\data\\remediation_20260907\\test.csv": {
+      "sha256": "87126c258ad5c02efc08938428493751b726eb39204e076fb8fb3fae348fac79",
+      "bytes": 52650
+    },
+    "FFCWS\\data\\remediation_20260907\\config.yaml": {
+      "sha256": "cf82d6f49878527d14923cab7b505fd110768affdb7d3b4432be0da90a5277dc",
+      "bytes": 1250
+    }
+  },
+  "universe_comparisons": {
+    "median_mode": {
+      "equal_json_objects": true,
+      "versioned_sha256": "9a66f07ba1558833d5088ee58e1f7521e3e2fe065bce66824e06c680c6d4ea45",
+      "generated_sha256": "9a66f07ba1558833d5088ee58e1f7521e3e2fe065bce66824e06c680c6d4ea45",
+      "groups": 3400,
+      "columns": 11432,
+      "sampling_units": 3400
+    },
+    "median_missing_indicator": {
+      "equal_json_objects": true,
+      "versioned_sha256": "22cc2f04709062d6920fb9aad76faf180ed477e6392b25b9f236793863a99def",
+      "generated_sha256": "22cc2f04709062d6920fb9aad76faf180ed477e6392b25b9f236793863a99def",
+      "groups": 8053,
+      "columns": 16085,
+      "sampling_units": 3400
+    },
+    "tree_ordinal": {
+      "equal_json_objects": true,
+      "versioned_sha256": "b7740ee79855e59a2b9ba52ef04ffa61a58d7fb16895f60234b2f3f217df2bcb",
+      "generated_sha256": "b7740ee79855e59a2b9ba52ef04ffa61a58d7fb16895f60234b2f3f217df2bcb",
+      "groups": 3400,
+      "columns": 3400,
+      "sampling_units": 3400
+    }
+  },
+  "original_data_policy": "read-only original archive; extracted and generated only under fresh remediation directory",
+  "adapter_log": "FFC-adapter.txt"
+}

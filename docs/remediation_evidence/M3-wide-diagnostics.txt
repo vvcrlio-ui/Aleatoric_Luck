@@ -1,0 +1,25 @@
+.....................                                                    [100%]
+============================== warnings summary ===============================
+tests/test_remediation_batch.py: 24 warnings
+  D:\Aleatoric_power_law\NK_Grid\tests\test_remediation_batch.py:14: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (1) reached and the optimization hasn't converged yet.
+    model = clone(estimator).fit(np.arange(fit_n).reshape(-1, 1) / fit_n, np.zeros(fit_n))
+
+tests/test_remediation_batch.py: 24 warnings
+  D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\neural_network\_multilayer_perceptron.py:785: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (1) reached and the optimization hasn't converged yet.
+    warnings.warn(
+
+tests/test_remediation_batch.py::test_c3_auto_compatibility
+  D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\neural_network\_multilayer_perceptron.py:785: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (2) reached and the optimization hasn't converged yet.
+    warnings.warn(
+
+tests/test_remediation_batch.py::test_c3_auto_compatibility
+tests/test_remediation_batch.py::test_c3_auto_compatibility
+  D:\Aleatoric_power_law\NK_Grid\tests\test_remediation_batch.py:29: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (2) reached and the optimization hasn't converged yet.
+    model = cls(hidden_layer_sizes=(2,), max_iter=2, random_state=8, batch_size=policy).fit(X, y)
+
+tests/test_remediation_batch.py: 22 warnings
+  D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (2) reached and the optimization hasn't converged yet.
+    self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+21 passed, 73 warnings in 5.30s

@@ -1,0 +1,36 @@
+{
+  "repository": "D:\\Aleatoric_power_law",
+  "branch": "SMR&FFC",
+  "audit_head": "555796ac962951e3ecc9dbca6664cc7730ed936f",
+  "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+  "runtime": {
+    "python": "3.12.14",
+    "system": "Windows",
+    "machine": "AMD64",
+    "numpy": "2.4.4",
+    "scipy": "1.17.1",
+    "pandas": "3.0.2",
+    "scikit-learn": "1.8.0",
+    "lightgbm": "4.6.0",
+    "xgboost": "3.2.0",
+    "pyarrow": "25.0.0",
+    "joblib": "1.5.3",
+    "pyyaml": "6.0.2",
+    "threads": {
+      "OMP_NUM_THREADS": null,
+      "MKL_NUM_THREADS": null,
+      "OPENBLAS_NUM_THREADS": null,
+      "BLIS_NUM_THREADS": null
+    }
+  },
+  "platform": "Windows-10-10.0.19045-SP0",
+  "python_executable": "D:\\Aleatoric_power_law\\.venv-remediation\\Scripts\\python.exe",
+  "worktree_status": [
+    "?? docs/"
+  ],
+  "limitations": [
+    "Windows portable package namespace bypass, no faked POSIX resource or locks",
+    "24 pre-existing default slow deselections are not acceptance",
+    "native benchmark is process high-water RSS, not Slurm cgroup or whole worker tree"
+  ]
+}

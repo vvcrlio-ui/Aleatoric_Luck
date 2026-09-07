@@ -1,0 +1,783 @@
+[
+  {
+    "id": "A1",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "934e38adfa418eb324baf89fc191a86bb9212714",
+    "inputs": "三种版本化宇宙、seed=37/K=25",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_contracts.py"
+    ],
+    "expected": "均为3400个抽样单位且选择相同",
+    "actual": "通过；真实重建的三份宇宙也与版本化定义逐对象相等",
+    "status": "通过",
+    "evidence": [
+      "M1-canonical-order.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "A2",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "934e38adfa418eb324baf89fc191a86bb9212714",
+    "inputs": "派生组倒序及提前source_order",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_contracts.py"
+    ],
+    "expected": "规范父变量顺序与派生原子性不变",
+    "actual": "通过；独立列清单及父顺序断言",
+    "status": "通过",
+    "evidence": [
+      "M1-canonical-order.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "A3",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "934e38adfa418eb324baf89fc191a86bb9212714",
+    "inputs": "容量/容量+1；10行内部划分test_size=.3",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_contracts.py"
+    ],
+    "expected": "合法边界通过；非法计划在写入前拒绝",
+    "actual": "helper通过；真实planner测试在Windows跳过，Linux未验收",
+    "status": "未验收",
+    "evidence": [
+      "final-portable-regression.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_contracts.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "A4",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "934e38adfa418eb324baf89fc191a86bb9212714",
+    "inputs": "bool/0/负数/小数/NaN/重复/逆序/空",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_contracts.py"
+    ],
+    "expected": "报错且不归一化非法输入",
+    "actual": "8类非法输入均拒绝；历史审计测试不改写源CSV",
+    "status": "通过",
+    "evidence": [
+      "final-portable-regression.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "A5",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "934e38adfa418eb324baf89fc191a86bb9212714",
+    "inputs": "10行其中2个缺失目标，外部test有2行",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_contracts.py"
+    ],
+    "expected": "有效训练容量为8；N=9拒绝",
+    "actual": "已补真实session用例；Windows跳过；内部分类容量用例仍需Linux扩充",
+    "status": "未验收",
+    "evidence": [
+      "final-portable-regression.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_contracts.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "A6",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "934e38adfa418eb324baf89fc191a86bb9212714",
+    "inputs": "绕过CLI直接执行N=4/容量3和K=5/容量2",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_contracts.py"
+    ],
+    "expected": "最终执行在抽样和fit前拒绝",
+    "actual": "真实入口Windows跳过；实际方法AST门检查及移除检查mutant通过，仍非完整session验收",
+    "status": "未验收",
+    "evidence": [
+      "final-portable-regression.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_contracts.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "A7",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "934e38adfa418eb324baf89fc191a86bb9212714",
+    "inputs": "合法旧设计及原抽样/模型seed",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_contracts.py"
+    ],
+    "expected": "离散设计不变，旧方法预测在固定门槛内",
+    "actual": "直接git基线比较抽样/模型seed通过；B1有数值证据，但全引擎旧新合法设计端到端未验收",
+    "status": "未验收",
+    "evidence": [
+      "M1-final-boundaries.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_cell_centric_execution.py NK_Grid/tests/test_seed_shards.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "B1",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "a782d4d87e6ae186fc0b179adb30e850e735c125",
+    "inputs": "dense/wide/NaN/constant/min-N；原生lgb.cv/xgb.cv",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_boosting.py"
+    ],
+    "expected": "曲线预测rtol=1e-7/atol=1e-9；轮数严格一致",
+    "actual": "通过；M2提交先于M4验证；补独立参数字面量及真实git基线NPZ对照",
+    "status": "通过",
+    "evidence": [
+      "M2-portable.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "B2",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "a782d4d87e6ae186fc0b179adb30e850e735c125",
+    "inputs": "首次/末次最优、并列和early-stop边界曲线",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_boosting.py"
+    ],
+    "expected": "首个统一最优和原聚合早停规则",
+    "actual": "通过；平均折最优的受控错误被捕获",
+    "status": "通过",
+    "evidence": [
+      "mutations.json",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "B3",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "a782d4d87e6ae186fc0b179adb30e850e735c125",
+    "inputs": "N=23、5折不同误差",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_boosting.py"
+    ],
+    "expected": "保留原索引和平均RMSE，不替换为pooled-MSE",
+    "actual": "通过；LightGBM原生余数行CV规则保留，最终训练全N",
+    "status": "通过",
+    "evidence": [
+      "final-portable-regression.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "B4",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "a782d4d87e6ae186fc0b179adb30e850e735c125",
+    "inputs": "真实GPA 201×16085 float64；weakref生命周期",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_boosting.py"
+    ],
+    "expected": "最多1个折上下文且测目标进程树/阶段峰值",
+    "actual": "生命周期通过；Windows原生process峰值已测；目标Linux进程树/完整任务驻留未验收",
+    "status": "未验收",
+    "evidence": [
+      "native-lightgbm-m2.json",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_boosting.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "B5",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "a782d4d87e6ae186fc0b179adb30e850e735c125",
+    "inputs": "第3折Python异常；原生kill/timeout",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_boosting.py"
+    ],
+    "expected": "不基于部分曲线成功；既有失败路径完整",
+    "actual": "XGBoost第3折注入通过；原生kill/timeout至WAL失败路径未验收",
+    "status": "未验收",
+    "evidence": [
+      "final-portable-regression.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_boosting.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "B6",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "a782d4d87e6ae186fc0b179adb30e850e735c125",
+    "inputs": "FFC缺失指示K=3400；K=25最宽及40个随机子集",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_width.py"
+    ],
+    "expected": "全宽16085；最大K单位宽度覆盖任意子集",
+    "actual": "通过；独立集合枚举及真实NPZ均为16085列",
+    "status": "通过",
+    "evidence": [
+      "M2-width.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "B7",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "a782d4d87e6ae186fc0b179adb30e850e735c125",
+    "inputs": "原集群OOM单元及同CPU/内存限制",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_boosting.py"
+    ],
+    "expected": "候选完成且记录旧新退出/峰值/时长",
+    "actual": "缺原OOM配置、日志和集群访问；未验收；不宣称OOM已解决",
+    "status": "未验收",
+    "evidence": [
+      "native-input.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_boosting.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "C1",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "f5f2a093f0c75a0d2639007d510691fc655e5936",
+    "inputs": "N199/200/201/250/251/252及实际折fit大小",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_batch.py"
+    ],
+    "expected": "auto边界正确，full每fit一批",
+    "actual": "通过；与独立sklearn MLP实际预测比较，未仅相信诊断标签",
+    "status": "通过",
+    "evidence": [
+      "M3-wide-diagnostics.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "C2",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "f5f2a093f0c75a0d2639007d510691fc655e5936",
+    "inputs": "clone/pickle及折内/最终fit",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_batch.py"
+    ],
+    "expected": "配置和诊断不丢失",
+    "actual": "通过；clone丢策略mutant被捕获",
+    "status": "通过",
+    "evidence": [
+      "mutations.json",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "C3",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "f5f2a093f0c75a0d2639007d510691fc655e5936",
+    "inputs": "auto、显式200、旧sklearn MLP",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_batch.py"
+    ],
+    "expected": "auto与200机制及数值兼容",
+    "actual": "通过；未改变引擎checkpoint batch_size；默认仍auto",
+    "status": "通过",
+    "evidence": [
+      "M3-wide-diagnostics.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "C4",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "f5f2a093f0c75a0d2639007d510691fc655e5936",
+    "inputs": "外部输入极端值及训练池内独立holdout",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_batch.py"
+    ],
+    "expected": "测试目标/文件不影响fit与策略选择",
+    "actual": "predict前后完整模型pickle不变；driver不使用外部test值；尚无全引擎替换测试文件验收",
+    "status": "未验收",
+    "evidence": [
+      "M3-wide-diagnostics.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_nk_grid_engine.py NK_Grid/tests/test_worker_event_wal.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "C5",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "f5f2a093f0c75a0d2639007d510691fc655e5936",
+    "inputs": "零目标/强信号N10 K30；边界batch用例",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_batch.py"
+    ],
+    "expected": "有限输出、真实fit诊断；不要求分数提高",
+    "actual": "通过；记录各折N、batch、未收敛；没有正分或单调性断言",
+    "status": "通过",
+    "evidence": [
+      "M3-wide-diagnostics.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "C6",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "f5f2a093f0c75a0d2639007d510691fc655e5936",
+    "inputs": "GPA训练池holdout731；9个N×K10/100×2seed×2策略×2方法",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_gpa_diagnostic.py --schema FFCWS/data/remediation_20260907/schema/ffc_median_mode_gpa.json --method legacy --output FFCWS/data/remediation_20260907/gpa-legacy-paired.jsonl",
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_gpa_diagnostic.py --schema FFCWS/data/remediation_20260907/schema/ffc_median_mode_gpa.json --seeds 12345 --output FFCWS/data/remediation_20260907/gpa-fold-local-seed12345.jsonl",
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_gpa_diagnostic.py --schema FFCWS/data/remediation_20260907/schema/ffc_median_mode_gpa.json --seeds 23456 --output FFCWS/data/remediation_20260907/gpa-fold-local-seed23456.jsonl"
+    ],
+    "expected": "M4后完整重复成对诊断，保留全部seed和失败",
+    "actual": "完整度见GPA-paired-summary.json；默认auto不变；不据此宣称历史下降已修复",
+    "status": "未验收",
+    "evidence": [
+      "GPA-paired-summary.json",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_batch.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "D1",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "c5bbf2e38178e41f4c0bbba3dca806403b0ec81d",
+    "inputs": "内折validation X极值；实际LGBM树及MLP fit",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_folds.py"
+    ],
+    "expected": "训练统计和该折模型参数不变",
+    "actual": "通过；实际第一折模型与训练输入严格不变",
+    "status": "通过",
+    "evidence": [
+      "M4-final-oracles.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "D2",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "c5bbf2e38178e41f4c0bbba3dca806403b0ec81d",
+    "inputs": "只影响该折validation侧y或与X共同极值",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_folds.py"
+    ],
+    "expected": "该折基模型及目标缩放不变",
+    "actual": "通过；MLP训练目标直接对照独立标准化公式；不错误要求最终调参不变",
+    "status": "通过",
+    "evidence": [
+      "M4-final-oracles.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "D3",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "c5bbf2e38178e41f4c0bbba3dca806403b0ec81d",
+    "inputs": "外部变换极值/全模型prediction变换",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_folds.py"
+    ],
+    "expected": "全部训练统计/alpha/权重不受外部X/y影响",
+    "actual": "transform及SL模型状态不变已测；全引擎所有模型外部文件变更未验收",
+    "status": "未验收",
+    "evidence": [
+      "M3-wide-diagnostics.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_nk_grid_engine.py NK_Grid/tests/test_worker_event_wal.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "D4",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "c5bbf2e38178e41f4c0bbba3dca806403b0ec81d",
+    "inputs": "全缺失源、未出现类别、ordinal、passthrough",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_folds.py"
+    ],
+    "expected": "旧类型/先验/NaN契约，列不漂移",
+    "actual": "通过；独立旧reference与折内transform相同",
+    "status": "通过",
+    "evidence": [
+      "M4-final-oracles.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "D5",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "c5bbf2e38178e41f4c0bbba3dca806403b0ec81d",
+    "inputs": "全N与折内中位数不同的validation极值",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_folds.py"
+    ],
+    "expected": "真正折内填补可区别伪修复",
+    "actual": "通过；全N填补mutant被独立LOO oracle捕获",
+    "status": "通过",
+    "evidence": [
+      "mutations.json",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "D6",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "c5bbf2e38178e41f4c0bbba3dca806403b0ec81d",
+    "inputs": "显式逐alpha sklearn Ridge完整管线LOO",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_folds.py"
+    ],
+    "expected": "所有OOF预测/损失与选择一致",
+    "actual": "通过；rtol=1e-10/atol=1e-12，单SVD生产路径未减少折数",
+    "status": "通过",
+    "evidence": [
+      "M4-final-oracles.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "D7",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "c5bbf2e38178e41f4c0bbba3dca806403b0ec81d",
+    "inputs": "无缺失且量纲/目标极端；MLP目标缩放",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_folds.py"
+    ],
+    "expected": "能检测X和y缩放泄漏",
+    "actual": "通过；独立无缺失LOO和实际MLP fit；全N缩放mutant被捕获",
+    "status": "通过",
+    "evidence": [
+      "mutations.json",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "E1",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "d8612d7b8bb517838d149a49a7bc999be2e3b213",
+    "inputs": "test=[0,2],train_mean=2,pred=[2,2]",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_metrics.py"
+    ],
+    "expected": "MSE2/train-skill0/test-R2负1",
+    "actual": "通过；独立直接求和oracle",
+    "status": "通过",
+    "evidence": [
+      "M5-portable.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "E2",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "d8612d7b8bb517838d149a49a7bc999be2e3b213",
+    "inputs": "完美/训练均值/测试均值/很差预测",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_metrics.py"
+    ],
+    "expected": "公式一致且不截断负分",
+    "actual": "通过；交换分母和负分截断mutant均被捕获",
+    "status": "通过",
+    "evidence": [
+      "mutations.json",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "E3",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "d8612d7b8bb517838d149a49a7bc999be2e3b213",
+    "inputs": "常数目标、单样本、0分母、NaN/Inf预测",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_metrics.py"
+    ],
+    "expected": "未定义记NaN；非有限拒绝",
+    "actual": "通过；未把零分母转换为高分",
+    "status": "通过",
+    "evidence": [
+      "M5-portable.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "E4",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "d8612d7b8bb517838d149a49a7bc999be2e3b213",
+    "inputs": "目标/预测同时平移或非零缩放",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_metrics.py"
+    ],
+    "expected": "相对分数不变，MSE按平方缩放",
+    "actual": "通过；独立求和oracle",
+    "status": "通过",
+    "evidence": [
+      "M5-portable.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "E5",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "d8612d7b8bb517838d149a49a7bc999be2e3b213",
+    "inputs": "仅改变训练目标均值",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_metrics.py"
+    ],
+    "expected": "MSE/test-R2不变，train-skill改变",
+    "actual": "通过；旧列定义保留",
+    "status": "通过",
+    "evidence": [
+      "M5-portable.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "E6",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "d8612d7b8bb517838d149a49a7bc999be2e3b213",
+    "inputs": "新契约JSON往返；嵌套serializer1/2/999/None",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "合法新契约可读；旧新混合拒绝",
+    "actual": "发现并修复顶层读取错误；新往返通过；完整CSV/WAL混合发布仍需Linux",
+    "status": "未验收",
+    "evidence": [
+      "E6-roundtrip-after-fix.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_nk_grid_engine.py NK_Grid/tests/test_worker_event_wal.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "F1",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "4502dcd56444f2c7eb2489875f3d4e638f43456b",
+    "inputs": "同snapshot恢复，记录写任务表函数调用",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "字节不变、无重新plan枚举",
+    "actual": "代码事实：已有submitter复用snapshot；未做Linux入口调用跟踪",
+    "status": "未验收",
+    "evidence": [
+      "full-suite-windows.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_posix.py NK_Grid/tests/test_worker_event_wal.py NK_Grid/tests/test_generation_control.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "F2",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "4502dcd56444f2c7eb2489875f3d4e638f43456b",
+    "inputs": "数据字节变化但size/mtime固定；参数/源顺序/seed变化",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "内容/语义漂移拒绝",
+    "actual": "内容哈希/不可变locator反例及跳过校验mutant通过；完整恢复入口所有变体未验收",
+    "status": "未验收",
+    "evidence": [
+      "E6-roundtrip-after-fix.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_environment.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "F3",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "4502dcd56444f2c7eb2489875f3d4e638f43456b",
+    "inputs": "requirements不变，声明的实际numpy版本不符",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "运行环境不匹配明确拒绝",
+    "actual": "契约层通过；线程声明静态回归和全部sbatch语法检查通过",
+    "status": "通过",
+    "evidence": [
+      "E6-roundtrip-after-fix.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": null,
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "F4",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "4502dcd56444f2c7eb2489875f3d4e638f43456b",
+    "inputs": "并发恢复相同输出",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "schedule lease阻止重复发布",
+    "actual": "POSIX锁不可在当前Windows验收；既有用例保留",
+    "status": "未验收",
+    "evidence": [
+      "full-suite-windows.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_posix.py NK_Grid/tests/test_worker_event_wal.py NK_Grid/tests/test_generation_control.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "F5",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "4502dcd56444f2c7eb2489875f3d4e638f43456b",
+    "inputs": "任务表/激活/WAL/发布边界中断",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "原子恢复或明确拒绝；成功记录不丢",
+    "actual": "计时故障透传通过；真实协议中断矩阵及POSIX用例未运行",
+    "status": "未验收",
+    "evidence": [
+      "full-suite-windows.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_posix.py NK_Grid/tests/test_worker_event_wal.py NK_Grid/tests/test_generation_control.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "F6",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "4502dcd56444f2c7eb2489875f3d4e638f43456b",
+    "inputs": "删成功行再复制另一行补总数",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "按完整任务键拒绝，不只看行数",
+    "actual": "真实SQLite归约器捕获重复补行，count-only mutant被捕获；完整WAL/发布入口未验收",
+    "status": "未验收",
+    "evidence": [
+      "M6-content-and-keys.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_posix.py NK_Grid/tests/test_worker_event_wal.py NK_Grid/tests/test_generation_control.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "F7",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "4502dcd56444f2c7eb2489875f3d4e638f43456b",
+    "inputs": "任务重排及未授权worker数变更",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "设计数值不变；非法执行契约变更拒绝",
+    "actual": "执行契约/分配规则未删除；目标端到端未验收",
+    "status": "未验收",
+    "evidence": [
+      "full-suite-windows.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_posix.py NK_Grid/tests/test_worker_event_wal.py NK_Grid/tests/test_generation_control.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  },
+  {
+    "id": "F8",
+    "baseline_commit": "d5df3df55e10bbce593f3fb8d5db7b10c550701d",
+    "candidate_commit": "4502dcd56444f2c7eb2489875f3d4e638f43456b",
+    "inputs": "相同硬件输入FS的冷启动/恢复",
+    "environment": "environment.json; source hashes in evidence-index.json and GPA identity records",
+    "commands": [
+      ".venv-remediation/Scripts/python.exe NK_Grid/tests/run_portable_remediation.py -q NK_Grid/tests/test_remediation_environment.py"
+    ],
+    "expected": "逐阶段耗时；恢复不重建plan",
+    "actual": "计时已实现；无目标环境配对耗时，不宣称准备提速",
+    "status": "未验收",
+    "evidence": [
+      "full-suite-windows.txt",
+      "final-portable-regression.txt"
+    ],
+    "remaining_command": "PYTHONPATH=NK_Grid/src python -m pytest -q NK_Grid/tests/test_remediation_posix.py NK_Grid/tests/test_worker_event_wal.py NK_Grid/tests/test_generation_control.py",
+    "remaining_scope": "见报告的 Linux/Slurm 补验命令；单个 pytest 文件不自动满足真实负载或协议矩阵"
+  }
+]

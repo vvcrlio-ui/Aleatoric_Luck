@@ -1,0 +1,43 @@
+F                                                                        [100%]
+================================== FAILURES ===================================
+_____ test_e6_new_analysis_contract_roundtrip_and_nested_serializer_drift _____
+
+    def test_e6_new_analysis_contract_roundtrip_and_nested_serializer_drift():
+        import json
+        import copy
+        spec = CellExecutionSpec.from_payload({
+            'cell_spec_format_version':CELL_SPEC_FORMAT_VERSION, 'runtime_environment':runtime_environment(),
+            'models':['ols'], 'model_n_jobs':1, 'resolved_n_grid':[10], 'resolved_k_grid':[1],
+            'resolved_repeat_plan':[[1,0]], 'git_commit':'d'*40, 'algorithm_version':'test-v1',
+            'resolved_model_params':{'ols':{}}, 'environment_overrides':{},
+            'execution_groups':[{'k_features':1,'groups':[]}],
+            'input_provenance':{'train':{'path':'train.csv','sha256':'a'*64}}, 'require_clean_worktree':False,
+        })
+        created = AnalysisContract.create(cell_execution_spec=spec, task_design_digest='b'*64,
+            expected_task_rows=1, expected_model_rows=1,
+            public_result_schema=['mse','null_mse_train_mean','test_target_variance','skill_train_mean','r2_test_mean','r2_test'])
+        payload = json.loads(json.dumps(created.to_payload()))
+>       restored = AnalysisContract.from_payload(payload)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+NK_Grid\tests\test_remediation_environment.py:63: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+cls = <class 'aleatoric_nk_grid.execution_contract.AnalysisContract'>
+payload = {'analysis_contract_format_version': 1, 'cell_execution_spec': {'cell_spec_format_version': 2, 'runtime_environment': ...9599f3059816736195b1fa', 'task_design_digest': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', ...}
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "AnalysisContract":
+        candidate = dict(payload)
+        expected_id = candidate.pop("analysis_id", None)
+        expected_sha = candidate.pop("analysis_contract_sha256", None)
+        if candidate.get("analysis_contract_format_version") != ANALYSIS_CONTRACT_FORMAT_VERSION:
+            raise ContractError("unsupported analysis contract format")
+        if candidate.get("serializer_version") != PUBLIC_RESULT_SERIALIZER_VERSION:
+>           raise ContractError("unsupported public result serializer; do not mix metric schemas")
+E           aleatoric_nk_grid.execution_contract.ContractError: unsupported public result serializer; do not mix metric schemas
+
+NK_Grid\src\aleatoric_nk_grid\execution_contract.py:405: ContractError
+=========================== short test summary info ===========================
+FAILED NK_Grid\tests\test_remediation_environment.py::test_e6_new_analysis_contract_roundtrip_and_nested_serializer_drift
+1 failed, 5 deselected in 0.19s

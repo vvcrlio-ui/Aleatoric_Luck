@@ -1,0 +1,131 @@
+{
+  "commit": "e31914158c7b6b596fa5d792996e34f8c7733eaa",
+  "files": [
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\audit_history.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\calibrate_cost.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\chunk_planning.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\dynamic_exit_monitor.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\evaluation.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\execution_contract.py",
+      "current_bytes_match_frozen": false,
+      "current_normalized_matches_declared_commit": false
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\experiment.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\flat_task_table.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\fold_local.py",
+      "current_bytes_match_frozen": false,
+      "current_normalized_matches_declared_commit": false
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\generation_control.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\grid_contract.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\helpers_logging.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\ingest.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\model_registry.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\native_process.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\nk_grid.py",
+      "current_bytes_match_frozen": false,
+      "current_normalized_matches_declared_commit": false
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\phase_timing.py",
+      "current_bytes_match_frozen": false,
+      "current_normalized_matches_declared_commit": false
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\prediction_export.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\preprocessing.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\run_panels.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\seed_shards.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\slurm_jobs.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\validate_input.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\worker_event_wal.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    },
+    {
+      "path": "NK_Grid\\src\\aleatoric_nk_grid\\__init__.py",
+      "current_bytes_match_frozen": true,
+      "current_normalized_matches_declared_commit": true
+    }
+  ],
+  "note": "Git normalizes repository line endings; frozen worktree files may contain mixed CRLF/LF. Current-file comparison is supplemental; use original per-file hashes in run identity."
+}

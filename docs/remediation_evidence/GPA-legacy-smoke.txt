@@ -1,0 +1,60 @@
+mkdir -p failed for path C:\Users\15309\.matplotlib: [WinError 5] �ܾ����ʡ�: 'C:\\Users\\15309\\.matplotlib'
+Matplotlib created a temporary cache directory at C:\Users\15309\AppData\Local\Temp\matplotlib-4txdp8gy because there was an issue with the default path (C:\Users\15309\.matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+{"seed": 12345, "draw": 0, "N": 199, "K": 10, "batch": "auto", "status": "ok", "seconds": 5.141922799999975}
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+{"seed": 12345, "draw": 0, "N": 199, "K": 10, "batch": "full", "status": "ok", "seconds": 4.4463974000000235}
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+{"seed": 12345, "draw": 0, "N": 201, "K": 10, "batch": "auto", "status": "ok", "seconds": 4.339486599999873}
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (500) reached and the optimization hasn't converged yet.
+  self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+{"seed": 12345, "draw": 0, "N": 201, "K": 10, "batch": "full", "status": "ok", "seconds": 4.416437999999971}

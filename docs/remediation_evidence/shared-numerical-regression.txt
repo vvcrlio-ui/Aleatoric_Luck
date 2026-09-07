@@ -1,0 +1,29 @@
+......................................................                   [100%]
+============================== warnings summary ===============================
+tests/test_mlp_cv_alpha.py: 33 warnings
+  D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\neural_network\_multilayer_perceptron.py:785: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (40) reached and the optimization hasn't converged yet.
+    warnings.warn(
+
+tests/test_mlp_cv_alpha.py::test_pure_noise_with_p_over_n_prefers_strong_penalty
+tests/test_mlp_cv_alpha.py::test_pure_noise_with_p_over_n_prefers_strong_penalty
+tests/test_mlp_cv_alpha.py::test_pure_noise_with_p_over_n_prefers_strong_penalty
+tests/test_mlp_cv_alpha.py::test_pure_noise_with_p_over_n_prefers_strong_penalty
+tests/test_mlp_cv_alpha.py::test_pure_noise_with_p_over_n_prefers_strong_penalty
+  D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\neural_network\_multilayer_perceptron.py:785: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (300) reached and the optimization hasn't converged yet.
+    warnings.warn(
+
+tests/test_prior_invariance.py: 10 warnings
+  D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\neural_network\_multilayer_perceptron.py:785: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (30) reached and the optimization hasn't converged yet.
+    warnings.warn(
+
+tests/test_prior_invariance.py::test_registered_model_predictions_are_invariant_to_full_missing_prior[super_learner]
+tests/test_prior_invariance.py::test_registered_model_predictions_are_invariant_to_full_missing_prior[super_learner]
+tests/test_prior_invariance.py::test_registered_model_predictions_are_invariant_to_full_missing_prior[super_learner]
+tests/test_prior_invariance.py::test_registered_model_predictions_are_invariant_to_full_missing_prior[super_learner]
+tests/test_prior_invariance.py::test_registered_model_predictions_are_invariant_to_full_missing_prior[super_learner]
+tests/test_prior_invariance.py::test_registered_model_predictions_are_invariant_to_full_missing_prior[super_learner]
+  D:\Aleatoric_power_law\.venv-remediation\Lib\site-packages\sklearn\compose\_target.py:293: ConvergenceWarning: Stochastic Optimizer: Maximum iterations (30) reached and the optimization hasn't converged yet.
+    self.regressor_.fit(X, y_trans, **routed_params.regressor.fit)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+54 passed, 54 warnings in 4.23s
