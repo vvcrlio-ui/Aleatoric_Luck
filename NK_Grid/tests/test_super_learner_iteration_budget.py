@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_budget_reaches_actual_fold_and_final_fits(monkeypatch):
     params = load_model_params(ROOT / "FFCWS/model_params.yaml", task="regression", models=["super_learner"])["super_learner"]
-    params.update(n_estimators=2, lgbm_n_estimators=2, ridge_n_alphas=2, hidden_layer_sizes=[2])
+    params.update(mlp_batch_size="auto", n_estimators=2, lgbm_n_estimators=2, ridge_n_alphas=2, hidden_layer_sizes=[2])
     seen = []
     original = MLPRegressor.fit
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,7 @@ DEFAULTS: dict[str, Any] = {
     "seed": 12345,
     "test_size": 0.3,
     "batch_size": 20,
+    "checkpoint_retention": "default",
     # Panel resolution must not depend on the submit host's environment.
     # Slurm workers replace this scheduler-only value from their allocation.
     "n_jobs": 4,
@@ -112,6 +114,7 @@ PANEL_FIELDS = frozenset(
         "max_n",
         "max_k",
         "batch_size",
+        "checkpoint_retention",
         "n_jobs",
         "test_size",
         "allow_large_run",
@@ -228,6 +231,9 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
             (str(entry["model"]), int(entry["N"]), int(entry["K"]))
         )
     values["prediction_export_cells"] = tuple(normalized_export_cells)
+    retention = values["checkpoint_retention"]
+    if type(retention) is not str or retention not in {"default", "keep", "delete"}:
+        raise ValueError(f"Panel {name} checkpoint_retention must be default, keep, or delete")
     extra = sorted(set(values) - CONFIG_FIELDS)
     if extra:
         raise ValueError(f"Panel {name} did not resolve cleanly: {extra}")
@@ -287,6 +293,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--only", nargs="+", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-jobs", type=int, default=None)
+    parser.add_argument("--checkpoints", choices=("keep", "delete"), default=None)
     # ``default=None`` keeps an absent flag from overriding a panel that already
     # declares ``allow_large_run``; passing the flag still authorizes every panel.
     parser.add_argument("--allow-large-run", action="store_true", default=None)
@@ -294,6 +301,8 @@ def main(argv: list[str] | None = None) -> None:
     panels = resolved_panels(
         args.manifest, only=set(args.only) if args.only else None
     )
+    if args.checkpoints is not None:
+        panels = [(name, replace(config, checkpoint_retention=args.checkpoints)) for name, config in panels]
     if args.dry_run:
         print(
             json.dumps(

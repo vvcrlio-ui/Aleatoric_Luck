@@ -23,8 +23,9 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, fields
+from functools import wraps
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -33,6 +34,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .experiment import utc_now, write_json_atomic
+from .checkpoint_retention import (
+    CheckpointArchiveError,
+    archive_checkpoint_wals,
+    archive_generation_paths,
+    checkpoint_archive_path,
+    reject_archived_checkpoints,
+)
 from .execution_contract import (
     AnalysisContract,
     CellExecutionSpec,
@@ -151,13 +159,13 @@ def _aborted_reason(exc: BaseException) -> str:
 
 
 @contextmanager
-def _generation_shared_lease(path: Path):
-    """Hold a generation shared lease for the complete worker invocation."""
+def _generation_shared_lease(path: Path, *, exclusive: bool = False):
+    """Hold an existing lease; archive cleanup uses an exclusive generation lease."""
 
     descriptor = os.open(Path(path), os.O_RDWR)
     try:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ControlBusyError(f"generation lease is busy: {path}") from exc
         yield
@@ -166,6 +174,29 @@ def _generation_shared_lease(path: Path):
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+def _dynamic_checkpoint_policy(snapshot: Mapping[str, object]) -> str:
+    config = snapshot.get("config")
+    policy = config.get("checkpoint_retention", "default") if isinstance(config, Mapping) else "default"
+    if not isinstance(policy, str) or policy not in {"default", "keep", "delete"}:
+        raise ValueError("checkpoint_retention must be default, keep, or delete")
+    return policy
+
+
+def _checkpoint_archive_reader(function):
+    """Readers from any historical policy cannot overlap terminal cleanup."""
+    @wraps(function)
+    def guarded(snapshot_path: Path, *args, **kwargs):
+        snapshot = _load_snapshot(snapshot_path)
+        root = Path(str(snapshot["output_dir"]))
+        reject_archived_checkpoints(root)
+        _dynamic_checkpoint_policy(snapshot)
+        require_analysis_schedule_lease(root)
+        with _generation_shared_lease(root / ".analysis-schedule.lease"):
+            reject_archived_checkpoints(root)
+            return function(snapshot_path, *args, **kwargs)
+    return guarded
 
 
 @dataclass(frozen=True)
@@ -509,6 +540,7 @@ def _csv_key(row: Mapping[str, str]) -> tuple[str, int, int, int, int]:
     return (str(row["model"]), int(row["seed"]), int(row["draw"]), int(row["N"]), int(row["K"]))
 
 
+@_checkpoint_archive_reader
 def run_slice(
     snapshot_path: Path, *, round_index: int, worker_index: int,
     expected_prep_token: str,
@@ -631,6 +663,7 @@ def run_slice(
     return wal_path
 
 
+@_checkpoint_archive_reader
 def close_generation(
     snapshot_path: Path, *, round_index: int, submission_generation: str,
     expected_prep_token: str, expected_previous_generation: str | None = None,
@@ -737,6 +770,7 @@ def recover_generation_activation(
     # Recovery owns the same exclusive schedule transaction as preparation.
     # In particular, temp cleanup must never race an in-flight immutable write.
     with schedule_transaction(root):
+        reject_archived_checkpoints(root)
         return _recover_generation_activation_locked(
             snapshot_path,
             root=root,
@@ -1497,6 +1531,7 @@ def prepare_round(
 
     prep_token = _validated_prep_token(prep_token)
     payload = _load_snapshot(snapshot_path)
+    reject_archived_checkpoints(Path(str(payload["output_dir"])))
     analysis, execution = _load_contract_chain(payload)
     output_dir = Path(str(payload["output_dir"])); workers = int(payload["workers"])
     if workers != int(execution.payload["worker_count"]):
@@ -1728,6 +1763,7 @@ def prepare_round(
 
 
 @timed_phase("queue.verify_total")
+@_checkpoint_archive_reader
 def verify_rounds(
     snapshot_path: Path, *, tmp_dir: Path | None = None,
     round_index: int | None = None, submission_generation: str | None = None,
@@ -2146,14 +2182,14 @@ def _write_sealed_wal_csv(
     return target, count
 
 
-@timed_phase("queue.finalize_total")
-def finalize_snapshot(
+def _finalize_snapshot_unlocked(
     snapshot_path: Path, *, tmp_dir: Path | None = None,
     round_index: int | None = None, submission_generation: str | None = None,
     expected_prep_token: str | None = None, expected_previous_generation: str | None = None,
     expected_pointer_version: int | None = None, prep_job_id: str | None = None,
     expected_previous_execution_plan_id: str | None = None,
     expected_previous_round_index: int | None = None,
+    _archive_checkpoints: bool = False,
 ) -> dict[str, object]:
     """Stream, validate and atomically publish all dynamic worker shards.
 
@@ -2247,6 +2283,10 @@ def finalize_snapshot(
             "final_output": str(output),
         }
         write_json_atomic(finalization_manifest_path(output), receipt)
+        if _archive_checkpoints:
+            return _archive_finalized_checkpoints(
+                output_dir, target=target, output=output, frozen_frontier=frozen_frontier,
+            )
         return receipt
     except sqlite3.Error as exc:
         raise FinalizationError(f"SQLite finalization failed in {run_dir}: {exc}") from exc
@@ -2254,6 +2294,78 @@ def finalize_snapshot(
         if connection is not None:
             connection.close()
         shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _archive_finalized_checkpoints(
+    root: Path, *, target: ActivationTarget, output: Path,
+    frozen_frontier: Sequence[Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """Called only inside the exclusive analysis schedule transaction."""
+    marker = checkpoint_archive_path(root)
+    if marker.exists() or marker.is_symlink():
+        generations = archive_generation_paths(root)
+    else:
+        assert frozen_frontier is not None
+        generations = tuple(Path(str(item["closed_path"])).parent for item in frozen_frontier)
+    # Workers hold shared generation leases from reclassification through their
+    # final WAL write. Close/prep use the same schedule-before-generation order.
+    with ExitStack() as leases:
+        for generation in generations:
+            canonical = generation.resolve()
+            if root.resolve() not in canonical.parents or canonical != generation.absolute():
+                raise CheckpointArchiveError("archive generation escapes the analysis root")
+            leases.enter_context(_generation_shared_lease(canonical / "generation.lease", exclusive=True))
+        pointer_file = pointer_path(root)
+        if pointer_file.exists():
+            pointer = json.loads(pointer_file.read_text(encoding="utf-8"))
+            active = Path(str(pointer.get("generation_activation_path", "")))
+            if (active.resolve().parent not in {path.resolve() for path in generations}
+                    or not (active.parent / "generation.closed.json").is_file()
+                    or pointer.get("generation_activation_sha256") != sha256_file(active)):
+                raise CheckpointArchiveError("cannot archive checkpoints while another generation is active or pointer is invalid")
+        return archive_checkpoint_wals(
+            root, target=asdict(target), output=output,
+            receipt_path=finalization_manifest_path(output), frozen_frontier=frozen_frontier,
+        )
+
+
+@timed_phase("queue.finalize_total")
+def finalize_snapshot(
+    snapshot_path: Path, *, tmp_dir: Path | None = None,
+    round_index: int | None = None, submission_generation: str | None = None,
+    expected_prep_token: str | None = None, expected_previous_generation: str | None = None,
+    expected_pointer_version: int | None = None, prep_job_id: str | None = None,
+    expected_previous_execution_plan_id: str | None = None,
+    expected_previous_round_index: int | None = None,
+) -> dict[str, object]:
+    snapshot = _load_snapshot(snapshot_path)
+    root = Path(str(snapshot["output_dir"]))
+    arguments = dict(
+        tmp_dir=tmp_dir, round_index=round_index, submission_generation=submission_generation,
+        expected_prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
+        expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+        expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+        expected_previous_round_index=expected_previous_round_index,
+    )
+    archive = checkpoint_archive_path(root)
+    policy = _dynamic_checkpoint_policy(snapshot)
+    if round_index is None or submission_generation is None or expected_prep_token is None:
+        raise FinalizationError("finalizer requires an exact verification target")
+    with schedule_transaction(root):
+        if archive.exists() or archive.is_symlink():
+            _, _, target = _exact_target(
+                snapshot, round_index=round_index, submission_generation=submission_generation,
+                prep_token=expected_prep_token, expected_previous_generation=expected_previous_generation,
+                expected_pointer_version=expected_pointer_version, prep_job_id=prep_job_id,
+                expected_previous_execution_plan_id=expected_previous_execution_plan_id,
+                expected_previous_round_index=expected_previous_round_index,
+            )
+            config = snapshot.get("config")
+            if not isinstance(config, Mapping) or not isinstance(config.get("out"), str):
+                raise FinalizationError("snapshot config.out is required for finalization")
+            output = Path(str(config["out"])).expanduser().resolve()
+            return _archive_finalized_checkpoints(root, target=target, output=output)
+        return _finalize_snapshot_unlocked(snapshot_path, **arguments, _archive_checkpoints=policy == "delete")
 
 
 @dataclass(frozen=True)

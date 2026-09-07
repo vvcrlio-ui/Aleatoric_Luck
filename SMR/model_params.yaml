@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v6-fold-local-1
+algorithm_version: nk-grid-v7-mlp-batch-cv-1
 
 regression:
   ols:
@@ -23,6 +23,8 @@ regression:
     max_features: sqrt
     min_samples_leaf: 5
   shallow_neural_network:
+    mlp_batch_size: cv
+    mlp_batch_candidates: [32, 64, 128, 256]
     hidden_layer_sizes:
       - 32
     activation: relu
@@ -35,6 +37,9 @@ regression:
     max_iter: 2000
     early_stopping: false
   super_learner:
+    mlp_batch_size: cv
+    mlp_batch_candidates: [32, 64, 128, 256]
+    mlp_batch_cv_folds: 3
     cv: 5
     passthrough: false
     ridge_alpha_log10_min: -4

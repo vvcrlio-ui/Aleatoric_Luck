@@ -73,6 +73,8 @@ def parser():
     p.add_argument("--refresh-env", action="store_true", help="Reinstall fixed dependencies into the selected environment")
     p.add_argument("--allow-large-run", action="store_true")
     p.add_argument("--max-jobs", type=positive, help="Local-only bound on model cells")
+    p.add_argument("--checkpoints", choices=("keep", "delete"),
+                   help="Keep or delete checkpoint data only after verified success; omission preserves the configured/default behavior")
     p.add_argument("--dry-run", action="store_true", help="Read-only launch preview; no installation, data reads or submission")
     p.add_argument("--resume", help="Slurm: reuse an existing plan JSON; do not regenerate the task table")
     p.add_argument("--account", help="Required for Slurm, including resume; explicitly enter your authorized project account")
@@ -122,7 +124,42 @@ def launch_spec(args):
                 manifest=str(manifest), schema=str(path_from_repo(args.schema)) if args.schema else None,
                 models=args.models, output=str(output), allow_large_run=args.allow_large_run,
                 max_jobs=args.max_jobs, cluster=cluster, plan_memory=args.plan_memory,
+                checkpoint_retention=args.checkpoints or "default",
                 plan_time=args.plan_time or ("08:00:00" if production else "01:00:00"))
+
+
+def validate_resume_checkpoints(plan_path, requested=None):
+    """A resumed dynamic run keeps the policy frozen in its snapshot."""
+    plan_path = Path(plan_path)
+    if not plan_path.is_file():
+        raise ValueError(f"plan does not exist: {plan_path}")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    snapshot_path = plan.get("snapshot")
+    if not snapshot_path:
+        if requested is None:
+            return
+        raise ValueError("cannot confirm frozen checkpoint policy: plan has no snapshot")
+    snapshot_path = Path(snapshot_path)
+    if not snapshot_path.is_absolute():
+        snapshot_path = plan_path.parent / snapshot_path
+    if not snapshot_path.is_file():
+        raise ValueError(f"cannot confirm frozen checkpoint policy: snapshot does not exist: {snapshot_path}")
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    output_dir = snapshot.get("output_dir")
+    if output_dir:
+        output_dir = Path(output_dir)
+        if not output_dir.is_absolute():
+            output_dir = snapshot_path.parent / output_dir
+        if (output_dir / "checkpoint-archive.json").exists():
+            raise ValueError("run already completed and its checkpoints were archived/deleted; final CSV is retained; do not resume training")
+    frozen = snapshot.get("config", {}).get("checkpoint_retention", "default")
+    if frozen not in ("default", "keep", "delete"):
+        raise ValueError(f"invalid frozen checkpoint_retention: {frozen!r}")
+    # Historical dynamic runs retain WAL when no retention policy was set.
+    effective = "keep" if frozen == "default" else frozen
+    if requested is not None and requested != effective:
+        raise ValueError(f"resume cannot override frozen checkpoint policy ({effective}); omit --checkpoints or use --checkpoints {effective}")
+    return effective
 
 
 def ensure_environment(args):
@@ -204,7 +241,10 @@ def resolve_experiment(spec):
         raise ValueError("--models must be a unique subset of the declared panel models")
     config = replace(config, out=Path(spec["output"]) / "final.csv", models=models,
                      schema=Path(spec["schema"]) if spec["schema"] else config.schema,
-                     n_jobs=1, allow_large_run=spec["allow_large_run"])
+                     n_jobs=1, allow_large_run=spec["allow_large_run"],
+                     checkpoint_retention=(config.checkpoint_retention
+                                           if spec.get("checkpoint_retention", "default") == "default"
+                                           else spec["checkpoint_retention"]))
     try:
         loaded = load_input(config.schema, config.outcome)
     except FileNotFoundError as exc:
@@ -258,11 +298,17 @@ def main(argv=None):
     if args.target == "execute":
         if not args.request:
             raise ValueError("execute requires --request")
+        if args.checkpoints is not None:
+            raise ValueError("execute reuses the frozen launch request; set --checkpoints on local or slurm instead")
         if sys.platform == "win32":
             raise ValueError("Full engine execution requires Linux/WSL")
         execute(json.loads(Path(args.request).read_text(encoding="utf-8")))
         return
     spec = launch_spec(args)
+    if args.resume:
+        resume_retention = validate_resume_checkpoints(path_from_repo(args.resume), args.checkpoints)
+        if resume_retention is not None:
+            spec["checkpoint_retention"] = resume_retention
     if args.dry_run:
         print(json.dumps({"launch": spec, "resume": args.resume, "venv": args.venv or os.environ.get("VENV", ".venv-linux"),
                           "actions": ["validate/reuse or create environment", "reuse plan" if args.resume else

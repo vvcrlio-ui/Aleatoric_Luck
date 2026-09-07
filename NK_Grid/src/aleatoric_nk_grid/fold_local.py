@@ -97,6 +97,22 @@ class FoldLocalMLP(RegressorMixin, BaseEstimator):
                              TransformedTargetRegressor(regressor=mlp, transformer=StandardScaler()))
 
     def fit(self, X, y):
+        from .mlp_batch_cv import validate_batch
+        validate_batch(self.params.get('mlp_batch_size', 'auto'),
+                       self.params.get('mlp_batch_candidates', (32, 64, 128, 256)),
+                       self.params['max_cv_folds'])
+        if self.params.get('mlp_batch_size', 'auto') == 'cv':
+            from .model_registry import AdaptiveMLPRegressor
+            from .mlp_batch_cv import BatchSearchMLP
+            self.search_ = BatchSearchMLP(
+                AdaptiveMLPRegressor(seed=self.seed, **self.params)._mlp(0.0),
+                np.logspace(self.params['alpha_log10_min'], self.params['alpha_log10_max'], self.params['n_alphas']),
+                self.params.get('mlp_batch_candidates', (32, 64, 128, 256)),
+                self.params['max_cv_folds'], self.preprocessor).fit(X, y)
+            self.alpha_, self.batch_size_ = self.search_.alpha_, self.search_.batch_size_
+            self.cv_mse_, self.diagnostics_ = self.search_.cv_mse_, self.search_.diagnostics_
+            self.model_ = self.search_.model_
+            return self
         y = np.asarray(y)
         alphas = np.logspace(self.params['alpha_log10_min'], self.params['alpha_log10_max'], self.params['n_alphas'])
         folds = tuple(KFold(min(self.params['max_cv_folds'], len(y))).split(X))

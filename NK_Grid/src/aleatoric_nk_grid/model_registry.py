@@ -140,13 +140,21 @@ def _validated_params(
 ) -> dict[str, Any]:
     reject_removed_model(model_name)
     allowed = MODEL_PARAM_KEYS.get(task, {}).get(model_name)
+    if task == "regression" and model_name in {"super_learner", "shallow_neural_network"}:
+        allowed = allowed | {"mlp_batch_size", "mlp_batch_candidates"}
+        params = {"mlp_batch_size": "auto", **params}
+        from .mlp_batch_cv import DEFAULT_BATCH_CANDIDATES, validate_batch
+        params = {"mlp_batch_candidates": list(DEFAULT_BATCH_CANDIDATES), **params}
+        if model_name == "super_learner":
+            allowed = allowed | {"mlp_batch_cv_folds"}
+            params = {"mlp_batch_cv_folds": 3, **params}
+        folds = params.get("max_cv_folds") if model_name == "shallow_neural_network" else params["mlp_batch_cv_folds"]
+        validate_batch(params["mlp_batch_size"], params["mlp_batch_candidates"], folds)
+        if model_name == "super_learner" and (type(params.get("cv")) is not int or params["cv"] < 2):
+            raise ValueError("stacking cv must be an integer >= 2")
     if task == "regression" and model_name == "super_learner":
-        allowed = allowed | {"mlp_batch_size", "diagnostics"}
-        params = {"mlp_batch_size": "auto", "diagnostics": False, **params}
-        batch = params["mlp_batch_size"]
-        if not ((isinstance(batch, str) and batch in {"auto", "full"}) or
-                (type(batch) is int and batch > 0)):
-            raise ValueError("mlp_batch_size must be auto, full, or a positive integer")
+        allowed = allowed | {"diagnostics"}
+        params = {"diagnostics": False, **params}
         if type(params["diagnostics"]) is not bool:
             raise ValueError("diagnostics must be boolean")
     if allowed is None:
@@ -248,12 +256,17 @@ def load_algorithm_version(path: Path) -> str:
 def resolved_model_params(
     params: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Apply documented environment overrides for manifest recording."""
+    """Record environment overrides and the implemented CV rule in identity."""
 
-    return {
+    from .mlp_batch_cv import BATCH_CV_RULE
+    resolved = {
         model_name: _apply_environment_overrides(model_name, model_params)
         for model_name, model_params in params.items()
     }
+    for model_params in resolved.values():
+        if model_params.get("mlp_batch_size") == "cv":
+            model_params["mlp_batch_cv_rule"] = BATCH_CV_RULE
+    return resolved
 
 
 def _apply_environment_overrides(
@@ -591,6 +604,8 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
         max_cv_folds: int,
         validation_fraction: float = 0.1,
         n_iter_no_change: int = 10,
+        mlp_batch_size: str | int = "auto",
+        mlp_batch_candidates: Sequence[int] = (32, 64, 128, 256),
     ):
         self.seed = seed
         self.hidden_layer_sizes = hidden_layer_sizes
@@ -605,9 +620,12 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
         self.max_cv_folds = max_cv_folds
         self.validation_fraction = validation_fraction
         self.n_iter_no_change = n_iter_no_change
+        self.mlp_batch_size = mlp_batch_size
+        self.mlp_batch_candidates = mlp_batch_candidates
 
     def _mlp(self, alpha: float) -> MLPRegressor:
-        return MLPRegressor(
+        return FitBatchMLPRegressor(
+            batch_size=self.mlp_batch_size,
             hidden_layer_sizes=tuple(self.hidden_layer_sizes),
             activation=self.activation,
             solver=self.solver,
@@ -621,6 +639,16 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
         )
 
     def fit(self, X, y):
+        from .mlp_batch_cv import BatchSearchMLP, validate_batch
+        validate_batch(self.mlp_batch_size, self.mlp_batch_candidates, self.max_cv_folds)
+        if self.mlp_batch_size == "cv":
+            self.search_ = BatchSearchMLP(self._mlp(0.0),
+                np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas),
+                self.mlp_batch_candidates, self.max_cv_folds).fit(X, y)
+            self.model_ = self.search_
+            self.alpha_, self.batch_size_ = self.search_.alpha_, self.search_.batch_size_
+            self.cv_mse_, self.diagnostics_ = self.search_.cv_mse_, self.search_.diagnostics_
+            return self
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float).ravel()
         if len(y) < 2:
@@ -658,8 +686,17 @@ class FitBatchMLPRegressor(MLPRegressor):
     def fit(self, X, y, sample_weight=None):
         policy = self.batch_size
         self.fit_n_ = len(y)
-        self.effective_batch_size_ = min(200, len(y)) if policy == "auto" else (
-            len(y) if policy == "full" else min(policy, len(y)))
+        # sklearn removes the early-stopping holdout before clipping batch size.
+        # This is diagnostic only; retain the historical constructor/fit policy.
+        optimizer_n = len(y)
+        if self.early_stopping and self.solver in {"adam", "sgd"}:
+            optimizer_n -= int(np.ceil(self.validation_fraction * len(y)))
+        if self.solver == "lbfgs":
+            # L-BFGS evaluates the full training objective; batch_size is ignored.
+            self.effective_batch_size_ = len(y)
+        else:
+            self.effective_batch_size_ = min(200, optimizer_n) if policy == "auto" else (
+                optimizer_n if policy == "full" else min(policy, optimizer_n))
         self.batch_size = len(y) if policy == "full" else policy
         try:
             with warnings.catch_warnings(record=True) as captured:
@@ -700,6 +737,8 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         lgbm_num_leaves: int,
         lgbm_min_data_in_leaf: int,
         mlp_batch_size: str | int = "auto",
+        mlp_batch_candidates: Sequence[int] = (32, 64, 128, 256),
+        mlp_batch_cv_folds: int = 3,
         diagnostics: bool = False,
         preprocessor=None,
     ):
@@ -724,10 +763,16 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         self.lgbm_num_leaves = lgbm_num_leaves
         self.lgbm_min_data_in_leaf = lgbm_min_data_in_leaf
         self.mlp_batch_size = mlp_batch_size
+        self.mlp_batch_candidates = mlp_batch_candidates
+        self.mlp_batch_cv_folds = mlp_batch_cv_folds
         self.diagnostics = diagnostics
         self.preprocessor = preprocessor
 
     def fit(self, X, y):
+        from .mlp_batch_cv import validate_batch
+        validate_batch(self.mlp_batch_size, self.mlp_batch_candidates, self.mlp_batch_cv_folds)
+        if type(self.cv) is not int or self.cv < 2:
+            raise ValueError("stacking cv must be an integer >= 2")
         if self.passthrough and np.asarray(pd.isna(X)).any():
             raise ValueError(
                 "Super Learner passthrough=True does not support NaN values in X; "
@@ -810,6 +855,21 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                 self.ridge_n_alphas, self.ridge_scoring))
             for _, estimator in estimators[1:]:
                 estimator.steps[0] = ("typed_preprocessing", clone(self.preprocessor))
+        from .mlp_batch_cv import BatchSearchMLP, SerialBatchStack
+        if self.mlp_batch_size == "cv":
+            estimators[-1] = ("shallow_nn", BatchSearchMLP(
+                FitBatchMLPRegressor(hidden_layer_sizes=tuple(self.hidden_layer_sizes),
+                    alpha=self.alpha, learning_rate_init=self.learning_rate_init,
+                    max_iter=self.max_iter, random_state=self.seed),
+                (self.alpha,), self.mlp_batch_candidates, self.mlp_batch_cv_folds,
+                self.preprocessor))
+            self.model_ = SerialBatchStack(estimators, cv, self.positive, self.passthrough).fit(X, y)
+            self.diagnostics_ = {"fits": self.model_.mlp_fits_,
+                "fit_count": sum(f["fit_count"] for f in self.model_.mlp_fits_),
+                "coefficients": self.model_.final_estimator_.coef_.tolist(),
+                "intercept": float(self.model_.final_estimator_.intercept_),
+                "note": "actual serial OOF/full fits; no diagnostic replay"}
+            return self
         self.model_ = StackingRegressor(
             estimators=estimators,
             final_estimator=LinearRegression(positive=self.positive),
@@ -1097,6 +1157,9 @@ def make_model(
     resolved_params = _validated_params(task, name, params)
     resolved_params = _apply_environment_overrides(name, resolved_params)
 
+    if task == "regression" and name == "shallow_neural_network" and resolved_params["mlp_batch_size"] == "cv":
+        from .fold_local import FoldLocalMLP
+        return FoldLocalMLP(preprocessor, seed, resolved_params)
     if preprocessor is not None and task == "regression":
         from .fold_local import FoldLocalRidge, FoldLocalLasso, FoldLocalMLP
         if name == "ridge":

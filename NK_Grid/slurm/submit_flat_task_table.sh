@@ -27,6 +27,12 @@ done
 [ -n "$PLAN" ] || { usage; exit 2; }
 [ -x "$PYTHON" ] || { echo "Python not found: $PYTHON" >&2; exit 1; }
 [ -f "$PLAN" ] || { echo "Plan JSON not found: $PLAN" >&2; exit 1; }
+JOURNAL="$ENGINE_DIR/slurm/submission_journal.py"
+if [ "$SUBMIT" = "1" ] && [ -z "${NKGRID_SUBMISSION_RECEIPT:-}" ]; then
+  # The parent holds one identity-scoped lease for this entire chain. Every
+  # sbatch call below writes its intent and acceptance through the same journal.
+  exec "$PYTHON" "$JOURNAL" guard --plan "$PLAN" -- bash "${BASH_SOURCE[0]}" --submit "$PLAN"
+fi
 
 FIELDS=$("$PYTHON" -c '
 import json, sys
@@ -120,7 +126,13 @@ lease = root / ".analysis-schedule.lease"
 lease.parent.mkdir(parents=True, exist_ok=True)
 fd = os.open(lease, os.O_RDWR | os.O_CREAT, 0o640)
 try:
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("analysis schedule is busy; no new chain submitted; inspect the active run before retrying")
+    archive = root / "checkpoint-archive.json"
+    if archive.exists() or archive.is_symlink():
+        raise SystemExit("run is terminally archived; final CSV is retained; no new chain submitted")
     pointer_path = root / "active-generation.json"
     if not pointer_path.exists():
         print(""); print(""); print(""); print("0"); print(current_plan)
@@ -170,13 +182,13 @@ submit_or_print() {
     printf 'DRY RUN (%s):' "$label"; printf ' %q' "$@"; printf '\n'
     JOB_ID="dry-$label"
   else
-    JOB_ID=$(sbatch --parsable "${@:2}")
+    JOB_ID=$("$PYTHON" "$JOURNAL" submit --receipt "$NKGRID_SUBMISSION_RECEIPT" \
+      --plan "$PLAN" --label "$label" --generation "$GENERATION" -- "${@:2}")
   fi
 }
 
 GENERATIONS=($("$PYTHON" -c 'import sys, uuid; [print(uuid.uuid4()) for _ in range(int(sys.argv[1]))]' "$ROUNDS"))
 PREVIOUS_CLOSE=""
-RECEIPT=""
 for ROUND in $(seq 1 "$ROUNDS"); do
   GENERATION="${GENERATIONS[$((ROUND - 1))]}"
   POINTER_VERSION=$((INITIAL_POINTER_VERSION + ROUND - 1))
@@ -199,16 +211,10 @@ for ROUND in $(seq 1 "$ROUNDS"); do
     submit_or_print "prep-$ROUND" sbatch "${PREP_COMMAND[@]}" "--dependency=afterany:$PREVIOUS_CLOSE" "$PREP" "${PREP_SCRIPT_ARGS[@]}"
   fi
   PREP_JOB="$JOB_ID"
-  if [ "$SUBMIT" != "0" ]; then
-    if [ -z "$PREVIOUS_CLOSE" ]; then RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"none"$'\n';
-    else RECEIPT+="prep-$ROUND"$'\t'"$PREP_JOB"$'\t'"afterany:$PREVIOUS_CLOSE"$'\n'; fi
-  fi
   submit_or_print "work-$ROUND" sbatch "${SBATCH_ARGS[@]}" "--dependency=afterany:$PREP_JOB" "--array=$ARRAY_SPEC" "$WORKER" "$SNAPSHOT" "$ROUND" "$PREP_JOB" "$GENERATION" "$PREVIOUS_GENERATION" "$POINTER_VERSION" "$PREVIOUS_PLAN" "$PREVIOUS_ROUND"
   WORK_JOB="$JOB_ID"
-  [ "$SUBMIT" = "0" ] || RECEIPT+="work-$ROUND"$'\t'"$WORK_JOB"$'\t'"afterany:$PREP_JOB"$'\n'
   submit_or_print "close-$ROUND" sbatch "${PREPARATION_SBATCH_ARGS[@]}" "--dependency=afterany:$WORK_JOB" "$CLOSER" "$SNAPSHOT" "$ROUND" "$GENERATION" "$PREP_JOB" "$PREVIOUS_GENERATION" "$POINTER_VERSION" "$PREVIOUS_PLAN" "$PREVIOUS_ROUND"
   CLOSE_JOB="$JOB_ID"
-  [ "$SUBMIT" = "0" ] || RECEIPT+="close-$ROUND"$'\t'"$CLOSE_JOB"$'\t'"afterany:$WORK_JOB"$'\n'
   PREVIOUS_CLOSE="$CLOSE_JOB"
 done
 LAST_GENERATION="${GENERATIONS[$((ROUNDS - 1))]}"
@@ -223,28 +229,13 @@ if [ "$VERIFICATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then
 fi
 submit_or_print "verify" sbatch "${VERIFY_COMMAND[@]}"
 VERIFY_JOB="$JOB_ID"
-[ "$SUBMIT" = "0" ] || RECEIPT+="verify"$'\t'"$VERIFY_JOB"$'\t'"afterany:$PREVIOUS_CLOSE"$'\n'
 FINALIZER_COMMAND=("${FINALIZATION_SBATCH_ARGS[@]}" "--dependency=afterok:$VERIFY_JOB" "$FINALIZER" "$SNAPSHOT" "$ROUNDS" "$LAST_GENERATION" "$PREP_JOB" "$LAST_PREVIOUS" "$LAST_POINTER_VERSION" "$LAST_PREVIOUS_PLAN" "$LAST_PREVIOUS_ROUND")
 if [ "$FINALIZATION_TMP_DIR" != "__NK_GRID_NONE__" ]; then
   FINALIZER_COMMAND+=("$FINALIZATION_TMP_DIR")
 fi
 submit_or_print "finalize" sbatch "${FINALIZER_COMMAND[@]}"
 FINALIZE_JOB="$JOB_ID"
-[ "$SUBMIT" = "0" ] || RECEIPT+="finalize"$'\t'"$FINALIZE_JOB"$'\t'"afterok:$VERIFY_JOB"$'\n'
 
 if [ "$SUBMIT" = "1" ]; then
-  RECEIPT_PATH=$("$PYTHON" -c '
-import datetime, json, sys
-from pathlib import Path
-plan = Path(sys.argv[1]); rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.strip()]
-p = json.load(plan.open(encoding="utf-8")); submission = p["submission"]
-resources = {
-    phase: {"sbatch_args": p[phase]["sbatch_args"], "tmp_dir": p[phase].get("tmp_dir")}
-    for phase in ("preparation", "verification", "finalization")
-}
-out = plan.with_name(plan.stem + ".submission-receipt-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".json")
-out.write_text(json.dumps({"plan": str(plan.resolve()), "snapshot": p["snapshot"], "sbatch_account": submission["account"], "sbatch_constraint": submission["constraint"], "resources": resources, "jobs": [{"label": label, "slurm_job_id": job_id, "dependency": dependency} for label, job_id, dependency in rows]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-print(out)
-' "$PLAN" <<< "$RECEIPT")
-  echo "Receipt: $RECEIPT_PATH"
+  echo "Receipt: $NKGRID_SUBMISSION_RECEIPT"
 fi

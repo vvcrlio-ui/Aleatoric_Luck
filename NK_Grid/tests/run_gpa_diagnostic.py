@@ -43,8 +43,13 @@ parser.add_argument('--k',nargs='+',type=int,default=[10,100])
 parser.add_argument('--seeds',nargs='+',type=int,default=[12345,23456])
 parser.add_argument('--draws',nargs='+',type=int,default=[0])
 parser.add_argument('--method',choices=['legacy','fold-local'],default='fold-local')
+parser.add_argument('--model', choices=['super_learner', 'shallow_neural_network'], default='super_learner')
+parser.add_argument('--batches', nargs='+', default=['auto', 'full'])
 args=parser.parse_args()
-params=load_model_params(args.params,task='regression',models=['super_learner'])['super_learner']
+policies = [int(p) if p.isdecimal() else p for p in args.batches]
+if len(set(policies)) != len(policies) or any(p not in ('auto', 'full') and (type(p) is not int or p <= 0) for p in policies):
+    parser.error('--batches must be distinct auto, full, or positive integers')
+params=load_model_params(args.params,task='regression',models=[args.model])[args.model]
 loaded=load_input(args.schema,'gpa')
 groups=source_groups(loaded.predictors,loaded.manifest,loaded.schema.continuous_priors)
 units=sampling_units(groups)
@@ -55,6 +60,7 @@ unit_map={u.name:u for u in units}
 if max(args.n)>len(fit_ids) or max(args.k)>len(units):
     raise ValueError('requested diagnostic N/K exceeds training-pool capacity')
 identity={'kind':'training-pool GPA paired diagnostic','method':args.method,
+          'model':args.model, 'batches':policies,
           'commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
           'runtime':runtime_environment(),'schema_sha256':hashlib.sha256(args.schema.read_bytes()).hexdigest(),
           'train_file_sha256':sha256_file(loaded.schema.table),
@@ -76,23 +82,35 @@ with args.output.open('x',encoding='utf-8') as output, threadpool_limits(limits=
                 cols=[c for u in selected for c in u.features]; selected_groups=tuple(g for u in selected for g in u.groups)
                 for n in args.n:
                     rows=order.row_index[:n]; X=pool.loc[rows,cols]; y=pool.loc[rows,'gpa']; V=pool.loc[valid_ids,cols]
-                    for policy in ['auto','full']:
+                    for policy in policies:
                         record={'seed':seed,'draw':draw,'N':n,'K':k,'K_expanded':len(cols),'batch':policy,
                                 'model_seed':_model_seed(seed,draw,n,k),'sources':[u.name for u in selected],
                                 'row_order_sha256':hashlib.sha256(np.asarray(rows).tobytes()).hexdigest()}
                         started=time.perf_counter()
                         try:
-                            preprocessor=FoldPreprocessor(selected_groups,loaded.schema.imputation,'super_learner')
+                            preprocessor=FoldPreprocessor(selected_groups,loaded.schema.imputation,args.model)
                             if args.method=='legacy':
-                                prepared=preprocess_cell(X,V,selected_groups,loaded.schema.imputation,model_name='super_learner')
+                                prepared=preprocess_cell(X,V,selected_groups,loaded.schema.imputation,model_name=args.model)
                                 train_X,valid_X=prepared.X_train,prepared.X_test; preprocessor=None
                             else:
                                 train_X,valid_X=X,V
-                            model=make_model('super_learner',seed=record['model_seed'],n_jobs=1,
-                                params={**params,'mlp_batch_size':policy,'diagnostics':True},preprocessor=preprocessor).fit(train_X,y)
+                            run_params = {**params, 'mlp_batch_size':policy}
+                            if args.model == 'super_learner':
+                                run_params['diagnostics'] = True
+                            model=make_model(args.model,seed=record['model_seed'],n_jobs=1,
+                                params=run_params,preprocessor=preprocessor).fit(train_X,y)
                             predictions=model.predict(valid_X)
                             if not np.isfinite(predictions).all():raise ValueError('nonfinite predictions')
-                            record.update(status='ok',validation_mse=float(np.mean((predictions-pool.loc[valid_ids,'gpa'])**2)),diagnostics=model.diagnostics_)
+                            if args.model == 'super_learner':
+                                diagnostics = model.diagnostics_
+                            else:
+                                adaptive = model if args.method == 'fold-local' else model[-1].regressor_
+                                fitted = adaptive.model_[-1].regressor_ if args.method == 'fold-local' else adaptive.model_
+                                diagnostics = {'alpha':adaptive.alpha_, 'cv_mse':list(adaptive.cv_mse_),
+                                    'final_fit':{'N':fitted.fit_n_, 'batch':fitted.effective_batch_size_,
+                                        'iterations':fitted.n_iter_, 'max_iter':fitted.max_iter,
+                                        'convergence_warnings':fitted.convergence_warnings_}}
+                            record.update(status='ok',validation_mse=float(np.mean((predictions-pool.loc[valid_ids,'gpa'])**2)),diagnostics=diagnostics)
                         except Exception as exc:
                             record.update(status='failed',error=f'{type(exc).__name__}: {exc}')
                         record['seconds']=time.perf_counter()-started

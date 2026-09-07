@@ -494,8 +494,10 @@ def compact_checkpoint_parts(
 def write_checkpoint_part(
     rows: Iterable[dict[str, Any]],
     out_path: Path,
+    *,
+    keep_all: bool = False,
 ) -> Path | None:
-    """Atomically append one WAL shard and periodically compact loose shards."""
+    """Append one shard; keep_all disables source-deleting automatic compaction."""
 
     frame = pd.DataFrame(list(rows))
     if frame.empty:
@@ -505,6 +507,8 @@ def write_checkpoint_part(
         checkpoint_loose_parts_dir(out_path),
         compact=False,
     )
+    if keep_all:
+        return part
     compacted = compact_checkpoint_parts(out_path)
     return compacted or part
 

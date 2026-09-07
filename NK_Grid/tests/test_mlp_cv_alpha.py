@@ -86,7 +86,7 @@ def test_make_model_builds_cv_pipeline_from_locked_params():
         models=("shallow_neural_network",),
     )["shallow_neural_network"]
     fast = dict(params)
-    fast.update(hidden_layer_sizes=[4], max_iter=40, n_alphas=2, max_cv_folds=2)
+    fast.update(hidden_layer_sizes=[4], max_iter=40, n_alphas=2, max_cv_folds=2, mlp_batch_size="auto")
     model = make_model(
         "shallow_neural_network", seed=42, n_jobs=1, task="regression", params=fast
     )

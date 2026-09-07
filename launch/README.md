@@ -37,6 +37,54 @@ bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT --resume runs/EX
 
 `--dry-run`是启动层的只读预览，不声称输入已经通过数值验证。实际N/K和总单元数在执行节点通过引擎统一解析并打印。production与超过引擎规模阈值的设计都要求显式 `--allow-large-run`。`--max-jobs`仅用于本地；Slurm不可用它伪装成有界实验。
 
+交接时应写明使用本页的 `run.sh` 入口。它从 panel 的通用预设解析网格；直接调用
+`chunk_planning` 的同名 `pilot` 使用另一组显式 N/K，二者不是同一设计。
+以执行节点打印的实际 N/K 和冻结的 snapshot 为准，不要仅凭预设名称认定实验相同。
+
+## 成功结束后的 checkpoint 保留
+
+在原运行命令末尾显式加入 `--checkpoints keep` 或 `--checkpoints delete`：
+
+```bash
+bash run.sh local --checkpoints keep
+bash run.sh local --checkpoints delete
+bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT --checkpoints delete
+```
+
+PowerShell/WSL 入口同样透传该选项。也可在 panel 条目中设置
+`checkpoint_retention: keep` 或 `delete`，命令行显式值优先。
+省略时，新本地运行沿用成功后清理分片的历史行为，新动态 Slurm 运行沿用保留 WAL
+的历史行为；本地恢复会继承已有 manifest 的显式策略，Slurm 恢复复用 snapshot 冻结策略。
+Slurm `--resume` 不能改变已经冻结的策略。
+
+`keep` 保留最终完整 CSV 和每次写出的 checkpoint。本地会关闭删除源分片的自动压缩，
+所以分片文件数可能显著增加；它不是保存每个 epoch 的模型权重。
+`delete` 在计算期间照常写 checkpoint，只有完整成功、最终表和完成记录通过校验后才清理。
+失败、中断、未完成或最终表校验失败均保留恢复数据。最终 CSV、模型选择诊断、
+运行身份、计划、配置和日志不会因该选项被删除。
+
+动态 Slurm 删除只针对封存清单中的精确 WAL 文件，并写入
+`out/checkpoint-archive.json`，保留封存/验证记录及最终 CSV 的 SHA-256。
+这标志着该运行已终态归档，不能再通过 prep/run/close/verify 或 launcher resume 继续训练；
+重复原精确 finalize 命令可验证最终文件或继续中断的清理。
+清理意图落盘后如删除中断，剩余 WAL 继续保留，不能当作未归档运行重新提交。
+应从一开始使用 `keep` 才能保留所有原始分片；后来切换策略无法恢复此前已经压缩或删除的分片。
+
+最终 CSV 是逐 `model/seed/draw/N/K` 单元的完整长表，不是只剩一组平均数。
+有足够重复时，可用它分析抽样/随机化的重复实验不确定性，不需要中间 checkpoint。
+同一 seed 共享划分，同一 seed/draw 的 N/K 单元使用嵌套样本与特征前缀，
+因此不能把整张表的行当作独立观测随机打散；应按设计保留分组和模型配对关系。
+配对重采样的索引原则参见 [SciPy bootstrap 文档](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.bootstrap.html)。
+
+如果 bootstrap 的对象是测试集里的每个个体、并需重算 MSE/R²，则必须保留逐行
+`row_id/y_true/y_pred`。现有 `prediction_export_cells` 可为选定本地单元导出最终
+`.predictions.parquet`；普通 checkpoint 也不含这些行级预测，动态 Slurm 暂不支持该导出。
+如果重采样训练集并重新调参训练，需要原始数据、配置和重新拟合；保留指标 checkpoint
+不能替代训练。当前仓库尚无上述统计 bootstrap 分析程序。
+
+本功能的 Windows 测试覆盖参数传递、本地策略判断和临时文件上的归档协议；
+完整 POSIX 引擎、文件锁竞争及 BMRC/Slurm 依赖链仍需在目标环境验收。
+
 ## 环境与输入
 
 `launch/profiles/bmrc.sh` 保存用户提供的 `Python/3.11.3-GCCcore-12.3.0` 和 `skl-compat`，不设置项目账户。不包含用户名和绝对仓库路径。模块加载完成后，默认venv为当前仓库的 `venv/aleatoric-${MODULE_CPU_TYPE}`，与模块的CPU类型对应；可通过 `--venv` 或 `VENV` 指向已经准备的环境。
@@ -57,7 +105,16 @@ bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT --resume runs/EX
 
 运行目录包含：`launch.json`、`submission.json`、`logs/plan-JOBID.out`、`logs/plan-JOBID.err`，以及计划生成后的 `plan.json`、`snapshot.json`、`tasks.parquet`、`out/` 和最终CSV。后续作业日志由原脚本写入同一运行目录的 `logs/`。既有提交收据与恢复拒绝行为继续有效。
 
-本实现要求计划计算节点可以执行 `sbatch` 提交后续链。若站点禁止计算节点提交，需要基于现场策略调整提交位置；不能在没有站点测试时声称已完成BMRC验收。若计划生成成功但提交链中途失败，先检查原提交收据与调度器状态，不能盲目新建同样的生产实验。
+本实现要求计划计算节点可以执行 `sbatch` 提交后续链。若站点禁止计算节点提交，需要基于现场策略调整提交位置；不能在没有站点测试时声称已完成BMRC验收。
+
+提交器在每次 `sbatch` 前持久化待确认请求，接受后立即记录 job ID、依赖、generation 和完整命令。
+收据的 `complete` 只表示整条链已被调度器接受，不表示计算结束。
+中途失败、空或异常 job ID、接受后收据写入失败会保留 `partial` / `unknown` 或待确认意图，
+并输出已接受的任务；同一 execution 的自动重提交会被拒绝，包括 launcher `--resume`。
+必须人工对照收据和调度器核对这些任务，不能把非零返回理解成没有任务被接受。
+若尚未写出任何提交意图就失败，记录为 `failed_before_submission`，可以修复输入后重试。
+已有完整收据仍兼容原恢复流程，但恢复前须确认原链不再活跃且满足封存前驱条件；
+当前实现不自动查询 `squeue` / `sacct`，也不能全面阻止人工重复提交仍活跃的完整链。
 
 恢复时显式输入的 `--account` 必须与原计划冻结的账户相同，不匹配会在环境安装或提交之前拒绝。同一个活动输出不允许任意修改资源和设计后恢复。`--resume`复用冻结的plan；不同worker数、模型、schema、时间或内存需要合法的新执行计划或新实验。升级代码后，旧plan可能因契约不兼容被拒绝，不能手工编辑哈希绕过。
 
@@ -75,7 +132,15 @@ bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT --resume runs/EX
 
 ## MLP迭代预算
 
+当前新实验已采用 `nk-grid-v7-mlp-batch-cv-1`，FFC/SMR 的面板版本为
+`nkgrid-models-v5-mlp-batch-cv-1`：三份回归配置显式使用 `mlp_batch_size: cv`。
+候选、内折选择与兼容固定策略见[根目录说明](../README.md#回归-mlp-的-batch-选择)。
+以下记录此前的迭代预算与固定 batch 兼容行为；其中缺省 auto 指省略策略的旧参数，
+不代表当前随仓库提供的配置。启动、账户显式输入和 production 授权规则保持原约定。
+
 三份model_params中，回归Super Learner的MLP `max_iter` 从500提高至2000，与独立回归MLP一致。该值实际传递到五折模型及最终重拟合；诊断增加明确的 `max_iter`。FFC/SMR面板的 `model_spec_version` 更新为 `nkgrid-models-v4-sl-mlp2000`。
+
+回归独立 MLP 和 Super Learner 均支持在各自的模型参数段设置 `mlp_batch_size`（正整数、`auto` 或 `full`），例如在 `regression.shallow_neural_network` 下增加 `mlp_batch_size: 32`。该值传入每个内折和最终重拟合；两种模型分别配置，不会相互覆盖。缺省仍为 `auto`。这与实验写盘的 `batch_size` 无关；固定为 200 与 `auto` 等效。实际拟合行数不足时，正整数 batch 会截断至该次拟合的样本数。固定 batch 不保证预测曲面单调，应在训练池预先校准并冻结参数，不使用正式测试集选择。
 
 2000是epoch上限，并非必须执行2000轮；原收敛条件可能提前结束。提高上限不能单独证明欠拟合消失。batch默认仍为auto，学习率、网络结构、alpha、折数及分类模型预算保持原定义。
 
