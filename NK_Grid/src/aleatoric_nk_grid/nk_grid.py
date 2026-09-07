@@ -805,7 +805,7 @@ def _empty_classification_metrics() -> dict[str, float]:
     return {column: np.nan for column in CLASSIFICATION_METRIC_COLUMNS}
 
 
-def _empty_diagnostics() -> dict[str, float | bool]:
+def _empty_diagnostics() -> dict[str, float | bool | str]:
     return {
         "mlp_diagnostics_json": "",
         "K_varying": np.nan,
