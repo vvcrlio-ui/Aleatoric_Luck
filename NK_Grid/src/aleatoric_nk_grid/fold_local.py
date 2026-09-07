@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
-from sklearn.linear_model import Ridge, Lasso
+from sklearn.linear_model import Ridge, Lasso, lasso_path
 from sklearn.model_selection import KFold, LeaveOneOut
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -67,8 +67,13 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
         for train, valid in KFold(min(self.max_cv_folds, len(y))).split(X):
             process = make_pipeline(clone(self.preprocessor), StandardScaler()).fit(X.iloc[train])
             train_X, valid_X = process.transform(X.iloc[train]), process.transform(X.iloc[valid])
-            losses.append([float(np.mean((Lasso(alpha=alpha, max_iter=self.max_iter, random_state=self.seed)
-                .fit(train_X, y[train]).predict(valid_X) - y[valid]) ** 2)) for alpha in self.alphas_])
+            # Keep LassoCV's descending, warm-started coordinate-descent path
+            # rather than introducing independent zero starts at every alpha.
+            center, target_mean = train_X.mean(axis=0), y[train].mean()
+            _, coefficients, _ = lasso_path(train_X - center, y[train] - target_mean,
+                alphas=self.alphas_, max_iter=self.max_iter, random_state=self.seed)
+            predictions = (valid_X - center) @ coefficients + target_mean
+            losses.append(np.mean((predictions - y[valid, None]) ** 2, axis=0))
         self.cv_mse_ = np.mean(losses, axis=0)
         self.alpha_ = float(self.alphas_[np.argmin(self.cv_mse_)])
         self.model_ = make_pipeline(clone(self.preprocessor), StandardScaler(),

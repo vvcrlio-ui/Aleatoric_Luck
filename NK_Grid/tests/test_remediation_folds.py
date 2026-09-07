@@ -121,3 +121,45 @@ def test_d2_d7_mlp_target_and_scale_are_fold_local(monkeypatch):
     make_model('shallow_neural_network', seed=7, params=params, preprocessor=process(X.columns)).fit(changed,target)
     for old, new in zip(first, fits[0]):
         np.testing.assert_array_equal(old,new)
+
+
+def test_lasso_one_feature_soft_threshold_oracle():
+    from aleatoric_nk_grid.fold_local import FoldLocalLasso
+    X = pd.DataFrame({'a':np.arange(7,dtype=float)})
+    y = np.array([1.,4.,3.,10.,8.,9.,11.])
+    model = FoldLocalLasso(process(X.columns),7,1,-2,0,3,5,20000).fit(X,y)
+    validation = ([0,1],[2,3],[4],[5],[6])
+    losses=[]
+    for valid in validation:
+        train=[i for i in range(7) if i not in valid]
+        raw=X['a'].to_numpy(); mean=raw[train].mean(); scale=raw[train].std()
+        tx=(raw[train]-mean)/scale; vx=(raw[valid]-mean)/scale; target_mean=y[train].mean()
+        covariance=np.mean(tx*(y[train]-target_mean))
+        fold=[]
+        for alpha in (1.,.1,.01):
+            coefficient=np.sign(covariance)*max(abs(covariance)-alpha,0)/np.mean(tx**2)
+            fold.append(np.mean((vx*coefficient+target_mean-y[valid])**2))
+        losses.append(fold)
+    np.testing.assert_allclose(model.cv_mse_,np.mean(losses,axis=0),rtol=1e-10,atol=1e-12)
+
+
+def test_super_oof_columns_are_held_out(monkeypatch):
+    from sklearn.linear_model import LinearRegression
+    from sklearn.model_selection import KFold
+    from aleatoric_nk_grid.model_registry import make_model, load_model_params, DEFAULT_MODEL_PARAMS_PATH
+    X=pd.DataFrame({'a':np.arange(10,dtype=float),'b':np.arange(10,dtype=float)**2})
+    y=np.random.default_rng(319).normal(size=10)
+    params=load_model_params(DEFAULT_MODEL_PARAMS_PATH,task='regression',models=['super_learner'])['super_learner']
+    params={**params,'n_estimators':2,'lgbm_n_estimators':2,'max_iter':2,'ridge_n_alphas':3,'hidden_layer_sizes':[2]}
+    original=LinearRegression.fit; received=[]
+    def capture(self,X,y,**kwargs):
+        received.append(np.asarray(X).copy())
+        return original(self,X,y,**kwargs)
+    monkeypatch.setattr(LinearRegression,'fit',capture)
+    model=make_model('super_learner',seed=19,n_jobs=1,params=params,preprocessor=process(X.columns)).fit(X,y)
+    assert len(received)==1
+    expected=np.empty((10,4))
+    for train,valid in KFold(5).split(X):
+        for column,(_,estimator) in enumerate(model.model_.estimators):
+            expected[valid,column]=clone(estimator).fit(X.iloc[train],y[train]).predict(X.iloc[valid])
+    np.testing.assert_allclose(received[0],expected,rtol=1e-10,atol=1e-12)
