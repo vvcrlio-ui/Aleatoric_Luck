@@ -1,6 +1,7 @@
 """Source-aware, per-cell preprocessing for the shared engine."""
 
 from __future__ import annotations
+from sklearn.base import BaseEstimator, TransformerMixin
 
 import json
 from dataclasses import dataclass
@@ -868,6 +869,37 @@ def _preprocess_cell_vectorized_mixed(
     train.attrs["_preprocess_vectorized"] = True
     test.attrs["_preprocess_vectorized"] = True
     return CellPreprocessingResult(train, test, unobserved, False)
+
+
+class FoldPreprocessor(TransformerMixin, BaseEstimator):
+    """Learn the existing typed fill/prior contract using training rows only."""
+
+    def __init__(self, groups, imputation, model_name):
+        self.groups = groups
+        self.imputation = imputation
+        self.model_name = model_name
+
+    def fit(self, X, y=None):
+        self.columns_ = tuple(X.columns)
+        probe = pd.DataFrame(np.nan, index=[0], columns=self.columns_)
+        result = preprocess_cell(X, probe, self.groups, self.imputation, model_name=self.model_name)
+        self.fill_ = result.X_test.iloc[0].copy()
+        self.unobserved_ = tuple(not _source_observed(X, group).any() for group in self.groups)
+        self.passthrough_ = result.passthrough
+        return self
+
+    def transform(self, X):
+        if tuple(X.columns) != self.columns_:
+            raise ValueError("fold preprocessing column order mismatch")
+        result = X.copy()
+        for group, unobserved in zip(self.groups, self.unobserved_, strict=True):
+            columns = list(group.features)
+            if unobserved:
+                result.loc[:, columns] = self.fill_.loc[columns].to_numpy()
+            elif not self.passthrough_:
+                missing = ~_source_observed(X, group)
+                result.loc[missing, columns] = self.fill_.loc[columns].to_numpy()
+        return result
 
 
 def preprocess_cell(

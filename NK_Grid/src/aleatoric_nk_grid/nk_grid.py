@@ -99,6 +99,7 @@ from .model_registry import (
 )
 from .native_process import IsolatedProcessRunner
 from .preprocessing import (
+    FoldPreprocessor,
     SourceGroup,
     count_unobserved_sources,
     count_varying_sources,
@@ -1803,6 +1804,7 @@ def _fit_predict_model_cell(
     y_train: pd.Series,
     X_test: pd.DataFrame,
     model_n_jobs: int = 1,
+    preprocessor=None,
 ) -> dict[str, Any]:
     """Fit and predict one cell; safe to execute in an isolated subprocess."""
 
@@ -1812,6 +1814,7 @@ def _fit_predict_model_cell(
         n_jobs=model_n_jobs,
         task=task,
         params=params,
+        preprocessor=preprocessor,
     )
     fit_started = time.perf_counter()
     model.fit(X_train, y_train)
@@ -2189,9 +2192,11 @@ class NKGridExecutionSession:
                 return result(empty_metrics, status="skipped", error="below minimum per-class count for super_learner CV")
             if model_name in {"lightgbm", "super_learner"}:
                 log_progress(f"cell starting model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features}")
-            X_fit = X_prepared if model_name in SERIAL_OUTER_MODELS else X_prepared.copy(deep=True)
-            X_test_fit = X_test_prepared if model_name in SERIAL_OUTER_MODELS else X_test_prepared.copy(deep=True)
-            arguments = {"model_name": model_name, "model_seed": _model_seed(seed, draw, n_samples, k_features), "model_n_jobs": self.config.n_jobs if model_name == "super_learner" else 1, "task": self.task, "params": self.selected_model_params[model_name], "X_train": X_fit, "y_train": y_sub, "X_test": X_test_fit}
+            # The outer transformed matrices above are diagnostics only. CV
+            # must receive original missingness, including all-missing sources.
+            X_fit = X_sub_raw.copy(deep=True)
+            X_test_fit = X_test_raw.copy(deep=True)
+            arguments = {"model_name": model_name, "model_seed": _model_seed(seed, draw, n_samples, k_features), "model_n_jobs": self.config.n_jobs if model_name == "super_learner" else 1, "task": self.task, "params": self.selected_model_params[model_name], "X_train": X_fit, "y_train": y_sub, "X_test": X_test_fit, "preprocessor": FoldPreprocessor(tuple(selected_groups), self.schema.imputation, model_name)}
             if model_name in SERIAL_OUTER_MODELS:
                 fit = _run_native_model_cell_locked(self._runner, fit_arguments=arguments, on_native_crash=lambda attempt, exc: log_progress(f"native subprocess crashed attempt={attempt}/{self.config.native_process_max_attempts} model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features} error={exc}"), on_native_timeout=lambda attempt, exc: log_progress(f"native subprocess timed out attempt={attempt}/{self.config.native_process_max_attempts} model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features} error={exc}"))
             else:
