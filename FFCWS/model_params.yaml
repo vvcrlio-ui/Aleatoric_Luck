@@ -48,7 +48,8 @@ regression:
       - 32
     alpha: 0.01
     learning_rate_init: 0.001
-    max_iter: 500
+    # Same epoch ceiling as the standalone regression MLP; convergence may stop earlier.
+    max_iter: 2000
     positive: true
     lgbm_n_estimators: 200
     lgbm_learning_rate: 0.05

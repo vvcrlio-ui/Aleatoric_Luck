@@ -130,11 +130,13 @@ def test_regression_ridge_grids_are_consistent_across_parameter_files(params_pat
 
 @pytest.mark.parametrize("params_path", MODEL_PARAM_PATHS)
 def test_mlp_iteration_limit_distribution_is_locked(params_path):
-    values = [
-        line.strip() for line in params_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert values.count("max_iter: 500") == 3
-    assert values.count("max_iter: 2000") == 1
+    # Check model identity, not a count of identical YAML lines: swapped budgets
+    # must not pass. Regression stacking now receives the same ceiling as MLP.
+    for task, ceiling in (("regression", 2000), ("classification", 500)):
+        values = load_model_params(params_path, task=task,
+                                   models=("shallow_neural_network", "super_learner"))
+        assert values["shallow_neural_network"]["max_iter"] == ceiling
+        assert values["super_learner"]["max_iter"] == ceiling
 
 
 def test_removed_model_registry_covers_expected_retirements():

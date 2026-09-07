@@ -14,6 +14,8 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-linux/
+*.nkgrid-env.lock
 venv/
 .ipynb_checkpoints/
 dist/
@@ -36,6 +38,8 @@ datasets/
 results/
 runs/
 plans/
+/aleatoric-production/
+/aleatoric-pilot/
 reports/
 
 # Local implementation/review notes

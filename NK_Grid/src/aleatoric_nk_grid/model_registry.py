@@ -831,14 +831,14 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                               "mse": float(np.mean((fitted.predict(valid_X) - target[valid_rows]) ** 2))}
                     if name == "shallow_nn":
                         mlp = fitted.steps[-1][1].regressor_
-                        record.update(batch=mlp.effective_batch_size_, iterations=mlp.n_iter_,
+                        record.update(batch=mlp.effective_batch_size_, iterations=mlp.n_iter_, max_iter=mlp.max_iter,
                                       convergence_warnings=mlp.convergence_warnings_,
                                       reached_max_iter=mlp.n_iter_ >= mlp.max_iter)
                     records.append(record)
             mlp = self.model_.named_estimators_["shallow_nn"].steps[-1][1].regressor_
             records.append({"phase": "full", "model": "shallow_nn", "N": mlp.fit_n_,
                             "convergence_warnings": mlp.convergence_warnings_,
-                            "batch": mlp.effective_batch_size_, "iterations": mlp.n_iter_,
+                            "batch": mlp.effective_batch_size_, "iterations": mlp.n_iter_, "max_iter": mlp.max_iter,
                             "reached_max_iter": mlp.n_iter_ >= mlp.max_iter})
             self.diagnostics_ = {"fits": records, "coefficients": self.model_.final_estimator_.coef_.tolist(),
                                  "intercept": float(self.model_.final_estimator_.intercept_),
