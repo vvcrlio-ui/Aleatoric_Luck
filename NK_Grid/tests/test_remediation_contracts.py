@@ -45,6 +45,12 @@ def test_a2_derived_reordering():
         units = sampling_units(order)
         assert [u.name for u in units] == ['a', 'b']
         assert units[0].features == ('a', 'am1', 'am2')
+    # Move a derived group ahead of another parent's primary in source_order.
+    # Parent sampling order must still follow the original primaries.
+    groups = [SourceGroup('a', ('a',), 5, 'continuous'),
+              SourceGroup('b', ('b',), 3, 'continuous'),
+              SourceGroup('a_missing', ('am',), 1, 'continuous', sampling_source='a')]
+    assert [u.name for u in sampling_units(groups)] == ['b', 'a']
 
 
 def test_history_does_not_rewrite(tmp_path):

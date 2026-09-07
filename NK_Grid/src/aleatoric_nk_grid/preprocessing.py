@@ -123,10 +123,11 @@ def sampling_units(groups: Sequence[SourceGroup]) -> tuple[SamplingUnit, ...]:
     for group in sorted(groups, key=lambda item: item.source_order):
         source = group.sampling_source or group.name
         bundled.setdefault(source, []).append(group)
-    return tuple(
+    units = tuple(
         SamplingUnit(name=source, groups=tuple(source_groups))
         for source, source_groups in bundled.items()
     )
+    return tuple(sorted(units, key=lambda unit: unit.primary.source_order))
 
 
 def source_groups(

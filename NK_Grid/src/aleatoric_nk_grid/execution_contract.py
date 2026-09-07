@@ -8,6 +8,7 @@ different interpretation of JSON or paths.
 """
 
 from __future__ import annotations
+from .grid_contract import validate_size_grid
 
 import hashlib
 import importlib.metadata
@@ -208,6 +209,11 @@ class CellExecutionSpec:
         for name in ("resolved_n_grid", "resolved_k_grid", "resolved_repeat_plan"):
             if not isinstance(value.get(name), list) or not value[name]:
                 raise ContractError(f"cell execution spec requires frozen {name}")
+        for name in ("resolved_n_grid", "resolved_k_grid"):
+            try:
+                validate_size_grid(value[name], name)
+            except ValueError as exc:
+                raise ContractError(str(exc)) from exc
         if not isinstance(value.get("git_commit"), str) or len(str(value["git_commit"])) != 40:
             raise ContractError("cell execution spec requires a full git commit")
         if not isinstance(value.get("algorithm_version"), str) or not value["algorithm_version"]:
@@ -260,8 +266,8 @@ class CellExecutionSpec:
         job_count = int(config.n_jobs if model_n_jobs is None else model_n_jobs)
         if job_count < 1:
             raise ContractError("model_n_jobs must be positive")
-        n_grid = tuple(int(item) for item in (resolved_n_grid or config.n_grid or ()))
-        k_grid = tuple(int(item) for item in (resolved_k_grid or config.k_grid or ()))
+        n_grid = validate_size_grid(resolved_n_grid if resolved_n_grid is not None else (config.n_grid or ()), "N")
+        k_grid = validate_size_grid(resolved_k_grid if resolved_k_grid is not None else (config.k_grid or ()), "K")
         repeats = tuple((int(seed), int(draw)) for seed, draw in (resolved_repeat_plan or config.repeat_plan or ()))
         if not n_grid or not k_grid or not repeats:
             raise ContractError("CellExecutionSpec requires resolved grids and repeat plan")
