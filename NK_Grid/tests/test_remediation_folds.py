@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.base import clone
 from sklearn.linear_model import Ridge
 from aleatoric_nk_grid.preprocessing import FoldPreprocessor, SourceGroup, preprocess_cell
@@ -53,8 +54,11 @@ def test_d4_typed_transform_matches_original_rules():
             pd.testing.assert_frame_equal(model.transform(valid),oracle.X_test)
 
 
-def test_d6_d7_complete_pipeline_loo_independent_oracle():
+@pytest.mark.parametrize('missing', [False, True])
+def test_d6_d7_complete_pipeline_loo_independent_oracle(missing):
     X = pd.DataFrame({'a': [np.nan, 1., 4., 10., 100.], 'b': [2., 4., 1., 5., 1000.]})
+    if not missing:
+        X.iloc[0, 0] = -12.
     y = np.array([1., 2., -1., 3., 20.])
     model = FoldLocalRidge(process(X.columns), -1, 1, 3, 'neg_mean_squared_error').fit(X, y)
     oracle = np.empty((5, 3))
