@@ -44,7 +44,8 @@ plans/
 reports/
 
 # Local implementation/review notes
-# Keep launch/ source and docs/ plans, acceptance records and selected evidence tracked.
+# Keep launch/ source tracked; docs/ is maintained locally only.
+/docs/
 /AGENTS.md
 NK_Grid/CODE_REVIEW_REPORT_*.md
 NK_Grid/ADAPTER_TO_NK_GRID_WORKFLOW_HARDENING_PROPOSAL_*.md

@@ -1,6 +1,0 @@
-{
-  "state": "waiting",
-  "observed_and_expected": [],
-  "time_utc": "2026-09-07T11:17:21.945332+00:00",
-  "note": "Only waits for the existing prespecified runs; does not launch new computation."
-}

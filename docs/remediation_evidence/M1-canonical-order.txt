@@ -1,4 +1,0 @@
-............s......................................................      [100%]
-=========================== short test summary info ===========================
-SKIPPED [1] NK_Grid\tests\test_remediation_contracts.py:68: actual engine imports POSIX resource/fcntl
-66 passed, 1 skipped, 24 deselected in 0.86s

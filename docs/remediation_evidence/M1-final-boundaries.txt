@@ -1,6 +1,0 @@
-..............sss                                                        [100%]
-=========================== short test summary info ===========================
-SKIPPED [1] NK_Grid\tests\test_remediation_contracts.py:112: actual engine imports POSIX resource/fcntl
-SKIPPED [1] NK_Grid\tests\test_remediation_contracts.py:130: actual planner requires POSIX resource/fcntl
-SKIPPED [1] NK_Grid\tests\test_remediation_contracts.py:149: actual session requires POSIX resource/fcntl
-14 passed, 3 skipped in 0.36s

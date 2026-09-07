@@ -1,8 +1,0 @@
-diff --git a/NK_Grid/src/aleatoric_nk_grid/model_registry.py b/NK_Grid/src/aleatoric_nk_grid/model_registry.py
-index 8a9bbe2..425ef2e 100644
---- a/NK_Grid/src/aleatoric_nk_grid/model_registry.py
-+++ b/NK_Grid/src/aleatoric_nk_grid/model_registry.py
-@@ -863,0 +874 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
-+        preprocessor=None,
-@@ -880,0 +892 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
-+        self.preprocessor = preprocessor

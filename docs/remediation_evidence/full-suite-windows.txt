@@ -1,8 +1,0 @@
-ImportError while loading conftest 'D:\Aleatoric_power_law\NK_Grid\tests\conftest.py'.
-NK_Grid\tests\conftest.py:13: in <module>
-    from aleatoric_nk_grid.preprocessing import source_groups
-NK_Grid\src\aleatoric_nk_grid\__init__.py:31: in <module>
-    from .nk_grid import NKGridConfig, run_nk_grid
-NK_Grid\src\aleatoric_nk_grid\nk_grid.py:11: in <module>
-    import resource
-E   ModuleNotFoundError: No module named 'resource'
