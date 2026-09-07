@@ -65,6 +65,50 @@ def test_history_does_not_rewrite(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_a6_portable_actual_method_gate():
+    # Exact method body, no resource/fcntl substitutes. Full session is tested
+    # separately on POSIX; this proves only the pre-sampling boundary.
+    import ast
+    import aleatoric_nk_grid
+    from types import SimpleNamespace
+    from typing import Sequence
+    path = Path(aleatoric_nk_grid.__path__[0]) / 'nk_grid.py'
+    cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == 'NKGridExecutionSession')
+    node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'run_cell_group')
+    scope = {'Sequence':Sequence, 'validate_size_grid':validate_size_grid}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), scope)
+    session = SimpleNamespace(_closed=False, feature_units=('a','b'), config=SimpleNamespace(models=('ols',)),
+        repeat_pairs=((1,1),), n_grid=(3,4), k_grid=(2,5),
+        split_manager=SimpleNamespace(for_seed=lambda seed:SimpleNamespace(train_index=range(3))),
+        _orders=lambda *args:pytest.fail('oversized task reached sampling'))
+    for n,k in ((4,2),(3,5)):
+        with pytest.raises(ValueError, match='capacity'):
+            scope['run_cell_group'](session,seed=1,draw=1,n_samples=n,k_features=k,models=('ols',))
+
+
+def test_a7_baseline_draw_and_model_seeds():
+    import ast
+    import subprocess
+    from dataclasses import dataclass
+    from typing import Sequence
+    path = 'NK_Grid/src/aleatoric_nk_grid/nk_grid.py'
+    baseline = subprocess.check_output(['git','show',f'd5df3df55e10bbce593f3fb8d5db7b10c550701d:{path}'],cwd=ROOT,text=True)
+    functions = []
+    for source in (baseline, (ROOT / path).read_text()):
+        nodes = [n for n in ast.parse(source).body if isinstance(n,(ast.ClassDef,ast.FunctionDef))
+                 and n.name in ('DrawOrders','draw_orders','_model_seed')]
+        scope = {'np':np, 'dataclass':dataclass, 'Sequence':Sequence}
+        exec(compile(ast.Module(body=nodes,type_ignores=[]),path,'exec'),scope)
+        functions.append(scope)
+    for seed in (1, 12345, 23456):
+        for draw in (0, 3):
+            orders = [f['draw_orders']([3,7,8,19,22], ['a','b','c'],seed=seed,draw=draw) for f in functions]
+            np.testing.assert_array_equal(orders[0].row_index,orders[1].row_index)
+            np.testing.assert_array_equal(orders[0].feature_names,orders[1].feature_names)
+            for n,k in ((1,1),(3,2),(5,3)):
+                assert functions[0]['_model_seed'](seed,draw,n,k) == functions[1]['_model_seed'](seed,draw,n,k)
+
+
 @pytest.mark.skipif(__import__('os').name == 'nt', reason='actual engine imports POSIX resource/fcntl')
 def test_a6_actual_session_rejects_before_slice():
     from types import SimpleNamespace
