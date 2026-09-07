@@ -52,7 +52,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[2]
 
-from .evaluation import r2_against_training_mean
+from .evaluation import r2_against_training_mean, regression_denominators, METRIC_DEFINITION_VERSION
 from .execution_contract import (
     CellExecutionSpec,
     ContractError,
@@ -164,6 +164,7 @@ def _run_native_model_cell_locked(
 
 METRIC_COLUMNS = (
     "r2_test",
+    "mse", "null_mse_train_mean", "test_target_variance", "skill_train_mean", "r2_test_mean",
     "skill_score_pct",
     "rmse",
     "mae",
@@ -685,6 +686,7 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
     bottom_pred = preds <= np.quantile(preds, 0.10)
     return {
         "r2_test": r2_test,
+        **regression_denominators(y_true, preds, train),
         "skill_score_pct": 100.0 * r2_test,
         "rmse": rmse,
         "mae": mae,
@@ -1909,6 +1911,7 @@ class NKGridExecutionSession:
         self.repeat_pairs = resolve_repeat_pairs(config)
         self.n_grid, self.k_grid = resolve_input_grids(config, loaded, source_definitions)
         self.semantic_contract = {
+            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else "classification-v1",
             "kind": "nk_grid" if self.task == "regression" else "nk_grid_classification",
             "algorithm_version": algorithm_version,
             "dataset": self.dataset,
@@ -2405,6 +2408,7 @@ def _run_nk_grid_locked(
         )
 
     semantic_contract = {
+        "metric_definition_version": METRIC_DEFINITION_VERSION if task == "regression" else "classification-v1",
         "kind": "nk_grid" if task == "regression" else "nk_grid_classification",
         "algorithm_version": algorithm_version,
         "dataset": dataset,
