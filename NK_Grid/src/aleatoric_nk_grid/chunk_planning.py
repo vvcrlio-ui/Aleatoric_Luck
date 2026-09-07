@@ -137,16 +137,18 @@ def expanded_columns_for_k(schema_path: Path | str, k_features: int) -> int:
     return sum(sorted(widths.values(), reverse=True)[:k_features])
 
 
-def peak_memory_bytes(n_samples: int, expanded_columns: int, *, frame_copies: int = MEMORY_FRAME_COPIES) -> int:
+def peak_memory_bytes(n_samples: int, expanded_columns: int, *, frame_copies: int = MEMORY_FRAME_COPIES,
+                      resident_bytes: int = 0, test_rows: int = 0) -> int:
     """Heuristic worker estimate, not an RSS upper bound.
 
     Base allowance covers resident input; the multiplier approximates slices,
     preprocessing copies and native training. Allocator caches and process-tree
     peaks require target-environment measurement.
     """
-    if n_samples < 1 or expanded_columns < 1 or frame_copies < 1:
+    if n_samples < 1 or expanded_columns < 1 or frame_copies < 1 or resident_bytes < 0 or test_rows < 0:
         raise ValueError("n_samples, expanded_columns, and frame_copies must be positive")
-    return MEMORY_BASE_BYTES + int(frame_copies) * int(n_samples) * int(expanded_columns) * ENGINE_VALUE_BYTES
+    return (MEMORY_BASE_BYTES + int(resident_bytes) +
+            (int(frame_copies) * int(n_samples) + 2 * int(test_rows)) * int(expanded_columns) * ENGINE_VALUE_BYTES)
 
 
 def implied_frame_copies(measured_bytes: int, *, n_samples: int, expanded_columns: int) -> float:
@@ -306,7 +308,14 @@ def build_dynamic_plan(
     max_n = summary.max_n
     max_k = summary.max_k
     expanded = expanded_columns_for_k(config.schema, max_k)
-    formula_bytes = peak_memory_bytes(max_n, expanded)
+    resident_bytes = int(loaded.train.memory_usage(index=True, deep=True).sum())
+    if loaded.test is not None:
+        resident_bytes += int(loaded.test.memory_usage(index=True, deep=True).sum())
+        test_rows = len(loaded.test)
+    else:
+        # Conservative slice allowance; internal per-seed test counts may vary.
+        test_rows = len(loaded.train)
+    formula_bytes = peak_memory_bytes(max_n, expanded, resident_bytes=resident_bytes, test_rows=test_rows)
     request = ResourceRequest(
         cpus_per_task=1, partition=cluster.partition,
         memory=cluster.memory_override or format_slurm_memory(formula_bytes),
@@ -402,6 +411,8 @@ def build_dynamic_plan(
         "memory": {
             "max_n": max_n, "max_k": max_k, "expanded_columns": expanded,
             "formula_bytes": formula_bytes, "frame_copies": MEMORY_FRAME_COPIES,
+            "resident_input_bytes": resident_bytes, "test_slice_rows_allowance": test_rows,
+            "model": "base + resident input + 12 train/preprocess/native frames + 2 test slices; heuristic, not RSS bound",
             "request": request.memory,
         },
         "submission": {
