@@ -61,8 +61,8 @@ def path_from_repo(value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("target", choices=("local", "slurm", "execute"))
-    p.add_argument("--profile", choices=("local", "bmrc"), default="local")
+    p.add_argument("target", choices=("local", "slurm", "execute", "bootstrap"))
+    p.add_argument("--profile", choices=("local", "bmrc", "discoverer"), default="local")
     p.add_argument("--manifest", default="FFCWS/panels.yaml")
     p.add_argument("--panel", default="ffc_median_mode_gpa")
     p.add_argument("--preset", choices=("dev", "medium", "timing_full", "production", "pilot", "dev-dynamic"), default="dev")
@@ -78,19 +78,27 @@ def parser():
     p.add_argument("--dry-run", action="store_true", help="Read-only launch preview; no installation, data reads or submission")
     p.add_argument("--resume", help="Slurm: reuse an existing plan JSON; do not regenerate the task table")
     p.add_argument("--account", help="Required for Slurm, including resume; explicitly enter your authorized project account")
+    p.add_argument("--qos", help="Discoverer QoS; defaults to the explicit account")
+    p.add_argument("--prepare-ffc", action="store_true", help="Discoverer: prepare selected FFC panel on a compute node")
+    p.add_argument("--ffc-data-dir", help="Directory containing background.dta, train.csv and test.csv")
     p.add_argument("--constraint", default=os.environ.get("NKGRID_CONSTRAINT"))
     p.add_argument("--partition")
     p.add_argument("--time", dest="time_limit")
     p.add_argument("--workers", type=positive)
     p.add_argument("--rounds", type=positive)
     p.add_argument("--memory", help="Optional worker memory request, e.g. 16G")
-    p.add_argument("--plan-memory", default="16G")
+    p.add_argument("--plan-memory")
     p.add_argument("--plan-time", help="Planning job time; production 8h, other presets 1h")
     p.add_argument("--request", help=argparse.SUPPRESS)
     return p
 
 
 def launch_spec(args):
+    if args.profile == "discoverer":
+        from discoverer import configure
+        configure(args)
+    elif args.qos or args.prepare_ffc or args.ffc_data_dir:
+        raise ValueError("--qos, --prepare-ffc and --ffc-data-dir require --profile discoverer")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.panel):
         raise ValueError("panel name may contain only letters, digits, _, . and -")
     if args.target == "slurm" and args.max_jobs:
@@ -113,6 +121,8 @@ def launch_spec(args):
                    time_limit=args.time_limit or ("10-00:00:00" if production else "01:00:00"),
                    workers=args.workers or (600 if production else 32), rounds=args.rounds or (4 if production else 2),
                    memory_override=args.memory)
+    if args.profile == "discoverer":
+        cluster.update(qos=args.qos, single_node=True)
     for value in [*cluster.values(), args.plan_time, args.plan_memory]:
         if isinstance(value, str) and ("\n" in value or "\r" in value or "\x00" in value):
             raise ValueError("scheduler fields must be single-line strings")
@@ -120,10 +130,10 @@ def launch_spec(args):
     if not manifest.is_file():
         raise ValueError(f"manifest does not exist: {manifest}")
     output = path_from_repo(args.output) if args.output else ROOT / "runs" / (args.panel + "-" + uuid.uuid4().hex[:12])
-    return dict(format_version=1, target=args.target, panel=args.panel, preset=args.preset,
+    return dict(format_version=1, target=args.target, profile=args.profile, panel=args.panel, preset=args.preset,
                 manifest=str(manifest), schema=str(path_from_repo(args.schema)) if args.schema else None,
                 models=args.models, output=str(output), allow_large_run=args.allow_large_run,
-                max_jobs=args.max_jobs, cluster=cluster, plan_memory=args.plan_memory,
+                max_jobs=args.max_jobs, cluster=cluster, plan_memory=args.plan_memory or "16G",
                 checkpoint_retention=args.checkpoints or "default",
                 plan_time=args.plan_time or ("08:00:00" if production else "01:00:00"))
 
@@ -295,6 +305,12 @@ def slurm_command(spec, request):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.target == "bootstrap":
+        if args.checkpoints is not None:
+            raise ValueError("bootstrap reuses the frozen launch request; set --checkpoints on slurm instead")
+        from discoverer import bootstrap
+        bootstrap(args.request)
+        return
     if args.target == "execute":
         if not args.request:
             raise ValueError("execute requires --request")
@@ -309,6 +325,10 @@ def main(argv=None):
         resume_retention = validate_resume_checkpoints(path_from_repo(args.resume), args.checkpoints)
         if resume_retention is not None:
             spec["checkpoint_retention"] = resume_retention
+    if args.profile == "discoverer":
+        from discoverer import launch
+        launch(args, spec)
+        return
     if args.dry_run:
         print(json.dumps({"launch": spec, "resume": args.resume, "venv": args.venv or os.environ.get("VENV", ".venv-linux"),
                           "actions": ["validate/reuse or create environment", "reuse plan" if args.resume else

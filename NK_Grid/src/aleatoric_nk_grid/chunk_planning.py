@@ -195,6 +195,8 @@ class ClusterPolicy:
     finalization_time_limit: str | None = None
     finalization_tmp_dir: str | None = None
     rows_per_group: int = 100_000
+    qos: str | None = None
+    single_node: bool = False
 
     def validate(self) -> None:
         if self.workers < 1 or self.rounds < 1 or self.rows_per_group < 1:
@@ -319,6 +321,7 @@ def build_dynamic_plan(
         cpus_per_task=1, partition=cluster.partition,
         memory=cluster.memory_override or format_slurm_memory(formula_bytes),
         time_limit=cluster.time_limit, account=cluster.account, constraint=cluster.constraint,
+        qos=cluster.qos, single_node=cluster.single_node,
     )
     preparation_request = ResourceRequest(
         cpus_per_task=1,
@@ -327,6 +330,7 @@ def build_dynamic_plan(
         time_limit=cluster.preparation_time_limit or cluster.time_limit,
         account=cluster.account,
         constraint=cluster.constraint,
+        qos=cluster.qos, single_node=cluster.single_node,
     )
     verification_request = ResourceRequest(
         cpus_per_task=1,
@@ -335,6 +339,7 @@ def build_dynamic_plan(
         time_limit=cluster.verification_time_limit or cluster.time_limit,
         account=cluster.account,
         constraint=cluster.constraint,
+        qos=cluster.qos, single_node=cluster.single_node,
     )
     finalization_request = ResourceRequest(
         cpus_per_task=1,
@@ -343,6 +348,7 @@ def build_dynamic_plan(
         time_limit=cluster.finalization_time_limit or cluster.time_limit,
         account=cluster.account,
         constraint=cluster.constraint,
+        qos=cluster.qos, single_node=cluster.single_node,
     )
     def resolve_tmp_dir(value: str | None) -> str | None:
         return None if value is None else str(Path(value).expanduser().resolve())
@@ -423,6 +429,7 @@ def build_dynamic_plan(
             "sbatch_args": list(sbatch_resource_args(request)),
             "account": request.account,
             "constraint": request.constraint,
+            **({"qos": request.qos, "single_node": request.single_node} if request.qos is not None or request.single_node else {}),
         },
         "preparation": {
             "sbatch_args": list(sbatch_resource_args(preparation_request)),
@@ -446,6 +453,8 @@ def _cluster_from_payload(payload: Mapping[str, object]) -> ClusterPolicy:
             partition=str(payload["partition"]), time_limit=str(payload["time_limit"]),
             account=str(payload["account"]),
             constraint=str(payload["constraint"]),
+            qos=None if payload.get("qos") is None else str(payload["qos"]),
+            single_node=bool(payload.get("single_node", False)),
             memory_override=None if payload.get("memory_override") is None else str(payload.get("memory_override")),
             preparation_memory=None if payload.get("preparation_memory") is None else str(payload.get("preparation_memory")),
             preparation_time_limit=None if payload.get("preparation_time_limit") is None else str(payload.get("preparation_time_limit")),

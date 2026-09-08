@@ -16,7 +16,8 @@ done
 case "$PROFILE" in
   local) ;;
   bmrc) source "$ROOT/launch/profiles/bmrc.sh" ;;
-  *) echo "Unknown profile: $PROFILE (choose local or bmrc)" >&2; exit 2 ;;
+  discoverer) source "$ROOT/launch/profiles/discoverer.sh" ;;
+  *) echo "Unknown profile: $PROFILE (choose local, bmrc or discoverer)" >&2; exit 2 ;;
 esac
 cd "$ROOT"
 if [ "$UPDATE" = 1 ] && [ "$PREVIEW" = 0 ]; then
