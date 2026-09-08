@@ -140,8 +140,10 @@ def _validated_params(
     reject_removed_model(model_name)
     allowed = MODEL_PARAM_KEYS.get(task, {}).get(model_name)
     if task == "regression" and model_name in {"super_learner", "shallow_neural_network"}:
-        allowed = allowed | {"mlp_batch_size", "mlp_batch_candidates"}
-        params = {"mlp_batch_size": "auto", **params}
+        allowed = allowed | {"mlp_batch_size", "mlp_batch_candidates", "mlp_l2_normalization", "tol"}
+        params = {"mlp_batch_size": "auto", "mlp_l2_normalization": "batch", "tol": 1e-4, **params}
+        if params["mlp_l2_normalization"] not in {"batch", "fit_samples", "effective_batch"}:
+            raise ValueError("mlp_l2_normalization must be batch, fit_samples or effective_batch")
         from .mlp_batch_cv import DEFAULT_BATCH_CANDIDATES, validate_batch
         params = {"mlp_batch_candidates": list(DEFAULT_BATCH_CANDIDATES), **params}
         if model_name == "super_learner":
@@ -605,6 +607,8 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
         n_iter_no_change: int = 10,
         mlp_batch_size: str | int = "auto",
         mlp_batch_candidates: Sequence[int] = (32, 64, 128, 256),
+        mlp_l2_normalization: str = "batch",
+        tol: float = 1e-4,
     ):
         self.seed = seed
         self.hidden_layer_sizes = hidden_layer_sizes
@@ -621,6 +625,8 @@ class AdaptiveMLPRegressor(BaseEstimator, RegressorMixin):
         self.n_iter_no_change = n_iter_no_change
         self.mlp_batch_size = mlp_batch_size
         self.mlp_batch_candidates = mlp_batch_candidates
+        self.mlp_l2_normalization = mlp_l2_normalization
+        self.tol = tol
 
     def _mlp(self, alpha: float) -> MLPRegressor:
         return build_mlp_regressor(
@@ -698,6 +704,8 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         mlp_batch_size: str | int = "auto",
         mlp_batch_candidates: Sequence[int] = (32, 64, 128, 256),
         mlp_batch_cv_folds: int = 3,
+        mlp_l2_normalization: str = "batch",
+        tol: float = 1e-4,
         diagnostics: bool = False,
         preprocessor=None,
     ):
@@ -724,6 +732,8 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         self.mlp_batch_size = mlp_batch_size
         self.mlp_batch_candidates = mlp_batch_candidates
         self.mlp_batch_cv_folds = mlp_batch_cv_folds
+        self.mlp_l2_normalization = mlp_l2_normalization
+        self.tol = tol
         self.diagnostics = diagnostics
         self.preprocessor = preprocessor
 
@@ -741,6 +751,11 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         if cv < 2:
             raise ValueError("Super Learner requires at least two training rows.")
         import lightgbm as lgb
+
+        mlp_params = dict(hidden_layer_sizes=self.hidden_layer_sizes, activation="relu",
+            solver="adam", learning_rate_init=self.learning_rate_init, max_iter=self.max_iter,
+            early_stopping=False, n_iter_no_change=10, tol=self.tol,
+            mlp_batch_size=self.mlp_batch_size, mlp_l2_normalization=self.mlp_l2_normalization)
 
         estimators = [
             (
@@ -794,14 +809,7 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                     SimpleImputer(strategy="median"),
                     StandardScaler(),
                     TransformedTargetRegressor(
-                        regressor=FitBatchMLPRegressor(
-                            batch_size=self.mlp_batch_size,
-                            hidden_layer_sizes=tuple(self.hidden_layer_sizes),
-                            alpha=self.alpha,
-                            learning_rate_init=self.learning_rate_init,
-                            max_iter=self.max_iter,
-                            random_state=self.seed,
-                        ),
+                        regressor=build_mlp_regressor(seed=self.seed, alpha=self.alpha, params=mlp_params),
                         transformer=StandardScaler(),
                     ),
                 ),
@@ -817,13 +825,14 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         from .mlp_batch_cv import BatchSearchMLP, SerialBatchStack
         if self.mlp_batch_size == "cv":
             estimators[-1] = ("shallow_nn", BatchSearchMLP(
-                FitBatchMLPRegressor(hidden_layer_sizes=tuple(self.hidden_layer_sizes),
-                    alpha=self.alpha, learning_rate_init=self.learning_rate_init,
-                    max_iter=self.max_iter, random_state=self.seed),
+                build_mlp_regressor(seed=self.seed, alpha=self.alpha, params=mlp_params),
                 (self.alpha,), self.mlp_batch_candidates, self.mlp_batch_cv_folds,
                 self.preprocessor))
-            self.model_ = SerialBatchStack(estimators, cv, self.positive, self.passthrough).fit(X, y)
-            self.diagnostics_ = {"fits": self.model_.mlp_fits_,
+        if self.mlp_batch_size == "cv" or self.diagnostics:
+            self.model_ = SerialBatchStack(estimators, cv, self.positive, self.passthrough,
+                                          diagnostics=self.diagnostics).fit(X, y)
+            self.diagnostics_ = {"fits": (self.model_.mlp_fits_ if self.mlp_batch_size == "cv"
+                                         else self.model_.base_fits_),
                 "fit_count": sum(f["fit_count"] for f in self.model_.mlp_fits_),
                 "coefficients": self.model_.final_estimator_.coef_.tolist(),
                 "intercept": float(self.model_.final_estimator_.intercept_),
@@ -836,32 +845,6 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
             passthrough=self.passthrough,
             n_jobs=self.n_jobs,
         ).fit(X, y)
-        if self.diagnostics:
-            # Explicit diagnostic runs replay deterministic folds to inspect
-            # fitted estimators; this extra work is never enabled by default.
-            records = []
-            target = np.asarray(y)
-            for fold, (train_rows, valid_rows) in enumerate(KFold(cv).split(X)):
-                train_X = X.iloc[train_rows] if hasattr(X, "iloc") else X[train_rows]
-                valid_X = X.iloc[valid_rows] if hasattr(X, "iloc") else X[valid_rows]
-                for name, estimator in estimators:
-                    fitted = clone(estimator).fit(train_X, target[train_rows])
-                    record = {"phase": "oof", "fold": fold, "model": name, "N": len(train_rows),
-                              "mse": float(np.mean((fitted.predict(valid_X) - target[valid_rows]) ** 2))}
-                    if name == "shallow_nn":
-                        mlp = fitted.steps[-1][1].regressor_
-                        record.update(batch=mlp.effective_batch_size_, iterations=mlp.n_iter_, max_iter=mlp.max_iter,
-                                      convergence_warnings=mlp.convergence_warnings_,
-                                      reached_max_iter=mlp.n_iter_ >= mlp.max_iter)
-                    records.append(record)
-            mlp = self.model_.named_estimators_["shallow_nn"].steps[-1][1].regressor_
-            records.append({"phase": "full", "model": "shallow_nn", "N": mlp.fit_n_,
-                            "convergence_warnings": mlp.convergence_warnings_,
-                            "batch": mlp.effective_batch_size_, "iterations": mlp.n_iter_, "max_iter": mlp.max_iter,
-                            "reached_max_iter": mlp.n_iter_ >= mlp.max_iter})
-            self.diagnostics_ = {"fits": records, "coefficients": self.model_.final_estimator_.coef_.tolist(),
-                                 "intercept": float(self.model_.final_estimator_.intercept_),
-                                 "note": "diagnostic fold replay; epochs do not imply equal optimizer steps"}
         return self
 
     def predict(self, X):

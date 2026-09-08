@@ -70,7 +70,7 @@ def configure(args):
     args.plan_time = args.plan_time or "02:00:00"
     for value in (args.time_limit, args.plan_time):
         wall_seconds(value)
-    args.workers = args.workers or (496 if args.preset in ("timing_full", "production") else 16)
+    args.workers = args.workers or (None if args.preset in ("timing_full", "production") else 16)
     args.rounds = args.rounds or 2
     args.memory = args.memory or "16G"
     args.plan_memory = args.plan_memory or "48G"
@@ -131,8 +131,10 @@ def launch(args, spec):
         }
     if args.dry_run:
         print(json.dumps({"launch": spec, "actions": ["submit compute-node bootstrap",
-              "install/validate environment", "prepare FFC if requested", "build plan and submit existing dynamic queue chain"],
-              "note": "No data reads, installation or submission. Worker count is array concurrency, one CPU per worker."}, indent=2))
+              "install/validate environment", "prepare FFC if requested", "freeze task design", "start cluster-resident per-round continuation"],
+              "live_resources": {"workers": "unresolved until each round", "qos_account_partition_limits": "unresolved",
+                                 "existing_jobs": "unresolved", "effective_wall_time": "unresolved"},
+              "note": "No data reads, installation or submission. The planning placeholder worker count is not a resource decision. Each round resolves live limits and submits one array; --workers is an optional cap and --rounds a hard bound."}, indent=2))
         return
     if sys.platform == "win32":
         raise ValueError("Run this command in a Linux cluster login shell; --dry-run works locally")
@@ -142,6 +144,17 @@ def launch(args, spec):
     output = Path(spec["output"])
     if args.resume:
         common.validate_source(spec)
+        from discoverer_continuation import start
+        prepared = json.loads((output / "prepared-launch.json").read_text(encoding="utf-8"))
+        if not (output / "continuation.json").is_file():
+            raise ValueError("Legacy runs cannot be adopted by automatic continuation; preserve their frozen scheduler")
+        python = Path(prepared["bootstrap"]["venv"]) / "bin/python"
+        if not python.is_file():
+            raise ValueError("Frozen continuation Python is unavailable")
+        os.environ.update(PYTHON=str(python), VENV=prepared["bootstrap"]["venv"],
+                          ENGINE_DIR=str(common.ROOT / "NK_Grid"), PYTHON_MODULE=prepared["bootstrap"]["python_module"])
+        start(prepared, Path(spec["resume_plan"]))
+        return
     else:
         if output.exists():
             raise FileExistsError(f"run directory already exists: {output}")
@@ -156,10 +169,8 @@ def launch(args, spec):
         (output / "logs").mkdir()
     request = output / ("resume-" + uuid.uuid4().hex + ".json" if args.resume else "launch.json")
     common.atomic_json(request, spec)
-    result = common.command(bootstrap_command(spec, request), capture=True, env=batch_environment())
-    job = result.stdout.strip()
-    if not re.fullmatch(r"[0-9]+(?:;[A-Za-z0-9_.-]+)?", job):
-        raise ValueError(f"Unrecognized sbatch receipt: {job!r}; inspect scheduler before retrying")
+    from discoverer_continuation import submit_bootstrap
+    job = submit_bootstrap(request)
     receipt = request.with_name(request.stem + ".submission.json")
     common.atomic_json(receipt, {"bootstrap_job": job, "request": str(request)})
     print(f"Run directory: {output}\nBootstrap job: {job}\nReceipt: {receipt}")
@@ -226,7 +237,7 @@ def bootstrap(request):
     if spec.get("resume_plan"):
         if common.sha256(spec["resume_plan"]) != spec["resume_plan_sha256"]:
             raise ValueError("resume plan changed while queued")
-        common.command(["bash", common.ROOT / "NK_Grid/slurm/submit_flat_task_table.sh", "--submit", spec["resume_plan"]],
+        common.command([python, common.ROOT / "launch/discoverer_continuation.py", "start", spec["resume_plan"]],
                        cwd=Path(spec["resume_plan"]).parent, env=environment)
         return
     # Relaunch inside the verified venv before importing adapter/engine modules.

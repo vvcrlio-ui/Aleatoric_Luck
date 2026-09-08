@@ -1483,7 +1483,14 @@ def verify_rounds(
         _index_completed_rows(connection); _classify_queue_attempts(connection)
         completed_model_keys = int(connection.execute("SELECT COUNT(*) FROM completed").fetchone()[0])
         aborted = _queue_row_ids(connection, "aborted_rows")
+        _queue_incomplete_rows(connection)
+        remaining_task_rows = int(connection.execute("SELECT COUNT(*) FROM incomplete_rows").fetchone()[0])
+        executable_task_rows = int(connection.execute(
+            "SELECT COUNT(*) FROM incomplete_rows WHERE row_id NOT IN (SELECT row_id FROM too_long_rows)"
+        ).fetchone()[0])
         result: dict[str, object] = {
+            "remaining_task_rows": remaining_task_rows,
+            "executable_task_rows": executable_task_rows,
             "expected_model_keys": expected_model_keys,
             "completed_model_keys": completed_model_keys,
             "missing_model_keys": _queue_missing_model_keys(connection),

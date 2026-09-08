@@ -84,8 +84,8 @@ def parser():
     p.add_argument("--constraint", default=os.environ.get("NKGRID_CONSTRAINT"))
     p.add_argument("--partition")
     p.add_argument("--time", dest="time_limit")
-    p.add_argument("--workers", type=positive)
-    p.add_argument("--rounds", type=positive)
+    p.add_argument("--workers", type=positive, help="Worker cap; Discoverer timing_full/production resolves live capacity by default")
+    p.add_argument("--rounds", type=positive, help="Maximum continuation rounds; Discoverer submits only the current round")
     p.add_argument("--memory", help="Optional worker memory request, e.g. 16G")
     p.add_argument("--plan-memory")
     p.add_argument("--plan-time", help="Planning job time; production 8h, other presets 1h")
@@ -122,7 +122,7 @@ def launch_spec(args):
                    workers=args.workers or (600 if production else 32), rounds=args.rounds or (4 if production else 2),
                    memory_override=args.memory)
     if args.profile == "discoverer":
-        cluster.update(qos=args.qos, single_node=True)
+        cluster.update(qos=args.qos, single_node=True, workers=args.workers or 1)
     for value in [*cluster.values(), args.plan_time, args.plan_memory]:
         if isinstance(value, str) and ("\n" in value or "\r" in value or "\x00" in value):
             raise ValueError("scheduler fields must be single-line strings")
@@ -130,12 +130,17 @@ def launch_spec(args):
     if not manifest.is_file():
         raise ValueError(f"manifest does not exist: {manifest}")
     output = path_from_repo(args.output) if args.output else ROOT / "runs" / (args.panel + "-" + uuid.uuid4().hex[:12])
-    return dict(format_version=1, target=args.target, profile=args.profile, panel=args.panel, preset=args.preset,
+    result = dict(format_version=1, target=args.target, profile=args.profile, panel=args.panel, preset=args.preset,
                 manifest=str(manifest), schema=str(path_from_repo(args.schema)) if args.schema else None,
                 models=args.models, output=str(output), allow_large_run=args.allow_large_run,
                 max_jobs=args.max_jobs, cluster=cluster, plan_memory=args.plan_memory or "16G",
                 checkpoint_retention=args.checkpoints or "default",
                 plan_time=args.plan_time or ("08:00:00" if production else "01:00:00"))
+    if args.profile == "discoverer":
+        result["continuation"] = {"worker_cap": args.workers, "max_rounds": args.rounds or 2,
+                                  "max_no_progress_rounds": 2, "max_control_failures": 3,
+                                  "max_control_jobs": 4 * (args.rounds or 2) + 8}
+    return result
 
 
 def validate_resume_checkpoints(plan_path, requested=None):
@@ -287,8 +292,11 @@ def execute(spec):
                              snapshot_path=output / "snapshot.json", output_dir=output / "out", panel=spec["panel"])
     plan_path = output / "plan.json"
     atomic_json(plan_path, plan)
-    # Existing submitter preserves receipts, generations, WAL and publication gates.
-    command(["bash", ROOT / "NK_Grid/slurm/submit_flat_task_table.sh", "--submit", plan_path], cwd=output)
+    if spec.get("profile") == "discoverer":
+        from discoverer_continuation import start
+        start(spec, plan_path)
+    else:
+        command(["bash", ROOT / "NK_Grid/slurm/submit_flat_task_table.sh", "--submit", plan_path], cwd=output)
 
 
 def slurm_command(spec, request):

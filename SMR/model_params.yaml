@@ -1,8 +1,9 @@
-algorithm_version: nk-grid-v7-mlp-batch-cv-1
+algorithm_version: nk-grid-v8-ridge-5fold-1
 
 regression:
   ols:
     fit_intercept: true
+  # Regression Ridge uses complete-pipeline 5-fold CV (min(5, N)), no shuffle.
   ridge:
     alpha_log10_min: -4
     alpha_log10_max: 6

@@ -5,7 +5,7 @@ import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.linear_model import Ridge, Lasso, lasso_path
-from sklearn.model_selection import KFold, LeaveOneOut
+from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -13,7 +13,11 @@ from .mlp_estimator import build_mlp_regressor
 
 
 class FoldLocalRidge(RegressorMixin, BaseEstimator):
-    """Explicit complete-pipeline LOO; no N-dependent fold substitution."""
+    """Five-fold complete-pipeline CV, with one SVD per fold for all alphas.
+
+    Folds preserve row order. With fewer than five samples, use N folds;
+    select by the unweighted mean of fold MSEs, as in GridSearchCV.
+    """
     def __init__(self, preprocessor, alpha_log10_min, alpha_log10_max, n_alphas, scoring):
         self.preprocessor = preprocessor
         self.alpha_log10_min = alpha_log10_min
@@ -25,13 +29,17 @@ class FoldLocalRidge(RegressorMixin, BaseEstimator):
         if self.scoring != 'neg_mean_squared_error':
             raise ValueError('fold-local Ridge currently requires the declared neg_mean_squared_error scoring')
         y = np.asarray(y)
+        if len(y) < 2:
+            raise ValueError('Ridge CV requires at least two training rows')
+        self.n_splits_ = min(5, len(y))
         self.alphas_ = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)
         self.cv_predictions_ = np.empty((len(y), len(self.alphas_)))
-        for train, valid in LeaveOneOut().split(X):
+        fold_losses = []
+        for train, valid in KFold(self.n_splits_, shuffle=False).split(X):
             process = make_pipeline(clone(self.preprocessor), StandardScaler()).fit(X.iloc[train])
             train_X, valid_X = process.transform(X.iloc[train]), process.transform(X.iloc[valid])
             # One fold-specific SVD serves the unchanged alpha grid. This is
-            # complete-pipeline LOO, not full-N analytic RidgeCV.
+            # complete-pipeline five-fold CV, not full-N analytic RidgeCV.
             center = train_X.mean(axis=0)
             target_mean = y[train].mean()
             u, singular, vt = np.linalg.svd(train_X - center, full_matrices=False)
@@ -41,7 +49,9 @@ class FoldLocalRidge(RegressorMixin, BaseEstimator):
             target = u[:, keep].T @ (y[train] - target_mean)
             factors = singular[:, None] / (singular[:, None] ** 2 + self.alphas_[None, :])
             self.cv_predictions_[valid, :] = (projection * target) @ factors + target_mean
-        self.cv_mse_ = np.mean((self.cv_predictions_ - y[:, None]) ** 2, axis=0)
+            fold_losses.append(np.mean((self.cv_predictions_[valid] - y[valid, None]) ** 2, axis=0))
+        self.fold_mse_ = np.asarray(fold_losses)
+        self.cv_mse_ = self.fold_mse_.mean(axis=0)
         self.alpha_ = float(self.alphas_[np.argmin(self.cv_mse_)])
         self.model_ = make_pipeline(clone(self.preprocessor), StandardScaler(), Ridge(alpha=self.alpha_)).fit(X, y)
         return self
