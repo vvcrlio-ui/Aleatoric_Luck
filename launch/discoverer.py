@@ -66,11 +66,11 @@ def configure(args):
     args.partition = args.partition or "cn"
     if args.partition != "cn":
         raise ValueError("This Discoverer CPU profile supports partition cn")
-    args.time_limit = args.time_limit or ("24:00:00" if args.preset in ("timing_full", "production") else "01:00:00")
+    args.time_limit = args.time_limit or ("48:00:00" if args.preset in ("timing_full", "production") else "01:00:00")
     args.plan_time = args.plan_time or "02:00:00"
     for value in (args.time_limit, args.plan_time):
         wall_seconds(value)
-    args.workers = args.workers or 16
+    args.workers = args.workers or (496 if args.preset in ("timing_full", "production") else 16)
     args.rounds = args.rounds or 2
     args.memory = args.memory or "16G"
     args.plan_memory = args.plan_memory or "48G"

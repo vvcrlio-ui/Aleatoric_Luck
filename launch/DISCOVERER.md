@@ -13,6 +13,7 @@ bash run.sh slurm --profile discoverer \
   --manifest FFCWS/panels.yaml \
   --panel ffc_median_mode_gpa \
   --preset timing_full \
+  --checkpoints delete \
   --prepare-ffc --ffc-data-dir FFCWS/data \
   --output runs/discoverer-gpa-timing-001 \
   --dry-run
@@ -20,7 +21,9 @@ bash run.sh slurm --profile discoverer \
 
 `--dry-run` 不安装、不读取实验数据、不生成目录、不提交作业。 如果登录节点默认 Python 过旧，预览会自动加载本站 Python module；本地已有 Python 3.11–3.14 时无需 module。确认预览后，去掉该参数才会实际提交。输出目录必须是新的；不要重复提交同一个实验来尝试恢复。
 
-`timing_full` 沿用引擎定义：20×20 N/K 网格、1 seed、1 draw，模型取面板的完整模型列表；最终网格可能因去重而减少。`--workers 16` 表示最多 16 个单 CPU worker 同时运行，不是每个 worker 16 核。该预设覆盖完整 N/K 范围，不是几分钟必定完成的冒烟测试。
+`timing_full` 沿用引擎定义：20×20 N/K 网格、1 seed、1 draw，模型取面板的完整模型列表；最终网格可能因去重而减少。Discoverer 对 timing_full/production 默认使用 `--workers 496 --rounds 2 --time 48:00:00`，最多 496 个单 CPU worker 并发，两轮依次执行。rounds 是续跑轮次，不改变 seed、draw 或模型数量。该预设覆盖完整 N/K 范围，不是几分钟必定完成的冒烟测试。
+
+当前提交器一次提交全部轮次。按提交过程中作业均未结束计算，需要预留 `rounds × (workers + 2) + 3` 个作业名额（每轮 worker、prep、close，另加 verify、finalize、bootstrap）。496 × 2 合计 **999** 个；500 × 2 合计 1007 个，可能超过本项目当前每用户 1000 个提交作业上限。默认配置以没有其他排队或运行作业为前提；提交前用 `squeue -r -u "$USER"` 核对，账户限制有变化时重新调整。可显式传 `--workers`、`--rounds`、`--time` 覆盖默认值。
 
 ## 默认资源与环境
 
@@ -31,8 +34,8 @@ bash run.sh slurm --profile discoverer \
 | account | 必须显式传 `--account`，不继承 BMRC 账户 |
 | QoS | 默认等于 account；可显式 `--qos` |
 | constraint | `none`，不向 Slurm 发送 constraint 参数 |
-| worker | 1 CPU、16G 内存，16 workers、2 rounds |
-| worker wall time | timing_full/production 为 24h；其他预设为 1h |
+| worker | 1 CPU、16G 内存；timing_full/production 默认 496 workers，其他预设 16 workers；均为 2 rounds |
+| worker wall time | timing_full/production 为 48h；其他预设为 1h |
 | bootstrap | 1 CPU、48G、2h，可用 `--plan-memory` / `--plan-time` 调整 |
 | venv | 默认 `<运行目录>/venv`，避免复用不完整的安装环境 |
 
