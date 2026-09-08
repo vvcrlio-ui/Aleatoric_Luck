@@ -210,7 +210,16 @@ def bootstrap(request):
         raise ValueError("Discoverer bootstrap requires Linux and Python 3.11–3.14")
     if os.environ.get("PYTHON_MODULE") != options["python_module"]:
         raise ValueError("bootstrap Python module differs from submitted request")
+    # Compute-node /tmp can be too small for dependency wheels. Keep both
+    # pip's cache and temporary downloads/builds on the project filesystem.
+    temporary = Path(spec["output"]) / "tmp" / ("bootstrap-" + os.environ["SLURM_JOB_ID"])
+    temporary.mkdir(parents=True, exist_ok=True)
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[key] = str(temporary)
+    import tempfile
+    tempfile.tempdir = None
     os.environ["PIP_CACHE_DIR"] = str(Path(spec["output"]) / "pip-cache")
+    print(f"Bootstrap temporary directory: {temporary}", flush=True)
     python, venv = common.ensure_environment(argparse.Namespace(venv=options["venv"], refresh_env=options["refresh_env"]))
     environment = batch_environment()
     environment.update(VENV=str(venv), PYTHON=str(python), ENGINE_DIR=str(common.ROOT / "NK_Grid"))

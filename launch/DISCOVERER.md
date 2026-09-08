@@ -41,7 +41,7 @@ bash run.sh slurm --profile discoverer \
 
 每个作业显式携带 account、QoS、nodes、ntasks-per-node、ntasks-per-core 和内存。所有阶段的 QoS/资源写入冻结的执行计划，恢复时不会从当前 shell 猜测。48h 是本站账户当前已核实的上限；工作和 bootstrap 时限均在提交前校验。排队和并发仍受实际账户配额限制。
 
-若管理员提供其他模块，可设置 `DISCOVERER_PYTHON_MODULE`；不要复用 BMRC 的 Python venv。依赖严格按仓库锁定版本安装，包不可下载或版本不可用会终止 bootstrap，不会自动放宽版本继续跑。
+若管理员提供其他模块，可设置 `DISCOVERER_PYTHON_MODULE`；不要复用 BMRC 的 Python venv。安装临时文件位于 `<运行目录>/tmp/bootstrap-JOBID/`，pip 缓存位于 `<运行目录>/pip-cache/`，均使用项目存储，避免计算节点 `/tmp` 容量不足。依赖严格按仓库锁定版本安装，包不可下载或版本不可用会终止 bootstrap，不会自动放宽版本继续跑。
 
 如有已经验证且没有作业正在修改的环境，可显式 `--venv /绝对路径` 复用。环境不匹配时会拒绝运行；`--refresh-env` 会重新安装，仅在确认没有其他作业使用该环境后使用。恢复模式不接受环境刷新。
 
