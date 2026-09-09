@@ -260,6 +260,7 @@ def resolved_model_params(
     """Record environment overrides and the implemented CV rule in identity."""
 
     from .mlp_batch_cv import BATCH_CV_RULE
+    from .mlp_estimator import BALANCED_BATCH_RULE
     resolved = {
         model_name: _apply_environment_overrides(model_name, model_params)
         for model_name, model_params in params.items()
@@ -267,6 +268,8 @@ def resolved_model_params(
     for model_params in resolved.values():
         if model_params.get("mlp_batch_size") == "cv":
             model_params["mlp_batch_cv_rule"] = BATCH_CV_RULE
+        elif model_params.get("mlp_batch_size") == "balanced":
+            model_params["mlp_batch_rule"] = BALANCED_BATCH_RULE
     return resolved
 
 

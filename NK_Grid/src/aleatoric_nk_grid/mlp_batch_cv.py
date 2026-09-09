@@ -18,9 +18,9 @@ DEFAULT_BATCH_CANDIDATES = (32, 64, 128, 256)
 
 
 def validate_batch(policy, candidates, folds):
-    if not ((isinstance(policy, str) and policy in {"auto", "full", "cv"})
+    if not ((isinstance(policy, str) and policy in {"auto", "full", "cv", "balanced"})
             or (type(policy) is int and policy > 0)):
-        raise ValueError("mlp_batch_size must be auto, full, cv, or a positive integer")
+        raise ValueError("mlp_batch_size must be auto, full, cv, balanced, or a positive integer")
     if not isinstance(candidates, (list, tuple)) or not candidates:
         raise ValueError("mlp_batch_candidates must be a nonempty list or tuple")
     if any(type(b) is not int or b <= 0 for b in candidates):
@@ -150,6 +150,7 @@ class SerialBatchStack(RegressorMixin, BaseEstimator):
             return fitted.diagnostics_
         mlp = fitted[-1].regressor_
         return {"N": mlp.fit_n_, "alpha": float(mlp.alpha),
+            "batch_partition": mlp.batch_partition, "batch_sizes": mlp.batch_sizes_,
             "l2_normalization": mlp.l2_normalization,
             "selected_batch": mlp.batch_size, "batch": mlp.effective_batch_size_,
             "effective_batch": mlp.effective_batch_size_, "iterations": mlp.n_iter_,

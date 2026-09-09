@@ -65,7 +65,7 @@ bash run.sh slurm --profile discoverer \
 
 SMR 使用 `--manifest SMR/panels.yaml --panel ... --schema ...` 指向已经准备好的输入；FFC 专用准备开关不用于 SMR。
 
-## Ridge 方法版本
+## CV 与动态均衡分批方法版本
 
 `nk-grid-v8-ridge-5fold-1` 将生产路径的独立回归 Ridge 和 Super Learner
 内部 Ridge 改为完整预处理流水线的 5 折交叉验证。每折只在训练行上拟合
@@ -75,18 +75,32 @@ SMR 使用 `--manifest SMR/panels.yaml --panel ... --schema ...` 指向已经准
 
 这是调参方法变更，不能与此前逐行留一验证的结果混为同一算法版本。
 新实验使用新输出目录；正在运行的旧实验须保持其源码和参数不变。
-本次 Ridge 修改没有改变神经网络的 batch 策略或 2,000 轮上限。
 
-当前三份生产参数仍选择 batch CV 候选 `[32, 64, 128, 256]`，L2 使用原生
-`batch` 归一化。独立 MLP 保留三折 alpha/batch 搜索，Super Learner 保留
-五折 OOF、内部三折 batch 搜索及完整重训；每次实际 fit 的特征和目标预处理
-均在其训练行上拟合。停止仍为 `early_stopping=False` 下的原生训练损失规则，
-`tol=1e-4`、`n_iter_no_change=10`，最大 2,000 轮。
+当前 `nk-grid-v9-balanced-batch-1` 保留上述 Ridge 规则；panel 方法身份为
+`nkgrid-models-v6-balanced-batch-1`。三份生产参数的 MLP/SL 均采用
+`mlp_batch_size: balanced`：对每次实际训练的 m 行，分为 ceil(m/200) 批，
+批大小最多相差 1，较大批在前，每轮恰好使用所有行一次。例如 201 行分为
+101+100，401 行分为 134+134+133。200 是固定上限，不再交叉验证 batch。
+这消除了 1 行尾批，但批数仍会在阈值处改变。
 
-代码中的 `fit_samples`、`effective_batch` 是需显式选择的实验性 L2 对照，
-尚未采纳为生产方案；相关接口及回归测试不代表预测性能确认通过。批策略与
-尾批修正的科学评估已暂停，不据此修改生产参数或算法版本。可选诊断保留实际
-OOF 预测，并提供完整重训基础预测及元学习器系数，不额外重放训练。
+独立 MLP 保留三折搜索 5 个 alpha，随后完整重训（共 16 次 MLP fit）；
+Super Learner 保留五折 OOF 和完整重训，MLP alpha 固定为 0.01（共 6 次）。
+每次 fit 的特征和目标预处理均只在其训练行拟合。L2 保留原生按实际批大小
+归一化；初始化、Adam、shuffle 和停止均保持原生：early_stopping=False、
+tol=1e-4、n_iter_no_change=10，最大 2,000 轮。
+
+实现复用锁定的 sklearn 1.8.0 训练循环，仅在独立函数命名空间替换分批迭代器，
+不修改 sklearn 全局状态；其他版本明确报错，升级须重新验证数值一致性。
+运行身份额外记录 mlp_batch_rule；auto、整数、full、cv 仍可显式用作旧对照。
+fit_samples 和 effective_batch 仍仅为实验性 L2 对照，未采用为生产协议。
+
+十 seed 配对确认中，K=500 的 200 附近总变差平均下降约 61.1%（9/10 seed），
+400 附近平均下降约 11.3%，但仅 4/10 seed 改善。最大点 N=1165、K=3400 的
+三折 CV MSE 平均由 0.387132 降至 0.386480（约 0.168%，5/10 seed 改善）。
+该结果不保证全局平滑或全局最优，也不是独立外部测试准确率。
+本地证据保存在 runs/batch-tenseeds-20260909；旧代码快照另存于
+runs/balanced-adoption-20260909/baseline-758f0b4，旧结果保持原身份。
+可选诊断保留实际 OOF、完整重训基础预测和元学习器系数，不额外重放训练。
 
 ## 日志、失败和恢复
 

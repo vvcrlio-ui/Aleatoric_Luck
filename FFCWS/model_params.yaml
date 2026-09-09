@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v8-ridge-5fold-1
+algorithm_version: nk-grid-v9-balanced-batch-1
 
 regression:
   ols:
@@ -24,8 +24,9 @@ regression:
     max_features: sqrt
     min_samples_leaf: 5
   shallow_neural_network:
-    mlp_batch_size: cv
-    mlp_batch_candidates: [32, 64, 128, 256]
+    # Fixed cap 200; ceil(actual fit N / 200) balanced batches, native L2/stopping.
+    mlp_batch_size: balanced
+    mlp_l2_normalization: batch
     hidden_layer_sizes:
       - 32
     activation: relu
@@ -38,9 +39,9 @@ regression:
     max_iter: 2000
     early_stopping: false
   super_learner:
-    mlp_batch_size: cv
-    mlp_batch_candidates: [32, 64, 128, 256]
-    mlp_batch_cv_folds: 3
+    # Fixed cap 200; ceil(actual fit N / 200) balanced batches, native L2/stopping.
+    mlp_batch_size: balanced
+    mlp_l2_normalization: batch
     cv: 5
     passthrough: false
     ridge_alpha_log10_min: -4
