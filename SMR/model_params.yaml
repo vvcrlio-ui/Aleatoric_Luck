@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v9-balanced-batch-1
+algorithm_version: nk-grid-v10-svd-gesvd-fallback-1
 
 regression:
   ols:

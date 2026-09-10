@@ -10,6 +10,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from .mlp_estimator import build_mlp_regressor
+from .svd_fallback import ridge_svd
 
 
 class FoldLocalRidge(RegressorMixin, BaseEstimator):
@@ -32,6 +33,7 @@ class FoldLocalRidge(RegressorMixin, BaseEstimator):
         if len(y) < 2:
             raise ValueError('Ridge CV requires at least two training rows')
         self.n_splits_ = min(5, len(y))
+        self.svd_fallback_count_ = 0
         self.alphas_ = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)
         self.cv_predictions_ = np.empty((len(y), len(self.alphas_)))
         fold_losses = []
@@ -42,7 +44,8 @@ class FoldLocalRidge(RegressorMixin, BaseEstimator):
             # complete-pipeline five-fold CV, not full-N analytic RidgeCV.
             center = train_X.mean(axis=0)
             target_mean = y[train].mean()
-            u, singular, vt = np.linalg.svd(train_X - center, full_matrices=False)
+            (u, singular, vt), fallback_used = ridge_svd(train_X - center)
+            self.svd_fallback_count_ += int(fallback_used)
             keep = singular > 1e-15  # sklearn Ridge's SVD rank cutoff
             singular = singular[keep]
             projection = (valid_X - center) @ vt[keep].T
