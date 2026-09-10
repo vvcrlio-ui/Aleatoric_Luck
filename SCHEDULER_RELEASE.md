@@ -47,6 +47,17 @@ warnings come from a deliberately short integration fixture, not production
 hyperparameter changes. Earlier complete-budget numerical comparisons and their
 limits are in `LOCAL_VALIDATION.md` and `LOAD_BALANCE_698.md`.
 
+Discoverer job `4445430` completed successfully in 2m24s using code commit
+`3daaecf9aff7aa82cff345879602714d18354d99`. All 56 portable checks also passed
+there. The native CLI probe completed nine models at N122/K47; every public
+result field exactly matched the grouped native baseline, and dispatcher restart
+retained all nine completions. Probe runtime was 128.45s including input validation
+and both executions; this is a correctness check, not a speed comparison.
+An earlier entry attempt `4445429` exited immediately because of an incorrect
+old-repo argument, before any tests or fits. The corrected job is the receipt.
+Evidence is in the new checkout's ignored
+`runs/scheduler-validation-3daaecf-02/`, including pytest.txt and native/report.json.
+
 On Discoverer, submit the bounded validation script only after checking real-time
 quota. Its three arguments are the new repo, frozen old repo, and a fresh run
 directory **inside the new repo's ignored runs/**. It copies 82 MB of prepared
@@ -56,6 +67,7 @@ N122/K47, and verifies dispatcher restart. It does not submit a production run.
 
 ```bash
 sbatch --account=ehpc-dev-2026d08-299 --qos=ehpc-dev-2026d08-299 --partition=cn \
+  --chdir="$new_repo" \
   --output="$validation/slurm.out" --error="$validation/slurm.err" \
   NK_Grid/slurm/validate_single_model_scheduler.sbatch "$new_repo" "$old_repo" "$validation"
 ```
