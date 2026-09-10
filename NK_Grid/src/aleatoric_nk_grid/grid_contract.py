@@ -14,3 +14,19 @@ def validate_size_grid(values, name: str, capacity: int | None = None) -> tuple[
     if capacity is not None and values[-1] > capacity:
         raise ValueError(f"{name} exceeds actual capacity {capacity}: {values[-1]}")
     return tuple(int(v) for v in values)
+
+
+def select_grid_points(values, selection: str, name: str) -> tuple[int, ...]:
+    """Select existing grid points; an even grid uses its upper middle point.
+
+    Applying min/middle/max to an already frozen three-point grid is idempotent.
+    """
+
+    values = validate_size_grid(values, name)
+    if selection == "all":
+        return values
+    if selection != "min_middle_max":
+        raise ValueError(f"Unknown grid_selection: {selection!r}")
+    if len(values) < 3:
+        raise ValueError(f"{name} needs at least three production grid points for pilot")
+    return values[0], values[len(values) // 2], values[-1]

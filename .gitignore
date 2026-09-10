@@ -24,6 +24,15 @@ build/
 *.egg-info/
 .pytest_cache/
 
+# Tests are maintained locally and are not published with the repository.
+tests/
+test/
+__tests__/
+test_*.py
+*_test.py
+conftest.py
+/pytest.ini
+
 # R
 .Rhistory
 .Rapp.history

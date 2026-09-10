@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 from .phase_timing import timed_phase
-from .grid_contract import validate_size_grid
+from .grid_contract import select_grid_points, validate_size_grid
+from .config import (
+    DEFAULT_MODEL_PARAMS_PATH, NKGridConfig,
+    execution_groups_for_models, group_repeat_pairs_by_seed, resolve_repeat_pairs,
+)
 
 import argparse
 import json
@@ -13,7 +17,7 @@ import shutil
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -73,7 +77,6 @@ from .experiment import (
     core_environment,
     diagnostics_summary,
     git_state,
-    load_checkpoint,  # compatibility alias; production resume uses projected index
     load_checkpoint_index,
     manifest_path,
     merge_checkpoint_parts,
@@ -90,7 +93,6 @@ from .experiment import (
 from .helpers_logging import log_progress
 from .ingest import LoadedInput, load_input
 from .model_registry import (
-    DEFAULT_MODEL_PARAMS_PATH,
     SUPPORTED_MODEL_NAMES,
     load_algorithm_version,
     load_model_params,
@@ -138,7 +140,8 @@ ROW_METADATA_FIELDS = (
 )
 
 # Super Learner fits each of its 4 base learners once per CV fold plus one final
-# refit on the full subsample: 4 x (cv + 1) with cv=5.
+# refit on the full subsample: 4 x (cv + 1) with cv=5. This counts only
+# outer base-estimator calls, not their nested hyperparameter searches.
 SUPER_LEARNER_FITS_PER_CELL = 24
 
 
@@ -252,21 +255,6 @@ def public_result_columns(task: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((*ROW_METADATA_FIELDS, *BASE_RESULT_COLUMNS, *metrics, *STABLE_DIAGNOSTIC_RESULT_COLUMNS, *task_column, "status", "error")))
 
 
-def execution_groups_for_models(models: Sequence[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """Return the ordered preprocessing groups used by the task-table codec."""
-
-    selected = tuple(str(model) for model in models)
-    if not selected or len(selected) != len(set(selected)):
-        raise ValueError("models must be non-empty and unique")
-    passthrough = tuple(model for model in selected if model in {"lightgbm", "xgboost"})
-    imputed = tuple(model for model in selected if model not in passthrough)
-    return tuple(
-        (name, group)
-        for name, group in (("imputed_core", imputed), ("passthrough", passthrough))
-        if group
-    )
-
-
 def _frozen_input_provenance_for_schema(schema: Any) -> dict[str, dict[str, str]]:
     """Freeze numeric inputs with the same fields used by dynamic planning."""
 
@@ -327,43 +315,6 @@ def project_public_result(row: Mapping[str, object], *, header: Sequence[str]) -
     if missing:
         raise ValueError(f"computed result lacks public columns: {missing}")
     return {column: row[column] for column in columns}
-
-@dataclass(frozen=True)
-class NKGridConfig:
-    schema: Path
-    out: Path
-    outcome: str
-    models: tuple[str, ...]
-    seed: int
-    test_size: float
-    n_seeds: int
-    n_draws: int
-    n_sizes_n: int
-    n_sizes_k: int
-    max_n: int
-    max_k: int
-    batch_size: int
-    n_jobs: int
-    min_n: int = 10
-    model_params: Path = DEFAULT_MODEL_PARAMS_PATH
-    failed_abs_threshold: int = 50
-    failed_ratio_threshold: float = 0.05
-    native_process_max_attempts: int = 2
-    native_process_timeout_seconds: float = 21_600.0
-    preset: str | None = None
-    allow_large_run: bool = False
-    dry_run: bool = False
-    rerun_completed: bool = True
-    # Direct construction is used by the test/dev API. Production manifests
-    # always override these explicit values.
-    experiment_id: str = "nkgrid-test-v1"
-    data_version: str = "test-data-v1"
-    model_spec_version: str = "nkgrid-test-models-v1"
-    repeat_plan: tuple[tuple[int, int], ...] | None = None
-    n_grid: tuple[int, ...] | None = None
-    k_grid: tuple[int, ...] | None = None
-    prediction_export_cells: tuple[tuple[str, int, int], ...] = ()
-
 
 @dataclass(frozen=True)
 class SplitData:
@@ -468,45 +419,6 @@ class SplitIndexManager:
         )
         self._cache[int(seed)] = frozen
         return frozen
-
-
-def resolve_repeat_pairs(config: NKGridConfig) -> tuple[tuple[int, int], ...]:
-    """Resolve legacy counts or explicit absolute pairs into one representation."""
-
-    if config.repeat_plan is not None:
-        if config.n_seeds != 1 or config.n_draws != 1:
-            raise ValueError("repeat_plan cannot be combined with n_seeds or n_draws")
-        pairs = tuple((seed, draw) for seed, draw in config.repeat_plan)
-    else:
-        pairs = tuple(
-            (config.seed + offset, draw)
-            for offset in range(config.n_seeds)
-            for draw in range(config.n_draws)
-        )
-    group_repeat_pairs_by_seed(pairs)
-    return tuple(sorted(pairs))
-
-
-def group_repeat_pairs_by_seed(
-    repeat_pairs: Sequence[tuple[int, int]],
-) -> dict[int, tuple[int, ...]]:
-    """Validate and group absolute repeat pairs without silently deduplicating."""
-
-    grouped: dict[int, list[int]] = {}
-    seen: set[tuple[int, int]] = set()
-    for pair in repeat_pairs:
-        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-            raise ValueError("repeat_plan entries must be (seed, draw) pairs")
-        seed, draw = pair
-        if isinstance(seed, bool) or isinstance(draw, bool) or not isinstance(seed, int) or not isinstance(draw, int) or seed < 0 or draw < 0:
-            raise ValueError("repeat_plan seed and draw must be non-negative integers")
-        if (seed, draw) in seen:
-            raise ValueError(f"repeat_plan contains duplicate pair ({seed}, {draw})")
-        seen.add((seed, draw))
-        grouped.setdefault(seed, []).append(draw)
-    if not grouped:
-        raise ValueError("repeat_plan must not be empty")
-    return {seed: tuple(sorted(draws)) for seed, draws in sorted(grouped.items())}
 
 
 def log2_size_grid(
@@ -1204,15 +1116,19 @@ def _select_output_path(
     return _timestamped_out_path(directory, stem, segment, suffix)
 
 
-def estimate_run_size(config: NKGridConfig) -> dict[str, int | str]:
+def estimate_run_size(config: NKGridConfig) -> dict[str, int | str | None]:
     """Return a conservative pre-data estimate for panel dry-runs."""
 
     _validate_config(config)
+    n_count = len(config.n_grid) if config.n_grid is not None else config.n_sizes_n
+    k_count = len(config.k_grid) if config.k_grid is not None else config.n_sizes_k
+    if config.grid_selection == "min_middle_max":
+        n_count = k_count = 3
     top_level = (
         len(config.models)
         * len(resolve_repeat_pairs(config))
-        * len(config.n_grid or tuple(range(config.n_sizes_n)))
-        * len(config.k_grid or tuple(range(config.n_sizes_k)))
+        * n_count
+        * k_count
     )
     super_cells = (
         top_level // len(config.models)
@@ -1233,18 +1149,27 @@ def estimate_run_size(config: NKGridConfig) -> dict[str, int | str]:
             else checkpoint_writes
         ),
     )
+    if config.checkpoint_retention == "keep":
+        stable_checkpoint_parts = peak_checkpoint_parts = checkpoint_writes
     return {
         "top_level_model_cells": int(top_level),
         "expected_output_rows": int(top_level),
         "estimated_super_learner_internal_fits": int(
             super_cells * SUPER_LEARNER_FITS_PER_CELL
         ),
+        "super_learner_fit_estimate_scope": (
+            "4 base learners x (5 OOF folds + 1 full fit); excludes inner "
+            "parameter search and meta-learner, not a total MLP fit count"
+        ),
         "estimated_checkpoint_writes": checkpoint_writes,
         # Backward-compatible key now describes the stable physical shard
         # count after automatic WAL compaction, not the number of writes.
         "estimated_checkpoint_parts": stable_checkpoint_parts,
         "estimated_peak_checkpoint_parts": peak_checkpoint_parts,
-        "checkpoint_compaction_loose_parts": CHECKPOINT_COMPACTION_LOOSE_PARTS,
+        "checkpoint_compaction_loose_parts": (
+            None if config.checkpoint_retention == "keep" else CHECKPOINT_COMPACTION_LOOSE_PARTS
+        ),
+        "checkpoint_retention": config.checkpoint_retention,
         "max_uncheckpointed_cells": min(
             int(config.batch_size),
             int(top_level),
@@ -1304,9 +1229,20 @@ def validate_prediction_export_grid(
 def _validate_config(config: NKGridConfig) -> None:
     """Reject invalid run controls before dry-run arithmetic or data loading."""
 
+    if config.grid_selection not in ("all", "min_middle_max"):
+        raise ValueError("grid_selection must be all or min_middle_max")
+    if type(config.checkpoint_retention) is not str or config.checkpoint_retention not in {"default", "keep", "delete"}:
+        raise ValueError("checkpoint_retention must be default, keep, or delete")
+
     for name in ("n_grid", "k_grid"):
         if getattr(config, name) is not None:
             validate_size_grid(getattr(config, name), name)
+    if config.grid_selection == "min_middle_max":
+        for grid_name, count_name in (("n_grid", "n_sizes_n"), ("k_grid", "n_sizes_k")):
+            values = getattr(config, grid_name)
+            count = len(values) if values is not None else getattr(config, count_name)
+            if count < 3:
+                raise ValueError(f"{grid_name} needs at least three production grid points for pilot")
     for field in (
         "n_seeds",
         "n_draws",
@@ -1490,8 +1426,9 @@ def _manifest_payload(
             "parallelism": _parallelism_payload(config),
             "checkpointing": {
                 "batch_size": int(config.batch_size),
-                "loose_parts_per_compaction": int(
-                    CHECKPOINT_COMPACTION_LOOSE_PARTS
+                "loose_parts_per_compaction": (
+                    None if config.checkpoint_retention == "keep"
+                    else int(CHECKPOINT_COMPACTION_LOOSE_PARTS)
                 ),
                 "materialization_backend": "sqlite_streaming",
             },
@@ -1523,6 +1460,7 @@ def _manifest_payload(
             "csv": out_path.name,
             "parts_directory": checkpoint_parts_dir(out_path).name,
             "checkpoint_parts_deleted": False,
+            "checkpoint_retention": config.checkpoint_retention,
             **(
                 {
                     "predictions_parquet": prediction_export_path(out_path).name,
@@ -1560,6 +1498,13 @@ def _manifest_payload(
 
 def _prune_checkpoint_parts(out_path: Path, manifest: dict) -> bool:
     """Delete shards only after the persisted final artifacts pass QA."""
+
+    policy = manifest.get("output", {}).get("checkpoint_retention", "default")
+    if type(policy) is not str or policy not in {"default", "keep", "delete"}:
+        raise ValueError("checkpoint_retention must be default, keep, or delete")
+    if policy == "keep":
+        log_progress("checkpoint retention requested: all written parts are retained")
+        return False
 
     completion = manifest["completion"]
     status = completion["status"]
@@ -1614,6 +1559,34 @@ def _prune_checkpoint_parts(out_path: Path, manifest: dict) -> bool:
             f"{retired.name} ({type(exc).__name__}: {exc})"
         )
     return True
+
+
+def _apply_completed_checkpoint_retention(
+    out_path: Path, manifest: dict, policy: str,
+) -> None:
+    """Apply an explicit storage request when reusing a verified complete run."""
+    if policy == "default":
+        return
+    if policy not in {"keep", "delete"}:
+        raise ValueError("checkpoint_retention must be default, keep, or delete")
+    if policy == "keep" and not checkpoint_parts(out_path):
+        raise ValueError(
+            "Completed run no longer has checkpoints; --checkpoints keep cannot "
+            "reconstruct deleted shards. Start a new output with keep enabled."
+        )
+    manifest["output"]["checkpoint_retention"] = policy
+    if _prune_checkpoint_parts(out_path, manifest):
+        manifest["output"]["checkpoint_parts_deleted"] = True
+
+
+def _resumed_checkpoint_config(config: NKGridConfig, prior: dict | None) -> NKGridConfig:
+    """An omitted flag must not revoke an earlier explicit retention request."""
+    if config.checkpoint_retention != "default" or prior is None:
+        return config
+    policy = prior.get("output", {}).get("checkpoint_retention", "default")
+    if type(policy) is not str or policy not in {"default", "keep", "delete"}:
+        raise ValueError("Existing manifest has invalid checkpoint_retention")
+    return replace(config, checkpoint_retention=policy)
 
 
 def _read_prior_manifest(path: Path, experiment_id: str) -> dict | None:
@@ -1859,6 +1832,8 @@ def resolve_input_grids(config, loaded, source_definitions):
     for seed in seeds:
         validate_size_grid(n_grid, f"N (seed={seed})", len(manager.for_seed(seed).train_index))
     validate_size_grid(k_grid, "K", len(units))
+    n_grid = select_grid_points(n_grid, config.grid_selection, "N")
+    k_grid = select_grid_points(k_grid, config.grid_selection, "K")
     return np.asarray(n_grid, dtype=int), np.asarray(k_grid, dtype=int)
 
 
@@ -2545,6 +2520,10 @@ def _run_nk_grid_locked(
                 "Existing exact-output manifest must be a JSON object"
             )
         _require_resumable_manifest(exact_prior, metadata)
+    prior_manifest = _read_prior_manifest(
+        manifest_path(out_path), metadata["experiment_id"]
+    )
+    config = _resumed_checkpoint_config(config, prior_manifest)
     existing_index = load_checkpoint_index(out_path)
     indexed_completed = _completed_jobs_for_experiment(
         existing_index,
@@ -2557,9 +2536,11 @@ def _run_nk_grid_locked(
     prediction_jobs = [
         job for job in jobs if _selected_prediction_job(config, job)
     ]
+    # Preset reruns already received a new timestamped path above. A verified
+    # complete output at the selected path is reuse even when a direct caller
+    # leaves rerun_completed=True; its retention checks must not be bypassed.
     if (
-        not config.rerun_completed
-        and _verified_complete_artifacts(
+        _verified_complete_artifacts(
             out_path,
             metadata["experiment_id"],
             expected_rows,
@@ -2589,6 +2570,9 @@ def _run_nk_grid_locked(
         completed_manifest["updated_at"] = utc_now()
         completed_manifest["design"]["parallelism"] = _parallelism_payload(
             config
+        )
+        _apply_completed_checkpoint_retention(
+            out_path, completed_manifest, config.checkpoint_retention,
         )
         write_json_atomic(completed_manifest_path, completed_manifest)
         log_progress(f"already complete; no-op reuse of verified output: {out_path}")
@@ -2674,7 +2658,7 @@ def _run_nk_grid_locked(
         prediction_write_seconds = 0.0
 
         def write_session_checkpoint(rows: list[dict]) -> Path | None:
-            return write_checkpoint_part(rows, out_path)
+            return write_checkpoint_part(rows, out_path, keep_all=config.checkpoint_retention == "keep")
 
         def persist_cell_predictions(rows: list[dict[str, object]]) -> None:
             nonlocal prediction_parts_written, prediction_write_seconds
@@ -2986,6 +2970,8 @@ def parse_args() -> NKGridConfig:
     parser.add_argument("--max-n", type=int, default=100, help="Use <=0 for full train set.")
     parser.add_argument("--max-k", type=int, default=100, help="Use <=0 for all features.")
     parser.add_argument("--batch-size", type=int, default=20)
+    parser.add_argument("--checkpoints", dest="checkpoint_retention", choices=("keep", "delete"),
+                        default="default", help="Keep all checkpoints, or delete after verified success only.")
     parser.add_argument("--failed-abs-threshold", type=int, default=50)
     parser.add_argument("--failed-ratio-threshold", type=float, default=0.05)
     parser.add_argument("--native-process-max-attempts", type=int, default=2)
@@ -3049,6 +3035,7 @@ def parse_args() -> NKGridConfig:
         max_n=args.max_n,
         max_k=args.max_k,
         batch_size=args.batch_size,
+        checkpoint_retention=args.checkpoint_retention,
         n_jobs=args.n_jobs,
         model_params=Path(args.model_params),
         failed_abs_threshold=args.failed_abs_threshold,

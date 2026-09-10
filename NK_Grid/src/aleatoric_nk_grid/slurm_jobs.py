@@ -19,11 +19,14 @@ from .experiment import (
     write_json_atomic,
 )
 from .helpers_logging import log_progress
-from .nk_grid import (
-    LARGE_RUN_THRESHOLD, NKGridConfig, estimate_run_size, run_nk_grid,
+from .config import (
+    NKGridConfig, config_from_json as _config_from_json, config_to_json,
     group_repeat_pairs_by_seed, resolve_repeat_pairs,
 )
-from .run_panels import ROOT, config_to_json, resolved_panels
+from .nk_grid import (
+    LARGE_RUN_THRESHOLD, estimate_run_size, run_nk_grid,
+)
+from .run_panels import ROOT, resolved_panels
 
 
 def chunk_master_indices(indices: tuple[int, ...], max_array_size: int) -> tuple[tuple[int, ...], ...]:
@@ -203,20 +206,6 @@ def _require_unique_output_paths(jobs: list[SlurmJob]) -> None:
         raise ValueError(
             "Slurm per-model final outputs must be unique within a panel"
         )
-
-
-def _config_from_json(payload: dict[str, Any]) -> NKGridConfig:
-    values = dict(payload)
-    for key in ("schema", "out", "model_params"):
-        if values.get(key) is not None:
-            values[key] = Path(values[key])
-    values["models"] = tuple(values["models"])
-    if values.get("repeat_plan") is not None:
-        values["repeat_plan"] = tuple(tuple(pair) for pair in values["repeat_plan"])
-    for field in ("n_grid", "k_grid"):
-        if values.get(field) is not None:
-            values[field] = tuple(values[field])
-    return NKGridConfig(**values)
 
 
 def _with_rerun_policy(

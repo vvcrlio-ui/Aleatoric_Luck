@@ -1,8 +1,9 @@
-algorithm_version: nk-grid-v6-fold-local-1
+algorithm_version: nk-grid-v9-balanced-batch-1
 
 regression:
   ols:
     fit_intercept: true
+  # Regression Ridge uses complete-pipeline 5-fold CV (min(5, N)), no shuffle.
   ridge:
     alpha_log10_min: -4
     alpha_log10_max: 6
@@ -23,6 +24,9 @@ regression:
     max_features: sqrt
     min_samples_leaf: 5
   shallow_neural_network:
+    # Fixed cap 200; ceil(actual fit N / 200) balanced batches, native L2/stopping.
+    mlp_batch_size: balanced
+    mlp_l2_normalization: batch
     hidden_layer_sizes:
       - 32
     activation: relu
@@ -35,6 +39,9 @@ regression:
     max_iter: 2000
     early_stopping: false
   super_learner:
+    # Fixed cap 200; ceil(actual fit N / 200) balanced batches, native L2/stopping.
+    mlp_batch_size: balanced
+    mlp_l2_normalization: batch
     cv: 5
     passthrough: false
     ridge_alpha_log10_min: -4

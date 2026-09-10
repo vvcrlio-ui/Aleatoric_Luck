@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +12,17 @@ import yaml
 
 from .helpers_logging import log_progress
 from .ingest import SCHEMA_FIELDS, load_schema
-from .model_registry import DEFAULT_MODEL_PARAMS_PATH
-from .nk_grid import NKGridConfig, estimate_run_size, run_nk_grid
+from .config import DEFAULT_MODEL_PARAMS_PATH, NKGridConfig, config_to_json
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PRODUCTION_GRID = {
+    "n_sizes_n": 20,
+    "n_sizes_k": 20,
+    "min_n": 10,
+    "max_n": 0,
+    "max_k": 0,
+}
 PRESETS: dict[str, dict[str, int]] = {
     "dev": {
         "n_seeds": 3,
@@ -48,11 +55,7 @@ PRESETS: dict[str, dict[str, int]] = {
     "production": {
         "n_seeds": 100,
         "n_draws": 50,
-        "n_sizes_n": 20,
-        "n_sizes_k": 20,
-        "min_n": 10,
-        "max_n": 0,
-        "max_k": 0,
+        **PRODUCTION_GRID,
         # Keep the checkpoint/signal boundary small. Automatic WAL compaction
         # controls the physical part count without making slow models redo
         # 1,000 cells after a forced requeue.
@@ -61,11 +64,9 @@ PRESETS: dict[str, dict[str, int]] = {
     "pilot": {
         "n_seeds": 84,
         "n_draws": 1,
-        "n_sizes_n": 3,
-        "n_sizes_k": 2,
-        "min_n": 10,
-        "max_n": 400,
-        "max_k": 25,
+        # Resolve the same source grid as production before selecting three
+        # existing points on each axis. Panel grid overrides apply to both.
+        **PRODUCTION_GRID,
     },
     "dev-dynamic": {
         "n_seeds": 3,
@@ -81,6 +82,7 @@ DEFAULTS: dict[str, Any] = {
     "seed": 12345,
     "test_size": 0.3,
     "batch_size": 20,
+    "checkpoint_retention": "default",
     # Panel resolution must not depend on the submit host's environment.
     # Slurm workers replace this scheduler-only value from their allocation.
     "n_jobs": 4,
@@ -112,6 +114,7 @@ PANEL_FIELDS = frozenset(
         "max_n",
         "max_k",
         "batch_size",
+        "checkpoint_retention",
         "n_jobs",
         "test_size",
         "allow_large_run",
@@ -194,6 +197,7 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
     values["models"] = tuple(str(model) for model in values["models"])
     values["outcome"] = outcome
     values["preset"] = preset_name
+    values["grid_selection"] = "min_middle_max" if preset_name == "pilot" else "all"
     if "repeat_plan" in panel:
         if "n_seeds" in panel or "n_draws" in panel:
             raise ValueError(f"Panel {name} cannot combine repeat_plan with n_seeds/n_draws")
@@ -228,6 +232,9 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
             (str(entry["model"]), int(entry["N"]), int(entry["K"]))
         )
     values["prediction_export_cells"] = tuple(normalized_export_cells)
+    retention = values["checkpoint_retention"]
+    if type(retention) is not str or retention not in {"default", "keep", "delete"}:
+        raise ValueError(f"Panel {name} checkpoint_retention must be default, keep, or delete")
     extra = sorted(set(values) - CONFIG_FIELDS)
     if extra:
         raise ValueError(f"Panel {name} did not resolve cleanly: {extra}")
@@ -268,25 +275,15 @@ def resolved_panels(
     return panels
 
 
-def config_to_json(config: NKGridConfig) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for field in CONFIG_FIELDS:
-        value = getattr(config, field)
-        if isinstance(value, Path):
-            result[field] = str(value)
-        elif isinstance(value, tuple):
-            result[field] = list(value)
-        else:
-            result[field] = value
-    return {key: result[key] for key in sorted(result)}
-
-
 def main(argv: list[str] | None = None) -> None:
+    from .nk_grid import estimate_run_size, run_nk_grid
+
     parser = argparse.ArgumentParser(description="Run declared N×K grid panels.")
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--only", nargs="+", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-jobs", type=int, default=None)
+    parser.add_argument("--checkpoints", choices=("keep", "delete"), default=None)
     # ``default=None`` keeps an absent flag from overriding a panel that already
     # declares ``allow_large_run``; passing the flag still authorizes every panel.
     parser.add_argument("--allow-large-run", action="store_true", default=None)
@@ -294,6 +291,8 @@ def main(argv: list[str] | None = None) -> None:
     panels = resolved_panels(
         args.manifest, only=set(args.only) if args.only else None
     )
+    if args.checkpoints is not None:
+        panels = [(name, replace(config, checkpoint_retention=args.checkpoints)) for name, config in panels]
     if args.dry_run:
         print(
             json.dumps(

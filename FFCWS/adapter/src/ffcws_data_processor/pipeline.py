@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable
 
 import pandas as pd
 from aleatoric_nk_grid.ingest import load_input
+from aleatoric_nk_grid.input_publication import publish_validated_inputs, validate_dataset_name
 from aleatoric_nk_grid.validate_input import validate_input
 
 from .common.io import (
@@ -55,7 +58,15 @@ def _required_mapping(document: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
-def run_pipeline(
+def _output_roots(document: dict[str, Any], config_dir: Path) -> tuple[Path, Path, Path]:
+    paths = _required_mapping(document, "paths")
+    output = _resolve_path(paths["output_root"], config_dir)
+    ard = _resolve_path(paths.get("ard_root", output / "ard"), config_dir)
+    schema = _resolve_path(paths.get("schema_root", output / "schemas"), config_dir)
+    return output, ard, schema
+
+
+def _build_pipeline(
     config_path: Path,
     *,
     strategies: Iterable[str] | None = None,
@@ -63,6 +74,7 @@ def run_pipeline(
     min_n: int = 10,
     test_size: float = 0.3,
     seed: int = 12345,
+    output_roots: tuple[Path, Path, Path],
 ) -> dict[str, Any]:
     config_path = Path(config_path).resolve()
     document = load_yaml(config_path)
@@ -93,11 +105,7 @@ def run_pipeline(
     background_path = _resolve_path(paths["background"], config_dir)
     train_path = _resolve_path(paths["train"], config_dir)
     test_path = _resolve_path(paths["test"], config_dir)
-    output_root = _resolve_path(paths["output_root"], config_dir)
-    ard_root = _resolve_path(paths.get("ard_root", output_root / "ard"), config_dir)
-    schema_root = _resolve_path(
-        paths.get("schema_root", output_root / "schemas"), config_dir
-    )
+    output_root, ard_root, schema_root = output_roots
     selected = list(strategies or document.get("strategies") or STRATEGIES)
     selected_validation_models = tuple(validation_models)
     if not selected_validation_models:
@@ -105,6 +113,9 @@ def run_pipeline(
     unknown = [name for name in selected if name not in STRATEGIES]
     if unknown:
         raise ValueError(f"Unknown preprocessing strategy: {', '.join(unknown)}")
+    for strategy in selected:
+        for outcome in outcomes:
+            validate_dataset_name(f"ffc_{strategy}_{outcome}")
 
     background, value_labels = read_stata_with_labels(background_path)
     train = pd.read_csv(train_path)
@@ -155,9 +166,6 @@ def run_pipeline(
         strategy_dir = output_root / result.strategy
         suffix = ".parquet"
         features_path = strategy_dir / f"features{suffix}"
-        stale_features_path = strategy_dir / "features.csv"
-        if stale_features_path.exists():
-            stale_features_path.unlink()
         manifest_path = strategy_dir / "feature_manifest.csv"
         qa_path = strategy_dir / "qa_summary.json"
         write_frame(features_path, result.features)
@@ -201,10 +209,6 @@ def run_pipeline(
             dataset_dir = ard_root / dataset
             train_ard = dataset_dir / f"data{suffix}"
             test_ard = dataset_dir / f"test{suffix}"
-            for stale_name in ("data.csv", "test.csv"):
-                stale_path = dataset_dir / stale_name
-                if stale_path.exists():
-                    stale_path.unlink()
             manifest_ard = dataset_dir / "feature_manifest.csv"
             write_frame(train_ard, outcome_frames[("train", outcome)])
             write_frame(test_ard, outcome_frames[("test", outcome)])
@@ -261,6 +265,64 @@ def run_pipeline(
 
     write_json(output_root / "run_summary.json", run_summary)
     return run_summary
+
+
+def run_pipeline(
+    config_path: Path,
+    *,
+    strategies: Iterable[str] | None = None,
+    validation_models: Iterable[str] = ("ols",),
+    min_n: int = 10,
+    test_size: float = 0.3,
+    seed: int = 12345,
+) -> dict[str, Any]:
+    """Validate every selected input before publishing any schema entry point.
+
+    Each published schema references an immutable, complete input version.
+    Readers holding a previously loaded schema can keep reading its version
+    even when this adapter is rebuilding or publishing a newer one.
+    """
+    config_path = Path(config_path).resolve()
+    document = load_yaml(config_path)
+    output_root, ard_root, schema_root = _output_roots(document, config_path.parent)
+    staging_parent = ard_root.parent
+    while not staging_parent.exists():
+        parent = staging_parent.parent
+        if parent == staging_parent:
+            raise FileNotFoundError(f"No existing staging parent for {ard_root}")
+        staging_parent = parent
+    with TemporaryDirectory(prefix=".ffcws-build-", dir=staging_parent) as temporary:
+        staging = Path(temporary)
+        staged_output = staging / "work"
+        summary = _build_pipeline(
+            config_path,
+            strategies=strategies,
+            validation_models=tuple(validation_models),
+            min_n=min_n,
+            test_size=test_size,
+            seed=seed,
+            output_roots=(staged_output, staging / "ard", staging / "schema"),
+        )
+        staged_schemas = [
+            Path(path)
+            for result in summary["strategies"].values()
+            for path in result["engine_schemas"].values()
+        ]
+        published = publish_validated_inputs(
+            staged_schemas, schema_root=schema_root, ard_root=ard_root
+        )
+        for result in summary["strategies"].values():
+            for key in ("features", "feature_manifest"):
+                result[key] = str(output_root / Path(result[key]).relative_to(staged_output))
+            result["engine_schemas"] = {
+                outcome: str(published[Path(path)])
+                for outcome, path in result["engine_schemas"].items()
+            }
+        # These reports are derived diagnostics; engine inputs are read only
+        # through the schema entries published above.
+        write_json(staged_output / "run_summary.json", summary)
+        shutil.copytree(staged_output, output_root, dirs_exist_ok=True)
+        return summary
 
 
 def main(argv: list[str] | None = None) -> None:

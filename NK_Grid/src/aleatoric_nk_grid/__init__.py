@@ -1,5 +1,6 @@
 """Shared, article-agnostic N×K grid engine."""
 
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
@@ -27,9 +28,6 @@ if _PACKAGE_DIR.name != "aleatoric_nk_grid" or not (
         f"{_PACKAGE_PATH}"
     )
 
-from .ingest import InputSchema, LoadedInput, load_input, load_schema
-from .nk_grid import NKGridConfig, run_nk_grid
-
 __all__ = [
     "InputSchema",
     "LoadedInput",
@@ -38,5 +36,30 @@ __all__ = [
     "load_schema",
     "run_nk_grid",
 ]
+
+_EXPORT_MODULES = {
+    "InputSchema": ".ingest",
+    "LoadedInput": ".ingest",
+    "NKGridConfig": ".config",
+    "load_input": ".ingest",
+    "load_schema": ".ingest",
+    "run_nk_grid": ".nk_grid",
+}
+
+
+def __getattr__(name: str):
+    """Load execution dependencies only when an execution API is requested."""
+
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+
 
 __version__ = "1.0.0"

@@ -16,7 +16,8 @@ done
 case "$PROFILE" in
   local) ;;
   bmrc) source "$ROOT/launch/profiles/bmrc.sh" ;;
-  *) echo "Unknown profile: $PROFILE (choose local or bmrc)" >&2; exit 2 ;;
+  discoverer) source "$ROOT/launch/profiles/discoverer.sh" ;;
+  *) echo "Unknown profile: $PROFILE (choose local, bmrc or discoverer)" >&2; exit 2 ;;
 esac
 cd "$ROOT"
 if [ "$UPDATE" = 1 ] && [ "$PREVIEW" = 0 ]; then
@@ -41,4 +42,19 @@ export ENGINE_DIR="$ROOT/NK_Grid"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1
 BOOTSTRAP="${NKGRID_BOOTSTRAP_PYTHON:-python3}"
 command -v "$BOOTSTRAP" >/dev/null 2>&1 || BOOTSTRAP=python
+bootstrap_compatible() {
+  "$BOOTSTRAP" -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] < (3, 15) else 1)' >/dev/null 2>&1
+}
+# A preview skips installation/submission, but still needs a supported parser.
+# Login nodes may default to an older system Python even with a site profile.
+if ! bootstrap_compatible; then
+  if [ "$PREVIEW" = 1 ] && [ -n "${PYTHON_MODULE:-}" ] && [ -z "${NKGRID_BOOTSTRAP_PYTHON:-}" ] && command -v module >/dev/null 2>&1; then
+    module purge
+    module load "$PYTHON_MODULE"
+    hash -r
+    BOOTSTRAP=python3
+    command -v "$BOOTSTRAP" >/dev/null 2>&1 || BOOTSTRAP=python
+  fi
+  bootstrap_compatible || { echo 'Python 3.11–3.14 required; load the site Python module or set NKGRID_BOOTSTRAP_PYTHON to a supported interpreter.' >&2; exit 2; }
+fi
 exec "$BOOTSTRAP" "$ROOT/launch/experiment.py" "${ARGS[@]}"

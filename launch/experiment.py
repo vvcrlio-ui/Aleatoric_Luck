@@ -61,8 +61,8 @@ def path_from_repo(value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("target", choices=("local", "slurm", "execute"))
-    p.add_argument("--profile", choices=("local", "bmrc"), default="local")
+    p.add_argument("target", choices=("local", "slurm", "execute", "bootstrap"))
+    p.add_argument("--profile", choices=("local", "bmrc", "discoverer"), default="local")
     p.add_argument("--manifest", default="FFCWS/panels.yaml")
     p.add_argument("--panel", default="ffc_median_mode_gpa")
     p.add_argument("--preset", choices=("dev", "medium", "timing_full", "production", "pilot", "dev-dynamic"), default="dev")
@@ -73,22 +73,32 @@ def parser():
     p.add_argument("--refresh-env", action="store_true", help="Reinstall fixed dependencies into the selected environment")
     p.add_argument("--allow-large-run", action="store_true")
     p.add_argument("--max-jobs", type=positive, help="Local-only bound on model cells")
+    p.add_argument("--checkpoints", choices=("keep", "delete"),
+                   help="Keep or delete checkpoint data only after verified success; omission preserves the configured/default behavior")
     p.add_argument("--dry-run", action="store_true", help="Read-only launch preview; no installation, data reads or submission")
     p.add_argument("--resume", help="Slurm: reuse an existing plan JSON; do not regenerate the task table")
     p.add_argument("--account", help="Required for Slurm, including resume; explicitly enter your authorized project account")
+    p.add_argument("--qos", help="Discoverer QoS; defaults to the explicit account")
+    p.add_argument("--prepare-ffc", action="store_true", help="Discoverer: prepare selected FFC panel on a compute node")
+    p.add_argument("--ffc-data-dir", help="Directory containing background.dta, train.csv and test.csv")
     p.add_argument("--constraint", default=os.environ.get("NKGRID_CONSTRAINT"))
     p.add_argument("--partition")
     p.add_argument("--time", dest="time_limit")
-    p.add_argument("--workers", type=positive)
-    p.add_argument("--rounds", type=positive)
+    p.add_argument("--workers", type=positive, help="Worker cap; Discoverer timing_full/production resolves live capacity by default")
+    p.add_argument("--rounds", type=positive, help="Maximum continuation rounds; Discoverer submits only the current round")
     p.add_argument("--memory", help="Optional worker memory request, e.g. 16G")
-    p.add_argument("--plan-memory", default="16G")
+    p.add_argument("--plan-memory")
     p.add_argument("--plan-time", help="Planning job time; production 8h, other presets 1h")
     p.add_argument("--request", help=argparse.SUPPRESS)
     return p
 
 
 def launch_spec(args):
+    if args.profile == "discoverer":
+        from discoverer import configure
+        configure(args)
+    elif args.qos or args.prepare_ffc or args.ffc_data_dir:
+        raise ValueError("--qos, --prepare-ffc and --ffc-data-dir require --profile discoverer")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.panel):
         raise ValueError("panel name may contain only letters, digits, _, . and -")
     if args.target == "slurm" and args.max_jobs:
@@ -111,6 +121,8 @@ def launch_spec(args):
                    time_limit=args.time_limit or ("10-00:00:00" if production else "01:00:00"),
                    workers=args.workers or (600 if production else 32), rounds=args.rounds or (4 if production else 2),
                    memory_override=args.memory)
+    if args.profile == "discoverer":
+        cluster.update(qos=args.qos, single_node=True, workers=args.workers or 1)
     for value in [*cluster.values(), args.plan_time, args.plan_memory]:
         if isinstance(value, str) and ("\n" in value or "\r" in value or "\x00" in value):
             raise ValueError("scheduler fields must be single-line strings")
@@ -118,11 +130,51 @@ def launch_spec(args):
     if not manifest.is_file():
         raise ValueError(f"manifest does not exist: {manifest}")
     output = path_from_repo(args.output) if args.output else ROOT / "runs" / (args.panel + "-" + uuid.uuid4().hex[:12])
-    return dict(format_version=1, target=args.target, panel=args.panel, preset=args.preset,
+    result = dict(format_version=1, target=args.target, profile=args.profile, panel=args.panel, preset=args.preset,
                 manifest=str(manifest), schema=str(path_from_repo(args.schema)) if args.schema else None,
                 models=args.models, output=str(output), allow_large_run=args.allow_large_run,
-                max_jobs=args.max_jobs, cluster=cluster, plan_memory=args.plan_memory,
+                max_jobs=args.max_jobs, cluster=cluster, plan_memory=args.plan_memory or "16G",
+                checkpoint_retention=args.checkpoints or "default",
                 plan_time=args.plan_time or ("08:00:00" if production else "01:00:00"))
+    if args.profile == "discoverer":
+        result["continuation"] = {"worker_cap": args.workers, "max_rounds": args.rounds or 2,
+                                  "max_no_progress_rounds": 2, "max_control_failures": 3,
+                                  "max_control_jobs": 4 * (args.rounds or 2) + 8}
+    return result
+
+
+def validate_resume_checkpoints(plan_path, requested=None):
+    """A resumed dynamic run keeps the policy frozen in its snapshot."""
+    plan_path = Path(plan_path)
+    if not plan_path.is_file():
+        raise ValueError(f"plan does not exist: {plan_path}")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    snapshot_path = plan.get("snapshot")
+    if not snapshot_path:
+        if requested is None:
+            return
+        raise ValueError("cannot confirm frozen checkpoint policy: plan has no snapshot")
+    snapshot_path = Path(snapshot_path)
+    if not snapshot_path.is_absolute():
+        snapshot_path = plan_path.parent / snapshot_path
+    if not snapshot_path.is_file():
+        raise ValueError(f"cannot confirm frozen checkpoint policy: snapshot does not exist: {snapshot_path}")
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    output_dir = snapshot.get("output_dir")
+    if output_dir:
+        output_dir = Path(output_dir)
+        if not output_dir.is_absolute():
+            output_dir = snapshot_path.parent / output_dir
+        if (output_dir / "checkpoint-archive.json").exists():
+            raise ValueError("run already completed and its checkpoints were archived/deleted; final CSV is retained; do not resume training")
+    frozen = snapshot.get("config", {}).get("checkpoint_retention", "default")
+    if frozen not in ("default", "keep", "delete"):
+        raise ValueError(f"invalid frozen checkpoint_retention: {frozen!r}")
+    # Historical dynamic runs retain WAL when no retention policy was set.
+    effective = "keep" if frozen == "default" else frozen
+    if requested is not None and requested != effective:
+        raise ValueError(f"resume cannot override frozen checkpoint policy ({effective}); omit --checkpoints or use --checkpoints {effective}")
+    return effective
 
 
 def ensure_environment(args):
@@ -204,7 +256,10 @@ def resolve_experiment(spec):
         raise ValueError("--models must be a unique subset of the declared panel models")
     config = replace(config, out=Path(spec["output"]) / "final.csv", models=models,
                      schema=Path(spec["schema"]) if spec["schema"] else config.schema,
-                     n_jobs=1, allow_large_run=spec["allow_large_run"])
+                     n_jobs=1, allow_large_run=spec["allow_large_run"],
+                     checkpoint_retention=(config.checkpoint_retention
+                                           if spec.get("checkpoint_retention", "default") == "default"
+                                           else spec["checkpoint_retention"]))
     try:
         loaded = load_input(config.schema, config.outcome)
     except FileNotFoundError as exc:
@@ -237,8 +292,11 @@ def execute(spec):
                              snapshot_path=output / "snapshot.json", output_dir=output / "out", panel=spec["panel"])
     plan_path = output / "plan.json"
     atomic_json(plan_path, plan)
-    # Existing submitter preserves receipts, generations, WAL and publication gates.
-    command(["bash", ROOT / "NK_Grid/slurm/submit_flat_task_table.sh", "--submit", plan_path], cwd=output)
+    if spec.get("profile") == "discoverer":
+        from discoverer_continuation import start
+        start(spec, plan_path)
+    else:
+        command(["bash", ROOT / "NK_Grid/slurm/submit_flat_task_table.sh", "--submit", plan_path], cwd=output)
 
 
 def slurm_command(spec, request):
@@ -255,14 +313,30 @@ def slurm_command(spec, request):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.target == "bootstrap":
+        if args.checkpoints is not None:
+            raise ValueError("bootstrap reuses the frozen launch request; set --checkpoints on slurm instead")
+        from discoverer import bootstrap
+        bootstrap(args.request)
+        return
     if args.target == "execute":
         if not args.request:
             raise ValueError("execute requires --request")
+        if args.checkpoints is not None:
+            raise ValueError("execute reuses the frozen launch request; set --checkpoints on local or slurm instead")
         if sys.platform == "win32":
             raise ValueError("Full engine execution requires Linux/WSL")
         execute(json.loads(Path(args.request).read_text(encoding="utf-8")))
         return
     spec = launch_spec(args)
+    if args.resume:
+        resume_retention = validate_resume_checkpoints(path_from_repo(args.resume), args.checkpoints)
+        if resume_retention is not None:
+            spec["checkpoint_retention"] = resume_retention
+    if args.profile == "discoverer":
+        from discoverer import launch
+        launch(args, spec)
+        return
     if args.dry_run:
         print(json.dumps({"launch": spec, "resume": args.resume, "venv": args.venv or os.environ.get("VENV", ".venv-linux"),
                           "actions": ["validate/reuse or create environment", "reuse plan" if args.resume else
