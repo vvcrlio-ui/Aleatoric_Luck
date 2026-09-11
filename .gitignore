@@ -52,8 +52,6 @@ plans/
 reports/
 
 # Local implementation/review notes
-# Keep README files local at every directory depth, regardless of case or suffix.
-[Rr][Ee][Aa][Dd][Mm][Ee]*
 # Keep launch/ source tracked; docs/ is maintained locally only.
 /docs/
 /AGENTS.md
