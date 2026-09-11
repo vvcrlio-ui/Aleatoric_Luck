@@ -38,7 +38,7 @@ def prepare(args):
             algorithm_version=session.algorithm_version,
             resolved_model_params=nk.resolved_model_params(session.selected_model_params),
             environment_overrides=nk.model_run_settings(config.models),
-            execution_groups=[{'k_features': k, 'groups': [{'group': g, 'models': list(ms)}
+            execution_groups=[{'k_features': int(k), 'groups': [{'group': g, 'models': list(ms)}
                 for g, ms in nk.execution_groups_for_models(config.models)]} for k in session.k_grid],
             input_provenance=nk._frozen_input_provenance_for_schema(session.schema), require_clean_worktree=True)
     payload = spec.to_payload()
