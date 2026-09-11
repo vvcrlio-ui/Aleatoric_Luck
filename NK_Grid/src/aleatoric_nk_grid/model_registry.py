@@ -73,7 +73,7 @@ MODEL_PARAM_KEYS = {
         },
         "lasso": {
             "alpha_log10_min", "alpha_log10_max", "n_alphas",
-            "max_cv_folds", "max_iter",
+            "max_cv_folds", "max_iter", "alpha_scale", "tol",
         },
         "random_forest": {"n_estimators", "max_features", "min_samples_leaf"},
         "extra_trees": {"n_estimators", "max_features", "min_samples_leaf"},
@@ -1157,6 +1157,10 @@ def make_model(
             AdaptiveRidgeCV(**resolved_params),
         )
     if name == "lasso":
+        if resolved_params.get("alpha_scale") == "relative":
+            from .fold_local import FoldLocalLasso
+            return FoldLocalLasso(preprocessor=SimpleImputer(strategy="median"),
+                seed=seed, n_jobs=n_jobs, **resolved_params)
         return make_pipeline(
             SimpleImputer(strategy="median"),
             StandardScaler(),

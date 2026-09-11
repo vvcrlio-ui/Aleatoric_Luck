@@ -1,5 +1,21 @@
 # SMR data preparation
 
+## Regression Lasso protocol
+
+SMR model version `nkgrid-models-v7-relative-lasso-3fold-1` uses three-fold,
+fold-local Lasso CV. Each fold fits its own imputation and scaling and evaluates
+25 descending log-spaced ratios from 1 to 0.001 times that fold's alpha_max.
+The minimum mean fold MSE selects a ratio; ties select the stronger penalty.
+The final fit recomputes alpha_max using all training rows. The tolerance remains
+1e-4 and the iteration ceiling remains 20,000. No test outcomes select the grid.
+Weak-boundary selection and iteration-limit hits are recorded in worker logs;
+the search range does not silently expand for individual N/K cells.
+
+New runs must use a new identity and cannot import old absolute-alpha Lasso
+results as equivalent. `launch/fresh_single_model.py` prepares and verifies a
+fresh panel using the deployed direct-success dispatcher supplied by `--runtime`.
+Each model is an independent task with its own durable result receipt.
+
 SMR uses the provider's existing `asample2_withlag.csv` analysis matrix. The adapter selects predictors and outcomes using fixed definitions, describes category groups, and passes them to the shared engine. It does not reconstruct wages, income, lagged variables, or existing missingness indicators.
 
 ## Fixed variable definitions

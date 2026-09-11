@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v10-svd-gesvd-fallback-1
+algorithm_version: nk-grid-v11-relative-lasso-3fold-1
 
 regression:
   ols:
@@ -10,11 +10,14 @@ regression:
     n_alphas: 63
     scoring: neg_mean_squared_error
   lasso:
-    alpha_log10_min: -4
-    alpha_log10_max: 1
-    n_alphas: 50
-    max_cv_folds: 5
+    # Ratios to alpha_max computed independently within each training fold.
+    alpha_scale: relative
+    alpha_log10_min: -3
+    alpha_log10_max: 0
+    n_alphas: 25
+    max_cv_folds: 3
     max_iter: 20000
+    tol: 0.0001
   random_forest:
     n_estimators: 500
     max_features: sqrt
