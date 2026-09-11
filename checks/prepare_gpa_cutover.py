@@ -42,7 +42,7 @@ def main():
         kwargs = target(round_state)
         atomic_json(a.output / 'phase.json', {'phase': 'sealing'})
         closed = ft.close_generation(snapshot, **kwargs)
-        atomic_json(a.output / 'closed.json', closed)
+        atomic_json(a.output / 'closed.json', json.loads(json.dumps(closed, default=str)))
         atomic_json(a.output / 'phase.json', {'phase': 'exporting'})
         manifest = export_sealed(snapshot, target_arguments=kwargs, output=a.output / 'base', tmp_dir=scratch)
         certificate = source_compatibility(a.old, a.new)
