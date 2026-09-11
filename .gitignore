@@ -52,6 +52,12 @@ plans/
 reports/
 
 # Local implementation/review notes
+/checks/
+/NK_Grid/slurm/validate_single_model_scheduler.sbatch
+/*_VALIDATION.md
+/LOAD_BALANCE_698.md
+/SCHEDULER_DEVELOPMENT.md
+/SCHEDULER_RELEASE.md
 # Keep launch/ source tracked; docs/ is maintained locally only.
 /docs/
 /AGENTS.md
