@@ -5,19 +5,23 @@ must be provisioned and validated separately before a production deployment.
 """
 from __future__ import annotations
 import argparse
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import math
 import os
 import random
+import socket
 import ssl
 from pathlib import Path
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
-from .shared_queue import Dispatcher, QueueError, atomic_json, canonical
+from .shared_queue import Dispatcher, QueueError, atomic_json, canonical, file_lock
 
 
 class TransientServiceError(OSError):
@@ -25,16 +29,19 @@ class TransientServiceError(OSError):
 
 
 class Client:
-    def __init__(self, url, token, queue_id, *, ca_file=None):
+    def __init__(self, url, token, queue_id, *, ca_file=None, timeout=30):
         self.url = url.rstrip("/"); self.token = token; self.queue_id = queue_id
         self.context = ssl.create_default_context(cafile=ca_file) if ca_file else None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Request timeout must be positive and finite")
+        self.timeout = timeout
 
     def call(self, operation, **arguments):
         request = urllib.request.Request(self.url + "/" + operation,
             data=canonical({"queue_id": self.queue_id, **arguments}),
             headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=30, context=self.context) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             if exc.code == 429 or exc.code >= 500:
@@ -70,7 +77,8 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
                 if value.pop("queue_id", None) != dispatcher.queue_id:
                     raise QueueError("Wrong queue identity")
                 methods = {"/claim": dispatcher.claim, "/heartbeat": dispatcher.heartbeat,
-                           "/submit": dispatcher.submit, "/stats": dispatcher.stats}
+                           "/submit": dispatcher.submit, "/stats": dispatcher.stats,
+                           "/identity": lambda: {"queue_id": dispatcher.queue_id, "epoch": dispatcher.epoch}}
                 if self.path not in methods:
                     self.reply(404, {"error": "Unknown operation"}); return
                 self.reply(200, methods[self.path](**value))
@@ -89,6 +97,29 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
     return server
 
 
+@contextmanager
+def worker_slot(spool, queue_id):
+    """Persist one logical worker identity and exclusively own its durable spool.
+
+    Reuse the same path when restarting a slot, including on another node. Each
+    concurrent slot needs a distinct shared-storage path. Never copy a live slot.
+    """
+    root = Path(spool); root.mkdir(parents=True, exist_ok=True)
+    with file_lock(root / ".worker.lock"):
+        path = root / ".worker-identity"
+        if path.exists():
+            value = json.loads(path.read_bytes())
+            if (value.get("queue_id") != queue_id or
+                    not isinstance(value.get("worker"), str) or
+                    not 0 < len(value["worker"]) <= 256):
+                raise QueueError("Worker spool identity does not match this queue")
+        else:
+            value = {"queue_id": queue_id,
+                     "worker": socket.gethostname()[:200] + ":" + uuid.uuid4().hex}
+            atomic_json(path, value)
+        yield value["worker"]
+
+
 def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
                    heartbeat_seconds=20, idle_seconds=2., stop=lambda: False,
                    deadline_seconds=3600):
@@ -101,6 +132,26 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
     root = Path(spool); root.mkdir(parents=True, exist_ok=True)
     until = time.monotonic() + deadline_seconds
     accepted = 0
+    # Recover before claiming: an accepted result whose reply was lost will no
+    # longer be returned by claim. The server also checks live/stale lease tokens.
+    for receipt in sorted(root.glob("*.json")):
+        previous = json.loads(receipt.read_bytes())
+        if previous.get("queue_id") != client.queue_id:
+            raise QueueError("Result spool belongs to another queue")
+        while True:
+            try:
+                client.call("submit", task_id=receipt.stem, token=previous["token"],
+                            worker=worker, result=previous["result"])
+                receipt.unlink(); accepted += 1
+                break
+            except (OSError, urllib.error.URLError):
+                if time.monotonic() >= until:
+                    return {"state": "unacknowledged", "accepted": accepted, "receipt": str(receipt)}
+                time.sleep(idle_seconds)
+            except QueueError:
+                # Retain evidence. A reclaimed task gets a new token and must be
+                # recomputed; an obsolete result may never override its winner.
+                break
     while not stop() and time.monotonic() < until:
         try:
             lease = client.call("claim", worker=worker, cached_cells=cached_cells())
@@ -179,11 +230,18 @@ def main():
     parser.add_argument("--tls-cert", type=Path)
     parser.add_argument("--tls-key", type=Path)
     parser.add_argument("--drain-file", type=Path, help="Local control file: create to drain; remove to resume")
+    parser.add_argument("--ready-file", type=Path, help="Publish only after complete index rebuild and journal replay")
+    parser.add_argument("--generation", help="Unique controller-assigned launch generation for --ready-file")
+    parser.add_argument("--advertise-host", help="Resolvable TLS certificate hostname for the readiness endpoint")
     args = parser.parse_args()
     if bool(args.tls_cert) != bool(args.tls_key):
         parser.error('Both --tls-cert and --tls-key are required')
     if args.host not in ('127.0.0.1', '::1', 'localhost') and not args.tls_cert:
         parser.error('Non-loopback service requires TLS')
+    if bool(args.ready_file) != bool(args.generation):
+        parser.error('--ready-file and --generation must be supplied together')
+    if args.advertise_host and not args.ready_file:
+        parser.error('--advertise-host requires --ready-file')
     tls_context = None
     if args.tls_cert:
         tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -192,10 +250,19 @@ def main():
     token = args.token_file.read_text().strip()
     with Dispatcher(args.root, scratch=args.scratch) as dispatcher:
         server = make_server(dispatcher, token=token, host=args.host, port=args.port, tls_context=tls_context)
+        ready = None
         try:
+            if args.ready_file:
+                from .queue_readiness import publish_ready
+                host = args.advertise_host or (socket.getfqdn() if args.host in ('0.0.0.0', '::') else args.host)
+                ready = publish_ready(args.ready_file, dispatcher, host=host, port=server.server_port,
+                                      tls=tls_context is not None, generation=args.generation)
             serve_with_drain(server, drain_file=args.drain_file)
         finally:
             server.server_close()
+            if ready:
+                from .queue_readiness import remove_owned_ready
+                remove_owned_ready(args.ready_file, ready)
 
 
 if __name__ == "__main__":

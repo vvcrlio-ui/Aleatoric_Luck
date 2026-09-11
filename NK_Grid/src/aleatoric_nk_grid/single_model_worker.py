@@ -5,8 +5,6 @@ import json
 import math
 import os
 from pathlib import Path
-import socket
-import uuid
 
 from .shared_queue import Dispatcher, ModelTask, QueueError, digest
 from .scheduler_cost import CostEstimator, DEFAULT_COST_WEIGHTS
@@ -43,7 +41,7 @@ def run(args):
     from .execution_contract import CellExecutionSpec
     from .nk_grid import NKGridExecutionSession
     from .cell_cache import CachedSession, NodeInputStore, session_namespace
-    from .queue_service import Client, execute_worker
+    from .queue_service import Client, execute_worker, worker_slot
     manifest = json.loads((args.root / "manifest.json").read_bytes())
     queue_id = digest(manifest)
     if json.loads((args.root / "queue-id.json").read_bytes())["queue_id"] != queue_id:
@@ -52,8 +50,8 @@ def run(args):
     if spec.payload["model_n_jobs"] != 1:
         raise QueueError("First scheduler version requires one numerical thread")
     client = Client(args.url, args.token_file.read_text().strip(), queue_id, ca_file=args.ca_file)
-    worker = socket.gethostname() + ":" + str(os.getpid()) + ":" + uuid.uuid4().hex
-    with threadpool_limits(1), NKGridExecutionSession.open(spec, repo_root=args.repo_root) as session:
+    with worker_slot(args.spool, queue_id) as worker, threadpool_limits(1), \
+            NKGridExecutionSession.open(spec, repo_root=args.repo_root) as session:
         store = None
         if args.node_cache:
             store = NodeInputStore(args.node_cache, namespace=session_namespace(session), max_bytes=args.disk_cache_mib * 1024**2)
@@ -91,7 +89,8 @@ def main():
     worker.add_argument("--repo-root", type=Path, required=True)
     worker.add_argument("--token-file", type=Path, required=True)
     worker.add_argument("--ca-file", type=Path, help="Trust the private dispatcher CA; hostname verification remains enabled")
-    worker.add_argument("--spool", type=Path, required=True)
+    worker.add_argument("--spool", type=Path, required=True,
+        help="Durable directory unique to this logical slot; reuse it after a process/node restart")
     worker.add_argument("--node-cache", type=Path)
     worker.add_argument("--memory-cache-mib", type=int, default=0, help="Opt in after workload-specific benchmarks")
     worker.add_argument("--disk-cache-mib", type=int, default=1024)
