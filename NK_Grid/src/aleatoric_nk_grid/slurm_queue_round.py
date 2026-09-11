@@ -70,7 +70,7 @@ def run(args):
                         '-keyout', str(key), '-out', str(cert), '-config', str(cnf)],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         key.chmod(0o600)
-        scratch = Path('/dev/shm') / ('gpa-round-' + os.environ['SLURM_JOB_ID'])
+        scratch = Path('/dev/shm') / ('gpa-round-' + os.environ['SLURM_JOB_ID'] + '-' + generation)
         scratch.mkdir(exist_ok=False)
         if os.statvfs(scratch).f_bavail * os.statvfs(scratch).f_frsize < args.scratch_gib * 1024**3:
             raise QueueError('Insufficient node-local scratch for measured replay volume')
