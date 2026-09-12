@@ -59,13 +59,13 @@ bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --pre
 Use dev to check the path from input data through training to result output:
 
 ```bash
-bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset dev --checkpoints keep --output runs/ffc-gpa-dev
+bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset dev --checkpoints keep --output FFCWS/outputs/ffc-gpa-dev
 ```
 
 Use timing_full to check memory use, runtime, convergence, and failures across the full N/K range:
 
 ```bash
-bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset timing_full --checkpoints keep --output runs/ffc-gpa-timing
+bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset timing_full --checkpoints keep --output FFCWS/outputs/ffc-gpa-timing
 ```
 
 | Trial preset | Default size | Purpose |
@@ -80,7 +80,7 @@ Both use the panel's declared model list. timing_full assesses resource requirem
 Once trial results meet expectations, start the repeated experiment in a new directory:
 
 ```bash
-bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset production --allow-large-run --checkpoints keep --output runs/ffc-gpa-production
+bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset production --allow-large-run --checkpoints keep --output FFCWS/outputs/ffc-gpa-production
 ```
 
 production defaults to 100 seeds × 50 draws on the full 20×20 grid. `--allow-large-run` enables this scale. Each stage runs independently and saves its own results.
@@ -113,4 +113,4 @@ The shared entry point writes results to `final.csv` in the selected run directo
 
 Each row represents one model at a particular seed, draw, N, and K. `K_expanded` is the actual input column count. For regression, start with `mse`. `r2_test` uses the current training-sample mean as its baseline; R² relative to the test mean is stored separately as `r2_test_mean`.
 
-Use a new output directory for each stage. Omitting `--output` generates a unique directory automatically. To resume an existing Slurm run, use the original environment and account with `--resume PATH_TO_RUN/plan.json`.
+Use a new output directory for each stage. Omitting `--output` creates `<manifest directory>/outputs/<panel>-<unique ID>/` automatically, with the validated result in `final.csv`. FFC GPA defaults to `FFCWS/outputs/ffc_median_mode_gpa-<unique ID>/`; SMR panels default to `SMR/outputs/<panel>-<unique ID>/`. These paths are inside the repository. An explicit `--output` overrides the default. To resume an existing Slurm run, use the original environment and account with `--resume PATH_TO_RUN/plan.json`.

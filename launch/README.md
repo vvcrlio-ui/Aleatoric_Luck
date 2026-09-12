@@ -29,3 +29,40 @@ A resumed run reuses the original inputs and parameters, reads saved results, an
 `complete` means result validation, publication, and the selected checkpoint handling have finished. Training whose results were not saved before interruption is repeated on resume.
 
 Existing environment integrations include BMRC and Discoverer. Other clusters require configuration and submission scripts suited to their environment. See the [root quick start](../README.md) for installation, trial runs, and execution commands.
+
+## Default outputs and the GPA recovery entry
+
+New experiments use `run.sh`. Omitting `--output` creates
+`<manifest directory>/outputs/<panel>-<unique ID>/final.csv`.
+For FFC GPA this is under the repository's `FFCWS/outputs/`; SMR panels use
+`SMR/outputs/`. Explicit output paths and frozen resume paths take precedence.
+
+The new `python -m aleatoric_nk_grid.direct_success_queue` entry recovers an
+existing stopped GPA run. It enables lease recovery and threaded TLS handshakes;
+it does not replace `run.sh` for fresh experiments. With the intended Python
+environment, from the source checkout:
+
+```bash
+PYTHONPATH="$PWD/NK_Grid/src" python -m aleatoric_nk_grid.direct_success_queue prepare \
+  --base /absolute/path/to/stopped-gpa-run --repo "$PWD"
+```
+
+Without `--root`, prepare chooses a fresh directory under `<repo>/FFCWS/outputs/`
+and prints its absolute `root` and eventual `final_csv`. If `--repo` is omitted,
+the imported module's checkout is used for this default. An explicit `--root`
+overrides the location. Keep the reported root. Inside an existing Slurm
+allocation, run:
+
+```bash
+PYTHONPATH="$PWD/NK_Grid/src" python -m aleatoric_nk_grid.direct_success_queue run \
+  --root /absolute/path/reported/by/prepare --repo /absolute/path/to/frozen-scientific-checkout \
+  --old /absolute/path/to/original-checkout --workers 3
+```
+
+This example needs at least four allocated tasks: three workers and a controller.
+The command does not submit an allocation. The run's `--repo` must match the
+prepared manifest's scientific commit; preparation does not migrate that identity.
+Run always requires the exact prepared `--root`, never guesses a previous run,
+and publishes `<root>/final/ffc_median_mode_gpa.csv` plus `.manifest.json` only
+after complete validation. `--validate-only` skips the merge. Existing runs stay
+in their original directories.

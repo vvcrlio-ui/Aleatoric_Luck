@@ -486,18 +486,35 @@ def run(root, repo, old, workers, validate_only=False):
         merge(root, old)
 
 
-if __name__ == '__main__':
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'run'])
-    parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--root', type=Path, help='Prepared run directory; prepare defaults to <repo>/FFCWS/outputs/ffc_median_mode_gpa-<unique ID>')
     parser.add_argument('--base', type=Path)
     parser.add_argument('--repo', type=Path)
     parser.add_argument('--old', type=Path)
     parser.add_argument('--workers', type=int, default=21)
     parser.add_argument('--validate-only', action='store_true')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.command == 'prepare':
+        if args.base is None:
+            parser.error('prepare requires --base pointing to a stopped GPA run')
+        if args.root is None:
+            repo = (args.repo or Path(__file__).resolve().parents[3]).expanduser().resolve()
+            args.root = repo / 'FFCWS' / 'outputs' / ('ffc_median_mode_gpa-' + uuid.uuid4().hex[:12])
+        args.root = args.root.expanduser().resolve()
+        args.base = args.base.expanduser().resolve()
         owner_root = args.base if (args.base/'manifest.json').exists() else args.base/'queue'
         with file_lock(args.base / 'control/round.lock'), file_lock(owner_root / 'dispatcher.lock'):
             prepare(args.base, args.root)
-    else: run(args.root, args.repo, args.old, args.workers, args.validate_only)
+        print(json.dumps({'root': str(args.root),
+                          'final_csv': str(args.root / 'final' / 'ffc_median_mode_gpa.csv')}), flush=True)
+    else:
+        if args.root is None or args.repo is None or args.old is None:
+            parser.error('run requires --root from prepare, --repo and --old')
+        run(args.root.expanduser().resolve(), args.repo.expanduser().resolve(),
+            args.old.expanduser().resolve(), args.workers, args.validate_only)
+
+
+if __name__ == '__main__':
+    main()

@@ -66,7 +66,7 @@ def parser():
     p.add_argument("--manifest", default="FFCWS/panels.yaml")
     p.add_argument("--panel", default="ffc_median_mode_gpa")
     p.add_argument("--preset", choices=("dev", "medium", "timing_full", "production", "pilot", "dev-dynamic"), default="dev")
-    p.add_argument("--output", help="New run directory; defaults to runs/<panel>-<unique ID>")
+    p.add_argument("--output", help="New run directory; defaults to <manifest directory>/outputs/<panel>-<unique ID>")
     p.add_argument("--schema", help="Use existing prepared data via its schema; never rewrite tracked schema")
     p.add_argument("--models", nargs="+", help="Optional explicit subset of the panel's models")
     p.add_argument("--venv", help="Environment path (or VENV); created only when absent")
@@ -129,7 +129,7 @@ def launch_spec(args):
     manifest = path_from_repo(args.manifest)
     if not manifest.is_file():
         raise ValueError(f"manifest does not exist: {manifest}")
-    output = path_from_repo(args.output) if args.output else ROOT / "runs" / (args.panel + "-" + uuid.uuid4().hex[:12])
+    output = path_from_repo(args.output) if args.output else manifest.parent / "outputs" / (args.panel + "-" + uuid.uuid4().hex[:12])
     result = dict(format_version=1, target=args.target, profile=args.profile, panel=args.panel, preset=args.preset,
                 manifest=str(manifest), schema=str(path_from_repo(args.schema)) if args.schema else None,
                 models=args.models, output=str(output), allow_large_run=args.allow_large_run,
