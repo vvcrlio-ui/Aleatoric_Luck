@@ -14,6 +14,7 @@ import os
 import random
 import socket
 import ssl
+import sys
 from pathlib import Path
 import threading
 import time
@@ -21,7 +22,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-from .shared_queue import Dispatcher, QueueError, atomic_json, canonical, file_lock
+from .shared_queue import (Dispatcher, LeaseLostError, QueueError, atomic_json,
+                           canonical, digest, file_lock, sync_directory)
 
 
 class TransientServiceError(OSError):
@@ -46,10 +48,18 @@ class Client:
         except urllib.error.HTTPError as exc:
             if exc.code == 429 or exc.code >= 500:
                 raise TransientServiceError("Dispatcher temporarily unavailable") from exc
-            raise QueueError(exc.read().decode()) from exc
+            raw = exc.read().decode()
+            try:
+                error = json.loads(raw)
+            except ValueError:
+                error = {}
+            if exc.code == 409 and isinstance(error, dict) and error.get("code") == "lease_lost":
+                raise LeaseLostError(error.get("error", "Lease lost")) from exc
+            raise QueueError(raw) from exc
 
 
-def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None):
+def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None,
+                threaded_tls_handshake=False):
     if len(token) < 32:
         raise ValueError("Use a private random token of at least 32 characters")
 
@@ -82,6 +92,8 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
                 if self.path not in methods:
                     self.reply(404, {"error": "Unknown operation"}); return
                 self.reply(200, methods[self.path](**value))
+            except LeaseLostError as exc:
+                self.reply(409, {"error": str(exc), "code": "lease_lost"})
             except (QueueError, ValueError, TypeError, KeyError) as exc:
                 self.reply(409, {"error": str(exc)})
             except Exception:
@@ -89,8 +101,22 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
 
     class QueueHTTPServer(ThreadingHTTPServer):
         request_queue_size = 1024
+
+        def get_request(self):
+            connection, address = super().get_request()
+            if tls_context is not None and threaded_tls_handshake:
+                # Accept promptly. The bounded-time TLS handshake happens when
+                # the request thread reads, not on the single accept thread.
+                connection.settimeout(10)
+                try:
+                    connection = tls_context.wrap_socket(connection, server_side=True,
+                                                         do_handshake_on_connect=False)
+                except BaseException:
+                    connection.close()
+                    raise
+            return connection, address
     server = QueueHTTPServer((host, port), Handler)
-    if tls_context is not None:
+    if tls_context is not None and not threaded_tls_handshake:
         server.socket = tls_context.wrap_socket(server.socket, server_side=True)
     server.daemon_threads = True
     server.dispatcher = dispatcher
@@ -122,7 +148,7 @@ def worker_slot(spool, queue_id):
 
 def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
                    heartbeat_seconds=20, idle_seconds=2., stop=lambda: False,
-                   deadline_seconds=3600):
+                   deadline_seconds=3600, recover_stale_leases=False):
     """Keep one task in flight. Local spool survives a lost submit response.
 
     Stop is a drain: finish and acknowledge current model, then stop claiming.
@@ -132,6 +158,28 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
     root = Path(spool); root.mkdir(parents=True, exist_ok=True)
     until = time.monotonic() + deadline_seconds
     accepted = 0
+    recovered = 0
+
+    def report(state, **extra):
+        return {"state": state, "accepted": accepted,
+                **({"recovered_leases": recovered} if recovered else {}), **extra}
+
+    def quarantine(receipt, reason):
+        nonlocal recovered
+        # Keep every token's evidence outside the replay glob. Never retag a
+        # stale result with a new lease, or overwrite it on the next execution.
+        previous = json.loads(receipt.read_bytes())
+        rejected = root / "rejected"; rejected.mkdir(exist_ok=True)
+        target = rejected / (receipt.stem + "-" + digest(previous["token"]) + ".json")
+        if target.exists() and target.read_bytes() != receipt.read_bytes():
+            raise QueueError("Conflicting quarantined receipt")
+        os.replace(receipt, target)
+        sync_directory(rejected); sync_directory(root)
+        recovered += 1
+        print(json.dumps({"worker_event": "lease_recovered", "worker": worker,
+                          "reason": str(reason), "receipt": str(target)}),
+              file=sys.stderr, flush=True)
+        time.sleep(idle_seconds * random.uniform(.8, 1.2))
     # Recover before claiming: an accepted result whose reply was lost will no
     # longer be returned by claim. The server also checks live/stale lease tokens.
     for receipt in sorted(root.glob("*.json")):
@@ -146,11 +194,15 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
                 break
             except (OSError, urllib.error.URLError):
                 if time.monotonic() >= until:
-                    return {"state": "unacknowledged", "accepted": accepted, "receipt": str(receipt)}
+                    return report("unacknowledged", receipt=str(receipt))
                 time.sleep(idle_seconds)
-            except QueueError:
+            except QueueError as exc:
                 # Retain evidence. A reclaimed task gets a new token and must be
                 # recomputed; an obsolete result may never override its winner.
+                if recover_stale_leases:
+                    if not isinstance(exc, LeaseLostError):
+                        raise
+                    quarantine(receipt, exc)
                 break
     while not stop() and time.monotonic() < until:
         try:
@@ -158,17 +210,18 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
         except (OSError, urllib.error.URLError):
             time.sleep(idle_seconds * random.uniform(.8, 1.2)); continue
         if lease["state"] in {"complete", "blocked", "paused"}:
-            return {"state": lease["state"], "accepted": accepted}
+            return report(lease["state"])
         if lease["state"] == "wait":
             time.sleep(idle_seconds * random.uniform(.8, 1.2)); continue
         done = threading.Event(); lost = []
 
         def heartbeat(lease=lease, done=done, lost=lost):
-            while not done.wait(heartbeat_seconds):
+            while not done.wait(heartbeat_seconds * random.uniform(.8, 1.2)
+                                if recover_stale_leases else heartbeat_seconds):
                 try:
                     client.call("heartbeat", task_id=lease["id"], token=lease["token"], worker=worker)
                 except QueueError as exc:
-                    lost.append(str(exc)); return
+                    lost.append(exc); return
                 except (OSError, urllib.error.URLError):
                     # A network error is not proof of revoked ownership. The
                     # server's token/expiry check is authoritative at submit.
@@ -187,22 +240,35 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
                     result = {**lease["task"], "status": "failed", "error": f"{type(exc).__name__}: {exc}"}
                 atomic_json(receipt, {"queue_id": client.queue_id, "token": lease["token"], "result": result})
             if lost:
-                return {"state": "lease_lost", "accepted": accepted, "receipt": str(receipt)}
+                if recover_stale_leases:
+                    if not isinstance(lost[0], LeaseLostError):
+                        raise lost[0]
+                    quarantine(receipt, lost[0])
+                    continue
+                return report("lease_lost", receipt=str(receipt))
+            rejected = False
             while True:
                 try:
                     client.call("submit", task_id=lease["id"], token=lease["token"], worker=worker, result=result)
                     break
                 except (OSError, urllib.error.URLError):
                     if time.monotonic() >= until:
-                        return {"state": "unacknowledged", "accepted": accepted, "receipt": str(receipt)}
+                        return report("unacknowledged", receipt=str(receipt))
                     time.sleep(idle_seconds)
                 except QueueError as exc:
-                    return {"state": "submission_rejected", "accepted": accepted,
-                            "receipt": str(receipt), "error": str(exc)}
+                    if recover_stale_leases:
+                        if not isinstance(exc, LeaseLostError):
+                            raise
+                        quarantine(receipt, exc)
+                        rejected = True
+                        break
+                    return report("submission_rejected", receipt=str(receipt), error=str(exc))
+            if rejected:
+                continue
             receipt.unlink(); accepted += 1
         finally:
             done.set(); thread.join(timeout=5)
-    return {"state": "drained", "accepted": accepted}
+    return report("drained")
 
 
 def serve_with_drain(server, *, drain_file=None, stop=lambda: False):

@@ -35,6 +35,8 @@ def worker(args):
     command = [sys.executable, '-m', 'aleatoric_nk_grid.single_model_worker', 'run', str(root),
                '--url', info['url'], '--repo-root', ready['repo'], '--token-file', ready['token_file'],
                '--ca-file', ready['ca_file'], '--spool', str(slot), '--max-seconds', '172800']
+    if ready.get('recover_stale_leases', False):
+        command.append('--recover-stale-leases')
     # Exec ensures Slurm signals reach the actual numerical worker process.
     os.execv(sys.executable, command)
 

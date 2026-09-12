@@ -67,6 +67,7 @@ def run(args):
             report = execute_worker(client, worker, execute,
                 spool=args.spool, cached_cells=lambda: cached.cached_cells,
                 heartbeat_seconds=min(20., manifest["lease_seconds"] / 3),
+                recover_stale_leases=getattr(args, 'recover_stale_leases', False),
                 stop=lambda: bool(args.stop_file and args.stop_file.exists()),
                 deadline_seconds=args.max_seconds)
             report["cache"] = cached.stats; report["worker"] = worker
@@ -96,6 +97,8 @@ def main():
     worker.add_argument("--disk-cache-mib", type=int, default=1024)
     worker.add_argument("--stop-file", type=Path)
     worker.add_argument("--max-seconds", type=float, default=3600)
+    worker.add_argument("--recover-stale-leases", action="store_true",
+        help="Quarantine fenced results and keep claiming; requires typed lease-loss RPC")
     args = parser.parse_args()
     if args.command == "plan":
         identity = json.loads(args.identity.read_bytes())

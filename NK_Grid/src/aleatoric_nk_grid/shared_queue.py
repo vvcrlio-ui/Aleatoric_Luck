@@ -24,6 +24,10 @@ class QueueError(ValueError):
     pass
 
 
+class LeaseLostError(QueueError):
+    """Authoritative ownership loss; never a data/identity validation failure."""
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
@@ -292,7 +296,7 @@ class Dispatcher:
     def _check_lease(self, task_id, token, worker):
         row = self._get(task_id)
         if row["state"] != "leased" or row["token"] != token or row["worker"] != worker or row["expiry"] <= self.clock():
-            raise QueueError("Lease is stale, expired or owned by another worker")
+            raise LeaseLostError("Lease is stale, expired or owned by another worker")
         return row
 
     def claim(self, worker, *, cached_cells=()):
@@ -347,6 +351,8 @@ class Dispatcher:
             if row["state"] in {"done", "failed"}:
                 if row["accepted_token"] == token and row["result"] == canonical(result).decode():
                     return {"accepted": True, "duplicate": True}
+                if row["accepted_token"] != token:
+                    raise LeaseLostError("Completed task belongs to another lease")
                 raise QueueError("Conflicting or stale completed submission")
             self._check_lease(task_id, token, worker)
             self._commit({"kind": "result", "id": task_id, "token": token, "result": result})
