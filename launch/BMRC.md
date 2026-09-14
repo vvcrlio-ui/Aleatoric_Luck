@@ -73,9 +73,9 @@ Saved prediction error is MSE for regression and probability-prediction Brier sc
 
 `--checkpoints keep` is the default. To delete intermediate checkpoints after complete validated publication, explicitly add `--checkpoints delete` to the original launch. Only that run's `rounds/` is removed. Worker logs, manifests, progress and allocation evidence are first retained under `logs/<round>/`; inputs, environment, configuration, final results and verification receipts remain. Interrupted or incomplete runs retain their checkpoints. A failure while archiving logs also leaves checkpoints in place. Checkpoint policy cannot change on resume.
 
-## Charlie's BMRC acceptance
+## BMRC validation
 
-Native BMRC acceptance is **pending**. Development validation used portable Windows queue tests, real loopback TLS clients with a deliberately lost acknowledgement, and synthetic data; it does not certify BMRC modules, cross-node networking, native numerical fits, or scheduler resource accounting. The developer could not connect to BMRC. Record site acceptance separately from local test results.
+Native BMRC validation is **pending**. Local validation used portable Windows queue tests, real loopback TLS clients with a deliberately lost acknowledgement, and synthetic data; it does not certify BMRC modules, cross-node networking, native numerical fits, or scheduler resource accounting. Record site validation separately from local test results.
 
 First run a small suite with an explicit account and a separate resource file:
 

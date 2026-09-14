@@ -30,7 +30,7 @@ FFCWS retains the official train/test split and uses only the official training 
 
 ## Quick start
 
-For Charlie's **BMRC non-GPA suite**, clone the delivery branch and run all fifteen panels with one command after making the raw FFC files available:
+To run the **BMRC non-GPA suite**, clone the `SMR&FFC` branch and run all fifteen panels with one command after making the raw FFC files available:
 
 ```bash
 git clone --branch 'SMR&FFC' --single-branch https://github.com/OxfordDemSci/aleatoric_luck.git
@@ -40,7 +40,7 @@ bash run.sh slurm --profile bmrc --suite ffc_non_gpa --preset timing_full \
   --resources FFCWS/outputs/bmrc-resources.json
 ```
 
-The raw directory contains `background.dta`, `train.csv`, and `test.csv`. Environment installation and all data preparation run on compute nodes. Checkpoints are kept by default. `timing_full` and `production` reuse the same saved allocation; their default round limits are 24 hours and 10 days respectively. See the [BMRC suite guide](launch/BMRC.md) for production, keep/delete, status, resume, and Charlie's native cluster acceptance steps. The single-panel commands below remain available.
+The raw directory contains `background.dta`, `train.csv`, and `test.csv`. Environment installation and all data preparation run on compute nodes. Checkpoints are kept by default. `timing_full` and `production` reuse the same saved allocation; their default round limits are 24 hours and 10 days respectively. See the [BMRC suite guide](launch/BMRC.md) for production, keep/delete, status, resume, and native cluster validation steps. The single-panel commands below remain available.
 
 The shared entry point is `run.sh`. Each stage starts with one command. The recommended sequence is:
 
