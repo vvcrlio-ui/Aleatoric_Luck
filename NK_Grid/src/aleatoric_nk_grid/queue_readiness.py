@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import re
+import random
 import time
 from urllib.parse import urlsplit
 
@@ -84,7 +85,8 @@ def wait_ready(path, *, queue_id, generation, token, ca_file=None,
         except OSError:
             # Missing file/unavailable endpoint is never proof of readiness.
             pass
-        time.sleep(min(poll_seconds, max(0., deadline - time.monotonic())))
+        time.sleep(min(poll_seconds * random.uniform(.5, 1.5),
+                       max(0., deadline - time.monotonic())))
 
 
 def main():

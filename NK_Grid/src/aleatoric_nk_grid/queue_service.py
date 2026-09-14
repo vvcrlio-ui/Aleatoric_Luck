@@ -46,9 +46,11 @@ class Client:
             with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            if exc.code == 429 or exc.code >= 500:
-                raise TransientServiceError("Dispatcher temporarily unavailable") from exc
-            raw = exc.read().decode()
+            # HTTPError owns the response socket too, including retryable errors.
+            with exc:
+                if exc.code == 429 or exc.code >= 500:
+                    raise TransientServiceError("Dispatcher temporarily unavailable") from exc
+                raw = exc.read().decode()
             try:
                 error = json.loads(raw)
             except ValueError:
@@ -58,10 +60,41 @@ class Client:
             raise QueueError(raw) from exc
 
 
+def connection_budget(requested, *, fd_reserve=64):
+    """Leave descriptors for the journal, progress, subprocesses and shutdown."""
+    if type(requested) is not int or requested < 1:
+        raise ValueError("max_connections must be a positive integer")
+    try:
+        import resource
+    except ImportError:  # Windows has no RLIMIT_NOFILE.
+        return requested
+    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        return requested
+    try:
+        used = len(os.listdir('/proc/self/fd'))
+    except OSError:
+        used = 32
+    available = int(soft) - used - fd_reserve - 1  # Listening socket.
+    if available < 1:
+        raise QueueError("Insufficient file descriptors for dispatcher and control reserve")
+    return min(requested, available)
+
+
+def retry_delay(failures, base=2., cap=30.):
+    """Capped exponential backoff with jitter, below the 300s GPA lease."""
+    return random.uniform(.5, 1.) * min(cap, base * 2 ** min(failures, 10))
+
+
 def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None,
-                threaded_tls_handshake=False):
+                threaded_tls_handshake=False, max_connections=128, request_timeout=10.):
+    # Keep threaded_tls_handshake for existing launchers; all TLS now uses the
+    # bounded request threads, never a handshake on the single accept thread.
     if len(token) < 32:
         raise ValueError("Use a private random token of at least 32 characters")
+    if not math.isfinite(request_timeout) or request_timeout <= 0:
+        raise ValueError("Request timeout must be positive and finite")
+    capacity = connection_budget(max_connections)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -74,7 +107,6 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
 
         def do_POST(self):
             try:
-                self.connection.settimeout(10)
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 1024 * 1024:
                     raise QueueError("Invalid request size")
@@ -96,29 +128,94 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
                 self.reply(409, {"error": str(exc), "code": "lease_lost"})
             except (QueueError, ValueError, TypeError, KeyError) as exc:
                 self.reply(409, {"error": str(exc)})
+            except (ConnectionError, ssl.SSLError, TimeoutError):
+                # The peer is gone: a second reply only creates another traceback.
+                raise
             except Exception:
                 self.reply(503, {"error": "Dispatcher unavailable; retain result and retry"})
 
     class QueueHTTPServer(ThreadingHTTPServer):
         request_queue_size = 1024
+        daemon_threads = False
+        block_on_close = True
+
+        def __init__(self, *args):
+            self.slots = threading.BoundedSemaphore(capacity)
+            self.metrics_lock = threading.Lock()
+            self.active_connections = self.peak_connections = self.transport_errors = 0
+            super().__init__(*args)
+
+        def connection_stats(self):
+            with self.metrics_lock:
+                value = dict(max_connections=capacity, active_connections=self.active_connections,
+                             peak_connections=self.peak_connections, transport_errors=self.transport_errors)
+            try:
+                import resource
+                value['nofile_soft_limit'] = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+                value['open_fds'] = len(os.listdir('/proc/self/fd'))
+            except (ImportError, OSError):
+                pass
+            return value
 
         def get_request(self):
-            connection, address = super().get_request()
-            if tls_context is not None and threaded_tls_handshake:
-                # Accept promptly. The bounded-time TLS handshake happens when
-                # the request thread reads, not on the single accept thread.
-                connection.settimeout(10)
-                try:
-                    connection = tls_context.wrap_socket(connection, server_side=True,
-                                                         do_handshake_on_connect=False)
-                except BaseException:
+            # Acquire BEFORE accept: queued peers stay in the kernel backlog and
+            # consume neither a process FD nor a Python thread. A short wait lets
+            # serve_forever observe shutdown even when every slot is occupied.
+            if not self.slots.acquire(timeout=.05):
+                raise BlockingIOError("Dispatcher connection capacity reached")
+            connection = None
+            try:
+                connection, address = super().get_request()
+                connection.settimeout(request_timeout)  # Includes HTTP headers.
+                with self.metrics_lock:
+                    self.active_connections += 1
+                    self.peak_connections = max(self.peak_connections, self.active_connections)
+                return connection, address
+            except BaseException:
+                if connection is not None:
                     connection.close()
-                    raise
-            return connection, address
+                self.slots.release()
+                raise
+
+        def release_slot(self):
+            with self.metrics_lock:
+                self.active_connections -= 1
+            self.slots.release()
+
+        def process_request(self, request, address):
+            try:
+                super().process_request(request, address)
+            except BaseException:
+                self.release_slot()  # Thread creation failed; base server closes FD.
+                # ThreadingMixIn registers the thread before start(). Remove an
+                # unstarted thread so server_close() can still join the others.
+                if hasattr(self._threads, 'reap'):
+                    self._threads.reap()
+                raise
+
+        def process_request_thread(self, request, address):
+            try:
+                if tls_context is not None:
+                    request = tls_context.wrap_socket(request, server_side=True,
+                                                      do_handshake_on_connect=False)
+                    request.do_handshake()
+                self.finish_request(request, address)
+            except Exception:
+                self.handle_error(request, address)
+            finally:
+                try:
+                    self.shutdown_request(request)
+                finally:
+                    self.release_slot()
+
+        def handle_error(self, request, address):
+            if isinstance(sys.exc_info()[1], (ConnectionError, ssl.SSLError, TimeoutError)):
+                with self.metrics_lock:
+                    self.transport_errors += 1
+                return
+            super().handle_error(request, address)
+
     server = QueueHTTPServer((host, port), Handler)
-    if tls_context is not None and not threaded_tls_handshake:
-        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
-    server.daemon_threads = True
     server.dispatcher = dispatcher
     return server
 
@@ -186,6 +283,7 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
         previous = json.loads(receipt.read_bytes())
         if previous.get("queue_id") != client.queue_id:
             raise QueueError("Result spool belongs to another queue")
+        failures = 0
         while True:
             try:
                 client.call("submit", task_id=receipt.stem, token=previous["token"],
@@ -195,7 +293,7 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
             except (OSError, urllib.error.URLError):
                 if time.monotonic() >= until:
                     return report("unacknowledged", receipt=str(receipt))
-                time.sleep(idle_seconds)
+                time.sleep(retry_delay(failures, idle_seconds)); failures += 1
             except QueueError as exc:
                 # Retain evidence. A reclaimed task gets a new token and must be
                 # recomputed; an obsolete result may never override its winner.
@@ -204,11 +302,13 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
                         raise
                     quarantine(receipt, exc)
                 break
+    failures = 0
     while not stop() and time.monotonic() < until:
         try:
             lease = client.call("claim", worker=worker, cached_cells=cached_cells())
         except (OSError, urllib.error.URLError):
-            time.sleep(idle_seconds * random.uniform(.8, 1.2)); continue
+            time.sleep(retry_delay(failures, idle_seconds)); failures += 1; continue
+        failures = 0
         if lease["state"] in {"complete", "blocked", "paused"}:
             return report(lease["state"])
         if lease["state"] == "wait":
@@ -216,8 +316,7 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
         done = threading.Event(); lost = []
 
         def heartbeat(lease=lease, done=done, lost=lost):
-            while not done.wait(heartbeat_seconds * random.uniform(.8, 1.2)
-                                if recover_stale_leases else heartbeat_seconds):
+            while not done.wait(heartbeat_seconds * random.uniform(.8, 1.2)):
                 try:
                     client.call("heartbeat", task_id=lease["id"], token=lease["token"], worker=worker)
                 except QueueError as exc:
@@ -254,7 +353,7 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
                 except (OSError, urllib.error.URLError):
                     if time.monotonic() >= until:
                         return report("unacknowledged", receipt=str(receipt))
-                    time.sleep(idle_seconds)
+                    time.sleep(retry_delay(failures, idle_seconds)); failures += 1
                 except QueueError as exc:
                     if recover_stale_leases:
                         if not isinstance(exc, LeaseLostError):

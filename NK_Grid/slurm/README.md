@@ -4,7 +4,7 @@ Cluster execution distributes predefined N/K, seed, draw, and model combinations
 
 ## Define the experiment, then distribute tasks
 
-The code first determines all training combinations in the experiment and organizes them into tasks. Depending on the scheduling path, tasks are assigned in groups or claimed individually from a shared queue.
+The code freezes every `(seed, draw, N, K, model)` combination. All new cluster submissions use one shared single-model queue, with estimated expensive tasks first and workers free to claim any model.
 
 Slurm allocates resources according to the submission script. Workers obtain tasks, call the engine, save results, and continue with subsequent tasks. Before preparing another batch, the program excludes combinations with valid saved results.
 
@@ -22,8 +22,8 @@ If checkpoint cleanup is selected, it takes place after result validation.
 
 ## Adapting to different clusters
 
-Cluster configuration covers accounts, partitions, CPU and memory requests, wall-time limits, environment loading, and data paths. The integration also controls batched submission and resumption. Task computation and result merging use shared code. Other clusters require environment configuration and submission scripts that match their requirements.
+Cluster configuration covers accounts, partitions, CPU and memory requests, wall-time limits, environment loading, and data paths. BMRC, Discoverer and other configured Slurm clusters all use `launch/cluster_scheduler.py` for submission and resumption. Each round checks live scoped limits and CPU-minute headroom, reserves a dispatcher task, and submits one worker allocation. Resource checks are conservative; Slurm determines when the allocation starts.
 
-Use the root entry point for routine runs. `calibrate.sbatch` probes memory usage with synthetic data; `plan_production.sbatch` and `make_production_request.py` support manual planning; `submit_nk_grid.sh`, `run_nk_grid.sbatch`, and `finalize_seed_shards.sbatch` maintain legacy static runs.
+Use `run.sh slurm` for new experiments. `submit_flat_task_table.sh [--submit] PLAN.json` routes saved single-model plans to the shared scheduler and historical grouped plans to their original journaled protocol. The pre-table `submit_nk_grid.sh` submission path is retired. Historical snapshot, input and code checks remain in force; recover existing jobs from their original frozen checkout, or explicitly migrate sealed results. Calibration scripts remain diagnostic tools. The [BMRC multi-panel suite](../../launch/BMRC.md) uses a shared pool across panels and a fixed resource file.
 
-See [flat_task_table.py](../src/aleatoric_nk_grid/flat_task_table.py) for the task-table implementation, [launch](../../launch/README.md) for the launch flow, and the [root README](../../README.md) for execution examples.
+See [cluster_queue.py](../src/aleatoric_nk_grid/cluster_queue.py) for task preparation and publication, [launch](../../launch/README.md) for the launch flow, and the [root README](../../README.md) for examples.

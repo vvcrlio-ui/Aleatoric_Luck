@@ -30,6 +30,18 @@ FFCWS retains the official train/test split and uses only the official training 
 
 ## Quick start
 
+For Charlie's **BMRC non-GPA suite**, clone the delivery branch and run all fifteen panels with one command after making the raw FFC files available:
+
+```bash
+git clone --branch 'SMR&FFC' --single-branch https://github.com/OxfordDemSci/aleatoric_luck.git
+cd aleatoric_luck
+bash run.sh slurm --profile bmrc --suite ffc_non_gpa --preset timing_full \
+  --account YOUR_PROJECT_ACCOUNT --ffc-data-dir /path/to/FFC \
+  --resources FFCWS/outputs/bmrc-resources.json
+```
+
+The raw directory contains `background.dta`, `train.csv`, and `test.csv`. Environment installation and all data preparation run on compute nodes. Checkpoints are kept by default. `timing_full` and `production` reuse the same saved allocation; their default round limits are 24 hours and 10 days respectively. See the [BMRC suite guide](launch/BMRC.md) for production, keep/delete, status, resume, and Charlie's native cluster acceptance steps. The single-panel commands below remain available.
+
 The shared entry point is `run.sh`. Each stage starts with one command. The recommended sequence is:
 
 ```text
@@ -95,7 +107,7 @@ The workflow applies to local and cluster execution. Use the same environment pr
 | BMRC | `bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT` |
 | Discoverer | `bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT` |
 
-Replace `YOUR_ACCOUNT` with your account. Other clusters require their own environment configuration and submission integration. Slurm submission uses a clean, committed checkout.
+Replace `YOUR_ACCOUNT` with your account. All Slurm profiles use the same single-model queue and per-round continuation. Other Slurm clusters use `bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION --constraint none --qos YOUR_QOS`, with a compatible Python environment and site-appropriate resource options. Slurm submission uses a clean, committed checkout. See [cluster requirements and resource checks](launch/README.md).
 
 The launcher creates or checks the Python environment and installs locked dependencies. Local execution supports Python 3.11–3.14; use WSL on Windows.
 
@@ -109,7 +121,7 @@ On Discoverer, `--prepare-ffc --ffc-data-dir YOUR_DATA_DIRECTORY` prepares the s
 
 The shared entry point writes results to `final.csv` in the selected run directory. After a trial, check process or scheduler logs for OOM errors and timeouts, and inspect the result columns `status` and `error`.
 
-`ok` means fitting completed, `skipped` means the combination was skipped because of data conditions, and `failed` means execution failed. Completion records describe overall run status; Discoverer uses `continuation.json`.
+`ok` means fitting completed, `skipped` means the combination was skipped because of data conditions, and `failed` means execution failed. New cluster runs record overall status in `cluster-state.json`; `verified.json` confirms complete, validated publication. Historical Discoverer runs retain their original `continuation.json` protocol.
 
 Each row represents one model at a particular seed, draw, N, and K. `K_expanded` is the actual input column count. For regression, start with `mse`. `r2_test` uses the current training-sample mean as its baseline; R² relative to the test mean is stored separately as `r2_test_mean`.
 

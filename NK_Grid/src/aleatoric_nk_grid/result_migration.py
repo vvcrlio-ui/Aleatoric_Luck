@@ -82,8 +82,8 @@ def source_compatibility(old_repo, new_repo):
 
 
 def validate_scientific_result(row, *, task_kind):
-    if task_kind != "regression":
-        raise QueueError("First migration implementation supports regression only")
+    if task_kind not in ("regression", "classification"):
+        raise QueueError("Unknown frozen task kind")
     status = row.get("status")
     if status == "failed":
         return False
@@ -93,7 +93,7 @@ def validate_scientific_result(row, *, task_kind):
         return True
     if status != "ok":
         raise QueueError("Unknown result status")
-    metrics = ("mse", "rmse", "mae")
+    metrics = ("mse", "rmse", "mae") if task_kind == "regression" else ("brier", "accuracy")
     for metric in metrics:
         try:
             value = float(row[metric])
@@ -101,6 +101,8 @@ def validate_scientific_result(row, *, task_kind):
             raise QueueError(f"Invalid metric: {metric}") from exc
         if not math.isfinite(value) or value < 0:
             raise QueueError(f"Nonfinite/negative metric: {metric}")
+        if task_kind == "classification" and value > 1:
+            raise QueueError(f"Classification metric outside [0,1]: {metric}")
     return True
 
 

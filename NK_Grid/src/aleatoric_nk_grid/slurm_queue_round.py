@@ -8,6 +8,7 @@ are submitted here. A failed/interrupted round is recoverable from this root.
 import argparse
 import json
 import os
+import random
 from pathlib import Path
 import secrets
 import signal
@@ -28,13 +29,16 @@ def read(path):
 
 def worker(args):
     ready = read(args.launch)
+    # Spread cross-node readiness/TLS admission after a large srun launch.
+    time.sleep(random.uniform(0., ready.get('startup_jitter_seconds', 0.)))
     root = Path(ready['queue'])
     slot = Path(ready['control']) / 'spools' / os.environ['SLURM_PROCID']
     info = wait_ready(ready['ready_file'], queue_id=ready['queue_id'], generation=ready['generation'],
                       token=Path(ready['token_file']).read_text().strip(), ca_file=ready['ca_file'])
     command = [sys.executable, '-m', 'aleatoric_nk_grid.single_model_worker', 'run', str(root),
                '--url', info['url'], '--repo-root', ready['repo'], '--token-file', ready['token_file'],
-               '--ca-file', ready['ca_file'], '--spool', str(slot), '--max-seconds', '172800']
+               '--ca-file', ready['ca_file'], '--spool', str(slot),
+               '--max-seconds', str(ready.get('max_seconds', 172800))]
     if ready.get('recover_stale_leases', False):
         command.append('--recover-stale-leases')
     # Exec ensures Slurm signals reach the actual numerical worker process.

@@ -20,6 +20,8 @@ case "$PROFILE" in
   *) echo "Unknown profile: $PROFILE (choose local, bmrc or discoverer)" >&2; exit 2 ;;
 esac
 cd "$ROOT"
+# Status never loads a cluster module or installs dependencies.
+if [ "${ARGS[0]:-}" = status ]; then PREVIEW=1; fi
 if [ "$UPDATE" = 1 ] && [ "$PREVIEW" = 0 ]; then
   [ "$(git branch --show-current)" = 'SMR&FFC' ] || { echo 'Update requires branch SMR&FFC; switch explicitly first.' >&2; exit 2; }
   [ -z "$(git status --porcelain)" ] || { echo 'Update refused: worktree has changes.' >&2; exit 2; }

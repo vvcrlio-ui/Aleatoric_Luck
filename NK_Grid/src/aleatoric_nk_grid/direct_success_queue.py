@@ -8,6 +8,7 @@ import argparse
 from array import array
 from collections import deque
 from dataclasses import asdict
+import errno
 import hashlib
 import heapq
 import json
@@ -334,7 +335,7 @@ class FlatDispatcher(Dispatcher):
                         raise LeaseLostError('Completed task belongs to another lease')
                     raise QueueError('Conflicting completed result')
                 if result['status'] != 'failed':
-                    validate_scientific_result(result, task_kind='regression')
+                    validate_scientific_result(result, task_kind=self.manifest['identity'].get('task_kind', 'regression'))
                     if result.get('algorithm_version') != self.manifest['identity']['cell_spec']['algorithm_version']:
                         raise QueueError('Scientific identity changed')
                 envelope = {'result': result, 'origin': {'queue_id': self.queue_id},
@@ -424,7 +425,23 @@ def merge(root, old):
     merge_original(SimpleNamespace(output=target, old=old, new_results=target / 'combined.jsonl'))
 
 
-def run(root, repo, old, workers, validate_only=False):
+def write_progress(path, dispatcher, server, *, previous_errors=0):
+    """Progress is advisory; durable result writes must still fail closed."""
+    try:
+        atomic_json(path, {'stats': dispatcher.stats(), 'observed_at': time.time(),
+                          'rpc': server.connection_stats(),
+                          'progress_write_errors': previous_errors})
+    except OSError as exc:
+        if exc.errno not in (errno.EMFILE, errno.ENFILE):
+            raise
+        if previous_errors == 0:
+            print('Dispatcher FD pressure: progress snapshot deferred; results remain durable',
+                  file=sys.stderr, flush=True)
+        return previous_errors + 1
+    return previous_errors
+
+
+def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800):
     from aleatoric_nk_grid.queue_service import make_server
     from aleatoric_nk_grid.queue_readiness import publish_ready
     if int(os.environ['SLURM_NTASKS']) < workers + 1:
@@ -440,7 +457,8 @@ def run(root, repo, old, workers, validate_only=False):
         generation = uuid.uuid4().hex; attempt = control / generation; attempt.mkdir(mode=0o700)
         host = socket.gethostname(); token = attempt / 'token'; token.write_text(uuid.uuid4().hex + uuid.uuid4().hex)
         token.chmod(0o600); cert = attempt / 'ca.crt'; key = attempt / 'server.key'
-        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '7',
+        cert_days = str(max(7, (int(max_seconds) + 86399) // 86400 + 1))
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', cert_days,
             '-keyout', str(key), '-out', str(cert), '-subj', '/CN=' + host,
             '-addext', 'subjectAltName=DNS:' + host + ',DNS:' + socket.getfqdn()],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -449,27 +467,31 @@ def run(root, repo, old, workers, validate_only=False):
         context.load_cert_chain(cert, key)
         server = make_server(dispatcher, token=token.read_text(), host='0.0.0.0', port=0,
                              tls_context=context, threaded_tls_handshake=True)
-        serving = threading.Thread(target=server.serve_forever, daemon=True); serving.start()
-        ready_path = attempt / 'ready.json'
-        publish_ready(ready_path, dispatcher, host=host, port=server.server_port, tls=True, generation=generation)
-        launch = dict(queue=str(root.resolve()), queue_id=dispatcher.queue_id, repo=str(repo.resolve()),
-            control=str(control.resolve()), generation=generation, token_file=str(token.resolve()),
-            ca_file=str(cert.resolve()), ready_file=str(ready_path.resolve()),
-            job_id=os.environ['SLURM_JOB_ID'], source_commit=commit, workers=workers,
-            recover_stale_leases=True)
-        atomic_json(attempt / 'launch.json', launch); atomic_json(control / 'latest.json', launch)
-        atomic_json(attempt / 'admission.json', {'stats': dispatcher.stats(), 'sqlite': False})
-        def interrupted(signum, frame): raise InterruptedError('Interrupted ' + str(signum))
-        signal.signal(signal.SIGTERM, interrupted); signal.signal(signal.SIGINT, interrupted)
+        serving = threading.Thread(target=server.serve_forever); serving.start()
         child = None
         try:
+            ready_path = attempt / 'ready.json'
+            publish_ready(ready_path, dispatcher, host=host, port=server.server_port, tls=True, generation=generation)
+            launch = dict(queue=str(root.resolve()), queue_id=dispatcher.queue_id, repo=str(repo.resolve()),
+                control=str(control.resolve()), generation=generation, token_file=str(token.resolve()),
+                ca_file=str(cert.resolve()), ready_file=str(ready_path.resolve()),
+                job_id=os.environ['SLURM_JOB_ID'], source_commit=commit, workers=workers,
+                recover_stale_leases=True, max_seconds=max_seconds,
+                startup_jitter_seconds=min(30., workers / 100.))
+            atomic_json(attempt / 'launch.json', launch); atomic_json(control / 'latest.json', launch)
+            atomic_json(attempt / 'admission.json', {'stats': dispatcher.stats(), 'sqlite': False,
+                                                   'rpc': server.connection_stats()})
+            def interrupted(signum, frame): raise InterruptedError('Interrupted ' + str(signum))
+            signal.signal(signal.SIGTERM, interrupted); signal.signal(signal.SIGINT, interrupted)
             child = subprocess.Popen(['srun', '--ntasks=' + str(workers), '--cpus-per-task=1',
                 '--ntasks-per-core=1', '--distribution=cyclic', '--kill-on-bad-exit=1',
                 '--output=' + str(attempt / 'worker-%t.out'), '--error=' + str(attempt / 'worker-%t.err'),
                 sys.executable, '-m', 'aleatoric_nk_grid.slurm_queue_round', 'worker',
                 '--launch', str(attempt / 'launch.json')])
+            progress_errors = 0
             while child.poll() is None:
-                atomic_json(attempt / 'progress.json', {'stats': dispatcher.stats(), 'observed_at': time.time()})
+                progress_errors = write_progress(attempt / 'progress.json', dispatcher, server,
+                                                 previous_errors=progress_errors)
                 time.sleep(15)
             stats = dispatcher.stats()
             atomic_json(control / 'round-result.json', {'stats': stats, 'worker_exit': child.returncode,
@@ -477,11 +499,13 @@ def run(root, repo, old, workers, validate_only=False):
             if child.returncode or stats['done'] != stats['total']:
                 raise QueueError('Incomplete round; retain result receipts for next direct success scan')
         finally:
-            if child is not None and child.poll() is None:
-                child.terminate()
-                try: child.wait(timeout=90)
-                except subprocess.TimeoutExpired: child.kill(); child.wait(timeout=30)
-            server.shutdown(); server.server_close(); serving.join(timeout=10)
+            try:
+                if child is not None and child.poll() is None:
+                    child.terminate()
+                    try: child.wait(timeout=90)
+                    except subprocess.TimeoutExpired: child.kill(); child.wait(timeout=30)
+            finally:
+                server.shutdown(); serving.join(); server.server_close()
     if not validate_only:
         merge(root, old)
 
