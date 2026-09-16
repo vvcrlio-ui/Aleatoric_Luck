@@ -231,7 +231,8 @@ class FlatDispatcher(Dispatcher):
     def __init__(self, root, *, clock=time.time):
         self.root = Path(root); self.clock = clock
         self.mutex = threading.RLock(); self.closed = self.poisoned = False
-        self.submit_mutex = threading.RLock()
+        self.submit_mutex = threading.RLock(); self.fsync_mutex = threading.RLock()
+        self.written_seq = self.synced_seq = self.commits = 0
         self._owner = file_lock(self.root / 'dispatcher.lock'); self._owner.__enter__()
         self.journal = None
         try:
@@ -366,22 +367,41 @@ class FlatDispatcher(Dispatcher):
                     count = self.journal.write(pending)
                     if not count: raise OSError('Short result write')
                     pending = pending[count:]
-                started = time.monotonic()
-                os.fsync(self.journal.fileno())
-                elapsed = time.monotonic() - started
+                self.written_seq += 1
+                sequence = self.written_seq
             except BaseException:
                 with self.mutex: self.poisoned = True
                 raise
-            with self.mutex:
+        # Durability is shared. One fsync flushes every record whose write had
+        # already returned, so concurrent submissions pay for a single flush
+        # instead of one each. A result is still acknowledged only after a flush
+        # that started after its own bytes were written, never before.
+        elapsed = 0.; flushed = False
+        try:
+            with self.fsync_mutex:
+                if self.synced_seq < sequence:
+                    # Read the watermark under this lock: records written while
+                    # the flush runs are not claimed by it.
+                    target = self.written_seq
+                    started = time.monotonic()
+                    os.fsync(self.journal.fileno())
+                    elapsed = time.monotonic() - started
+                    self.synced_seq = target; flushed = True
+        except BaseException:
+            with self.mutex: self.poisoned = True
+            raise
+        with self.mutex:
+            self.commits += 1
+            if flushed:
                 self.fsync_count += 1; self.fsync_seconds += elapsed
-                row.pop('committing', None)
-                row.update(state='failed' if result['status'] == 'failed' else 'done',
-                    accepted_token=token, result=payload)
-                del self.active[task_id]; del self.by_worker[worker]
-                self.completed[task_id] = row
-                if row['state'] == 'done': self.done += 1
-                else: self.failed += 1
-                return {'accepted': True, 'duplicate': False}
+            row.pop('committing', None)
+            row.update(state='failed' if result['status'] == 'failed' else 'done',
+                accepted_token=token, result=payload)
+            del self.active[task_id]; del self.by_worker[worker]
+            self.completed[task_id] = row
+            if row['state'] == 'done': self.done += 1
+            else: self.failed += 1
+            return {'accepted': True, 'duplicate': False}
 
     def pause(self, paused=True):
         with self.mutex:
@@ -395,17 +415,25 @@ class FlatDispatcher(Dispatcher):
                 'total': len(self.order), 'paused': self.paused, 'queue_id': self.queue_id,
                 'expired_leases': self.expired_leases, 'fsync_count': self.fsync_count,
                 'fsync_seconds': self.fsync_seconds, 'heartbeats_ok': self.heartbeats_ok,
+                'commits': self.commits,
+                'results_per_fsync': self.commits / self.fsync_count if self.fsync_count else 0.,
                 'oldest_active_heartbeat_age_seconds': max(ages, default=0.),
                 'active_heartbeat_older_than_900s': sum(age > 900 for age in ages),
                 'active_heartbeat_older_than_1800s': sum(age > 1800 for age in ages)}
 
     def close(self):
-        with self.submit_mutex:
+        with self.submit_mutex, self.fsync_mutex:
             with self.mutex:
                 if self.closed: return
                 self.closed = True
-                if self.journal: self.journal.close()
-                self._owner.__exit__(None, None, None)
+            journal = self.journal
+            if journal is not None and not journal.closed and self.synced_seq < self.written_seq:
+                try:
+                    os.fsync(journal.fileno()); self.synced_seq = self.written_seq
+                except OSError:
+                    pass  # Unflushed results stay unacknowledged, never falsely accepted.
+            if journal is not None: journal.close()
+            self._owner.__exit__(None, None, None)
 
 
 def merge(root, old):
