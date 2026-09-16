@@ -10,7 +10,24 @@ import uuid
 
 from aleatoric_nk_grid import direct_success_queue as runtime
 from aleatoric_nk_grid.shared_queue import (atomic_json, digest, file_digest,
-                                            file_lock, QueueError)
+                                            file_lock, QueueError, transport_manifest)
+
+
+def runtime_identity(identity):
+    """Bind operational repairs while retaining the exact frozen scientific spec."""
+    modules = Path(runtime.__file__).parent
+    names = ('direct_success_queue.py', 'queue_service.py', 'queue_readiness.py',
+             'slurm_queue_round.py')
+    return {**identity, 'runtime_sha256': file_digest(Path(runtime.__file__)),
+            'runtime_files_sha256': {name: file_digest(modules/name) for name in names},
+            'launcher_sha256': file_digest(Path(__file__))}
+
+
+def validate_runtime(identity):
+    current = runtime_identity(identity)
+    for key in ('runtime_sha256', 'runtime_files_sha256', 'launcher_sha256'):
+        if key in identity and identity[key] != current[key]:
+            raise QueueError('Deployed operational runtime changed: ' + key)
 
 
 def prepare(args):
@@ -63,10 +80,9 @@ def prepare(args):
             order = base + np.arange(len(design.repeats),dtype='<u4')*len(design.models)
             handle.write(order.astype('<u4',copy=False).tobytes())
         handle.flush(); os.fsync(handle.fileno())
-    manifest = {'format':'direct-success-bitmap-v1', 'identity':{'cell_spec':payload,
-        'runtime_sha256':file_digest(Path(runtime.__file__))}, 'count':design.count,
+    manifest = {'format':'direct-success-bitmap-v1', 'identity':runtime_identity({'cell_spec':payload}), 'count':design.count,
         'remaining_sha256':file_digest(args.root/'remaining.u32'),
-        'lease_seconds':300., 'max_attempts':5, 'fresh':True, 'probe':args.probe,
+        **transport_manifest(), 'max_attempts':5, 'fresh':True, 'probe':args.probe,
         'panel':args.panel, 'preset':args.preset}
     atomic_json(args.root/'manifest.json',manifest)
     atomic_json(args.root/'queue-id.json',{'queue_id':digest(manifest)})
@@ -225,7 +241,8 @@ def resume(args):
                 raise QueueError('Parent complement count mismatch')
             remaining.tofile(args.root/'remaining.u32')
             prior_ids = list(dict.fromkeys([*prior_queue_ids, parent_qid]))
-            child = {**manifest, 'count': int(len(remaining)),
+            child = {**manifest, 'count': int(len(remaining)), **transport_manifest(),
+                'identity': runtime_identity(manifest['identity']),
                 'remaining_sha256': file_digest(args.root/'remaining.u32'),
                 'parent_root': str(parent), 'parent_manifest_sha256': file_digest(parent/'manifest.json'),
                 'parent_result_sha256': source_sha.hexdigest(), 'parent_result_bytes': source_size,
@@ -260,7 +277,9 @@ def main():
     p.add_argument('--allow-large-run',action='store_true')
     p.add_argument('--probe',action='store_true')
     p.add_argument('--workers',type=int,default=21)
+    p.add_argument('--max-seconds',type=int,default=172800)
     args=p.parse_args(); args.repo=args.repo.expanduser().resolve()
+    if args.max_seconds <= 0: p.error('--max-seconds must be positive')
     if args.root is None:
         if args.command not in {'prepare', 'resume'}: p.error('run/finalize require the prepared --root')
         args.root=args.repo/'FFCWS'/'outputs'/(args.panel+'-'+uuid.uuid4().hex[:12])
@@ -274,9 +293,9 @@ def main():
     elif args.command == 'finalize': finalize(args.root)
     else:
         manifest=json.loads((args.root/'manifest.json').read_bytes())
-        if file_digest(Path(runtime.__file__)) != manifest['identity']['runtime_sha256']:
-            raise QueueError('Deployed dispatcher changed')
-        runtime.run(args.root,args.repo,args.repo,args.workers,validate_only=True)
+        validate_runtime(manifest['identity'])
+        runtime.run(args.root,args.repo,args.repo,args.workers,validate_only=True,
+                    max_seconds=args.max_seconds)
         import gc
         gc.collect()
         finalize(args.root)

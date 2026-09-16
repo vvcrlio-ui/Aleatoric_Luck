@@ -12,7 +12,7 @@ import sys
 import uuid
 
 import experiment as common
-from discoverer_continuation import Journal, Slurm, TERMINAL, _lock, read
+from discoverer_continuation import Journal, Slurm, TERMINAL, controller_lock as _lock, read
 
 FORMAT = 'single-model-slurm-v1'
 DONE = {'complete', 'round_budget_exhausted', 'no_progress', 'control_budget_exhausted'}

@@ -15,7 +15,8 @@ import uuid
 from . import direct_success_queue as runtime
 from .pending_resume import Design
 from .scheduler_cost import CostEstimator
-from .shared_queue import QueueError, atomic_json, digest, file_digest, file_lock
+from .shared_queue import (QueueError, atomic_json, digest, file_digest, file_lock,
+                           transport_manifest)
 from .result_migration import validate_scientific_result
 
 
@@ -150,7 +151,7 @@ def prepare_round(plan, rounds, directory):
     manifest = {'format': 'direct-success-bitmap-v1',
         'identity': {'cell_spec': plan['cell_spec'], 'plan_sha256': digest(plan),
                      'runtime_sha256': plan['runtime_sha256'], 'task_kind': plan.get('task_kind', 'regression')},
-        'count': count, 'lease_seconds': 300., 'max_attempts': 5, 'sources': sources,
+        'count': count, **transport_manifest(), 'max_attempts': 5, 'sources': sources,
         'remaining_sha256': file_digest(stage / 'remaining.u32'), 'fresh': True}
     saved = {'done': done, 'remaining': count, 'queue_id': digest(manifest)}
     atomic_json(stage / 'manifest.json', manifest)

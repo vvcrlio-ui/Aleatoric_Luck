@@ -6,7 +6,7 @@ import math
 import os
 from pathlib import Path
 
-from .shared_queue import Dispatcher, ModelTask, QueueError, digest
+from .shared_queue import Dispatcher, ModelTask, QueueError, digest, heartbeat_interval
 from .scheduler_cost import CostEstimator, DEFAULT_COST_WEIGHTS
 
 def iter_model_tasks(spec, weights=None, *, profile=None):
@@ -43,6 +43,7 @@ def run(args):
     from .cell_cache import CachedSession, NodeInputStore, session_namespace
     from .queue_service import Client, execute_worker, worker_slot
     manifest = json.loads((args.root / "manifest.json").read_bytes())
+    heartbeat_seconds = heartbeat_interval(manifest)
     queue_id = digest(manifest)
     if json.loads((args.root / "queue-id.json").read_bytes())["queue_id"] != queue_id:
         raise QueueError("Queue identity changed")
@@ -66,7 +67,7 @@ def run(args):
                 return json_result(row)
             report = execute_worker(client, worker, execute,
                 spool=args.spool, cached_cells=lambda: cached.cached_cells,
-                heartbeat_seconds=min(20., manifest["lease_seconds"] / 3),
+                heartbeat_seconds=heartbeat_seconds,
                 recover_stale_leases=getattr(args, 'recover_stale_leases', False),
                 stop=lambda: bool(args.stop_file and args.stop_file.exists()),
                 deadline_seconds=args.max_seconds)

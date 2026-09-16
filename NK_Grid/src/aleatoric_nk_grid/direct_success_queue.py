@@ -24,7 +24,8 @@ import time
 import uuid
 
 from aleatoric_nk_grid.shared_queue import (
-    Dispatcher, LeaseLostError, ModelTask, QueueError, atomic_json, canonical, digest, file_digest, file_lock)
+    Dispatcher, LeaseLostError, MAX_SUBMISSIONS, ModelTask, QueueError, atomic_json, canonical,
+    digest, file_digest, file_lock, transport_manifest)
 from aleatoric_nk_grid.pending_resume import Design
 from aleatoric_nk_grid.result_migration import validate_scientific_result
 
@@ -117,7 +118,7 @@ def prepare(base, output):
     manifest = {'format': 'direct-success-bitmap-v1',
         'identity': {'cell_spec': bm['cell_spec'], 'base_manifest_sha256': ready['base_manifest_sha256'],
             'prior_success_sha256': file_digest(output / 'prior-success.jsonl')},
-        'count': len(remaining), 'lease_seconds': 300., 'max_attempts': 5,
+        'count': len(remaining), **transport_manifest(), 'max_attempts': 5,
         'remaining_sha256': file_digest(output / 'remaining.u32'),
         'completed_sha256': file_digest(output / 'completed.bits'),
         'base': str(base.resolve()), 'old_valid_unique': ready['old_valid_unique'],
@@ -204,7 +205,7 @@ def prepare_flat(base, output):
     remaining = ordinals[success[ordinals] == 0]
     remaining.tofile(output / 'remaining.u32')
     original_qid = read(Path(parent['base']) / 'ready.json')['queue_id']
-    manifest = {**parent, 'count': len(remaining),
+    manifest = {**parent, 'count': len(remaining), **transport_manifest(),
         'identity': {**parent['identity'], 'parent_manifest_sha256': parent_qid,
             'prior_success_sha256': file_digest(output/'prior-success.jsonl')},
         'remaining_sha256': file_digest(output/'remaining.u32'),
@@ -251,6 +252,7 @@ class FlatDispatcher(Dispatcher):
             self.completed = {}; self.attempts = {}; self.exhausted = 0
             self.expiries = []; self.expired_leases = 0
             self.fsync_seconds = 0.; self.fsync_count = 0
+            self.heartbeats_ok = 0
             self.done = self.failed = 0; self.paused = False; self.epoch = uuid.uuid4().hex
         except BaseException:
             self.close(); raise
@@ -305,6 +307,7 @@ class FlatDispatcher(Dispatcher):
             row = {'id': task_id, 'ordinal': ordinal, 'task': canonical(asdict(task)).decode(),
                 'cell': task.cell, 'state': 'leased', 'worker': worker, 'attempt': attempt,
                 'token': self.epoch + ':' + uuid.uuid4().hex,
+                'last_heartbeat': self.clock(),
                 'expiry': self.clock() + self.manifest['lease_seconds']}
             self.active[task_id] = row; self.by_worker[worker] = task_id
             heapq.heappush(self.expiries, (row['expiry'], task_id, row['token']))
@@ -315,6 +318,8 @@ class FlatDispatcher(Dispatcher):
             if self.closed or self.poisoned: raise QueueError('Dispatcher stopped')
             row = self._check_lease(task_id, token, worker)
             row['expiry'] = self.clock() + self.manifest['lease_seconds']
+            row['last_heartbeat'] = self.clock()
+            self.heartbeats_ok += 1
             return {'expiry': row['expiry']}
 
     def submit(self, task_id, token, worker, result):
@@ -371,11 +376,15 @@ class FlatDispatcher(Dispatcher):
 
     def stats(self):
         with self.mutex:
+            ages = [self.clock() - row['last_heartbeat'] for row in self.active.values()]
             return {'done': self.done, 'failed': self.failed, 'leased': len(self.active),
                 'pending': len(self.order) - self.cursor + len(self.retry), 'exhausted': self.exhausted,
                 'total': len(self.order), 'paused': self.paused, 'queue_id': self.queue_id,
                 'expired_leases': self.expired_leases, 'fsync_count': self.fsync_count,
-                'fsync_seconds': self.fsync_seconds}
+                'fsync_seconds': self.fsync_seconds, 'heartbeats_ok': self.heartbeats_ok,
+                'oldest_active_heartbeat_age_seconds': max(ages, default=0.),
+                'active_heartbeat_older_than_900s': sum(age > 900 for age in ages),
+                'active_heartbeat_older_than_1800s': sum(age > 1800 for age in ages)}
 
     def close(self):
         with self.submit_mutex:
@@ -466,7 +475,8 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(cert, key)
         server = make_server(dispatcher, token=token.read_text(), host='0.0.0.0', port=0,
-                             tls_context=context, threaded_tls_handshake=True)
+                             tls_context=context, threaded_tls_handshake=True,
+                             max_submissions=MAX_SUBMISSIONS)
         serving = threading.Thread(target=server.serve_forever); serving.start()
         child = None
         try:

@@ -28,6 +28,15 @@ Each `(seed, draw, N, K, model)` is an independent task. All workers share one q
 
 The compute nodes must share the run directory, permit worker-to-dispatcher TLS connections, and provide `srun` and `openssl`. The submitting account needs read access to Slurm association/QoS limits and usage (`sacctmgr`, `scontrol show assoc_mgr`). An unresolved limit stops submission. Site profiles retain Python modules, constraints, partitions and accounts; `--qos` is accepted for any Slurm profile.
 
+Every new queue round, fresh or resumed, uses a 600-second jittered heartbeat
+and a 3,600-second lease, recorded in the immutable queue manifest. Both values
+come from `shared_queue.transport_manifest`, so no launcher can set its own. Failed heartbeats
+retry within 30 seconds. The TLS service admits at most eight concurrent result
+submissions so journal writes cannot consume all connection slots; excess
+submissions receive retryable HTTP 503 and retain their durable worker receipt.
+Progress records report submission backpressure, heartbeat age and expired
+leases. A lost worker can take up to one lease interval to be reclaimed.
+
 ## Resuming after interruption
 
 A resumed run reuses the original inputs and parameters, reads saved results, and schedules only the remaining tasks.

@@ -22,8 +22,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-from .shared_queue import (Dispatcher, LeaseLostError, QueueError, atomic_json,
-                           canonical, digest, file_lock, sync_directory)
+from .shared_queue import (Dispatcher, LeaseLostError, MAX_SUBMISSIONS, QueueError,
+                           atomic_json, canonical, digest, file_lock, sync_directory)
 
 
 class TransientServiceError(OSError):
@@ -87,7 +87,8 @@ def retry_delay(failures, base=2., cap=30.):
 
 
 def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None,
-                threaded_tls_handshake=False, max_connections=128, request_timeout=10.):
+                threaded_tls_handshake=False, max_connections=128, request_timeout=10.,
+                max_submissions=MAX_SUBMISSIONS):
     # Keep threaded_tls_handshake for existing launchers; all TLS now uses the
     # bounded request threads, never a handshake on the single accept thread.
     if len(token) < 32:
@@ -95,6 +96,9 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
     if not math.isfinite(request_timeout) or request_timeout <= 0:
         raise ValueError("Request timeout must be positive and finite")
     capacity = connection_budget(max_connections)
+    if type(max_submissions) is not int or max_submissions < 1:
+        raise ValueError("max_submissions must be a positive integer")
+    submit_capacity = min(max_submissions, max(1, capacity // 2))
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -123,7 +127,26 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
                            "/identity": lambda: {"queue_id": dispatcher.queue_id, "epoch": dispatcher.epoch}}
                 if self.path not in methods:
                     self.reply(404, {"error": "Unknown operation"}); return
-                self.reply(200, methods[self.path](**value))
+                if self.path == "/submit":
+                    # Do not let requests waiting on durable journal I/O occupy
+                    # every connection and starve lease renewals.
+                    if not self.server.submit_slots.acquire(blocking=False):
+                        with self.server.metrics_lock:
+                            self.server.submit_backpressure += 1
+                        self.reply(503, {"error": "Result submission busy; retain receipt and retry"})
+                        return
+                    with self.server.metrics_lock:
+                        self.server.active_submissions += 1
+                        self.server.peak_submissions = max(self.server.peak_submissions,
+                                                           self.server.active_submissions)
+                    try:
+                        self.reply(200, methods[self.path](**value))
+                    finally:
+                        with self.server.metrics_lock:
+                            self.server.active_submissions -= 1
+                        self.server.submit_slots.release()
+                else:
+                    self.reply(200, methods[self.path](**value))
             except LeaseLostError as exc:
                 self.reply(409, {"error": str(exc), "code": "lease_lost"})
             except (QueueError, ValueError, TypeError, KeyError) as exc:
@@ -141,6 +164,8 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
 
         def __init__(self, *args):
             self.slots = threading.BoundedSemaphore(capacity)
+            self.submit_slots = threading.BoundedSemaphore(submit_capacity)
+            self.submit_backpressure = self.active_submissions = self.peak_submissions = 0
             self.metrics_lock = threading.Lock()
             self.active_connections = self.peak_connections = self.transport_errors = 0
             super().__init__(*args)
@@ -148,7 +173,10 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
         def connection_stats(self):
             with self.metrics_lock:
                 value = dict(max_connections=capacity, active_connections=self.active_connections,
-                             peak_connections=self.peak_connections, transport_errors=self.transport_errors)
+                             peak_connections=self.peak_connections, transport_errors=self.transport_errors,
+                             submit_capacity=submit_capacity, submit_backpressure=self.submit_backpressure,
+                             active_submissions=self.active_submissions,
+                             peak_submissions=self.peak_submissions)
             try:
                 import resource
                 value['nofile_soft_limit'] = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
@@ -316,15 +344,21 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
         done = threading.Event(); lost = []
 
         def heartbeat(lease=lease, done=done, lost=lost):
-            while not done.wait(heartbeat_seconds * random.uniform(.8, 1.2)):
+            heartbeat_failures = 0
+            delay = heartbeat_seconds * random.uniform(.8, 1.2)
+            while not done.wait(delay):
                 try:
                     client.call("heartbeat", task_id=lease["id"], token=lease["token"], worker=worker)
                 except QueueError as exc:
                     lost.append(exc); return
                 except (OSError, urllib.error.URLError):
-                    # A network error is not proof of revoked ownership. The
-                    # server's token/expiry check is authoritative at submit.
-                    continue
+                    # Retry promptly instead of waiting another full heartbeat
+                    # period. The server still fences revoked lease tokens.
+                    delay = min(heartbeat_seconds, retry_delay(heartbeat_failures, base=2., cap=30.))
+                    heartbeat_failures += 1
+                else:
+                    heartbeat_failures = 0
+                    delay = heartbeat_seconds * random.uniform(.8, 1.2)
 
         thread = threading.Thread(target=heartbeat, daemon=True); thread.start()
         try:

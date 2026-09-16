@@ -28,6 +28,29 @@ class LeaseLostError(QueueError):
     """Authoritative ownership loss; never a data/identity validation failure."""
 
 
+# Transport settings validated on the 720-node, 17,279-worker allocation. One
+# jittered 600-second heartbeat leaves five renewals inside the lease, so a
+# delayed renewal no longer expires an owner, and bounded concurrent
+# submissions keep durable journal writes from occupying every connection.
+LEASE_SECONDS = 3600.
+HEARTBEAT_SECONDS = 600.
+MAX_SUBMISSIONS = 8
+
+
+def transport_manifest():
+    """The immutable lease/heartbeat pair every new queue round records."""
+    return {"lease_seconds": LEASE_SECONDS, "heartbeat_seconds": HEARTBEAT_SECONDS}
+
+
+def heartbeat_interval(manifest):
+    """Worker cadence from the manifest; a queue without one keeps 20 seconds."""
+    lease = float(manifest["lease_seconds"])
+    seconds = float(manifest.get("heartbeat_seconds", min(20., lease / 3)))
+    if not math.isfinite(seconds) or seconds <= 0 or seconds * 3 > lease:
+        raise QueueError("Heartbeat interval must leave lease renewal headroom")
+    return seconds
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
