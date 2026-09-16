@@ -32,9 +32,18 @@ class LeaseLostError(QueueError):
 # jittered 600-second heartbeat leaves five renewals inside the lease, so a
 # delayed renewal no longer expires an owner, and bounded concurrent
 # submissions keep durable journal writes from occupying every connection.
+#
+# MAX_SUBMISSIONS budgets connections, not throughput: the dispatcher commits
+# results under one mutex, so admitting more of them buys no parallelism, only
+# queue depth. Eight was measured too shallow on the FFC tree-ordinal round --
+# 23.5% of submissions were refused and each refused worker slept a second or
+# two before retrying, while the service itself was never idle. Admitting a
+# quarter of the connection budget lets that queue form inside the request,
+# where a submission waits milliseconds for the commit mutex instead, and still
+# reserves three quarters of the connections for lease renewal and claims.
 LEASE_SECONDS = 3600.
 HEARTBEAT_SECONDS = 600.
-MAX_SUBMISSIONS = 8
+MAX_SUBMISSIONS = 32
 
 
 def transport_manifest():
@@ -356,7 +365,13 @@ class Dispatcher:
             self._commit({"kind": "heartbeat", "id": task_id, "expiry": expiry})
             return {"expiry": expiry}
 
-    def validate_result(self, task_id, result):
+    def validate_result(self, task_id, result, *, payload=None):
+        """Pass `payload` when the caller already canonicalized this result.
+
+        Serializing a result row is the larger half of a durable submission and
+        needs no shared state, so a caller that holds a commit lock should do it
+        beforehand rather than repeat it here.
+        """
         row = self._get(task_id)
         expected = json.loads(row["task"])
         if any(str(result.get(k)) != str(v) for k, v in expected.items()):
@@ -365,7 +380,8 @@ class Dispatcher:
             raise QueueError("Invalid result status")
         # JSON canonicalization refuses nonfinite numeric payloads. Legacy CSV
         # metric strings receive additional semantic validation in the importer.
-        canonical(result)
+        if payload is None:
+            canonical(result)
         return row
 
     def submit(self, task_id, token, worker, result):

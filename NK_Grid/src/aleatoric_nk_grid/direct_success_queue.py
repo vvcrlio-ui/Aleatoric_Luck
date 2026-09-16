@@ -326,26 +326,39 @@ class FlatDispatcher(Dispatcher):
         # Serialize journal writes, but never hold the lease-state mutex across
         # shared-storage I/O. A validated submission pins its lease until durable
         # commit (or poison), so reaping cannot reassign a half-written result.
+        #
+        # Canonicalizing a result row and validating it scientifically read no
+        # shared state and are the larger half of a commit, so they run before
+        # the lock; only ownership, duplicate detection and the journal write
+        # stay serialized. A failure there is deferred rather than raised, so a
+        # stale worker still learns its lease is lost first, exactly as when
+        # both checks ran inside the lock.
+        deferred = None
+        payload_bytes = raw = None
+        try:
+            payload_bytes = canonical(result)
+            if result.get('status') != 'failed':
+                validate_scientific_result(result, task_kind=self.manifest['identity'].get('task_kind', 'regression'))
+                if result.get('algorithm_version') != self.manifest['identity']['cell_spec']['algorithm_version']:
+                    raise QueueError('Scientific identity changed')
+            raw = canonical({'result': result, 'origin': {'queue_id': self.queue_id},
+                'token': token, 'task_id': task_id}) + b'\n'
+        except (QueueError, ValueError, TypeError, KeyError) as exc:
+            deferred = exc
         with self.submit_mutex:
             with self.mutex:
                 if self.closed or self.poisoned: raise QueueError('Dispatcher stopped')
                 if task_id not in self.completed:
                     self._check_lease(task_id, token, worker)
-                row = self.validate_result(task_id, result)
-                payload = canonical(result).decode()
+                if deferred is not None: raise deferred
+                payload = payload_bytes.decode()
+                row = self.validate_result(task_id, result, payload=payload_bytes)
                 if row['state'] in ('done', 'failed'):
                     if row['accepted_token'] == token and row['result'] == payload:
                         return {'accepted': True, 'duplicate': True}
                     if row['accepted_token'] != token:
                         raise LeaseLostError('Completed task belongs to another lease')
                     raise QueueError('Conflicting completed result')
-                if result['status'] != 'failed':
-                    validate_scientific_result(result, task_kind=self.manifest['identity'].get('task_kind', 'regression'))
-                    if result.get('algorithm_version') != self.manifest['identity']['cell_spec']['algorithm_version']:
-                        raise QueueError('Scientific identity changed')
-                envelope = {'result': result, 'origin': {'queue_id': self.queue_id},
-                    'token': token, 'task_id': task_id}
-                raw = canonical(envelope) + b'\n'
                 row['committing'] = True
             try:
                 pending = memoryview(raw)
