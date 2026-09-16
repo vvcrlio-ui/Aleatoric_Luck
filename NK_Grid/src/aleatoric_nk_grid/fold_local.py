@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
-from sklearn.linear_model import Ridge, Lasso, lasso_path
+from sklearn.linear_model import Lasso, lasso_path
+from .robust_linear import Ridge
 from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler

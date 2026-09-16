@@ -22,9 +22,7 @@ from sklearn.ensemble import (
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import (
     LassoCV,
-    LinearRegression,
     LogisticRegression,
-    RidgeCV,
 )
 from sklearn.model_selection import KFold
 from sklearn.neural_network import MLPClassifier, MLPRegressor
@@ -34,6 +32,7 @@ from sklearn.preprocessing import StandardScaler
 # Keep the existing import path available for callers and older pickles.
 from .mlp_estimator import FitBatchMLPRegressor, build_mlp_regressor
 from .config import DEFAULT_MODEL_PARAMS_PATH
+from .robust_linear import LinearRegression, RidgeCV
 
 MODEL_NAMES = (
     "ols",

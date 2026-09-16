@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
+from .robust_linear import LinearRegression
 from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler

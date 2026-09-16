@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v11-relative-lasso-3fold-1
+algorithm_version: nk-grid-v11-relative-lasso-3fold-all-linear-fallback-1
 
 regression:
   ols:
