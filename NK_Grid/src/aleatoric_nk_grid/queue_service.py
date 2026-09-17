@@ -22,8 +22,9 @@ import urllib.error
 import urllib.request
 import uuid
 
-from .shared_queue import (Dispatcher, LeaseLostError, MAX_SUBMISSIONS, QueueError,
-                           atomic_json, canonical, digest, file_lock, sync_directory)
+from .shared_queue import (Dispatcher, HEARTBEAT_SECONDS, LeaseLostError, MAX_BATCH_TASKS,
+                           MAX_SUBMISSIONS, QueueError, TARGET_BATCH_SECONDS, atomic_json,
+                           canonical, digest, file_lock, sync_directory)
 
 
 class TransientServiceError(OSError):
@@ -124,10 +125,12 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
                     raise QueueError("Wrong queue identity")
                 methods = {"/claim": dispatcher.claim, "/heartbeat": dispatcher.heartbeat,
                            "/submit": dispatcher.submit, "/stats": dispatcher.stats,
+                           "/claim_batch": getattr(dispatcher, "claim_batch", None),
+                           "/submit_batch": getattr(dispatcher, "submit_batch", None),
                            "/identity": lambda: {"queue_id": dispatcher.queue_id, "epoch": dispatcher.epoch}}
-                if self.path not in methods:
+                if methods.get(self.path) is None:
                     self.reply(404, {"error": "Unknown operation"}); return
-                if self.path == "/submit":
+                if self.path in ("/submit", "/submit_batch"):
                     # Do not let requests waiting on durable journal I/O occupy
                     # every connection and starve lease renewals.
                     if not self.server.submit_slots.acquire(blocking=False):
@@ -399,6 +402,153 @@ def execute_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
             if rejected:
                 continue
             receipt.unlink(); accepted += 1
+        finally:
+            done.set(); thread.join(timeout=5)
+    return report("drained")
+
+
+def execute_batch_worker(client, worker, execute, *, spool, cached_cells=lambda: (),
+                         heartbeat_seconds=HEARTBEAT_SECONDS, idle_seconds=2.,
+                         stop=lambda: False, deadline_seconds=3600, recover_stale_leases=False,
+                         target_batch_seconds=TARGET_BATCH_SECONDS, max_batch=MAX_BATCH_TASKS):
+    """Keep one batch of cells in flight, sized by this worker's own rate.
+
+    One round trip and one durable flush per cell cost far more than a cheap
+    fit, so a batch carries as many cells as fit in `target_batch_seconds` of
+    measured work: an expensive cell still travels alone. A lost batch is
+    recomputed whole, which is why the target is seconds rather than cells.
+    The local spool survives a lost submit response, as for a single cell.
+    """
+    root = Path(spool); root.mkdir(parents=True, exist_ok=True)
+    until = time.monotonic() + deadline_seconds
+    accepted = 0
+    recovered = 0
+    count = 1
+
+    def report(state, **extra):
+        return {"state": state, "accepted": accepted, "cells_per_batch": count,
+                **({"recovered_leases": recovered} if recovered else {}), **extra}
+
+    def quarantine(receipt, reason):
+        nonlocal recovered
+        previous = json.loads(receipt.read_bytes())
+        rejected = root / "rejected"; rejected.mkdir(exist_ok=True)
+        target = rejected / (receipt.stem + "-" + digest(previous["token"]) + ".json")
+        if target.exists() and target.read_bytes() != receipt.read_bytes():
+            raise QueueError("Conflicting quarantined receipt")
+        os.replace(receipt, target)
+        sync_directory(rejected); sync_directory(root)
+        recovered += 1
+        print(json.dumps({"worker_event": "lease_recovered", "worker": worker,
+                          "reason": str(reason), "receipt": str(target)}),
+              file=sys.stderr, flush=True)
+        time.sleep(idle_seconds * random.uniform(.8, 1.2))
+
+    def deliver(receipt, previous):
+        """Resend one durable batch until it is accepted, lost or out of time."""
+        failures = 0
+        while True:
+            try:
+                client.call("submit_batch", task_ids=previous["task_ids"], token=previous["token"],
+                            worker=worker, results=previous["results"])
+                return len(previous["task_ids"])
+            except (OSError, urllib.error.URLError):
+                if time.monotonic() >= until:
+                    return None
+                time.sleep(retry_delay(failures, idle_seconds)); failures += 1
+            except QueueError as exc:
+                if recover_stale_leases:
+                    if not isinstance(exc, LeaseLostError):
+                        raise
+                    quarantine(receipt, exc)
+                    return 0
+                raise
+
+    # Recover before claiming: an accepted batch whose reply was lost will no
+    # longer be returned by claim. The server also fences stale lease tokens.
+    for receipt in sorted(root.glob("*.json")):
+        previous = json.loads(receipt.read_bytes())
+        if previous.get("queue_id") != client.queue_id:
+            raise QueueError("Result spool belongs to another queue")
+        if "task_ids" not in previous:
+            raise QueueError("Result spool holds single-cell receipts; use execute_worker")
+        delivered = deliver(receipt, previous)
+        if delivered is None:
+            return report("unacknowledged", receipt=str(receipt))
+        if delivered:
+            receipt.unlink(); accepted += delivered
+
+    failures = 0
+    while not stop() and time.monotonic() < until:
+        try:
+            lease = client.call("claim_batch", worker=worker, count=count,
+                                cached_cells=cached_cells())
+        except (OSError, urllib.error.URLError):
+            time.sleep(retry_delay(failures, idle_seconds)); failures += 1; continue
+        failures = 0
+        if lease["state"] in {"complete", "blocked", "paused"}:
+            return report(lease["state"])
+        if lease["state"] == "wait":
+            time.sleep(idle_seconds * random.uniform(.8, 1.2)); continue
+        tasks = lease["tasks"]
+        done = threading.Event(); lost = []
+
+        def heartbeat(lease=lease, done=done, lost=lost):
+            # One renewal covers the whole batch; they share a deadline.
+            heartbeat_failures = 0
+            delay = heartbeat_seconds * random.uniform(.8, 1.2)
+            while not done.wait(delay):
+                try:
+                    client.call("heartbeat", task_id=lease["tasks"][0]["id"],
+                                token=lease["token"], worker=worker)
+                except QueueError as exc:
+                    lost.append(exc); return
+                except (OSError, urllib.error.URLError):
+                    delay = min(heartbeat_seconds, retry_delay(heartbeat_failures, base=2., cap=30.))
+                    heartbeat_failures += 1
+                else:
+                    heartbeat_failures = 0
+                    delay = heartbeat_seconds * random.uniform(.8, 1.2)
+
+        thread = threading.Thread(target=heartbeat, daemon=True); thread.start()
+        try:
+            receipt = root / ("batch-" + digest(lease["token"]) + ".json")
+            previous = json.loads(receipt.read_bytes()) if receipt.exists() else None
+            if previous and previous.get("queue_id") == client.queue_id and previous.get("token") == lease["token"]:
+                results = previous["results"]
+            else:
+                started = time.monotonic()
+                results = []
+                for task in tasks:
+                    try:
+                        results.append(execute(task["task"]))
+                    except Exception as exc:
+                        # One unusable cell is a failed result, not a failed batch.
+                        results.append({**task["task"], "status": "failed",
+                                        "error": f"{type(exc).__name__}: {exc}"})
+                elapsed = time.monotonic() - started
+                atomic_json(receipt, {"queue_id": client.queue_id, "token": lease["token"],
+                                      "task_ids": [task["id"] for task in tasks], "results": results})
+                # Size the next request from what this batch actually cost, and
+                # never start one that cannot finish before the drain deadline.
+                seconds = elapsed / len(tasks)
+                room = max(0., until - time.monotonic())
+                count = max(1, min(max_batch,
+                                   int(target_batch_seconds / seconds) if seconds > 0 else max_batch,
+                                   int(room / seconds) if seconds > 0 else max_batch))
+            if lost:
+                if recover_stale_leases:
+                    if not isinstance(lost[0], LeaseLostError):
+                        raise lost[0]
+                    quarantine(receipt, lost[0])
+                    continue
+                return report("lease_lost", receipt=str(receipt))
+            delivered = deliver(receipt, json.loads(receipt.read_bytes()))
+            if delivered is None:
+                return report("unacknowledged", receipt=str(receipt))
+            if not delivered:
+                continue
+            receipt.unlink(); accepted += delivered
         finally:
             done.set(); thread.join(timeout=5)
     return report("drained")

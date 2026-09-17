@@ -45,6 +45,15 @@ LEASE_SECONDS = 3600.
 HEARTBEAT_SECONDS = 600.
 MAX_SUBMISSIONS = 32
 
+# A worker asks for as many cells as its own last batch says fit in
+# TARGET_BATCH_SECONDS of work, so an expensive cell still travels alone while
+# the cheap tail -- where one round trip and one flush cost far more than the
+# fit itself -- rides in one request. The server only bounds that request: a
+# batch is recomputed on loss, and a worker holding a long one starves the rest
+# of the fleet near the end of the queue.
+TARGET_BATCH_SECONDS = 30.
+MAX_BATCH_TASKS = 256
+
 
 def transport_manifest():
     """The immutable lease/heartbeat pair every new queue round records."""

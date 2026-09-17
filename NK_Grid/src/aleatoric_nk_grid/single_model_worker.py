@@ -6,7 +6,8 @@ import math
 import os
 from pathlib import Path
 
-from .shared_queue import Dispatcher, ModelTask, QueueError, digest, heartbeat_interval
+from .shared_queue import (Dispatcher, MAX_BATCH_TASKS, ModelTask, QueueError, digest,
+                           heartbeat_interval)
 from .scheduler_cost import CostEstimator, DEFAULT_COST_WEIGHTS
 
 def iter_model_tasks(spec, weights=None, *, profile=None):
@@ -41,7 +42,7 @@ def run(args):
     from .execution_contract import CellExecutionSpec
     from .nk_grid import NKGridExecutionSession
     from .cell_cache import CachedSession, NodeInputStore, session_namespace
-    from .queue_service import Client, execute_worker, worker_slot
+    from .queue_service import Client, execute_batch_worker, worker_slot
     manifest = json.loads((args.root / "manifest.json").read_bytes())
     heartbeat_seconds = heartbeat_interval(manifest)
     queue_id = digest(manifest)
@@ -65,9 +66,10 @@ def run(args):
                     row = session.run_cell_group(seed=value["seed"], draw=value["draw"],
                         n_samples=value["N"], k_features=value["K"], models=(value["model"],))[0]
                 return json_result(row)
-            report = execute_worker(client, worker, execute,
+            report = execute_batch_worker(client, worker, execute,
                 spool=args.spool, cached_cells=lambda: cached.cached_cells,
                 heartbeat_seconds=heartbeat_seconds,
+                max_batch=getattr(args, 'max_batch', MAX_BATCH_TASKS),
                 recover_stale_leases=getattr(args, 'recover_stale_leases', False),
                 stop=lambda: bool(args.stop_file and args.stop_file.exists()),
                 deadline_seconds=args.max_seconds)
@@ -100,6 +102,8 @@ def main():
     worker.add_argument("--max-seconds", type=float, default=3600)
     worker.add_argument("--recover-stale-leases", action="store_true",
         help="Quarantine fenced results and keep claiming; requires typed lease-loss RPC")
+    worker.add_argument("--max-batch", type=int, default=MAX_BATCH_TASKS,
+        help="Upper bound on cells leased per request; 1 restores one cell per round trip")
     args = parser.parse_args()
     if args.command == "plan":
         identity = json.loads(args.identity.read_bytes())
