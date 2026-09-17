@@ -12,6 +12,7 @@ import sys
 import uuid
 
 import experiment as common
+import inspect
 from discoverer_continuation import Journal, Slurm, TERMINAL, controller_lock as _lock, read
 
 FORMAT = 'single-model-slurm-v1'
@@ -137,7 +138,11 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
             state['status'] = 'complete'; journal.save(); return state
         index = len(previous)
         queue_root = root / 'rounds' / ('round-' + str(index))
-        report = backend.prepare_round(plan, previous, queue_root)
+        # Operational, not frozen: a profile beside the plan changes how many
+        # workers a round asks for, never what the round computes.
+        profile_path = root / 'cost-profile.json'
+        profile = read(profile_path) if profile_path.exists() else None
+        report = backend.prepare_round(plan, previous, queue_root, cost_profile=profile)
         state['completed'] = report['done']
         if report['remaining'] == 0:
             backend.finalize(plan, previous)
@@ -152,7 +157,9 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
                 stalled += 1
             if stalled >= spec.get('continuation', {}).get('max_no_progress_rounds', 2):
                 state['status'] = 'no_progress'; journal.save(); return state
-        allocation = resource_resolver(spec, report['remaining'])
+        extra = ({'work_seconds': report.get('work_seconds')}
+                 if 'work_seconds' in inspect.signature(resource_resolver).parameters else {})
+        allocation = resource_resolver(spec, report['remaining'], **extra)
         item = {'index': index, 'root': str(queue_root), 'label': 'W' + str(index),
                 'done_before': report['done'], 'allocation': allocation}
         if len(rounds) == index: rounds.append(item)

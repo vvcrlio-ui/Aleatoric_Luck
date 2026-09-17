@@ -43,7 +43,23 @@ def minute_headroom(text, qos):
     return min(limits) if limits else None
 
 
-def resolve(spec, remaining, *, run=base.query):
+def workers_for_work(work_seconds, wall_seconds, *, headroom=1.25):
+    """Workers that the remaining work can actually keep busy for one round.
+
+    Asking for more is what leaves an allocation idle rather than merely large:
+    the finished tree-ordinal round held 17,279 workers for 9.43 hours to
+    perform 1.58 hours of compute. Returns None when no measured profile has
+    priced the queue, leaving the caller's task-count bound in charge.
+    """
+    if work_seconds is None: return None
+    if not math.isfinite(work_seconds) or work_seconds <= 0:
+        raise ValueError('Remaining work must be positive and finite')
+    if not math.isfinite(wall_seconds) or wall_seconds <= 0:
+        raise ValueError('Round wall time must be positive and finite')
+    return max(1, math.ceil(headroom * work_seconds / wall_seconds))
+
+
+def resolve(spec, remaining, *, work_seconds=None, run=base.query):
     cluster = spec['cluster']
     qos = cluster.get('qos') or default_qos(cluster['account'], run=run)
     live = base.snapshot(cluster['account'], qos, cluster['partition'], run=run)
@@ -64,6 +80,8 @@ def resolve(spec, remaining, *, run=base.query):
     if slots < 1: raise ValueError('No node can fit worker memory plus dispatcher reserve')
     max_tasks = min(remaining + 1, bound['workers'])
     if cap is not None: max_tasks = min(max_tasks, cap + 1)
+    needed = workers_for_work(work_seconds, base.duration(bound['time_limit']))
+    if needed is not None: max_tasks = min(max_tasks, needed + 1)
     per_job = [base.tres(r['MaxTRES']) for r in live['qos_rows']]
     # Associations may carry a per-job limit inherited from a parent account.
     parents = {r['Account']: r['ParentName'] for r in live['associations'] if not r['User']}

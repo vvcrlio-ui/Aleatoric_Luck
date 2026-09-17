@@ -113,7 +113,7 @@ def scan(plan, rounds, accept=lambda row: None):
     return design, sources
 
 
-def prepare_round(plan, rounds, directory):
+def prepare_round(plan, rounds, directory, *, cost_profile=None):
     directory = Path(directory)
     design, sources = scan(plan, rounds)
     done = sum(b.bit_count() for b in design.bits)
@@ -132,18 +132,18 @@ def prepare_round(plan, rounds, directory):
     directory.parent.mkdir(parents=True, exist_ok=True)
     stage = directory.with_name('.' + directory.name + '-' + uuid.uuid4().hex)
     stage.mkdir()
-    estimator = CostEstimator()
+    estimator = CostEstimator(profile=cost_profile)
     groups = [(estimator.estimate(m, n, k), ki, ni, mi)
         for ki, k in enumerate(design.ks) for ni, n in enumerate(design.ns)
         for mi, m in enumerate(design.models)]
     groups.sort(key=lambda item: -item[0])
-    count = 0
+    count = 0; work = 0.
     with (stage / 'remaining.u32').open('xb') as handle:
-        for _, ki, ni, mi in groups:
+        for cost, ki, ni, mi in groups:
             base = (ki * len(design.ns) + ni) * len(design.repeats) * len(design.models) + mi
             chunk = array('I', (base + ri * len(design.models) for ri in range(len(design.repeats))
                                if not design.contains(base + ri * len(design.models))))
-            count += len(chunk)
+            count += len(chunk); work += cost * len(chunk)
             if sys.byteorder != 'little': chunk.byteswap()
             handle.write(chunk.tobytes())
         handle.flush(); os.fsync(handle.fileno())
@@ -153,7 +153,11 @@ def prepare_round(plan, rounds, directory):
                      'runtime_sha256': plan['runtime_sha256'], 'task_kind': plan.get('task_kind', 'regression')},
         'count': count, **transport_manifest(), 'max_attempts': 5, 'sources': sources,
         'remaining_sha256': file_digest(stage / 'remaining.u32'), 'fresh': True}
-    saved = {'done': done, 'remaining': count, 'queue_id': digest(manifest)}
+    # Only a measured profile carries seconds; the analytic estimator is a
+    # relative order, so reporting its total as work would invite sizing an
+    # allocation from a number that means nothing.
+    saved = {'done': done, 'remaining': count, 'queue_id': digest(manifest),
+             'work_seconds': work if cost_profile else None}
     atomic_json(stage / 'manifest.json', manifest)
     atomic_json(stage / 'queue-id.json', {'queue_id': digest(manifest)})
     atomic_json(stage / 'prepared.json', saved)
