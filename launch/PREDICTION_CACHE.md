@@ -24,7 +24,7 @@ prediction_cache:
   required: true
   oof_folds: 5
   shard_target_mib: 128
-  store_reported_sl_holdout: true
+  store_reported_sl_holdout: false
   quota_reserve_gb: 500
   file_reserve: 1000000
 execution:
@@ -53,11 +53,17 @@ frozen uncompressed estimate and temporary checkpoint bounds. Admission queries
 current Lustre project soft quotas and reserves unwritten bytes in a shared
 project ledger. The September 18 space snapshot is not an admission decision.
 
-The base phase contains eight independent model pipelines plus four separately
-identified original SL pipelines when `store_reported_sl_holdout` is enabled.
-Original SL regression still uses Ridge, Extra Trees, LightGBM and MLP. Their
-preprocessing and tuning are obtained from the original SL constructors rather
-than substituted with same-name independent models. OLS remains an independent
+The base phase contains the eight independent model pipelines. Setting
+`store_reported_sl_holdout` adds four more, reproducing the original
+four-model SL - Ridge, Extra Trees, LightGBM and MLP for regression - under its
+own `reported-sl4-*` identity. Those recipes come from the original SL
+constructors rather than being substituted with same-name independent models,
+because a same-named model is not the same training pipeline.
+
+That control is off by default. It is four extra pipelines of full and
+out-of-fold training, measured at 15.9% of base training time, not a disk
+write, and it cannot be added to a sealed cache afterwards - enabling it later
+means retraining the base phase. OLS remains an independent
 full/OOF column and its own independent score.
 
 The default combination is `standalone8-sl7-v1`: the seven library models except

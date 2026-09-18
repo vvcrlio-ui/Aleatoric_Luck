@@ -36,7 +36,7 @@ def normalize_prediction_options(cache=None, execution=None):
         raise ValueError("The version-1 cache codec freezes zlib compression level 6")
     result = {"mode": mode, "scope": "all", "dtype": "float64", "required": True,
               "layout": "shared-v1", "compaction_max_bytes": 512 * 1024**2,
-              "shard_target_mib": 128, "store_reported_sl_holdout": True,
+              "shard_target_mib": 128, "store_reported_sl_holdout": False,
               "quota_reserve_gb": 500, "file_reserve": 1_000_000, "oof_folds": 5,
               **options}
     if result["dtype"] != "float64" or result["scope"] != "all":

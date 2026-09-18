@@ -83,7 +83,10 @@ def contract_from_config(config, plan):
                      for model in ('ridge', 'lasso', 'random_forest', 'extra_trees',
                                    'xgboost', 'lightgbm', 'shallow_neural_network')],
                      'missing_policy': 'skip', 'combiner': default_combiner}]
-    if cache.get('store_reported_sl_holdout', True):
+    # Off by default: the original four-model SL is reproduced only when a run
+    # explicitly asks for that control. It is four extra pipelines of full+OOF
+    # training, not a disk write, and it cannot be added to a sealed cache later.
+    if cache.get('store_reported_sl_holdout', False):
         task_kind = plan['task_kind']; formal_id = 'reported-sl4-' + task_kind + '-v1'
         params = plan['cell_spec']['resolved_model_params']['super_learner']
         if params.get('passthrough') or (task_kind == 'regression' and not params.get('positive', True)):
