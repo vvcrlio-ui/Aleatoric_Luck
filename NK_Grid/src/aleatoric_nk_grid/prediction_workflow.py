@@ -74,8 +74,14 @@ def contract_from_config(config, plan):
         default_combiner = ({'rule': 'nnls-intercept-v1'} if plan['task_kind'] == 'regression' else
             {'rule': 'logistic-v1', 'C': sl_params.get('C', 1.), 'max_iter': sl_params.get('max_iter', 500),
              'random_state_rule': 'cell-model-seed'})
-        variants = [{'variant_id': 'standalone8-sl4-v1', 'pipeline_ids': ['standalone8-v1/' + model
-                     for model in ('ridge', 'extra_trees', 'lightgbm', 'shallow_neural_network')],
+        # OLS is excluded from the combination, not from the library: it keeps its
+        # own independent column and OOF. Underdetermined OLS predicts far outside
+        # the label range (GPA labels 1.0-4.0 against OLS predictions -779.8..760.9),
+        # and NNLS already gives it zero weight in 65.8% of the measured pairs.
+        # Evidence: docs/sl7-no-ols-60nodes-20260918 (20 seeds x 3 outcomes x 6 scales).
+        variants = [{'variant_id': 'standalone8-sl7-v1', 'pipeline_ids': ['standalone8-v1/' + model
+                     for model in ('ridge', 'lasso', 'random_forest', 'extra_trees',
+                                   'xgboost', 'lightgbm', 'shallow_neural_network')],
                      'missing_policy': 'skip', 'combiner': default_combiner}]
     if cache.get('store_reported_sl_holdout', True):
         task_kind = plan['task_kind']; formal_id = 'reported-sl4-' + task_kind + '-v1'

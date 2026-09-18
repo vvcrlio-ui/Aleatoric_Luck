@@ -58,9 +58,20 @@ identified original SL pipelines when `store_reported_sl_holdout` is enabled.
 Original SL regression still uses Ridge, Extra Trees, LightGBM and MLP. Their
 preprocessing and tuning are obtained from the original SL constructors rather
 than substituted with same-name independent models. OLS remains an independent
-full/OOF column. `standalone8-sl4-v1` is a distinct experimental combination;
-`reported-sl4-regression-v1` identifies the original frozen SL recipe. SL7/SL8
-remain separately named variants.
+full/OOF column and its own independent score.
+
+The default combination is `standalone8-sl7-v1`: the seven library models except
+OLS. OLS is dropped from the combination because an underdetermined fit predicts
+far outside the label range - GPA labels span 1.0-4.0 against OLS predictions of
+-779.8 to 760.9 - and the NNLS combiner already assigns it zero weight in 65.8%
+of measured pairs. Across 20 seeds x 3 outcomes x 6 scales the seven-model
+combination never lost on mean MSE, by 0.008% at the largest sizes and by 88%
+where OLS diverges (`docs/sl7-no-ols-60nodes-20260918`). Set `variants`
+explicitly to combine a different subset; each subset needs its own variant ID.
+
+`reported-sl4-regression-v1` identifies the original frozen SL recipe and stays
+available as a control. SL4 and SL8 remain separately named variants; results
+from different variants are never pooled.
 
 The controller completes every base task across the complete submission plan,
 verifies sealed cache coverage, writes `base-verified.json` and a read-only
