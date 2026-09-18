@@ -27,6 +27,53 @@ def operational_policy(root):
     return validate_policy(read(path) if path.exists() else None)
 
 
+def refresh_cost_profile(plan, root, previous):
+    """Price the next round from every timing this run is allowed to reuse.
+
+    Operational only: a profile decides how tasks are batched and whether the
+    economic drain can be costed, never what a round computes. Sources
+    accumulate, so a calibration run imported once keeps contributing its
+    breadth after later rounds add their own depth.
+
+    Pricing must never stall the controller. A source that has gone missing is
+    dropped; one whose timing identity does not belong to this plan makes the
+    whole import untrusted, so the run falls back to its own rounds and, if
+    those cannot be priced either, keeps whatever profile it already had.
+    Unpriced work still runs, one task per claim.
+    """
+    from aleatoric_nk_grid import prediction_profile
+    from aleatoric_nk_grid.shared_queue import atomic_json
+    root = Path(root)
+    profile_path = root / 'cost-profile.json'
+    imported = []
+    if profile_path.exists():
+        try:
+            for item in read(profile_path).get('evidence', {}).get('sources', ()):
+                imported.append(Path(item['path']))
+        except (ValueError, OSError):
+            imported = []
+    own = [Path(directory) / 'results.jsonl' for directory in previous]
+
+    def usable(paths):
+        result, seen = [], set()
+        for path in paths:
+            try: resolved = path.resolve()
+            except OSError: continue
+            if resolved in seen or not resolved.is_file(): continue
+            seen.add(resolved); result.append(resolved)
+        return result
+
+    for candidate in (usable(imported + own), usable(own)):
+        if not candidate: continue
+        try:
+            profile = prediction_profile.build(plan, candidate)
+        except Exception:
+            continue
+        atomic_json(profile_path, profile)
+        return profile
+    return None
+
+
 def operational_inputs(root, directory, item=None):
     """A submitted round reads its immutable snapshot, never a mutable profile."""
     from aleatoric_nk_grid.scheduler_cost import CostEstimator
@@ -317,6 +364,8 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         # Operational, not frozen: a profile beside the plan changes how many
         # workers a round asks for, never what the round computes.
         prepared_item = rounds[index] if len(rounds) > index else None
+        if workflow and prepared_item is None:
+            refresh_cost_profile(plan, root, previous)
         operational = operational_inputs(root, queue_root, prepared_item)
         policy, profile = operational['policy'], operational['cost_profile']
         try:

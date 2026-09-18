@@ -1,0 +1,46 @@
+# Two-phase base_then_sl manifest for the materialHardship tree-ordinal panel.
+# Scientific settings are copied unchanged from panels.yaml: the same schema,
+# the same model_params.yaml, the same nine models. Only the execution
+# workflow and the prediction cache are added, and they change how the run is
+# scheduled and what it persists, never what it computes.
+model_params: model_params.yaml
+preset: dev
+experiment_id: ffcws-aleatoric-v1
+data_version: ffcws-ard-v1
+model_spec_version: nkgrid-models-v6-balanced-batch-1
+
+panels:
+  - name: ffc_tree_ordinal_materialHardship
+    schema: schema/ffc_tree_ordinal_materialHardship.json
+    outcome: materialHardship
+    out: outputs/nk_grid_ffc_tree_ordinal_materialHardship.csv
+    models:
+      - ols
+      - ridge
+      - lasso
+      - random_forest
+      - xgboost
+      - lightgbm
+      - shallow_neural_network
+      - extra_trees
+      - super_learner
+    prediction_cache:
+      mode: holdout_oof
+      base_library: standalone8-v1
+      oof_folds: 5
+      # The original four-model SL control is not reproduced; the default
+      # combination is standalone8-sl7-v1, the seven library models bar OLS.
+      store_reported_sl_holdout: false
+    execution:
+      workflow: base_then_sl
+      barrier_scope: submission_plan
+      protocol_version: 2
+      phase_round_limits: {base: 2, sl: 1}
+      # The 30-minute default is sized for acceptance fixtures. At production
+      # repeat counts the combiner alone needs hours, so both phases get an
+      # explicit bound here and the real limit stays the frozen CPU-hour cap.
+      sl_resources:
+        worker_cap: 24
+        io_concurrency: 8
+        memory: 4G
+        time_limit: '04:00:00'
