@@ -696,6 +696,12 @@ def seal_base(plan, rounds):
         for item in evidence:
             stat = (Path(plan['prediction_workflow']['cache_root']) / item['path']).stat()
             item.update(bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
+        # A later same-size rewrite must not be able to reuse a sealed timestamp,
+        # or the receipt's timestamp fast path would skip its content check.
+        if evidence:
+            from .prediction_evidence import seal_mtime_barrier
+            seal_mtime_barrier(Path(plan['prediction_workflow']['cache_root']),
+                               max(item['mtime_ns'] for item in evidence))
     with temporary.open('r+b') as handle: os.fsync(handle.fileno())
     os.replace(temporary, root / 'base-records.sqlite')
     # Durable accepted rows are the authority. Unsubmitted tails cannot satisfy
