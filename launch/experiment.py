@@ -297,6 +297,8 @@ def execute(spec):
         raise ValueError('Legacy launch request requires its frozen checkout; do not change its scheduler in place')
     config = resolve_experiment(spec)
     if spec["target"] == "local":
+        from aleatoric_nk_grid.prediction_contract import reject_unsupported_prediction_backend
+        reject_unsupported_prediction_backend(config, "legacy local launcher")
         from aleatoric_nk_grid.nk_grid import run_nk_grid
         run_nk_grid(config, max_jobs=spec["max_jobs"], allow_large_run=spec["allow_large_run"])
         return

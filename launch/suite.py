@@ -214,6 +214,8 @@ def prepare(spec):
     manifest = area / "panels.yaml"; manifest.write_text(yaml.safe_dump(original, sort_keys=False))
     panels = []
     for name, config in resolved_panels(manifest, preset=spec["preset"]):
+        from aleatoric_nk_grid.prediction_contract import reject_unsupported_prediction_backend
+        reject_unsupported_prediction_backend(config, "legacy suite launcher")
         config = replace(config, n_jobs=1, checkpoint_retention=spec["checkpoint_retention"], allow_large_run=spec["allow_large_run"])
         with nk.NKGridExecutionSession.open_from_config(config) as session:
             cfg = replace(config, n_grid=tuple(map(int, session.n_grid)), k_grid=tuple(map(int, session.k_grid)),

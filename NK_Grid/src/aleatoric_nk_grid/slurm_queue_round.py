@@ -38,9 +38,14 @@ def worker(args):
     command = [sys.executable, '-m', 'aleatoric_nk_grid.single_model_worker', 'run', str(root),
                '--url', info['url'], '--repo-root', ready['repo'], '--token-file', ready['token_file'],
                '--ca-file', ready['ca_file'], '--spool', str(slot),
-               '--max-seconds', str(ready.get('max_seconds', 172800))]
+               '--max-seconds', str(ready.get('max_seconds', 172800)),
+               '--protocol-version', str(ready.get('protocol_version', 1))]
     if ready.get('recover_stale_leases', False):
         command.append('--recover-stale-leases')
+    if ready.get('deadline_epoch') is not None:
+        command.extend(['--deadline-epoch', str(ready['deadline_epoch'])])
+    if ready.get('fault_dir'):
+        command.extend(['--fault-dir', str(ready['fault_dir'])])
     # Exec ensures Slurm signals reach the actual numerical worker process.
     os.execv(sys.executable, command)
 
@@ -54,6 +59,10 @@ def run(args):
     os.chmod(args.control, 0o700)
     with file_lock(args.control / 'round.lock'):
         manifest = read(args.queue / 'manifest.json')
+        if manifest.get('identity', {}).get('prediction_workflow'):
+            raise QueueError('Legacy round backend cannot execute prediction workflows; use protocol-2 cluster_scheduler')
+        from .prediction_workflow import reject_unphased_cache
+        reject_unphased_cache(manifest['identity']['cell_spec'])
         qid = read(args.queue / 'queue-id.json')['queue_id']
         commit = subprocess.check_output(['git', '-C', str(args.repo), 'rev-parse', 'HEAD'], text=True).strip()
         if manifest['identity']['cell_spec']['git_commit'] != commit:

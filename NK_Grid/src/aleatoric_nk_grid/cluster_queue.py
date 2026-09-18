@@ -25,11 +25,28 @@ def read(path):
 
 
 def prepare(config, launch, repo):
+    from .prediction_contract import normalize_prediction_options
+    options, execution = normalize_prediction_options(getattr(config, 'prediction_cache', None),
+                                                      getattr(config, 'execution', None))
+    if options and execution.get('workflow') != 'base_then_sl':
+        raise QueueError('Cluster prediction cache requires base_then_sl; capture is a numerical-session API only')
     from . import nk_grid as nk
     from .execution_contract import CellExecutionSpec
     root = Path(launch['output'])
     with nk.NKGridExecutionSession.open_from_config(config) as session:
         task_kind = session.task
+        prediction_dimensions = None
+        if (getattr(config, 'execution', None) or {}).get('workflow') == 'base_then_sl':
+            frames = [session.frame] + ([session.external_frame] if session.external_frame is not None else [])
+            max_id_width = max((len(str(value)) * 4 for frame in frames
+                for value in frame[session.schema.id_column]), default=4)
+            prediction_dimensions = {
+                'n_test_max': max(len(session.split_manager.for_seed(seed).test_index)
+                                  for seed in {seed for seed, _ in session.repeat_pairs}),
+                'feature_map_bytes': sum(len(str(name)) * 4 + 16 for name in
+                                         (*session.predictors, *session.feature_units)),
+                'max_id_width': max_id_width,
+                'sample_index_width': max((len(str(value)) * 4 for frame in frames for value in frame.index), default=4)}
         spec = CellExecutionSpec.from_config(config, repo_root=repo, panel_id=launch['panel'],
             resolved_n_grid=session.n_grid, resolved_k_grid=session.k_grid,
             resolved_repeat_plan=session.repeat_pairs, model_n_jobs=1,
@@ -48,6 +65,17 @@ def prepare(config, launch, repo):
             'launch': {**launch, 'worker_environment': environment},
             'submission': launch['cluster'], 'task_kind': task_kind, 'public_columns': nk.public_result_columns(task_kind),
             'checkpoint_retention': config.checkpoint_retention}
+    from .prediction_workflow import contract_from_config
+    if prediction_dimensions is not None:
+        plan['prediction_dimensions'] = prediction_dimensions
+    workflow = contract_from_config(config, plan)
+    if workflow is not None:
+        plan['prediction_workflow'] = workflow
+        from .prediction_cache import initialize_cache
+        initialize_cache(workflow['cache_root'], {'workflow_sha256': digest(workflow),
+            'plan_sha256': digest(plan), 'contract': workflow})
+        from .prediction_maps import prepare_maps
+        prepare_maps(plan, repo_root=repo)
     path = root / 'plan.json'
     if path.exists():
         if read(path) != plan:
@@ -57,12 +85,56 @@ def prepare(config, launch, repo):
     return path
 
 
+def prepare_joint(plans, launch, *, phase_round_limits, sl_resources):
+    """Freeze one multi-panel submission and one barrier, without submitting.
+
+    Inputs are already-frozen single-panel plans, not running queues. The new
+    output identity is independent and never mutates their code, caches or jobs.
+    """
+    from .prediction_workflow import joint_contract, validate_round_time_limits
+    from .prediction_cache import initialize_cache
+    plans = [read(p) if isinstance(p, (str, Path)) else p for p in plans]
+    if not plans or any(p.get('format') != 'single-model-slurm-v1' or not p.get('prediction_workflow') for p in plans):
+        raise QueueError('Joint prediction submission needs frozen two-phase panel plans')
+    first = plans[0]
+    if any(p['runtime_sha256'] != first['runtime_sha256'] or
+           p['cell_spec'].get('git_commit') != first['cell_spec'].get('git_commit') for p in plans):
+        raise QueueError('Joint panels must use the same frozen runtime/code')
+    root = Path(launch['output']).resolve()
+    contract = joint_contract([p['prediction_workflow'] for p in plans], output_root=root,
+                             phase_round_limits=phase_round_limits, sl_resources=sl_resources)
+    validate_round_time_limits(contract, global_time_limit=launch['cluster']['time_limit'])
+    dimensions = [p.get('prediction_dimensions', {}) for p in plans]
+    if any(not d for d in dimensions): raise QueueError('Every joint panel requires storage dimensions')
+    merged = {}
+    for original in plans:
+        dims = original['prediction_dimensions']
+        for panel in original['prediction_workflow']['panels']:
+            merged[panel['panel_id']] = dims.get(panel['panel_id'], dims)
+    plan = {'format': 'single-model-slurm-v1', 'cell_spec': first['cell_spec'],
+        'runtime_sha256': first['runtime_sha256'], 'launch': launch, 'submission': launch['cluster'],
+        'task_kind': first['task_kind'], 'checkpoint_retention': 'keep',
+        'public_columns': list(dict.fromkeys(column for p in plans for column in p['public_columns'])),
+        'prediction_workflow': contract, 'prediction_dimensions': merged,
+        'source_panel_plan_sha256': [digest(p) for p in plans]}
+    root.mkdir(parents=True, exist_ok=True); path = root / 'plan.json'
+    if path.exists() and read(path) != plan: raise QueueError('Joint frozen plan changed')
+    initialize_cache(contract['cache_root'], {'workflow_sha256': digest(contract),
+        'plan_sha256': digest(plan), 'contract': contract})
+    from .prediction_maps import prepare_maps
+    prepare_maps(plan, repo_root=launch.get('source', {}).get('root', Path.cwd()))
+    if not path.exists(): atomic_json(path, plan)
+    return path
+
+
 def scan(plan, rounds, accept=lambda row: None):
     """Validate durable receipts with bounded key memory, including partial tails.
 
     The caller also checks Slurm termination. OS locks fence numerical owners
     and protect against a concurrent manually started allocation.
     """
+    from .prediction_workflow import reject_unphased_cache
+    reject_unphased_cache(plan['cell_spec'])
     design = Design(plan['cell_spec'])
     sources = []
     with ExitStack() as locks:
@@ -128,22 +200,56 @@ def prepare_round(plan, rounds, directory, *, cost_profile=None):
                 or read(directory / 'queue-id.json')['queue_id'] != digest(manifest)
                 or file_digest(directory / 'remaining.u32') != manifest['remaining_sha256']):
             raise QueueError('Prepared round changed')
-        return saved
+        # Preparation can precede live admission by hours (or a controller
+        # restart). Reprice the frozen ordinal list using this round's current
+        # operational profile; never reorder it or rewrite its queue identity.
+        work = None; coverage = None
+        if cost_profile is not None:
+            estimator = CostEstimator(profile=cost_profile)
+            order = array('I'); order.frombytes((directory / 'remaining.u32').read_bytes())
+            if sys.byteorder != 'little': order.byteswap()
+            counts = {}
+            for ordinal in order:
+                if ordinal >= design.count:
+                    raise QueueError('Prepared task ordinal exceeds design')
+                group, mi = divmod(ordinal, len(design.models))
+                group //= len(design.repeats)
+                ki, ni = divmod(group, len(design.ns))
+                key = (design.models[mi], design.ns[ni], design.ks[ki])
+                counts[key] = counts.get(key, 0) + 1
+            means = [(estimator.mean_seconds(*key), count) for key, count in counts.items()]
+            if all(mean is not None for mean, _ in means):
+                work = sum(mean * count for mean, count in means)
+            coverage = estimator.coverage(counts)
+        return {**saved, 'work_seconds': work,
+                'cost_profile_coverage': coverage,
+                'cost_profile_sha256': digest(cost_profile) if cost_profile is not None else None}
     directory.parent.mkdir(parents=True, exist_ok=True)
     stage = directory.with_name('.' + directory.name + '-' + uuid.uuid4().hex)
     stage.mkdir()
     estimator = CostEstimator(profile=cost_profile)
-    groups = [(estimator.estimate(m, n, k), ki, ni, mi)
-        for ki, k in enumerate(design.ks) for ni, n in enumerate(design.ns)
-        for mi, m in enumerate(design.models)]
+    fallback = CostEstimator()
+    groups = []
+    for ki, k in enumerate(design.ks):
+        for ni, n in enumerate(design.ns):
+            for mi, model in enumerate(design.models):
+                mean = estimator.mean_seconds(model, n, k)
+                # Relative fallback weights only order unknown groups. They are
+                # never added to a seconds total or treated as a batch price.
+                ordering = mean if mean is not None else fallback.estimate(model, n, k)
+                groups.append((ordering, ki, ni, mi, mean))
     groups.sort(key=lambda item: -item[0])
-    count = 0; work = 0.
+    count = 0; work = 0.; remaining_groups = []; fully_priced = cost_profile is not None
     with (stage / 'remaining.u32').open('xb') as handle:
-        for cost, ki, ni, mi in groups:
+        for _, ki, ni, mi, mean in groups:
             base = (ki * len(design.ns) + ni) * len(design.repeats) * len(design.models) + mi
             chunk = array('I', (base + ri * len(design.models) for ri in range(len(design.repeats))
                                if not design.contains(base + ri * len(design.models))))
-            count += len(chunk); work += cost * len(chunk)
+            count += len(chunk)
+            if chunk:
+                if mean is None: fully_priced = False
+                else: work += mean * len(chunk)
+                remaining_groups.append((design.models[mi], design.ns[ni], design.ks[ki]))
             if sys.byteorder != 'little': chunk.byteswap()
             handle.write(chunk.tobytes())
         handle.flush(); os.fsync(handle.fileno())
@@ -157,7 +263,9 @@ def prepare_round(plan, rounds, directory, *, cost_profile=None):
     # relative order, so reporting its total as work would invite sizing an
     # allocation from a number that means nothing.
     saved = {'done': done, 'remaining': count, 'queue_id': digest(manifest),
-             'work_seconds': work if cost_profile else None}
+             'work_seconds': work if fully_priced else None,
+             'cost_profile_coverage': estimator.coverage(remaining_groups) if cost_profile is not None else None,
+             'cost_profile_sha256': digest(cost_profile) if cost_profile is not None else None}
     atomic_json(stage / 'manifest.json', manifest)
     atomic_json(stage / 'queue-id.json', {'queue_id': digest(manifest)})
     atomic_json(stage / 'prepared.json', saved)
@@ -166,6 +274,8 @@ def prepare_round(plan, rounds, directory, *, cost_profile=None):
 
 
 def finalize(plan, rounds):
+    from .prediction_workflow import reject_unphased_cache
+    reject_unphased_cache(plan['cell_spec'])
     from .nk_grid import project_public_result
     root = Path(plan['launch']['output'])
     final, receipt = root / 'final.csv', root / 'verified.json'

@@ -2073,6 +2073,8 @@ def write_work_snapshot(
     task_summary: TaskTableSummary | None = None,
     cell_spec_repo_root: Path | None = None,
 ) -> Path:
+    from .prediction_contract import reject_unsupported_prediction_backend
+    reject_unsupported_prediction_backend(config, "legacy flat task table")
     if workers < 1:
         raise ValueError("workers must be positive")
     table = Path(table_path).resolve()

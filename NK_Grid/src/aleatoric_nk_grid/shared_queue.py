@@ -53,6 +53,9 @@ MAX_SUBMISSIONS = 32
 # of the fleet near the end of the queue.
 TARGET_BATCH_SECONDS = 30.
 MAX_BATCH_TASKS = 256
+# Protocol v2 leases are time/byte bounded by the dispatcher. Keep the v1 cap
+# for old clients; increasing it alone would create oversized result receipts.
+MAX_LEASE_TASKS = 4096
 
 
 def transport_manifest():
@@ -161,6 +164,9 @@ class Dispatcher:
     @staticmethod
     def create(root, tasks: Iterable[tuple[ModelTask, float]], *, identity: dict,
                lease_seconds=120., max_attempts=5):
+        if (identity.get("prediction_workflow") or
+                (identity.get("cell_spec", {}).get("prediction_cache") or {}).get("mode", "off") != "off"):
+            raise QueueError("Legacy Dispatcher cannot execute required prediction caching; use the two-phase controller")
         root = Path(root)
         if root.exists():
             raise QueueError("Use a new output directory")
@@ -198,6 +204,10 @@ class Dispatcher:
         self.db_path = None
         try:
             self.manifest = json.loads((self.root / "manifest.json").read_bytes())
+            identity = self.manifest.get("identity", {})
+            if (identity.get("prediction_workflow") or
+                    (identity.get("cell_spec", {}).get("prediction_cache") or {}).get("mode", "off") != "off"):
+                raise QueueError("Legacy Dispatcher cannot restore a required prediction workflow")
             self.queue_id = digest(self.manifest)
             if json.loads((self.root / "queue-id.json").read_bytes())["queue_id"] != self.queue_id:
                 raise QueueError("Manifest changed")

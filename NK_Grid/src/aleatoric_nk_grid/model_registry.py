@@ -739,19 +739,8 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
         self.diagnostics = diagnostics
         self.preprocessor = preprocessor
 
-    def fit(self, X, y):
-        from .mlp_batch_cv import validate_batch
-        validate_batch(self.mlp_batch_size, self.mlp_batch_candidates, self.mlp_batch_cv_folds)
-        if type(self.cv) is not int or self.cv < 2:
-            raise ValueError("stacking cv must be an integer >= 2")
-        if self.passthrough and np.asarray(pd.isna(X)).any():
-            raise ValueError(
-                "Super Learner passthrough=True does not support NaN values in X; "
-                "impute X before fitting or set passthrough=False."
-            )
-        cv = min(self.cv, len(y))
-        if cv < 2:
-            raise ValueError("Super Learner requires at least two training rows.")
+    def base_estimators(self):
+        """Unfitted exact reported-SL recipes, for separately scheduled base work."""
         import lightgbm as lgb
 
         mlp_params = dict(hidden_layer_sizes=self.hidden_layer_sizes, activation="relu",
@@ -830,9 +819,27 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                 build_mlp_regressor(seed=self.seed, alpha=self.alpha, params=mlp_params),
                 (self.alpha,), self.mlp_batch_candidates, self.mlp_batch_cv_folds,
                 self.preprocessor))
+        return estimators
+
+    def fit(self, X, y):
+        from .mlp_batch_cv import validate_batch
+        validate_batch(self.mlp_batch_size, self.mlp_batch_candidates, self.mlp_batch_cv_folds)
+        if type(self.cv) is not int or self.cv < 2:
+            raise ValueError("stacking cv must be an integer >= 2")
+        if self.passthrough and np.asarray(pd.isna(X)).any():
+            raise ValueError(
+                "Super Learner passthrough=True does not support NaN values in X; "
+                "impute X before fitting or set passthrough=False."
+            )
+        cv = min(self.cv, len(y))
+        if cv < 2:
+            raise ValueError("Super Learner requires at least two training rows.")
+        estimators = self.base_estimators()
+        from .mlp_batch_cv import SerialBatchStack
         if self.mlp_batch_size == "cv" or self.diagnostics:
             self.model_ = SerialBatchStack(estimators, cv, self.positive, self.passthrough,
-                                          diagnostics=self.diagnostics).fit(X, y)
+                                          diagnostics=self.diagnostics,
+                                          capture_predictions=getattr(self, "capture_predictions", False)).fit(X, y)
             self.diagnostics_ = {"fits": (self.model_.mlp_fits_ if self.mlp_batch_size == "cv"
                                          else self.model_.base_fits_),
                 "fit_count": sum(f["fit_count"] for f in self.model_.mlp_fits_),
@@ -840,7 +847,11 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
                 "intercept": float(self.model_.final_estimator_.intercept_),
                 "note": "actual serial OOF/full fits; no diagnostic replay"}
             return self
-        self.model_ = StackingRegressor(
+        stack_class = StackingRegressor
+        if getattr(self, "capture_predictions", False):
+            from .prediction_training import CapturingStackingRegressor
+            stack_class = CapturingStackingRegressor
+        self.model_ = stack_class(
             estimators=estimators,
             final_estimator=LinearRegression(positive=self.positive),
             cv=cv,
@@ -895,18 +906,8 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         self.lgbm_min_data_in_leaf = lgbm_min_data_in_leaf
         self.preprocessor = preprocessor
 
-    def fit(self, X, y):
-        if self.passthrough and np.asarray(pd.isna(X)).any():
-            raise ValueError(
-                "Super Learner passthrough=True does not support NaN values in X; "
-                "impute X before fitting or set passthrough=False."
-            )
-        _, counts = np.unique(np.asarray(y), return_counts=True)
-        cv = min(self.cv, int(counts.min())) if len(counts) >= 2 else 0
-        if cv < 2:
-            raise ValueError(
-                "Super Learner classification requires at least two rows per class."
-            )
+    def base_estimators(self):
+        """Unfitted exact reported-SL recipes, for separately scheduled base work."""
         import lightgbm as lgb
 
         estimators = [
@@ -966,7 +967,26 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         if getattr(self, "preprocessor", None) is not None:
             for _, estimator in estimators:
                 estimator.steps.insert(0, ("typed_preprocessing", clone(self.preprocessor)))
-        self.model_ = StackingClassifier(
+        return estimators
+
+    def fit(self, X, y):
+        if self.passthrough and np.asarray(pd.isna(X)).any():
+            raise ValueError(
+                "Super Learner passthrough=True does not support NaN values in X; "
+                "impute X before fitting or set passthrough=False."
+            )
+        _, counts = np.unique(np.asarray(y), return_counts=True)
+        cv = min(self.cv, int(counts.min())) if len(counts) >= 2 else 0
+        if cv < 2:
+            raise ValueError(
+                "Super Learner classification requires at least two rows per class."
+            )
+        estimators = self.base_estimators()
+        stack_class = StackingClassifier
+        if getattr(self, "capture_predictions", False):
+            from .prediction_training import CapturingStackingClassifier
+            stack_class = CapturingStackingClassifier
+        self.model_ = stack_class(
             estimators=estimators,
             final_estimator=LogisticRegression(
                 C=self.C, max_iter=self.max_iter, random_state=self.seed

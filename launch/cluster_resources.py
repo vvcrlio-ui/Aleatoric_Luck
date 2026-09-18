@@ -6,8 +6,40 @@ No site quota or node count is embedded in the submission path.
 """
 import math
 import re
+from copy import deepcopy
 
 import discoverer_resources as base
+
+
+class CpuBudgetExhausted(ValueError):
+    """The cumulative operational budget cannot admit another allocation."""
+
+
+def phase_spec(spec, workflow, phase, *, round_index=0):
+    """Freeze separate lightweight SL resources, including a filesystem cap."""
+    if phase == 'base':
+        from aleatoric_nk_grid.prediction_workflow import validate_round_time_limits
+        times = validate_round_time_limits(workflow, global_time_limit=spec['cluster']['time_limit'])
+        if times is None: return spec
+        if type(round_index) is not int or not 0 <= round_index < len(times):
+            raise ValueError('Base phase round index is outside its frozen time-limit vector')
+        result = deepcopy(spec)
+        result['cluster']['time_limit'] = times[round_index]
+        result['prediction_phase'] = 'base'
+        result['prediction_phase_round_index'] = round_index
+        return result
+    if phase != 'sl': raise ValueError('Unknown prediction workflow phase')
+    resources = workflow['sl_resources']; result = deepcopy(spec)
+    result['cluster']['memory_override'] = resources['memory']
+    result['cluster']['time_limit'] = resources['time_limit']
+    cap = min(resources['worker_cap'], resources['io_concurrency'])
+    old_cap = result.get('continuation', {}).get('worker_cap')
+    if old_cap is not None: cap = min(cap, old_cap)
+    if result['profile'] != 'discoverer': cap = min(cap, result['cluster']['workers'])
+    result.setdefault('continuation', {})['worker_cap'] = cap
+    result['prediction_phase'] = 'sl'
+    result['prediction_io_concurrency'] = resources['io_concurrency']
+    return result
 
 
 def default_qos(account, *, run=base.query):
@@ -59,18 +91,22 @@ def workers_for_work(work_seconds, wall_seconds, *, headroom=1.25):
     return max(1, math.ceil(headroom * work_seconds / wall_seconds))
 
 
-def resolve(spec, remaining, *, work_seconds=None, run=base.query):
+def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
+            cpu_hours_remaining=None, control_jobs_reserved=2, max_nodes=60, run=base.query):
+    if type(max_nodes) is not int or max_nodes < 1:
+        raise ValueError('Explicit total node cap must be a positive integer')
+    node_cap = max_nodes
     cluster = spec['cluster']
     qos = cluster.get('qos') or default_qos(cluster['account'], run=run)
     live = base.snapshot(cluster['account'], qos, cluster['partition'], run=run)
     memory = cluster.get('memory_override') or '16G'
     cap = spec.get('continuation', {}).get('worker_cap')
     if cap is None and spec['profile'] != 'discoverer': cap = cluster['workers']
-    # Retaining the old per-worker scoped bound deliberately underestimates
-    # capacity; it cannot spend the old array's full allowance per allocation.
+    # This is one Slurm job, not an array of independently submitted workers.
+    # Keep job slots and every scoped CPU/memory/node headroom dimension separate.
     bound = base.capacity(live, remaining=2**63 - 1, memory=memory,
         requested_time=cluster['time_limit'], worker_cap=None,
-        extra_submit=3, extra_running=2)
+        extra_submit=3, extra_running=2, single_allocation=True, control_memory=spec['plan_memory'])
     threads = max(int(n['threads']) for n in live['nodes'])
     cpu_per_task = max(threads, bound['allocated_cpu_per_worker_bound'])
     mem = base.memory_mb(memory)
@@ -78,10 +114,29 @@ def resolve(spec, remaining, *, work_seconds=None, run=base.query):
     slots = min(min(int(n['cpu']) // threads, int((float(n['mem']) - overhead) // mem))
                 for n in live['nodes'])
     if slots < 1: raise ValueError('No node can fit worker memory plus dispatcher reserve')
-    max_tasks = min(remaining + 1, bound['workers'])
+    max_tasks = remaining + 1
     if cap is not None: max_tasks = min(max_tasks, cap + 1)
-    needed = workers_for_work(work_seconds, base.duration(bound['time_limit']))
+    wall_seconds = base.duration(bound['time_limit'])
+    if target_round_seconds is not None:
+        if (not math.isfinite(target_round_seconds) or target_round_seconds <= 0):
+            raise ValueError('Target round seconds must be positive and finite')
+    sizing_seconds = min(wall_seconds, target_round_seconds or wall_seconds)
+    needed = workers_for_work(work_seconds, sizing_seconds)
     if needed is not None: max_tasks = min(max_tasks, needed + 1)
+    # Include every controller already journaled plus the worker's successor and
+    # its recovery guard. Their full requested durations are charged until an
+    # accounting-backed receipt can narrow them; no average runtime is assumed.
+    if not isinstance(control_jobs_reserved, int) or control_jobs_reserved < 0:
+        raise ValueError('Reserved control jobs must be a nonnegative integer')
+    control_hours = control_jobs_reserved * cpu_per_task * base.duration(spec['plan_time']) / 3600
+    if cpu_hours_remaining is not None:
+        if not math.isfinite(cpu_hours_remaining) or cpu_hours_remaining < 0:
+            raise ValueError('Remaining CPU hours must be nonnegative and finite')
+        task_budget = math.floor(max(0., cpu_hours_remaining - control_hours) * 3600
+                                 / (wall_seconds * cpu_per_task))
+        max_tasks = min(max_tasks, task_budget)
+        if max_tasks < 2:
+            raise CpuBudgetExhausted('CPU-hour budget cannot fit worker, dispatcher and control reserves')
     per_job = [base.tres(r['MaxTRES']) for r in live['qos_rows']]
     # Associations may carry a per-job limit inherited from a parent account.
     parents = {r['Account']: r['ParentName'] for r in live['associations'] if not r['User']}
@@ -91,15 +146,19 @@ def resolve(spec, remaining, *, work_seconds=None, run=base.query):
     per_job += [base.tres(r['MaxTRES']) for r in live['associations']
         if r['Account'] in ancestors and r['User'] in ('', live['user'])
         and r['Partition'] in ('', cluster['partition'])]
+    if any(not math.isfinite(value) or value < 0 for limits in per_job for value in limits.values()):
+        raise ValueError('Invalid whole-allocation per-job TRES limit')
     slots = min(slots, max_tasks)
     for limits in per_job:
         if 'cpu' in limits: slots = min(slots, int(limits['cpu'] // cpu_per_task))
         if 'mem' in limits: slots = min(slots, int((limits['mem'] - overhead) // mem))
     max_node_mem = base.finite(live['partition'].get('MaxMemPerNode', ''))
+    max_cpu_mem = base.finite(live['partition'].get('MaxMemPerCPU', ''))
     if max_node_mem not in (None, 0): slots = min(slots, int((max_node_mem - overhead) // mem))
     if slots < 1: raise ValueError('Per-job limits cannot fit worker and dispatcher memory')
     max_nodes = base.finite(live['partition'].get('MaxNodes', ''))
     if max_nodes is not None: max_tasks = min(max_tasks, max_nodes * slots)
+    max_tasks = min(max_tasks, node_cap * slots)
     raw_usage = run(['scontrol', 'show', 'assoc_mgr'])
     budgets = [minute_headroom(raw_usage, r['Name']) for r in live['qos_rows']]
     minutes = base.duration(bound['time_limit']) / 60
@@ -108,12 +167,17 @@ def resolve(spec, remaining, *, work_seconds=None, run=base.query):
     def fits(tasks):
         nodes = math.ceil(tasks / slots)
         request = {'node': nodes, 'cpu': nodes * slots * cpu_per_task, 'mem': nodes * node_memory}
-        units = max(request['node'], request['cpu'] / bound['allocated_cpu_per_worker_bound'], request['mem'] / mem)
-        if units > bound['workers']: return False
+        if any(request[limit['resource']] > limit['available'] for limit in bound['resource_constraints']):
+            return False
         if any(request[k] > v for limits in per_job for k, v in limits.items() if k in request): return False
+        if max_cpu_mem not in (None, 0) and request['mem'] / request['cpu'] > max_cpu_mem:
+            return False
         # Reserve two short control jobs as well as the allocation.
         needed_minutes = request['cpu'] * minutes + 2 * cpu_per_task * base.duration(spec['plan_time']) / 60
         if any(b is not None and needed_minutes > b for b in budgets): return False
+        if (cpu_hours_remaining is not None
+                and request['cpu'] * wall_seconds / 3600 + control_hours > cpu_hours_remaining):
+            return False
         return True
     low, high = 0, max_tasks
     while low < high:
@@ -122,7 +186,11 @@ def resolve(spec, remaining, *, work_seconds=None, run=base.query):
         else: high = mid - 1
     if low < 2: raise ValueError('No live capacity for one worker plus dispatcher and control reserves')
     nodes = math.ceil(low / slots)
-    return {'workers': low - 1, 'nodes': nodes, 'tasks_per_node': slots,
+    return {'workers': low - 1, 'nodes': nodes, 'max_nodes': node_cap, 'tasks_per_node': slots,
             'memory_mb_per_node': node_memory, 'time_limit': bound['time_limit'], 'qos': qos,
             'allocated_cpu_bound': nodes * slots * cpu_per_task,
+            'control_cpu_bound': cpu_per_task, 'target_round_seconds': target_round_seconds,
+            'work_seconds': work_seconds,
+            'reserved_cpu_hours': nodes * slots * cpu_per_task * wall_seconds / 3600,
+            'reserved_control_cpu_hours': control_hours,
             'qos_remaining_cpu_minutes': budgets, 'live_worker_bound': bound}

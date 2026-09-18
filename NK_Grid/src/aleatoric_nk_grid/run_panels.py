@@ -133,6 +133,8 @@ PANEL_FIELDS = frozenset(
         "n_grid",
         "k_grid",
         "prediction_export_cells",
+        "prediction_cache",
+        "execution",
     }
 )
 CONFIG_FIELDS = set(NKGridConfig.__dataclass_fields__)

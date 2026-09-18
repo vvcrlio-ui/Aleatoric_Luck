@@ -8,12 +8,15 @@ import argparse
 from array import array
 from collections import deque
 from dataclasses import asdict
+from datetime import datetime
 import errno
 import hashlib
 import heapq
 import json
+import math
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import ssl
@@ -28,6 +31,8 @@ from aleatoric_nk_grid.shared_queue import (
     atomic_json, canonical, digest, file_digest, file_lock, transport_manifest)
 from aleatoric_nk_grid.pending_resume import Design
 from aleatoric_nk_grid.result_migration import validate_scientific_result
+from aleatoric_nk_grid.scheduler_cost import CostEstimator
+from aleatoric_nk_grid.scheduler_policy import TailMonitor, validate_policy
 
 
 def read(path):
@@ -35,6 +40,8 @@ def read(path):
 
 
 def task_at(design, ordinal):
+    if hasattr(design, 'task_at'):
+        return design.task_at(int(ordinal))
     ordinal, m = divmod(int(ordinal), len(design.models))
     ordinal, r = divmod(ordinal, len(design.repeats))
     k, n = divmod(ordinal, len(design.ns))
@@ -51,6 +58,8 @@ def prepare(base, output):
     started = time.monotonic()
     ready = read(base / 'ready.json')
     bm = read(base / 'base-manifest.json')
+    from .prediction_workflow import reject_unphased_cache
+    reject_unphased_cache(bm['cell_spec'])
     if file_digest(base / 'base-manifest.json') != ready['base_manifest_sha256']:
         raise QueueError('Base manifest changed')
     bits = (base / 'completed.bits').read_bytes()
@@ -140,6 +149,10 @@ def prepare_flat(base, output):
     import numpy as np
     started = time.monotonic()
     parent = read(base / 'manifest.json'); parent_qid = digest(parent)
+    if parent.get('identity', {}).get('prediction_workflow'):
+        raise QueueError('Prediction workflows must resume through cluster_scheduler and its all-plan phase barrier')
+    from .prediction_workflow import reject_unphased_cache
+    reject_unphased_cache(parent['identity']['cell_spec'])
     if read(base / 'queue-id.json')['queue_id'] != parent_qid:
         raise QueueError('Parent identity changed')
     if parent['format'] != 'direct-success-bitmap-v1':
@@ -228,10 +241,18 @@ def prepare_flat(base, output):
 
 class FlatDispatcher(Dispatcher):
     """Compact pending list, bounded active leases, append-only result receipts."""
-    def __init__(self, root, *, clock=time.time):
+    def __init__(self, root, *, clock=time.time, fleet=1, policy=None,
+                 cost_profile=None, work_seconds=None):
+        if type(fleet) is not int or fleet < 1: raise QueueError('Invalid fleet size')
+        self.fleet = fleet; self.policy = validate_policy(policy)
+        self.estimator = CostEstimator(profile=cost_profile)
+        if work_seconds is not None and (not math.isfinite(work_seconds) or work_seconds < 0):
+            raise QueueError('Invalid remaining work estimate')
+        self.remaining_work_seconds = work_seconds
         self.root = Path(root); self.clock = clock
         self.mutex = threading.RLock(); self.closed = self.poisoned = False
         self.submit_mutex = threading.RLock(); self.fsync_mutex = threading.RLock()
+        self.submission_locks = {}  # Only currently submitting/waiting lease tokens.
         self.written_seq = self.synced_seq = self.commits = 0
         self._owner = file_lock(self.root / 'dispatcher.lock'); self._owner.__enter__()
         self.journal = None
@@ -241,7 +262,8 @@ class FlatDispatcher(Dispatcher):
                 raise QueueError('Manifest changed')
             if file_digest(self.root / 'remaining.u32') != self.manifest['remaining_sha256']:
                 raise QueueError('Remaining list changed')
-            self.design = Design(self.manifest['identity']['cell_spec'])
+            from .prediction_workflow import design_for
+            self.design = design_for(self.manifest['identity'])
             self.order = array('I'); self.order.frombytes((self.root / 'remaining.u32').read_bytes())
             if sys.byteorder != 'little': self.order.byteswap()
             if len(self.order) != self.manifest['count']:
@@ -256,6 +278,8 @@ class FlatDispatcher(Dispatcher):
             self.heartbeats_ok = 0
             self.leased_batches = self.leased_cells = 0
             self.done = self.failed = 0; self.paused = False; self.epoch = uuid.uuid4().hex
+            self.worker_status = {}; self.retired_leases = {}
+            self.draining = False; self.drain_reason = None
         except BaseException:
             self.close(); raise
 
@@ -271,6 +295,7 @@ class FlatDispatcher(Dispatcher):
                 # deadline per lease, without an O(active) scan on every claim.
                 heapq.heappush(self.expiries, (row['expiry'], task_id, token))
                 continue
+            self.retired_leases[row['worker']] = (token, 'lost')
             del self.active[task_id]; self._release(row['worker'], task_id)
             self.expired_leases += 1
             if row['attempt'] >= self.manifest['max_attempts']:
@@ -296,6 +321,80 @@ class FlatDispatcher(Dispatcher):
         if row is None: raise QueueError('Unknown/nonactive task')
         return row
 
+    def protocol(self, worker, version=2, hostname=''):
+        if version != 2: raise QueueError('Unsupported worker protocol')
+        if not isinstance(worker, str) or not 0 < len(worker) <= 256:
+            raise QueueError('Invalid worker')
+        if not isinstance(hostname, str) or len(hostname) > 256: raise QueueError('Invalid hostname')
+        with self.mutex:
+            if self.closed or self.poisoned: raise QueueError('Dispatcher stopped')
+            self.worker_status.setdefault(worker, {'state': 'idle', 'observed_at': self.clock(),
+                'hostname': hostname, 'version': version, 'task_id': None,
+                'unacknowledged_chunks': 0})
+            self.worker_status[worker]['hostname'] = hostname
+            p = self.policy
+            return {'version': 2, 'max_batch': p['max_batch_tasks'],
+                    'submit_bytes': p['submit_bytes'], 'max_request_bytes': 1024 * 1024,
+                    'flush_seconds': p['flush_seconds'], 'status_seconds': p['status_seconds'],
+                    'drain': self.draining}
+
+    def _status(self, worker, status):
+        if worker not in self.worker_status: return
+        current = self.worker_status[worker]
+        if status is not None:
+            if not isinstance(status, dict): raise QueueError('Invalid worker status')
+            state = status.get('state', current['state'])
+            if state not in ('computing', 'submitting', 'idle', 'draining', 'blocked'):
+                raise QueueError('Invalid worker state')
+            task_id = status.get('task_id')
+            elapsed = status.get('cell_elapsed_seconds', 0.)
+            if elapsed is None and state != 'computing': elapsed = 0.
+            if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed < 0:
+                raise QueueError('Invalid cell elapsed time')
+            chunks = status.get('unacknowledged_chunks', 0)
+            if type(chunks) is not int or chunks < 0: raise QueueError('Invalid unacknowledged chunks')
+            if state == 'computing' and (task_id not in self.active or self.active[task_id]['worker'] != worker):
+                # A concurrent submit may have just committed this status's cell.
+                row = self.completed.get(task_id)
+                if row is None or row['worker'] != worker: raise LeaseLostError('Status refers to another lease')
+                state = 'submitting'; task_id = None
+            current.update(state=state, task_id=task_id, cell_elapsed_seconds=elapsed,
+                           unacknowledged_chunks=chunks)
+        current['observed_at'] = self.clock()
+
+    def heartbeat_batch(self, worker, token, status=None):
+        with self.mutex:
+            if self.closed or self.poisoned: raise QueueError('Dispatcher stopped')
+            if worker not in self.worker_status: raise QueueError('Protocol handshake required')
+            retired = self.retired_leases.get(worker)
+            if retired == (token, 'lost'): raise LeaseLostError('Batch lease lost')
+            held = self.by_worker.get(worker, ())
+            if not held:
+                if retired != (token, 'complete'): raise LeaseLostError('Unknown batch lease')
+                self._status(worker, {'state': 'idle'})
+                return {'state': 'complete', 'drain': self.draining}
+            rows = [self._check_lease(t, token, worker) for t in held]
+            self._status(worker, status)
+            now = self.clock(); expiry = now + self.manifest['lease_seconds']
+            for row in rows:
+                row['expiry'] = expiry; row['last_heartbeat'] = now
+            self.heartbeats_ok += 1
+            return {'state': 'active', 'expiry': expiry, 'drain': self.draining}
+
+    def drain(self, reason):
+        with self.mutex:
+            self.draining = True; self.drain_reason = str(reason)
+            return {'state': 'draining', 'reason': self.drain_reason}
+
+    def worker_fault(self, worker, code, message=''):
+        if code not in ('payload_too_large', 'spool_limit', 'submission_rejected'):
+            raise QueueError('Invalid worker fault code')
+        if not isinstance(message, str) or len(message) > 1000: raise QueueError('Invalid worker fault message')
+        with self.mutex:
+            if worker not in self.worker_status: raise QueueError('Protocol handshake required')
+            self.worker_status[worker].update(state='blocked', fault=code)
+            return self.drain('worker_fault:' + code)
+
     def _batch_payload(self, held):
         rows = [self.active[task_id] for task_id in held]
         return {'state': 'task', 'token': rows[0]['token'], 'expiry': rows[0]['expiry'],
@@ -312,13 +411,8 @@ class FlatDispatcher(Dispatcher):
                 'attempt': first['attempt'], 'token': reply['token'], 'expiry': reply['expiry'],
                 'queue_id': reply['queue_id']}
 
-    def claim_batch(self, worker, count=1, *, cached_cells=()):
-        """Lease `count` consecutive cells under one token and one deadline.
-
-        The queue is ordered by descending cost, so a batch holds cells of
-        comparable size and the caller's own measured rate is a fair guide to
-        how many belong in one request.
-        """
+    def claim_batch(self, worker, count=1, *, cached_cells=(), remaining_seconds=None, status=None):
+        """V2 prices the next cells before consuming their queue ordinals."""
         if not isinstance(worker, str) or not 0 < len(worker) <= 256:
             raise QueueError('Invalid worker')
         if type(count) is not int or count < 1:
@@ -326,34 +420,77 @@ class FlatDispatcher(Dispatcher):
         with self.mutex:
             if self.closed or self.poisoned: raise QueueError('Dispatcher stopped')
             self._reap()
+            self._status(worker, status)
+            if self.draining: return {'state': 'draining'}
             if worker in self.by_worker:
                 return self._batch_payload(self.by_worker[worker])  # lost reply, same lease
             if self.paused: return {'state': 'paused'}
             pending = len(self.order) - self.cursor + len(self.retry)
             if not pending:
-                return {'state': 'wait' if self.active else ('blocked' if self.failed or self.exhausted else 'complete')}
+                reply = {'state': 'wait' if self.active else ('blocked' if self.failed or self.exhausted else 'complete')}
+                if worker in self.worker_status:
+                    w = self.worker_status[worker]
+                    w['state'] = 'idle'; w['waits'] = w.get('waits', 0) + 1
+                    reply['retry_after_seconds'] = min(30., 5. * 2 ** min(w['waits'] - 1, 3))
+                return reply
             # Never hand one worker so much of what is left that the rest of the
             # fleet idles behind it. The tail is where batches grow largest and
             # where a stranded fleet costs the most.
-            share = max(1, pending // (len(self.by_worker) + 1))
-            count = max(1, min(count, MAX_BATCH_TASKS, pending, share))
+            v2 = worker in self.worker_status
+            share = max(1, pending // max(self.fleet, len(self.by_worker) + 1))
+            count = max(1, min(count, self.policy['max_batch_tasks'] if v2 else MAX_BATCH_TASKS, pending, share))
+            budget = self.policy['target_batch_seconds']
+            if self.remaining_work_seconds is not None:
+                budget = min(budget, max(1., self.remaining_work_seconds / (2 * self.fleet)))
+            if remaining_seconds is not None:
+                if isinstance(remaining_seconds, bool) or not isinstance(remaining_seconds, (int, float)) or not math.isfinite(remaining_seconds) or remaining_seconds < 0:
+                    raise QueueError('Invalid worker remaining time')
+                if remaining_seconds <= 0: return {'state': 'draining'}
+                budget = min(budget, remaining_seconds)
             token = self.epoch + ':' + uuid.uuid4().hex
             now = self.clock(); expiry = now + self.manifest['lease_seconds']
-            held = []
-            for _ in range(count):
-                if self.retry: ordinal = self.retry.popleft()
-                elif self.cursor < len(self.order):
-                    ordinal = self.order[self.cursor]; self.cursor += 1
+            chosen = []; used = 0.; retry_count = len(self.retry)
+            payload_size = len(canonical({'state': 'task', 'token': token, 'expiry': expiry,
+                                         'queue_id': self.queue_id, 'tasks': []}))
+            for offset in range(count):
+                if offset < retry_count: ordinal = self.retry[offset]
+                elif self.cursor + offset - retry_count < len(self.order):
+                    ordinal = self.order[self.cursor + offset - retry_count]
                 else: break
                 task = task_at(self.design, ordinal); task_id = task.id
-                attempt = self.attempts.get(ordinal, 0) + 1; self.attempts[ordinal] = attempt
+                from .prediction_workflow import cost_identity
+                ci = cost_identity(task, getattr(self.design, 'contract', None))
+                pricing = {'identity': ci} if ci is not None else {}
+                price = self.estimator.batch_seconds(task.model, task.N, task.K, **pricing) if v2 else None
+                if v2:
+                    if chosen and (price is None or used + price > budget): break
+                    if not chosen and price is not None and remaining_seconds is not None and price > remaining_seconds:
+                        return {'state': 'draining'}
+                attempt = self.attempts.get(ordinal, 0) + 1
+                size = len(canonical({'id': task_id, 'task': asdict(task), 'cell': task.cell, 'attempt': attempt}))
+                if v2 and payload_size + size + bool(chosen) > self.policy['claim_bytes']:
+                    if not chosen: raise QueueError('Single task exceeds claim response limit')
+                    break
+                mean = self.estimator.estimate(task.model, task.N, task.K, **pricing) if self.remaining_work_seconds is not None else None
+                chosen.append((ordinal, task, attempt, price, mean))
+                payload_size += size + (len(chosen) > 1)
+                used += price or 0.
+                if v2 and (price is None or used >= budget): break
+            # Commit the selected prefix only after all pricing/encoding succeeds.
+            held = []
+            for ordinal, task, attempt, price, mean in chosen:
+                if self.retry: self.retry.popleft()
+                else: self.cursor += 1
+                task_id = task.id; self.attempts[ordinal] = attempt
                 self.active[task_id] = {'id': task_id, 'ordinal': ordinal,
                     'task': canonical(asdict(task)).decode(), 'cell': task.cell,
                     'state': 'leased', 'worker': worker, 'attempt': attempt, 'token': token,
-                    'last_heartbeat': now, 'expiry': expiry}
+                    'last_heartbeat': now, 'expiry': expiry, 'price': price, 'mean_seconds': mean}
                 heapq.heappush(self.expiries, (expiry, task_id, token))
                 held.append(task_id)
             self.by_worker[worker] = tuple(held)
+            self.retired_leases.pop(worker, None)
+            if v2: self.worker_status[worker].update(waits=0, state='submitting')
             self.leased_batches += 1; self.leased_cells += len(held)
             return self._batch_payload(self.by_worker[worker])
 
@@ -375,106 +512,139 @@ class FlatDispatcher(Dispatcher):
         reply = self.submit_batch([task_id], token, worker, [result])
         return {'accepted': True, 'duplicate': reply['duplicate'][0]}
 
-    def submit_batch(self, task_ids, token, worker, results):
-        # Serialize journal writes, but never hold the lease-state mutex across
-        # shared-storage I/O. A validated submission pins its lease until durable
-        # commit (or poison), so reaping cannot reassign a half-written result.
-        #
-        # Canonicalizing result rows and validating them scientifically read no
-        # shared state and are the larger half of a commit, so they run before
-        # the lock; only ownership, duplicate detection and the journal write
-        # stay serialized. A failure there is deferred rather than raised, so a
-        # stale worker still learns its lease is lost first, exactly as when
-        # both checks ran inside the lock.
-        if (not isinstance(task_ids, (list, tuple)) or not isinstance(results, (list, tuple))
-                or len(task_ids) != len(results) or not task_ids):
-            raise QueueError('Batch submission needs one result per task id')
-        if len(set(task_ids)) != len(task_ids):
-            raise QueueError('Repeated task id in one batch submission')
-        deferred = None; prepared = []
-        try:
-            for task_id, result in zip(task_ids, results):
-                payload = canonical(result)
-                if result.get('status') != 'failed':
-                    validate_scientific_result(result, task_kind=self.manifest['identity'].get('task_kind', 'regression'))
-                    if result.get('algorithm_version') != self.manifest['identity']['cell_spec']['algorithm_version']:
-                        raise QueueError('Scientific identity changed')
-                prepared.append((task_id, result, payload,
-                    canonical({'result': result, 'origin': {'queue_id': self.queue_id},
-                               'token': token, 'task_id': task_id}) + b'\n'))
-        except (QueueError, ValueError, TypeError, KeyError) as exc:
-            deferred = exc
-        duplicate = [False] * len(task_ids); writing = []
-        with self.submit_mutex:
-            with self.mutex:
-                if self.closed or self.poisoned: raise QueueError('Dispatcher stopped')
-                for task_id in task_ids:
-                    if task_id not in self.completed:
-                        self._check_lease(task_id, token, worker)
-                if deferred is not None: raise deferred
-                try:
-                    for index, (task_id, result, payload_bytes, raw) in enumerate(prepared):
-                        payload = payload_bytes.decode()
-                        row = self.validate_result(task_id, result, payload=payload_bytes)
-                        if row['state'] in ('done', 'failed'):
-                            if row['accepted_token'] == token and row['result'] == payload:
-                                duplicate[index] = True; continue
-                            if row['accepted_token'] != token:
-                                raise LeaseLostError('Completed task belongs to another lease')
-                            raise QueueError('Conflicting completed result')
-                        row['committing'] = True
-                        writing.append((row, result, payload, raw))
-                except BaseException:
-                    # A rejected batch must not leave its earlier cells pinned,
-                    # or reaping would never reclaim them.
-                    for pinned in writing: pinned[0].pop('committing', None)
-                    raise
-            sequence = self.written_seq
+    def submit_batch(self, task_ids, token, worker, results, chunk_id=None):
+        # ACK timeouts can replay a token while its original fsync is running.
+        # Serialize that token through durability and final state publication;
+        # distinct tokens still append concurrently and share the same fsync.
+        # References include blocked callers, preventing removal/recreation of a
+        # lock while a duplicate is waiting. Completed batches retain no lock.
+        if not isinstance(token, str) or not token:
+            raise QueueError('Invalid lease token')
+        with self.mutex:
+            guard = self.submission_locks.get(token)
+            if guard is None:
+                guard = [threading.Lock(), 0]
+                self.submission_locks[token] = guard
+            guard[1] += 1
+
+        def commit_submission():
+            # Serialize journal writes, but never hold the lease-state mutex across
+            # shared-storage I/O. A validated submission pins its lease until durable
+            # commit (or poison), so reaping cannot reassign a half-written result.
+            #
+            # Canonicalizing result rows and validating them scientifically read no
+            # shared state and are the larger half of a commit, so they run before
+            # the lock; only ownership, duplicate detection and the journal write
+            # stay serialized. A failure there is deferred rather than raised, so a
+            # stale worker still learns its lease is lost first, exactly as when
+            # both checks ran inside the lock.
+            if (not isinstance(task_ids, (list, tuple)) or not isinstance(results, (list, tuple))
+                    or len(task_ids) != len(results) or not task_ids):
+                raise QueueError('Batch submission needs one result per task id')
+            if len(set(task_ids)) != len(task_ids):
+                raise QueueError('Repeated task id in one batch submission')
+            deferred = None; prepared = []
+            try:
+                for task_id, result in zip(task_ids, results):
+                    payload = canonical(result)
+                    if result.get('status') != 'failed':
+                        from .prediction_workflow import task_kind, validate_result_cache
+                        validate_scientific_result(result, task_kind=task_kind(self.manifest['identity'], result))
+                        spec = (self.design.panels[result['panel_id']][2]['cell_spec']
+                                if hasattr(self.design, 'panels') else self.manifest['identity']['cell_spec'])
+                        if result.get('algorithm_version') != spec['algorithm_version']:
+                            raise QueueError('Scientific identity changed')
+                        validate_result_cache(self.manifest['identity'], result)
+                    prepared.append((task_id, result, payload,
+                        canonical({'result': result, 'origin': {'queue_id': self.queue_id},
+                                   'token': token, 'task_id': task_id}) + b'\n'))
+            except (QueueError, ValueError, TypeError, KeyError) as exc:
+                deferred = exc
+            duplicate = [False] * len(task_ids); writing = []
+            with self.submit_mutex:
+                with self.mutex:
+                    if self.closed or self.poisoned: raise QueueError('Dispatcher stopped')
+                    for task_id in task_ids:
+                        if task_id not in self.completed:
+                            self._check_lease(task_id, token, worker)
+                    if deferred is not None: raise deferred
+                    try:
+                        for index, (task_id, result, payload_bytes, raw) in enumerate(prepared):
+                            payload = payload_bytes.decode()
+                            row = self.validate_result(task_id, result, payload=payload_bytes)
+                            if row['state'] in ('done', 'failed'):
+                                if row['accepted_token'] == token and row['result'] == payload:
+                                    duplicate[index] = True; continue
+                                if row['accepted_token'] != token:
+                                    raise LeaseLostError('Completed task belongs to another lease')
+                                raise QueueError('Conflicting completed result')
+                            row['committing'] = True
+                            writing.append((row, result, payload, raw))
+                    except BaseException:
+                        # A rejected batch must not leave its earlier cells pinned,
+                        # or reaping would never reclaim them.
+                        for pinned in writing: pinned[0].pop('committing', None)
+                        raise
+                sequence = self.written_seq
+                if writing:
+                    try:
+                        pending = memoryview(b''.join(entry[3] for entry in writing))
+                        while pending:
+                            written = self.journal.write(pending)
+                            if not written: raise OSError('Short result write')
+                            pending = pending[written:]
+                        self.written_seq += len(writing)
+                        sequence = self.written_seq
+                    except BaseException:
+                        with self.mutex: self.poisoned = True
+                        raise
+            # Durability is shared. One fsync flushes every record whose write had
+            # already returned, so concurrent submissions pay for a single flush
+            # instead of one each. A result is still acknowledged only after a flush
+            # that started after its own bytes were written, never before. A batch
+            # that proved entirely duplicate wrote nothing and needs no flush.
+            elapsed = 0.; flushed = False
             if writing:
                 try:
-                    pending = memoryview(b''.join(entry[3] for entry in writing))
-                    while pending:
-                        written = self.journal.write(pending)
-                        if not written: raise OSError('Short result write')
-                        pending = pending[written:]
-                    self.written_seq += len(writing)
-                    sequence = self.written_seq
+                    with self.fsync_mutex:
+                        if self.synced_seq < sequence:
+                            # Read the watermark under this lock: records written while
+                            # the flush runs are not claimed by it.
+                            target = self.written_seq
+                            started = time.monotonic()
+                            os.fsync(self.journal.fileno())
+                            elapsed = time.monotonic() - started
+                            self.synced_seq = target; flushed = True
                 except BaseException:
                     with self.mutex: self.poisoned = True
                     raise
-        # Durability is shared. One fsync flushes every record whose write had
-        # already returned, so concurrent submissions pay for a single flush
-        # instead of one each. A result is still acknowledged only after a flush
-        # that started after its own bytes were written, never before. A batch
-        # that proved entirely duplicate wrote nothing and needs no flush.
-        elapsed = 0.; flushed = False
-        if writing:
-            try:
-                with self.fsync_mutex:
-                    if self.synced_seq < sequence:
-                        # Read the watermark under this lock: records written while
-                        # the flush runs are not claimed by it.
-                        target = self.written_seq
-                        started = time.monotonic()
-                        os.fsync(self.journal.fileno())
-                        elapsed = time.monotonic() - started
-                        self.synced_seq = target; flushed = True
-            except BaseException:
-                with self.mutex: self.poisoned = True
-                raise
-        with self.mutex:
-            self.commits += len(writing)
-            if flushed:
-                self.fsync_count += 1; self.fsync_seconds += elapsed
-            for row, result, payload, _ in writing:
-                row.pop('committing', None)
-                row.update(state='failed' if result['status'] == 'failed' else 'done',
-                    accepted_token=token, result=payload)
-                del self.active[row['id']]; self._release(worker, row['id'])
-                self.completed[row['id']] = row
-                if row['state'] == 'done': self.done += 1
-                else: self.failed += 1
-            return {'accepted': True, 'duplicate': duplicate}
+            with self.mutex:
+                self.commits += len(writing)
+                if flushed:
+                    self.fsync_count += 1; self.fsync_seconds += elapsed
+                for row, result, payload, _ in writing:
+                    row.pop('committing', None)
+                    row.update(state='failed' if result['status'] == 'failed' else 'done',
+                        accepted_token=token, result=payload)
+                    del self.active[row['id']]; self._release(worker, row['id'])
+                    self.completed[row['id']] = row
+                    if row['state'] == 'done':
+                        self.done += 1
+                        if self.remaining_work_seconds is not None:
+                            self.remaining_work_seconds = max(0., self.remaining_work_seconds - row['mean_seconds'])
+                    else: self.failed += 1
+                if writing and worker not in self.by_worker and self.retired_leases.get(worker) != (token, 'lost'):
+                    self.retired_leases[worker] = (token, 'complete')
+                return {'accepted': True, 'duplicate': duplicate}
+
+        try:
+            with guard[0]:
+                return commit_submission()
+        finally:
+            with self.mutex:
+                guard[1] -= 1
+                if not guard[1]:
+                    del self.submission_locks[token]
 
     def pause(self, paused=True):
         with self.mutex:
@@ -482,8 +652,36 @@ class FlatDispatcher(Dispatcher):
 
     def stats(self):
         with self.mutex:
-            ages = [self.clock() - row['last_heartbeat'] for row in self.active.values()]
-            return {'done': self.done, 'failed': self.failed, 'leased': len(self.active),
+            now = self.clock()
+            ages = [now - row['last_heartbeat'] for row in self.active.values()]
+            computing = submitting = idle = stragglers = 0
+            unknown = max(0, self.fleet - len(self.worker_status))
+            chunks = 0; tails = []; tail_known = True
+            for worker, status in self.worker_status.items():
+                age = now - status['observed_at']
+                chunks += status.get('unacknowledged_chunks', 0)
+                if age > self.policy['stale_status_seconds']:
+                    unknown += 1; tail_known = False; continue
+                task_id = status.get('task_id')
+                row = self.active.get(task_id)
+                if status['state'] == 'computing' and row is None:
+                    # Its last reported cell committed; the worker may already
+                    # compute the next. Do not mislabel it idle or drain on it.
+                    unknown += 1; tail_known = False; continue
+                if status['state'] == 'computing' and row is not None:
+                    computing += 1
+                    elapsed = status.get('cell_elapsed_seconds', 0.) + age
+                    price = row['price']
+                    if price is not None and elapsed > max(120., 4. * price): stragglers += 1
+                    assigned = [self.active[t]['price'] for t in self.by_worker.get(worker, ())]
+                    if any(p is None for p in assigned): tail_known = False
+                    # An over-p99 cell is not zero remaining work. Keep one
+                    # full current-cell price as an explicit conservative floor.
+                    else: tails.append(max(price, sum(assigned) - elapsed))
+                elif status['state'] == 'submitting': submitting += 1
+                else: idle += 1
+            return {'phase': getattr(self.design, 'phase', 'legacy'),
+                'done': self.done, 'failed': self.failed, 'leased': len(self.active),
                 'pending': len(self.order) - self.cursor + len(self.retry), 'exhausted': self.exhausted,
                 'total': len(self.order), 'paused': self.paused, 'queue_id': self.queue_id,
                 'expired_leases': self.expired_leases, 'fsync_count': self.fsync_count,
@@ -491,6 +689,14 @@ class FlatDispatcher(Dispatcher):
                 'commits': self.commits, 'leased_batches': self.leased_batches,
                 'cells_per_batch': self.leased_cells / self.leased_batches if self.leased_batches else 0.,
                 'results_per_fsync': self.commits / self.fsync_count if self.fsync_count else 0.,
+                'fleet': self.fleet, 'registered_workers': len(self.worker_status),
+                'computing_workers': computing, 'submitting_workers': submitting,
+                'idle_workers': idle, 'unknown_workers': unknown, 'straggler_workers': stragglers,
+                'compute_busy_fraction': computing / self.fleet,
+                'effective_busy_fraction': max(0, computing - stragglers) / self.fleet,
+                'unacknowledged_chunks': chunks, 'remaining_work_seconds': self.remaining_work_seconds,
+                'predicted_tail_seconds': max(tails, default=0.) if tail_known else None,
+                'draining': self.draining, 'drain_reason': self.drain_reason,
                 'oldest_active_heartbeat_age_seconds': max(ages, default=0.),
                 'active_heartbeat_older_than_900s': sum(age > 900 for age in ages),
                 'active_heartbeat_older_than_1800s': sum(age > 1800 for age in ages)}
@@ -549,10 +755,20 @@ def merge(root, old):
     merge_original(SimpleNamespace(output=target, old=old, new_results=target / 'combined.jsonl'))
 
 
-def write_progress(path, dispatcher, server, *, previous_errors=0):
+def write_progress(path, dispatcher, server, *, previous_errors=0, monitor=None,
+                   allocation=None, continuation_allowed=False):
     """Progress is advisory; durable result writes must still fail closed."""
     try:
-        atomic_json(path, {'stats': dispatcher.stats(), 'observed_at': time.time(),
+        stats = dispatcher.stats(); now = time.time()
+        observation = (monitor.observe(stats, now=now, allocation=allocation,
+                         continuation_allowed=continuation_allowed) if monitor else {})
+        if observation.get('idle_alert') and monitor.samples == monitor.policy['idle_samples']:
+            print('Scheduler idle fleet: ' + json.dumps(observation), file=sys.stderr, flush=True)
+        if observation.get('drain_recommended') and not dispatcher.draining:
+            atomic_json(Path(path).parent / 'drain-intent.json',
+                        {'reason': 'costed_tail', 'observed_at': now, **observation})
+            dispatcher.drain('costed_tail')
+        atomic_json(path, {'stats': stats, 'observed_at': now, 'efficiency': observation,
                           'rpc': server.connection_stats(),
                           'progress_write_errors': previous_errors})
     except OSError as exc:
@@ -565,9 +781,52 @@ def write_progress(path, dispatcher, server, *, previous_errors=0):
     return previous_errors
 
 
-def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800):
+def allocation_start_time(entered, max_seconds, *, environ=None, query=None):
+    """Use trusted allocation time, with a scoped live Slurm fallback.
+
+    Some sites do not export SLURM_JOB_START_TIME. Runtime entry time cannot
+    discount reserved CPU hours because module/bootstrap time precedes it.
+    Missing/malformed/mismatched Slurm evidence stays conservatively untrusted.
+    """
+    environ = os.environ if environ is None else environ
+    def valid(value):
+        return math.isfinite(value) and value > 0 and 0 <= entered - value <= max_seconds
+    try:
+        started = float(environ['SLURM_JOB_START_TIME'])
+        if valid(started): return started, 'slurm_job_start', {'source': 'SLURM_JOB_START_TIME'}
+    except (KeyError, ValueError, TypeError, OverflowError):
+        pass
+    job_id = environ.get('SLURM_JOB_ID', '')
+    if isinstance(job_id, str) and re.fullmatch(r'[1-9][0-9]*', job_id):
+        try:
+            if query is None:
+                raw = subprocess.check_output(['scontrol', 'show', 'job', '-o', job_id],
+                                              text=True, timeout=12)
+            else:
+                raw = query(['scontrol', 'show', 'job', '-o', job_id])
+            lines = [line for line in raw.splitlines() if line.strip()]
+            if len(lines) == 1:
+                fields = dict(token.split('=', 1) for token in lines[0].split() if '=' in token)
+                if fields.get('JobId') == job_id:
+                    started = datetime.fromisoformat(fields['StartTime']).timestamp()
+                    if valid(started):
+                        return started, 'slurm_job_start', {'source': 'scontrol', 'job_id': job_id,
+                                                           'StartTime': fields['StartTime']}
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, OverflowError):
+            pass
+    return entered, 'runtime_only', {'source': 'unavailable'}
+
+
+def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800,
+        policy=None, cost_profile=None, allocation=None, continuation_allowed=False):
     from aleatoric_nk_grid.queue_service import make_server
     from aleatoric_nk_grid.queue_readiness import publish_ready
+    policy = validate_policy(policy)
+    entered = time.time()
+    job_started, elapsed_source, elapsed_evidence = allocation_start_time(entered, max_seconds)
+    job_end = min(job_started + max_seconds, float(os.environ.get('SLURM_JOB_END_TIME', job_started + max_seconds)))
+    if not math.isfinite(job_end) or job_end <= entered: raise QueueError('Allocation has no time remaining')
+    work_deadline = max(entered, job_end - policy['drain_grace_seconds'])
     if int(os.environ['SLURM_NTASKS']) < workers + 1:
         raise QueueError('Missing controller task')
     manifest = read(root / 'manifest.json')
@@ -577,8 +836,10 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800):
     if subprocess.check_output(['git', '-C', str(repo), 'status', '--porcelain'], text=True).strip():
         raise QueueError('Frozen checkout dirty')
     control = root / 'control'; control.mkdir(exist_ok=True, mode=0o700)
-    with file_lock(control / 'round.lock'), FlatDispatcher(root) as dispatcher:
+    with file_lock(control / 'round.lock'), FlatDispatcher(root, fleet=workers, policy=policy,
+            cost_profile=cost_profile, work_seconds=(allocation or {}).get('work_seconds')) as dispatcher:
         generation = uuid.uuid4().hex; attempt = control / generation; attempt.mkdir(mode=0o700)
+        fault_dir = attempt / 'faults'; fault_dir.mkdir()
         host = socket.gethostname(); token = attempt / 'token'; token.write_text(uuid.uuid4().hex + uuid.uuid4().hex)
         token.chmod(0o600); cert = attempt / 'ca.crt'; key = attempt / 'server.key'
         cert_days = str(max(7, (int(max_seconds) + 86399) // 86400 + 1))
@@ -601,7 +862,8 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800):
                 control=str(control.resolve()), generation=generation, token_file=str(token.resolve()),
                 ca_file=str(cert.resolve()), ready_file=str(ready_path.resolve()),
                 job_id=os.environ['SLURM_JOB_ID'], source_commit=commit, workers=workers,
-                recover_stale_leases=True, max_seconds=max_seconds,
+                recover_stale_leases=True, max_seconds=max_seconds, deadline_epoch=work_deadline,
+                protocol_version=2, fault_dir=str(fault_dir.resolve()),
                 startup_jitter_seconds=min(30., workers / 100.))
             atomic_json(attempt / 'launch.json', launch); atomic_json(control / 'latest.json', launch)
             atomic_json(attempt / 'admission.json', {'stats': dispatcher.stats(), 'sqlite': False,
@@ -613,16 +875,30 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800):
                 '--output=' + str(attempt / 'worker-%t.out'), '--error=' + str(attempt / 'worker-%t.err'),
                 sys.executable, '-m', 'aleatoric_nk_grid.slurm_queue_round', 'worker',
                 '--launch', str(attempt / 'launch.json')])
-            progress_errors = 0
+            progress_errors = 0; drain_started = None
+            monitor = TailMonitor(policy, started=job_started)
             while child.poll() is None:
+                for path in fault_dir.glob('*.json'):
+                    fault = read(path)
+                    if fault.get('queue_id') != dispatcher.queue_id: raise QueueError('Worker fault queue changed')
+                    dispatcher.worker_fault(fault['worker'], fault['code'], fault.get('message', ''))
                 progress_errors = write_progress(attempt / 'progress.json', dispatcher, server,
-                                                 previous_errors=progress_errors)
-                time.sleep(15)
-            stats = dispatcher.stats()
-            atomic_json(control / 'round-result.json', {'stats': stats, 'worker_exit': child.returncode,
-                'complete': stats['done'] == stats['total'], 'generation': generation})
-            if child.returncode or stats['done'] != stats['total']:
-                raise QueueError('Incomplete round; retain result receipts for next direct success scan')
+                    previous_errors=progress_errors, monitor=monitor, allocation=allocation,
+                    continuation_allowed=continuation_allowed)
+                now = time.time()
+                if now >= work_deadline and not dispatcher.draining:
+                    atomic_json(attempt / 'drain-intent.json', {'reason': 'allocation_deadline', 'observed_at': now})
+                    dispatcher.drain('allocation_deadline')
+                if dispatcher.draining:
+                    if drain_started is None: drain_started = now
+                    # Economic drain waits for a persisted fold/cell boundary.
+                    # Only faults and the hard allocation deadline may interrupt
+                    # an unfinished fit; idle workers alone never justify it.
+                    grace_expired = (dispatcher.drain_reason != 'costed_tail' and
+                                     now - drain_started >= policy['drain_grace_seconds'])
+                    if grace_expired or now >= job_end - 5:
+                        break
+                time.sleep(min(15., max(.1, job_end - now - 5)))
         finally:
             try:
                 if child is not None and child.poll() is None:
@@ -631,6 +907,22 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800):
                     except subprocess.TimeoutExpired: child.kill(); child.wait(timeout=30)
             finally:
                 server.shutdown(); serving.join(); server.server_close()
+            # A final worker may exit between loop polls after writing its fault.
+            for path in fault_dir.glob('*.json'):
+                fault = read(path)
+                if fault.get('queue_id') != dispatcher.queue_id: raise QueueError('Worker fault queue changed')
+                dispatcher.worker_fault(fault['worker'], fault['code'], fault.get('message', ''))
+            stats = dispatcher.stats()
+            atomic_json(control / 'round-result.json', {'stats': stats, 'worker_exit': child.returncode if child else None,
+                'complete': stats['done'] == stats['total'], 'generation': generation,
+                'state': 'complete' if stats['done'] == stats['total'] else ('drained' if dispatcher.draining else 'incomplete'),
+                'job_id': os.environ['SLURM_JOB_ID'], 'elapsed_seconds': max(0., time.time() - job_started),
+                'elapsed_source': elapsed_source, 'elapsed_evidence': elapsed_evidence,
+                'job_started_epoch': job_started, 'queue_id': dispatcher.queue_id,
+                'allocation_cpu': (allocation or {}).get('allocated_cpu_bound'),
+                'drain_reason': dispatcher.drain_reason})
+        if stats['done'] != stats['total'] and not (dispatcher.draining and validate_only):
+            raise QueueError('Incomplete round; retain result receipts for next direct success scan')
     if not validate_only:
         merge(root, old)
 
