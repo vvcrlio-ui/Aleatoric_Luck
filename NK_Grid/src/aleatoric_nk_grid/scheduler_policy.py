@@ -1,5 +1,6 @@
 """Operational scheduling controls; never part of scientific task identity."""
 import math
+import re
 
 from .shared_queue import QueueError
 
@@ -13,6 +14,11 @@ DEFAULTS = {
     'restart_overhead_seconds': None, 'restart_cpu_hours': None,
     'target_round_seconds': None, 'max_cpu_hours': None, 'exclude_nodes': [],
     'max_nodes': 60,
+    # Geometry is operational: it decides how many workers a round asks for and
+    # how much memory each reserves, never what the round computes. Keeping it
+    # out of the frozen plan lets a run be resized between rounds instead of
+    # discarding every cell it already finished.
+    'worker_memory': None, 'worker_cap': None,
 }
 
 
@@ -33,10 +39,15 @@ def validate_policy(value=None):
             if type(item) is not bool: raise QueueError('drain_enabled must be boolean')
         elif item is None and default is None:
             continue
+        elif key == 'worker_memory':
+            if not isinstance(item, str) or not re.fullmatch(r'\d+[KMGT]?', item.strip()):
+                raise QueueError('worker_memory must be a Slurm memory size such as 4G')
         elif isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or item <= 0:
             raise QueueError('Scheduler policy ' + key + ' must be positive and finite')
     for key in ('max_batch_tasks', 'claim_bytes', 'submit_bytes', 'idle_samples', 'max_nodes'):
         if type(policy[key]) is not int: raise QueueError(key + ' must be an integer')
+    if policy['worker_cap'] is not None and type(policy['worker_cap']) is not int:
+        raise QueueError('worker_cap must be an integer')
     if policy['max_batch_tasks'] > 4096 or policy['claim_bytes'] > 512 * 1024 or policy['submit_bytes'] > 512 * 1024:
         raise QueueError('Scheduler policy exceeds protocol safety limits')
     if not 0 < policy['idle_fraction'] < 1: raise QueueError('idle_fraction must be between zero and one')

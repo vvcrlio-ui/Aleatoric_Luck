@@ -92,15 +92,24 @@ def workers_for_work(work_seconds, wall_seconds, *, headroom=1.25):
 
 
 def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
-            cpu_hours_remaining=None, control_jobs_reserved=2, max_nodes=60, run=base.query):
+            cpu_hours_remaining=None, control_jobs_reserved=2, max_nodes=60,
+            worker_memory=None, worker_cap=None, run=base.query):
+    """Size one round's allocation. Geometry may be operational.
+
+    ``worker_memory`` and ``worker_cap`` come from the round's policy snapshot
+    and win over the frozen launch request. They change how many workers a
+    round asks for and how much each reserves, never what the round computes,
+    so a run can be resized between rounds instead of discarding finished
+    cells. The frozen request remains the default when the policy is silent.
+    """
     if type(max_nodes) is not int or max_nodes < 1:
         raise ValueError('Explicit total node cap must be a positive integer')
     node_cap = max_nodes
     cluster = spec['cluster']
     qos = cluster.get('qos') or default_qos(cluster['account'], run=run)
     live = base.snapshot(cluster['account'], qos, cluster['partition'], run=run)
-    memory = cluster.get('memory_override') or '16G'
-    cap = spec.get('continuation', {}).get('worker_cap')
+    memory = worker_memory or cluster.get('memory_override') or '16G'
+    cap = worker_cap if worker_cap is not None else spec.get('continuation', {}).get('worker_cap')
     if cap is None and spec['profile'] != 'discoverer': cap = cluster['workers']
     # This is one Slurm job, not an array of independently submitted workers.
     # Keep job slots and every scoped CPU/memory/node headroom dimension separate.

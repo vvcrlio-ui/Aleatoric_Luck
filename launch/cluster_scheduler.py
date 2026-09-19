@@ -335,8 +335,13 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
             # A receipt can be published just before controller loss. Recover the
             # transition without starting another base allocation or resetting any budgets.
             if phase == 'sl' or (root / 'base-verified.json').exists():
+                # Reread the sealed bytes on the transition and after controller
+                # loss, not on every advance: the index is tens of gigabytes at
+                # production repeat counts and cannot change under our own lock.
+                reread = phase != 'sl' or not state.get('base_receipt_verified')
                 try:
-                    phases.verify_base_receipt(plan)
+                    phases.verify_base_receipt(plan, verify_files=reread)
+                    if reread: state['base_receipt_verified'] = True
                 except (ValueError, OSError, CacheBusyError) as exc:
                     state.update(status='repair_required', workflow_state='REPAIR_REQUIRED',
                                  blocked_reason=str(exc), derived_results_valid=False)
@@ -429,7 +434,10 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
                       'max_nodes': max(0, state['max_nodes'] - 2),
                       'target_round_seconds': policy.get('target_round_seconds'),
                       'cpu_hours_remaining': remaining_budget,
-                      'control_jobs_reserved': control_count + 2}
+                      'control_jobs_reserved': control_count + 2,
+                      # Geometry is operational, like the cost profile beside it.
+                      'worker_memory': policy.get('worker_memory'),
+                      'worker_cap': policy.get('worker_cap')}
         parameters = inspect.signature(resource_resolver).parameters
         extra = {key: value for key, value in candidates.items() if key in parameters}
         from cluster_resources import CpuBudgetExhausted

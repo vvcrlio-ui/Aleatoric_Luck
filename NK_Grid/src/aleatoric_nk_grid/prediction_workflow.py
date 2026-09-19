@@ -637,6 +637,16 @@ def build_recovery_index(plan, path, *, published_path=None):
 
 
 def verify_base_receipt(plan, *, verify_files=True):
+    """Confirm the sealed barrier. File bytes are reread only when asked.
+
+    The receipt's own identity is cheap and always checked. Rehashing the task
+    index and every cache index is not: at production repeat counts the index
+    alone is tens of gigabytes, and the controller calls this on every advance.
+    Those files are sealed under an exclusive lock and cannot change while the
+    run owns them, so callers pass ``verify_files`` for the transitions that
+    actually need it - sealing, controller restart, and consuming a cache this
+    run did not produce.
+    """
     path = Path(plan['launch']['output']) / 'base-verified.json'
     if not path.exists(): raise QueueError('Base verification barrier is not sealed')
     receipt = read(path)
