@@ -165,6 +165,53 @@ def check_plan_storage(plan, allocated_workers, *, query=_query):
     return report
 
 
+def abandon_plan_storage(plan, *, reason):
+    """Return an abandoned run's unwritten allowance to the shared ledger.
+
+    Cancelling a run is ordinary - a budget is wrong, a geometry is wrong, a
+    node dies - but only a verified run could release its reservation, so every
+    cancellation leaked its whole allowance. Three cancelled runs held 3,245.8
+    GB of a 4.9 TB project and blocked the next admission outright.
+
+    This releases the unwritten part and nothing else. Bytes already on disk
+    stay charged by Lustre, the entry is kept with its reason rather than
+    deleted, and a run that published a final receipt must go through
+    ``release_plan_storage`` instead so a completed run is never recorded as
+    abandoned. The caller is responsible for the run being dead; this refuses
+    only what it can check itself.
+    """
+    if not isinstance(reason, str) or not reason.strip():
+        raise QueueError('Abandoning a reservation requires an explicit recorded reason')
+    workflow = plan['prediction_workflow']
+    output = Path(workflow['output_root']).resolve()
+    if (output / 'verified.json').is_file():
+        raise QueueError('This run published a final receipt; release it instead of abandoning it')
+    parts = Path(workflow['cache_root']).resolve().parts
+    try:
+        at = parts.index('projects')
+        project = Path(*parts[:at + 2])
+    except (ValueError, IndexError) as exc:
+        raise QueueError('Storage release requires the frozen Lustre project path') from exc
+    ledger_path = project / '.prediction-cache-reservations.json'
+    key = digest({'output_root': workflow['output_root'], 'workflow': workflow})
+    with file_lock(project / '.prediction-cache-reservations.lock'):
+        if not ledger_path.is_file():
+            raise QueueError('Storage reservation ledger is missing')
+        ledger = json.loads(ledger_path.read_bytes())
+        reservations = ledger['reservations']
+        old = reservations.get(key)
+        if old is None or old.get('output_root') != workflow['output_root']:
+            raise QueueError('Storage reservation is missing or belongs to another output')
+        if old.get('released_at') or old.get('abandoned_at'):
+            return dict(old)
+        freed = old.get('pending_bytes', 0)
+        reservations[key] = {**old, 'pending_bytes': 0, 'pending_files': 0, 'temporary_bytes': 0,
+                             'abandoned_at': datetime.now(timezone.utc).isoformat(),
+                             'abandoned_reason': reason, 'abandoned_pending_bytes': freed}
+        atomic_json(ledger_path, ledger)
+        return dict(reservations[key])
+
+
 def release_plan_storage(plan):
     """Release this verified run's unwritten allowance without new admission.
 

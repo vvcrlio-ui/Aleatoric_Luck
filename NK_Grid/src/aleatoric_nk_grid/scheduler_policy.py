@@ -5,6 +5,8 @@ import re
 from .shared_queue import QueueError
 
 
+CONTROL_NODE_RESERVE = 2
+
 DEFAULTS = {
     'target_batch_seconds': 30., 'max_batch_tasks': 4096,
     'claim_bytes': 512 * 1024, 'submit_bytes': 512 * 1024,
@@ -48,6 +50,12 @@ def validate_policy(value=None):
         if type(policy[key]) is not int: raise QueueError(key + ' must be an integer')
     if policy['worker_cap'] is not None and type(policy['worker_cap']) is not int:
         raise QueueError('worker_cap must be an integer')
+    # The scheduler hands the resolver max_nodes minus two reserved control
+    # nodes, so a cap of two or less resolves to zero and fails deep inside
+    # sizing, after the controller has already been submitted. Say so here.
+    if policy['max_nodes'] < CONTROL_NODE_RESERVE + 1:
+        raise QueueError('max_nodes must leave room for %d control nodes plus at least one '
+                         'worker node; got %d' % (CONTROL_NODE_RESERVE, policy['max_nodes']))
     if policy['max_batch_tasks'] > 4096 or policy['claim_bytes'] > 512 * 1024 or policy['submit_bytes'] > 512 * 1024:
         raise QueueError('Scheduler policy exceeds protocol safety limits')
     if not 0 < policy['idle_fraction'] < 1: raise QueueError('idle_fraction must be between zero and one')
