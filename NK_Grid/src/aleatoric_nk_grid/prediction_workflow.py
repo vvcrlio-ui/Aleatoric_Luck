@@ -24,6 +24,11 @@ from .shared_queue import (ModelTask, QueueError, atomic_json, canonical, digest
 from .result_migration import validate_scientific_result
 
 FORMAT = 'prediction-workflow-v1'
+# One repeat short of nothing is useless and a whole group is too late: each
+# cost group is primed with exactly the observation count that lets
+# batch_seconds price it, so the next round can lease more than one task at a
+# time. Kept equal to the pricing threshold so the two cannot drift apart.
+from .cost_profile import DEFAULT_MIN_BATCH_OBSERVATIONS as PRICING_PRIME_REPEATS
 STATES = ('PLANNED', 'BASE_RUNNING', 'BASE_VERIFYING', 'SL_READY', 'SL_RUNNING',
           'FINAL_VERIFYING', 'COMPLETE', 'REPAIR_REQUIRED')
 
@@ -565,10 +570,23 @@ def prepare_round(plan, phase, rounds, directory, *, cost_profile=None):
     directory.parent.mkdir(parents=True, exist_ok=True)
     temporary = directory.with_name('.' + directory.name + '-' + uuid.uuid4().hex); temporary.mkdir()
     with (temporary / 'remaining.u32').open('xb') as handle:
-        for _, ordinals in sorted(ordered, key=lambda item: -item[0]):
-            chunk = array('I', (i for i in ordinals if not design.contains(i)))
+        ranked = sorted(ordered, key=lambda item: -item[0])
+        def emit(values):
+            chunk = array('I', values)
             if sys.byteorder != 'little': chunk.byteswap()
             handle.write(chunk.tobytes())
+        # Prime every cost group before any of it is consumed, then hand out
+        # the rest longest-first. Batch pricing needs a group's own measured
+        # history, and a pure cost order exhausts a group in the same round it
+        # first appears, so pricing never catches up and every claim stays one
+        # task. That is a throughput limit, not bookkeeping: at the measured
+        # median 2.5s cell a 2,135-worker fleet asks for work 854 times a
+        # second, against 62/s that is known to work. The prime is a fixed
+        # fraction of the design and stays cost-ordered within itself.
+        for _, ordinals in ranked:
+            emit(i for i in ordinals[:PRICING_PRIME_REPEATS] if not design.contains(i))
+        for _, ordinals in ranked:
+            emit(i for i in ordinals[PRICING_PRIME_REPEATS:] if not design.contains(i))
         handle.flush(); os.fsync(handle.fileno())
     manifest = {'format': 'direct-success-bitmap-v1', 'identity': identity,
         'count': report['remaining'], **transport_manifest(), 'max_attempts': 5,
