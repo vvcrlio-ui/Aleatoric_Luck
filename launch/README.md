@@ -10,7 +10,7 @@ Start with a dry-run preview, then use dev for a small trial or timing_full to c
 
 [experiment.py](experiment.py) reads the selected panel and determines the outcome, models, and N/K design. Once inputs are ready, the code checks the design against the available sample and source counts. Preview mode displays the launch request without reading analysis tables or starting training.
 
-Local runs call the engine directly. Every new Slurm run uses the shared single-model scheduler, including BMRC, Discoverer, and explicitly configured other clusters. Each new experiment uses a separate output directory.
+Local runs call the engine directly. Prepared-data Slurm runs use the shared single-model scheduler, including BMRC, Discoverer, and explicitly configured other clusters. BMRC suite/raw-data launches use the separate scheduler described above. Each new experiment uses a separate output directory.
 
 ## Preparing the environment and data
 
@@ -36,6 +36,56 @@ submissions so journal writes cannot consume all connection slots; excess
 submissions receive retryable HTTP 503 and retain their durable worker receipt.
 Progress records report submission backpressure, heartbeat age and expired
 leases. A lost worker can take up to one lease interval to be reclaimed.
+
+## Dispatcher shards and initial policy
+
+For a new run through the shared single-model Slurm entry, request the dispatcher
+count explicitly with `--dispatcher-shards 4` (supported range: 1–8). Base and SL
+use the same setting. This is the number of queue services, not compute nodes,
+prediction files, or verification chunks. Requests above one default to two
+validator processes per dispatcher unless a policy file specifies otherwise.
+
+`--scheduler-policy PATH.json` supplies the initial operational policy. Explicit
+`--dispatcher-shards` overrides that file; unspecified policy fields retain their
+defaults. The launch saves both `scheduler-policy.initial.json` and the current
+`scheduler-policy.json`. Restarting preparation never resets later operational
+edits. Resume uses the existing policy and rejects these new-run flags.
+
+The Discoverer cache preset requests four dispatchers, a common resource policy
+for base/SL, and distributed final verification:
+
+```bash
+bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
+  --manifest FFCWS/panels-mh-cache.yaml --panel ffc_tree_ordinal_materialHardship \
+  --preset timing_full --scheduler-policy launch/policies/discoverer-cache.json \
+  --dispatcher-shards 4 --dry-run
+```
+
+This command is a read-only preview. The preset uses capacity sizing, up to 300
+compute nodes plus two controller reservations, 3 GiB per worker, and ten-hour
+worker allocations. Use site-appropriate bounds for smaller runs. Actual geometry
+still depends on live limits, memory, service-core reservations and remaining
+work. If an allocation cannot fit the requested dispatcher services, admission
+falls back to one and reports `requested_dispatcher_shards`, the actual count,
+and `shard_admission_note`; four requested dispatchers do not guarantee four.
+
+| Entry | Explicit shard option | Cache/SL decoupling |
+|---|---|---|
+| Discoverer shared single-model entry | Supported | Implemented; isolated Linux validation required for each release |
+| BMRC or another Slurm cluster, prepared-data shared entry | Same policy and code | Core workflow shared; quota and CPU binding need site validation |
+| BMRC `--suite` or `--ffc-data-dir` entry | Rejected explicitly | Separate scheduler; not migrated |
+
+The cache admission adapter currently expects Lustre project paths and `lfs`
+project quota commands. The Discoverer preset is not a portable BMRC resource
+recommendation. See [cache workflow](PREDICTION_CACHE.md) for the frozen audit
+schedule, preserved predictions and final publication checks.
+
+A BMRC prepared-data preview, with its constraint selected explicitly, is:
+
+```bash
+bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT \
+  --constraint skl-compat --preset timing_full --dispatcher-shards 4 --dry-run
+```
 
 ## Resuming after interruption
 

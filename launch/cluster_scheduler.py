@@ -53,6 +53,22 @@ def refresh_cost_profile(plan, root, previous):
         except (ValueError, OSError):
             imported = []
     own = [Path(directory) / 'results.jsonl' for directory in previous]
+    # Only this phase's own journals can price it: a cost identity carries the
+    # phase, panel and pipeline, so a finished phase's rows can never match a
+    # lookup again, yet they dominate the bytes reparsed at every restart.
+    # Sources outside this run's rounds stay: they are small and may match.
+    rounds_root = (root / 'rounds').resolve()
+    kept = set()
+    for path in own:
+        try: kept.add(path.resolve())
+        except OSError: pass
+
+    def prices_this_phase(path):
+        try: resolved = path.resolve()
+        except OSError: return False
+        return resolved in kept or rounds_root not in resolved.parents
+
+    imported = [path for path in imported if prices_this_phase(path)]
 
     def usable(paths):
         result, seen = [], set()
@@ -106,7 +122,7 @@ def worker_cpu_hours(state):
     """Charge stopped rounds once; missing receipt means the full reservation."""
     from discoverer_resources import duration
     total = 0.
-    for item in state['rounds']:
+    for item in state['rounds'] + state.get('verification_rounds', []):
         if item['label'] not in state['jobs']: continue
         allocation = item['allocation']
         cpu = allocation.get('allocated_cpu_bound')
@@ -190,7 +206,8 @@ def load(plan_path):
 def batch_args(spec, mode, plan_path, *, dependency=None, allocation=None, policy=None):
     cluster, root = spec['cluster'], Path(spec['output'])
     args = ['--account=' + cluster['account'], '--partition=' + cluster['partition'],
-            '--cpus-per-task=1', '--ntasks-per-core=1', '--export=ALL', '--no-requeue',
+            '--cpus-per-task=' + str((allocation or {}).get('allocation_task_width', 1)),
+            '--ntasks-per-core=1', '--export=ALL', '--no-requeue',
             '--chdir=' + str(root), '--output=' + str(root / ('logs/' + mode + '-%j.out')),
             '--error=' + str(root / ('logs/' + mode + '-%j.err'))]
     qos = allocation['qos'] if allocation else cluster.get('qos')
@@ -203,19 +220,26 @@ def batch_args(spec, mode, plan_path, *, dependency=None, allocation=None, polic
     if allocation:
         if allocation['nodes'] + allocation.get('control_node_reserve', 0) > (policy or {}).get('max_nodes', 60):
             raise ValueError('Allocation exceeds the explicit total node hard limit')
-        args += ['--nodes=' + str(allocation['nodes']), '--ntasks=' + str(allocation['workers'] + 1),
-                 '--ntasks-per-node=' + str(allocation['tasks_per_node']),
+        args += ['--nodes=' + str(allocation['nodes']),
+                 '--ntasks=' + str(allocation.get('allocation_tasks', allocation['workers'] + allocation.get('controller_task_slots', 1))),
+                 '--ntasks-per-node=' + str(allocation.get('allocation_tasks_per_node', allocation['tasks_per_node'])),
                  '--mem=' + str(allocation['memory_mb_per_node']) + 'M',
                  '--time=' + allocation['time_limit']]
+        if allocation.get('allocation_task_width', 1) > 1:
+            args.append('--threads-per-core=1')
     else:
         args += ['--nodes=1', '--ntasks=1', '--mem=' + spec['plan_memory'], '--time=' + spec['plan_time']]
     environment_path = root / 'cluster-environment.json'
     environment = spec.get('worker_environment') or (read(environment_path) if environment_path.exists() else {
         'python': str(Path(sys.executable).absolute()), 'python_module': os.environ.get('PYTHON_MODULE', '')}
     )
-    return args + [str(common.ROOT / 'launch/cluster_queue.sbatch'),
+    command = args + [str(common.ROOT / 'launch/cluster_queue.sbatch'),
                    environment['python'], str(common.ROOT / 'launch/cluster_scheduler.py'),
                    mode, str(Path(plan_path).resolve()), environment['python_module']]
+    if allocation and allocation.get('controller_task_slots', 1) > 1:
+        command += [str(allocation['controller_task_slots']), str(allocation['controller_memory_mb']),
+                    str(allocation['cpu_per_task'])]
+    return command
 
 
 def state_for(plan_path, plan):
@@ -238,6 +262,104 @@ def state_for(plan_path, plan):
 
 def scheduler(spec):
     return Slurm(spec['cluster']['account'], spec['cluster'].get('qos'))
+
+
+def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, policy, resource_resolver):
+    """Submit a separately admitted verification allocation, never a local pool."""
+    from copy import deepcopy
+    from aleatoric_nk_grid import parallel_verification as verification
+    from aleatoric_nk_grid import prediction_workflow as phases
+    from aleatoric_nk_grid.shared_queue import digest
+    state = journal.state; root = Path(plan['launch']['output'])
+    receipt = root / {'base': 'base-verified.json', 'index': 'base-input-ready.json', 'final': 'verified.json'}[mode]
+    if receipt.exists():
+        if mode == 'base': phases.verify_base_receipt(plan)
+        elif mode == 'index': phases.verify_base_input_receipt(plan)
+        else: phases.finalize(plan, base_rounds, sl_rounds)
+        return True
+    directory = root / 'parallel-verification' / mode
+    manifest = verification.prepare(plan, mode, base_rounds, sl_rounds, directory,
+                                    block_bytes=policy['verification_block_bytes'])
+    failures = list(directory.glob('failure-*.json'))
+    if failures:
+        raise ValueError('Parallel verification failed: ' + str(read(failures[0])))
+    history = state.setdefault('verification_rounds', [])
+    submitted = [r for r in history if r['mode'] == mode and r['label'] in state['jobs']]
+    if len(submitted) >= policy['verification_round_limit']:
+        raise ValueError('Parallel verification retry limit exhausted; completed chunks retained')
+    pending = sum(not (directory / 'chunks' / ('c%06d.json' % c['index'])).exists() for c in manifest['chunks'])
+    index = len(history)
+    prepared = next((r for r in history if r['mode'] == mode and r['label'] not in state['jobs']), None)
+    if prepared is None:
+        from cluster_resources import phase_allocation_options
+        request = deepcopy(plan['launch'])
+        options = phase_allocation_options(policy, 'base')
+        options.update(worker_cap=min(max(1, pending), options['worker_cap'] or max(1, pending)),
+                       sizing_mode='capacity', target_round_seconds=None,
+                       max_nodes=state['max_nodes'] - 2, validation_processes=0, dispatcher_shards=1,
+                       cpu_hours_remaining=cpu_budget(state, policy),
+                       control_jobs_reserved=sum(k.startswith(('C', 'G')) for k in state['jobs']) + 2)
+        parameters = inspect.signature(resource_resolver).parameters
+        allocation = dict(resource_resolver(request, max(1, pending),
+                         **{k: v for k, v in options.items() if k in parameters}))
+        allocation.update(control_node_reserve=2, total_node_bound=allocation['nodes'] + 2)
+        if allocation['total_node_bound'] > state['max_nodes']:
+            raise ValueError('Verification exceeded the total node cap')
+        from aleatoric_nk_grid.prediction_admission import check_plan_storage
+        high_water = max([allocation['workers']] + [r['allocation']['workers'] for r in state['rounds']])
+        storage = check_plan_storage(plan, allocated_workers=high_water)
+        # CSV fragments plus atomic publication / index fragments must fit the
+        # already reserved temporary allowance. Do not silently overbook it.
+        required_temporary = 4 * sum(s['journal_bytes'] for s in manifest['sources'])
+        reserved_temporary = storage.get('reservation', {}).get('temporary_bytes')
+        if reserved_temporary is not None and required_temporary > reserved_temporary:
+            raise ValueError('Parallel verification artifacts exceed the existing temporary storage reservation')
+        state['verification_storage_admission'] = {**storage, 'required_temporary_upper': required_temporary}
+        attempt = directory / ('attempt-%d' % index); (attempt / 'control').mkdir(parents=True)
+        common.atomic_json(attempt / 'queue-id.json', {'queue_id': digest(manifest)})
+        prepared = {'index': index, 'label': 'V' + mode + str(index), 'mode': mode,
+            'root': str(attempt), 'work_root': str(directory), 'allocation': allocation,
+            'manifest_sha256': digest(manifest), 'policy': policy}
+        history.append(prepared); journal.save()
+    job = journal.submit(prepared['label'], batch_args(plan['launch'], 'check', root / 'plan.json',
+                           allocation=prepared['allocation'], policy=prepared['policy']))
+    prepared['job_id'] = job; journal.save()
+    journal.submit('Gwait-' + job, batch_args(plan['launch'], 'control', root / 'plan.json',
+                                            dependency=job, policy=policy))
+    return False
+
+
+def check(plan_path):
+    """Allocated verification entrypoint; controller handles the final join."""
+    from aleatoric_nk_grid import parallel_verification as verification
+    from aleatoric_nk_grid.direct_success_queue import allocation_start_time
+    from aleatoric_nk_grid.shared_queue import digest
+    from discoverer_resources import duration
+    import time
+    plan = load(plan_path); root = Path(plan_path).parent
+    with _lock(root / '.cluster-state.lock'):
+        state = read(root / 'cluster-state.json')
+        matches = [r for r in state.get('verification_rounds', [])
+                   if state['jobs'].get(r['label'], {}).get('job_id') == os.environ.get('SLURM_JOB_ID')]
+        if len(matches) != 1:
+            raise ValueError('Verification allocation is outside the submission journal')
+        item = {**matches[0], 'job_id': os.environ['SLURM_JOB_ID']}
+        manifest = read(Path(item['work_root']) / 'manifest.json')
+        if digest(manifest) != item['manifest_sha256']:
+            raise ValueError('Verification work manifest changed')
+        generation = uuid.uuid4().hex; control = Path(item['root']) / 'control'
+        common.atomic_json(control / 'latest.json', {'job_id': item['job_id'], 'generation': generation,
+                                                   'queue_id': digest(manifest)})
+    entered, elapsed_source, elapsed_evidence = allocation_start_time(time.time(), duration(item['allocation']['time_limit']))
+    complete = False
+    try:
+        verification.run(item['work_root'], item['allocation']['workers'])
+        complete = True
+    finally:
+        common.atomic_json(control / 'round-result.json', {'job_id': item['job_id'], 'generation': generation,
+            'queue_id': digest(manifest), 'state': 'complete' if complete else 'incomplete', 'complete': complete,
+            'elapsed_seconds': max(0., time.time() - entered), 'elapsed_source': elapsed_source,
+            'elapsed_evidence': elapsed_evidence, 'allocation_cpu': item['allocation']['allocated_cpu_bound']})
 
 
 def terminal(journal, label):
@@ -284,7 +406,7 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         # Resolve ALL intents before interpreting any missing job receipt.
         active = []
         for label in list(state['jobs']):
-            if label.startswith('W'):
+            if label.startswith(('W', 'V')):
                 ended, job = terminal(journal, label)
                 if not ended: active.append(job)
         if active:
@@ -301,6 +423,9 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
             if (str(receipt.get('job_id')) == str(state['jobs'][item['label']].get('job_id'))
                     and receipt.get('queue_id') == read(Path(item['root']) / 'queue-id.json')['queue_id']
                     and isinstance(reason, str) and reason.startswith('worker_fault:')):
+                repair = state.get('resolved_worker_faults', {}).get(str(receipt['job_id']), {})
+                if repair.get('receipt_sha256') == common.sha256(receipt_path):
+                    continue  # An explicitly recorded operational repair of this exact stopped attempt.
                 state.update(status='protocol_blocked', blocked_reason=reason)
                 journal.save(); return state
         controls = sum(k.startswith(('C', 'G')) for k in state['jobs'])
@@ -325,6 +450,9 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         rounds = state['rounds']
         # A prepared round without a W intent is safe to reuse after controller loss.
         all_previous = [r['root'] for r in rounds if r['label'] in state['jobs']]
+        from aleatoric_nk_grid.dispatcher_shards import heal_round
+        for directory in all_previous:
+            heal_round(directory)   # a sharded round whose controller ended before merging its journals
         workflow = plan.get('prediction_workflow')
         if workflow:
             from aleatoric_nk_grid import prediction_workflow as phases
@@ -334,14 +462,15 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
             sl_rounds = [r['root'] for r in rounds if r['label'] in state['jobs'] and r['phase'] == 'sl']
             # A receipt can be published just before controller loss. Recover the
             # transition without starting another base allocation or resetting any budgets.
-            if phase == 'sl' or (root / 'base-verified.json').exists():
+            if phase == 'sl' or (root / phases.base_input_filename(workflow)).exists():
                 # Reread the sealed bytes on the transition and after controller
                 # loss, not on every advance: the index is tens of gigabytes at
                 # production repeat counts and cannot change under our own lock.
-                reread = phase != 'sl' or not state.get('base_receipt_verified')
+                receipt_flag = 'base_input_receipt_verified' if phases.deferred_base_audit(workflow) else 'base_receipt_verified'
+                reread = phase != 'sl' or not state.get(receipt_flag)
                 try:
-                    phases.verify_base_receipt(plan, verify_files=reread)
-                    if reread: state['base_receipt_verified'] = True
+                    phases.verify_base_input_receipt(plan, verify_files=reread)
+                    if reread: state[receipt_flag] = True
                 except (ValueError, OSError, CacheBusyError) as exc:
                     state.update(status='repair_required', workflow_state='REPAIR_REQUIRED',
                                  blocked_reason=str(exc), derived_results_valid=False)
@@ -369,13 +498,22 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         # Operational, not frozen: a profile beside the plan changes how many
         # workers a round asks for, never what the round computes.
         prepared_item = rounds[index] if len(rounds) > index else None
-        if workflow and prepared_item is None:
+        # A restart inside the base barrier has only stopped base journals, which
+        # the profile already priced when the barrier was entered: rebuilding it
+        # would reparse every journal to reproduce the same file.
+        if workflow and prepared_item is None and state.get('workflow_state') not in ('BASE_VERIFYING', 'BASE_INDEXING'):
             refresh_cost_profile(plan, root, previous)
         operational = operational_inputs(root, queue_root, prepared_item)
         policy, profile = operational['policy'], operational['cost_profile']
         try:
-            report = (phases.prepare_round(plan, phase, previous, queue_root, cost_profile=profile) if workflow
-                      else backend.prepare_round(plan, previous, queue_root, cost_profile=profile))
+            if (workflow and phase == 'base' and state.get('workflow_state') in ('BASE_VERIFYING', 'BASE_INDEXING')):
+                expected = phases.PredictionDesign(plan['prediction_workflow'], 'base').count
+                if state.get('phase_completed', {}).get('base') != expected:
+                    raise ValueError('Persisted base verification checkpoint has incomplete coverage')
+                report = {'done': expected, 'remaining': 0, 'phase': 'base'}
+            else:
+                report = (phases.prepare_round(plan, phase, previous, queue_root, cost_profile=profile) if workflow
+                          else backend.prepare_round(plan, previous, queue_root, cost_profile=profile))
         except (ValueError, OSError, RuntimeError) as exc:
             if not workflow: raise
             state.update(status='repair_required', workflow_state='REPAIR_REQUIRED',
@@ -387,9 +525,14 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
             state['completed'] = sum(state['phase_completed'].values())
         if report['remaining'] == 0:
             if workflow and phase == 'base':
-                state.update(workflow_state='BASE_VERIFYING'); journal.save()
+                index_only = phases.deferred_base_audit(workflow)
+                state.update(workflow_state='BASE_INDEXING' if index_only else 'BASE_VERIFYING'); journal.save()
                 try:
-                    phases.seal_base(plan, previous)
+                    if policy['parallel_verification'] or index_only:
+                        if not ensure_parallel_verification(plan, 'index' if index_only else 'base', previous, [], journal, policy, resource_resolver):
+                            return state
+                    else:
+                        phases.seal_base(plan, previous)
                 except (ValueError, OSError, CacheBusyError) as exc:
                     state.update(status='repair_required', workflow_state='REPAIR_REQUIRED',
                                  blocked_reason=str(exc), derived_results_valid=False)
@@ -403,6 +546,9 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
                 if workflow:
                     state['workflow_state'] = 'FINAL_VERIFYING'; journal.save()
                     try:
+                        if policy['parallel_verification'] or phases.deferred_base_audit(workflow):
+                            if not ensure_parallel_verification(plan, 'final', base_rounds, sl_rounds, journal, policy, resource_resolver):
+                                return state
                         phases.finalize(plan, base_rounds, sl_rounds)
                     except (ValueError, OSError, CacheBusyError) as exc:
                         state.update(status='repair_required', workflow_state='REPAIR_REQUIRED',
@@ -417,6 +563,9 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
             state['status'] = 'cpu_budget_exhausted'; journal.save(); return state
         phase_index = len(previous)
         round_limit = workflow['phase_round_limits'][phase] if workflow else spec['cluster']['rounds']
+        # Operational: how many allocations a phase may use, never what it computes.
+        if workflow and policy.get(phase + '_round_limit') is not None:
+            round_limit = policy[phase + '_round_limit']
         if phase_index >= round_limit:
             state['status'] = 'round_budget_exhausted'; journal.save(); return state
         stalled = 0
@@ -437,14 +586,21 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
                       'control_jobs_reserved': control_count + 2,
                       # Geometry is operational, like the cost profile beside it.
                       'worker_memory': policy.get('worker_memory'),
-                      'worker_cap': policy.get('worker_cap')}
+                      'validation_processes': policy.get('validation_processes', 0),
+                      'dispatcher_shards': policy.get('dispatcher_shards', 1),
+                      'worker_cap': policy.get('worker_cap'),
+                      'worker_time_limit': policy.get('worker_time_limit') if phase != 'sl' else None}
+        from cluster_resources import phase_allocation_options
+        candidates.update(phase_allocation_options(policy, phase))
         parameters = inspect.signature(resource_resolver).parameters
         extra = {key: value for key, value in candidates.items() if key in parameters}
         from cluster_resources import CpuBudgetExhausted
         try:
             from cluster_resources import phase_spec
-            request_spec = phase_spec(spec, workflow, phase, round_index=phase_index) if workflow else spec
+            request_spec = phase_spec(spec, workflow, phase, round_index=phase_index, policy=policy) if workflow else spec
             allocation = dict(resource_resolver(request_spec, report['remaining'], **extra))
+            if allocation.get('shard_admission_note'):
+                print('Dispatcher admission: ' + allocation['shard_admission_note'], flush=True)
             allocation['control_node_reserve'] = 2
             allocation['total_node_bound'] = allocation['nodes'] + 2
             if allocation['total_node_bound'] > state['max_nodes']:
@@ -494,7 +650,11 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         if workflow:
             from aleatoric_nk_grid.prediction_admission import check_plan_storage
             try:
-                state['storage_admission'] = check_plan_storage(plan, allocated_workers=allocation['workers'])
+                storage_workers = max([allocation['workers']] + [
+                    r['allocation']['workers'] for r in rounds if r['label'] in state['jobs']])
+                state['storage_admission'] = check_plan_storage(plan, allocated_workers=storage_workers)
+                state['storage_admission']['reservation_worker_high_water'] = storage_workers
+                state['storage_admission']['current_numerical_workers'] = allocation['workers']
             except (ValueError, OSError) as exc:
                 state.update(status='storage_blocked', blocked_reason=str(exc))
                 journal.save(); return state
@@ -509,8 +669,18 @@ def work(plan_path):
     from aleatoric_nk_grid import direct_success_queue as runtime
     from aleatoric_nk_grid.shared_queue import file_digest
     plan = load(plan_path); root = Path(plan_path).parent
-    if file_digest(Path(runtime.__file__)) != plan['runtime_sha256']:
-        raise ValueError('Frozen dispatcher changed')
+    actual_runtime_sha256 = file_digest(Path(runtime.__file__))
+    if actual_runtime_sha256 != plan['runtime_sha256']:
+        # An explicit per-run operational revision may change scheduling/storage
+        # without changing the frozen scientific checkout or its cache identity.
+        authorization_path = root / 'operational-runtime.json'
+        authorization = read(authorization_path) if authorization_path.is_file() else {}
+        expected = authorization.get('runtime', {})
+        if (authorization.get('baseline_runtime_sha256') != plan['runtime_sha256']
+                or authorization.get('plan_sha256') != common.sha256(plan_path)
+                or Path(expected.get('path', '')).resolve() != Path(runtime.__file__).resolve()
+                or expected.get('sha256') != actual_runtime_sha256):
+            raise ValueError('Frozen dispatcher changed without a matching operational revision')
     with _lock(root / '.cluster-state.lock'):
         path, state = state_for(plan_path, plan)
         journal = Journal(path, state, scheduler(plan['launch']))
@@ -520,9 +690,10 @@ def work(plan_path):
         operational = operational_inputs(root, item['root'], item)
         if operational.get('queue_id') != read(Path(item['root']) / 'queue-id.json')['queue_id']:
             raise ValueError('Round operational snapshot belongs to another queue')
-        journal.submit('Gwait-' + os.environ['SLURM_JOB_ID'],
-            batch_args(plan['launch'], 'control', plan_path, dependency=os.environ['SLURM_JOB_ID'],
-                       policy=operational['policy']))
+        if not item.get('single_round_only', False):
+            journal.submit('Gwait-' + os.environ['SLURM_JOB_ID'],
+                batch_args(plan['launch'], 'control', plan_path, dependency=os.environ['SLURM_JOB_ID'],
+                           policy=operational['policy']))
     from discoverer_resources import duration
     runtime.run(Path(item['root']), common.ROOT, common.ROOT, item['allocation']['workers'],
                 validate_only=True, max_seconds=duration(item['allocation']['time_limit']),
@@ -565,7 +736,7 @@ def resume(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['start', 'control', 'work', 'preview'])
+    p.add_argument('command', choices=['start', 'control', 'work', 'check', 'preview'])
     p.add_argument('plan', type=Path)
     args = p.parse_args()
     if args.command == 'preview':
@@ -573,7 +744,7 @@ def main():
         if plan.get('format') != FORMAT: raise ValueError('Legacy grouped plan; use its frozen checkout')
         print(json.dumps({'scheduler': FORMAT, 'submission': plan['submission']}, indent=2))
     else:
-        {'start': start, 'control': advance, 'work': work}[args.command](args.plan.resolve())
+        {'start': start, 'control': advance, 'work': work, 'check': check}[args.command](args.plan.resolve())
 
 
 if __name__ == '__main__': main()

@@ -73,6 +73,13 @@ def auxiliary_disk_usage(output):
     for parent in (output / 'rounds', output):
         if parent.exists():
             paths.update(parent.glob('*/recovery.sqlite'))
+    # Parallel verification artifacts remain needed by the sealed base index
+    # and resumable final publication; account for them without scanning data.
+    verification = output / 'parallel-verification'
+    if verification.exists():
+        paths.update(verification.glob('*/*'))
+        paths.update(verification.glob('*/chunks/*'))
+    paths.add(output / 'base-records.manifest.json')
     return sum(p.stat().st_size for p in paths if p.is_file())
 
 

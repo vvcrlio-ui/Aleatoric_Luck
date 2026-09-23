@@ -6,7 +6,8 @@ never calls a model's fit method and never repairs missing caches by training.
 """
 from array import array
 from bisect import bisect_right
-from collections import Counter
+from collections import OrderedDict
+from copy import deepcopy
 from contextlib import closing
 from dataclasses import asdict, dataclass
 import csv
@@ -16,6 +17,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import threading
 import uuid
 
 from .pending_resume import Design
@@ -24,12 +26,13 @@ from .shared_queue import (ModelTask, QueueError, atomic_json, canonical, digest
 from .result_migration import validate_scientific_result
 
 FORMAT = 'prediction-workflow-v1'
+BASE_READY_FORMAT = 'base-input-ready-v1'
 # One repeat short of nothing is useless and a whole group is too late: each
 # cost group is primed with exactly the observation count that lets
 # batch_seconds price it, so the next round can lease more than one task at a
 # time. Kept equal to the pricing threshold so the two cannot drift apart.
 from .cost_profile import DEFAULT_MIN_BATCH_OBSERVATIONS as PRICING_PRIME_REPEATS
-STATES = ('PLANNED', 'BASE_RUNNING', 'BASE_VERIFYING', 'SL_READY', 'SL_RUNNING',
+STATES = ('PLANNED', 'BASE_RUNNING', 'BASE_INDEXING', 'BASE_VERIFYING', 'SL_READY', 'SL_RUNNING',
           'FINAL_VERIFYING', 'COMPLETE', 'REPAIR_REQUIRED')
 
 
@@ -124,6 +127,8 @@ def contract_from_config(config, plan):
     if 'base_round_time_limits' in execution:
         contract['base_round_time_limits'] = execution['base_round_time_limits']
         validate_round_time_limits(contract, global_time_limit=plan['launch']['cluster']['time_limit'])
+    if 'verification_schedule' in execution:
+        contract['verification_schedule'] = execution['verification_schedule']
     return validate_contract(contract)
 
 
@@ -137,6 +142,8 @@ def joint_contract(contracts, *, output_root, phase_round_limits, sl_resources):
             raise QueueError('Joint submission library/cache/protocol contracts differ')
         if c.get('base_round_time_limits') != first.get('base_round_time_limits'):
             raise QueueError('Joint panels require the same frozen base round time limits')
+        if c.get('verification_schedule', 'before_sl') != first.get('verification_schedule', 'before_sl'):
+            raise QueueError('Joint panels require the same verification schedule')
     root = Path(output_root).resolve()
     return validate_contract({**first, 'output_root': str(root), 'cache_root': str(root / 'prediction-cache'),
         'panels': [p for c in contracts for p in c['panels']],
@@ -151,6 +158,8 @@ def validate_contract(contract):
         raise QueueError('Prediction workflow requires the frozen protocol-2 submission-plan barrier')
     if not isinstance(contract.get('base_library_id'), str) or not contract['base_library_id']:
         raise QueueError('Frozen base library identity is required')
+    if contract.get('verification_schedule', 'before_sl') not in ('before_sl', 'final_only'):
+        raise QueueError('Unknown prediction verification schedule')
     if contract.get('cache_mode') != 'holdout_oof' or contract.get('required') is not True:
         raise QueueError('Two-phase SL requires complete OOF and holdout caches')
     panels = contract.get('panels')
@@ -261,6 +270,7 @@ class PredictionDesign:
         self.contract = validate_contract(contract)
         if phase not in ('base', 'sl'): raise QueueError('Unknown prediction phase')
         self.phase = phase
+        self._cost_identities = {}
         self.panels = {}; self.sections = []; self.starts = []; self.count = 0
         for panel in contract['panels']:
             definitions = panel['pipelines' if phase == 'base' else 'variants']
@@ -276,6 +286,13 @@ class PredictionDesign:
 
     def contains(self, ordinal):
         return bool(self.bits[ordinal // 8] & (1 << (ordinal % 8)))
+
+    def cost_identity(self, task):
+        """One numerical identity per frozen pipeline, not per grid task."""
+        key = (task.phase, task.panel_id, task.pipeline_id, task.variant_id)
+        if key not in self._cost_identities:
+            self._cost_identities[key] = cost_identity(task, self.contract)
+        return dict(self._cost_identities[key])
 
     def mark(self, ordinal):
         self.bits[ordinal // 8] |= 1 << (ordinal % 8)
@@ -332,11 +349,11 @@ def cost_identity(task, contract):
                       == (task.pipeline_id or task.variant_id))
     result = {'phase': task.phase, 'pipeline_id': task.pipeline_id, 'variant_id': task.variant_id,
             'base_library_id': task.base_library_id, 'oof_folds': definition.get('oof_folds', 0),
-            'cache_mode': contract['cache_mode'], 'training_identity': digest(definition),
-            'cell_spec_sha256': digest(panel['cell_spec'])}
+            'cache_mode': contract['cache_mode'], 'training_identity': digest(definition)}
     if contract.get('storage', {}).get('layout') == 'shared-v1':
-        result.pop('cell_spec_sha256')
         result['training_context_sha256'] = cost_training_context(panel['cell_spec'])
+    else:
+        result['cell_spec_sha256'] = digest(panel['cell_spec'])
     return result
 
 
@@ -361,9 +378,41 @@ def phase_identity(plan, phase):
                 'runtime_sha256': plan['runtime_sha256'],
                 'prediction_workflow': {'contract': contract, 'phase': phase}}
     if phase == 'sl':
-        receipt = verify_base_receipt(plan, verify_files=False)
-        identity['prediction_workflow']['base_receipt_sha256'] = digest(receipt)
+        receipt = verify_base_input_receipt(plan, verify_files=False)
+        identity['prediction_workflow'][base_input_digest_key(contract)] = digest(receipt)
     return identity
+
+
+def deferred_base_audit(contract):
+    return contract.get('verification_schedule', 'before_sl') == 'final_only'
+
+
+def base_input_filename(contract):
+    return 'base-input-ready.json' if deferred_base_audit(contract) else 'base-verified.json'
+
+
+def base_input_digest_key(contract):
+    return 'base_input_receipt_sha256' if deferred_base_audit(contract) else 'base_receipt_sha256'
+
+
+def verify_base_input_receipt(plan, *, verify_files=True):
+    """Bind an input snapshot; readiness does not claim a completed audit."""
+    contract = plan['prediction_workflow']
+    if not deferred_base_audit(contract):
+        return verify_base_receipt(plan, verify_files=verify_files)
+    path = Path(plan['launch']['output']) / 'base-input-ready.json'
+    if not path.is_file():
+        raise QueueError('Base input index is not ready')
+    receipt = read(path)
+    if (receipt.get('format') != BASE_READY_FORMAT or receipt.get('index_ready') is not True
+            or receipt.get('audit_complete') is not False or receipt.get('complete') is True
+            or receipt.get('plan_sha256') != digest(plan) or receipt.get('workflow_sha256') != digest(contract)
+            or receipt.get('records_index_format') != 'partitioned-base-reference-index-v1'):
+        raise QueueError('Base input readiness identity changed or was mislabelled as audited')
+    if verify_files:
+        with closing(open_base_records(contract, receipt=receipt, verify_files=True)):
+            pass
+    return receipt
 
 
 def task_kind(identity, row):
@@ -373,7 +422,80 @@ def task_kind(identity, row):
     return identity.get('task_kind', 'regression')
 
 
-def validate_sample_maps(contract, record, row, *, sealed=False):
+class ResultCacheValidator:
+    """Reuse a frozen contract and first-read checks within one reader phase.
+
+    The controller creates a new validator after writers are stopped or locations
+    are compacted. Cached maps are read-only; changed file metadata invalidates
+    the entry. This never bypasses the first content check or row/OOF identity.
+    """
+    def __init__(self, identity, *, max_map_bytes=64 * 1024**2, fast_reads=False):
+        self.identity = deepcopy(identity)
+        self.context = None
+        if fast_reads:                                              # opt-in: see ReadContext; nothing is imported when off
+            from .prediction_cache import ReadContext
+            self.context = ReadContext()
+        self.provenance = {}
+        workflow = self.identity.get('prediction_workflow')
+        if workflow:
+            phase = workflow['phase']
+            for panel in workflow['contract']['panels']:
+                input_digest = digest(panel['cell_spec'])
+                field = 'pipeline_id' if phase == 'base' else 'variant_id'
+                for definition in panel['pipelines' if phase == 'base' else 'variants']:
+                    self.provenance[(panel['panel_id'], definition[field])] = (
+                        input_digest, digest(definition))
+        self.maps = OrderedDict()
+        self.map_bytes = 0
+        self.max_map_bytes = max_map_bytes
+        self.lock = threading.RLock()
+
+    def __call__(self, row, *, sealed=False):
+        return validate_result_cache(self.identity, row, sealed=sealed, _validator=self)
+
+    def read_map(self, root, reference, *, expected_identity, require_sealed):
+        from .prediction_cache import verify_reference, safe_cache_path
+        from .prediction_layout import resolve_reference
+        key = (str(root), require_sealed, canonical(reference), canonical(expected_identity))
+        with self.lock:
+            cached = self.maps.pop(key, None)
+            if cached is not None:
+                path, signature, mapping, size = cached
+                stat = path.stat()
+                current = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                if signature == current:
+                    self.maps[key] = cached
+                    return mapping
+                self.map_bytes -= size
+        if self.context is None:
+            resolved = resolve_reference(root, reference)
+            path = safe_cache_path(root, resolved['path'])
+        else:
+            resolved = self.context.resolve(root, reference)
+            path = self.context.safe_path(root, resolved['path'])
+        mapping = verify_reference(root, reference, expected_identity=expected_identity,
+                                   require_sealed=require_sealed, context=self.context)
+        after = path.stat()
+        signature = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        # The bytes just read already matched the authoritative record checksum.
+        # Lustre timestamp observations can differ without a content change;
+        # use them only to invalidate future cache hits, never to reject this read.
+        for array in mapping['arrays'].values():
+            array.setflags(write=False)
+        size = sum(a.nbytes for a in mapping['arrays'].values()) + 3 * int(resolved['length']) + 4096
+        if size <= self.max_map_bytes:
+            with self.lock:
+                old = self.maps.pop(key, None)
+                if old is not None:
+                    self.map_bytes -= old[3]
+                while self.maps and (self.map_bytes + size > self.max_map_bytes or len(self.maps) >= 4096):
+                    self.map_bytes -= self.maps.popitem(last=False)[1][3]
+                self.maps[key] = (path, signature(after), mapping, size)
+                self.map_bytes += size
+        return mapping
+
+
+def validate_sample_maps(contract, record, row, *, sealed=False, _validator=None):
     """Verify exact content-addressed order/label maps before score ACK.
 
     Map identities are derived from the already-frozen ordered-array descriptors.
@@ -401,8 +523,9 @@ def validate_sample_maps(contract, record, row, *, sealed=False):
             raise QueueError('Frozen prediction identity lacks required sample/feature arrays')
         present = {name: ordered[name] for name in names if name in ordered}
         expected = {'sample_map_content': cache_identity({'metadata': {'kind': kind}, 'arrays': present})}
-        mapping = verify_reference(Path(contract['cache_root']), refs[kind],
-                                   expected_identity=expected, require_sealed=sealed)
+        reader = _validator.read_map if _validator is not None else verify_reference
+        mapping = reader(Path(contract['cache_root']), refs[kind],
+                         expected_identity=expected, require_sealed=sealed)
         if mapping['kind'] != 'sample_map' or mapping['status'] != 'ok':
             raise QueueError('Required sample-map reference has wrong record kind/status')
         if set(mapping['arrays']) != set(present):
@@ -436,7 +559,7 @@ def validate_sample_maps(contract, record, row, *, sealed=False):
     return values
 
 
-def validate_result_cache(identity, row, *, sealed=False):
+def validate_result_cache(identity, row, *, sealed=False, _validator=None):
     """Read durable numeric records before ACK/coverage; never trust flags alone."""
     workflow = identity.get('prediction_workflow')
     if not workflow or row.get('status') == 'failed': return
@@ -444,21 +567,30 @@ def validate_result_cache(identity, row, *, sealed=False):
     contract = workflow['contract']
     reference = row.get('prediction_cache_ref')
     if not isinstance(reference, dict): raise QueueError('Required prediction cache reference missing')
-    record = verify_reference(Path(contract['cache_root']), reference, require_sealed=sealed)
+    record = verify_reference(Path(contract['cache_root']), reference, require_sealed=sealed,
+                              context=getattr(_validator, 'context', None))
     metadata = record['metadata']
     expected = {key: row.get(key) for key in PredictionTask.__dataclass_fields__}
     stored = metadata.get('task', {})
     if any(str(stored.get(k)) != str(v) for k, v in expected.items()):
         raise QueueError('Prediction cache task identity mismatch')
+    # Bind journal scores to the checked prediction, not to a whole-file hash.
+    stored_result = metadata.get('result')
+    if isinstance(stored_result, dict):
+        for key, value in stored_result.items():
+            if not key.startswith('_') and key != 'prediction_cache_ref' and row.get(key) != value:
+                raise QueueError('Result differs from its persisted prediction: ' + key)
     if record['status'] not in ({'ok', 'nonconverged'} if row['status'] == 'ok' else {row['status']}):
         raise QueueError('Prediction cache status differs from result')
     panel = next(p for p in contract['panels'] if p['panel_id'] == row['panel_id'])
     definition = next(d for d in panel['pipelines' if workflow['phase'] == 'base' else 'variants']
         if d['pipeline_id' if workflow['phase'] == 'base' else 'variant_id'] == (row['pipeline_id'] or row['variant_id']))
-    if (metadata.get('input_spec_sha256') != digest(panel['cell_spec'])
-            or metadata.get('pipeline_sha256') != digest(definition)):
+    expected_digests = (_validator.provenance[(row['panel_id'], row['pipeline_id'] or row['variant_id'])]
+                        if _validator is not None else (digest(panel['cell_spec']), digest(definition)))
+    if (metadata.get('input_spec_sha256') != expected_digests[0]
+            or metadata.get('pipeline_sha256') != expected_digests[1]):
         raise QueueError('Prediction cache frozen input/pipeline provenance differs')
-    sample_arrays = validate_sample_maps(contract, record, row, sealed=sealed)
+    sample_arrays = validate_sample_maps(contract, record, row, sealed=sealed, _validator=_validator)
     if row['status'] == 'skipped':
         if not metadata.get('reason'): raise QueueError('Cache skip requires a durable reason')
     else:
@@ -484,54 +616,88 @@ def validate_result_cache(identity, row, *, sealed=False):
     return record
 
 
-def scan(plan, phase, rounds, accept=lambda row: None, *, sealed=False):
+def _source_ids(sources):
+    """Old receipts may contain whole-journal hashes; source identity does not."""
+    return [(item['root'], item['queue_id']) for item in sources]
+
+
+def _read_remaining(path, design, count):
+    order = array('I'); order.frombytes(Path(path).read_bytes())
+    if sys.byteorder != 'little': order.byteswap()
+    if len(order) != count:
+        raise QueueError('Prediction round count changed')
+    members = bytearray(len(design.bits))
+    for ordinal in order:
+        if ordinal >= design.count or design.contains(ordinal) or members[ordinal // 8] & (1 << (ordinal % 8)):
+            raise QueueError('Duplicate/outside prediction round task')
+        members[ordinal // 8] |= 1 << (ordinal % 8)
+    return order, members
+
+
+def round_members(directory, design, identity, sources):
+    """Check one stopped round's frozen identity and source chain; return its queue id and task bitmap."""
+    directory = Path(directory)
+    manifest = read(directory / 'manifest.json'); qid = digest(manifest)
+    if (manifest['identity'] != identity or _source_ids(manifest['sources']) != _source_ids(sources)
+            or read(directory / 'queue-id.json')['queue_id'] != qid):
+        raise QueueError('Prediction round identity changed')
+    _, members = _read_remaining(directory / 'remaining.u32', design, manifest['count'])
+    return qid, members
+
+
+def journal_rows(path, design, identity, qid, members, *, start=0):
+    """Yield (row, ordinal, end offset) for each provenance-checked scientific row.
+
+    Duplicate detection and content validation are left to the caller. A torn
+    final line (no newline) ends the stopped journal, exactly as before.
+    """
+    with Path(path).open('rb') as handle:
+        handle.seek(start)
+        while line := handle.readline(2 * 1024 * 1024 + 1):
+            if len(line) > 2 * 1024 * 1024: raise QueueError('Oversized prediction result')
+            if not line.endswith(b'\n'): break
+            entry = json.loads(line); row = entry['result']; ordinal = design.ordinal(row)
+            if (entry['origin']['queue_id'] != qid or entry['task_id'] != design.task_at(ordinal).id
+                    or not members[ordinal // 8] & (1 << (ordinal % 8))):
+                raise QueueError('Prediction result provenance mismatch')
+            if not validate_scientific_result(row, task_kind=task_kind(identity, row)): continue
+            panel_spec = design.panels[row['panel_id']][2]['cell_spec']
+            if row.get('algorithm_version') != panel_spec['algorithm_version']:
+                raise QueueError('Prediction algorithm changed')
+            yield row, ordinal, handle.tell()
+
+
+def scan(plan, phase, rounds, accept=lambda row: None, *, sealed=False, verify_records=True):
     """Stopped generations only; all panel identities share one coverage bitmap."""
     from contextlib import ExitStack
     identity = phase_identity(plan, phase)
+    validator = ResultCacheValidator(identity)
     design = PredictionDesign(plan['prediction_workflow'], phase); sources = []
     with ExitStack() as locks:
         for directory in map(Path, rounds):
             locks.enter_context(file_lock(directory / 'dispatcher.lock'))
-            manifest = read(directory / 'manifest.json'); qid = digest(manifest)
-            if (manifest['identity'] != identity or manifest['sources'] != sources
-                    or read(directory / 'queue-id.json')['queue_id'] != qid
-                    or file_digest(directory / 'remaining.u32') != manifest['remaining_sha256']):
-                raise QueueError('Prediction round identity changed')
-            order = array('I'); order.frombytes((directory / 'remaining.u32').read_bytes())
-            if sys.byteorder != 'little': order.byteswap()
-            if len(order) != manifest['count']: raise QueueError('Prediction round count changed')
-            members = bytearray(len(design.bits))
-            for ordinal in order:
-                if ordinal >= design.count or design.contains(ordinal) or members[ordinal // 8] & (1 << (ordinal % 8)):
-                    raise QueueError('Duplicate/outside prediction round task')
-                members[ordinal // 8] |= 1 << (ordinal % 8)
+            qid, members = round_members(directory, design, identity, sources)
             path = directory / 'results.jsonl'
             if not path.exists():
-                sources.append({'root': str(directory), 'queue_id': qid, 'results_sha256': None}); continue
+                sources.append({'root': str(directory), 'queue_id': qid}); continue
             size = path.stat().st_size
-            with path.open('rb') as handle:
-                while line := handle.readline(2 * 1024 * 1024 + 1):
-                    if len(line) > 2 * 1024 * 1024: raise QueueError('Oversized prediction result')
-                    if not line.endswith(b'\n'): break
-                    entry = json.loads(line); row = entry['result']; ordinal = design.ordinal(row)
-                    if (entry['origin']['queue_id'] != qid or entry['task_id'] != design.task_at(ordinal).id
-                            or not members[ordinal // 8] & (1 << (ordinal % 8))):
-                        raise QueueError('Prediction result provenance mismatch')
-                    if not validate_scientific_result(row, task_kind=task_kind(identity, row)): continue
-                    panel_spec = design.panels[row['panel_id']][2]['cell_spec']
-                    if row.get('algorithm_version') != panel_spec['algorithm_version']:
-                        raise QueueError('Prediction algorithm changed')
-                    validate_result_cache(identity, row, sealed=sealed)
-                    if design.contains(ordinal): raise QueueError('Duplicate prediction success')
-                    design.mark(ordinal); accept(row)
+            for row, ordinal, _ in journal_rows(path, design, identity, qid, members):
+                if verify_records:
+                    validator(row, sealed=sealed)
+                if design.contains(ordinal): raise QueueError('Duplicate prediction success')
+                design.mark(ordinal); accept(row)
             if path.stat().st_size != size: raise QueueError('Stopped prediction journal changed')
-            sources.append({'root': str(directory), 'queue_id': qid, 'results_sha256': file_digest(path)})
+            sources.append({'root': str(directory), 'queue_id': qid})
     return design, sources
 
 
 def prepare_round(plan, phase, rounds, directory, *, cost_profile=None):
     from .scheduler_cost import CostEstimator
-    design, sources = scan(plan, phase, rounds)
+    # Only stopped, exclusively locked acceptance journals are used here.
+    # The dispatcher checked each prediction before committing its receipt.
+    # Rebuilding pending keys needs those receipts, not another full array read.
+    # seal_base/finalize and every actual cache consumer still check records.
+    design, sources = scan(plan, phase, rounds, verify_records=False)
     done = sum(b.bit_count() for b in design.bits)
     if done == design.count: return {'done': done, 'remaining': 0, 'phase': phase}
     directory = Path(directory); identity = phase_identity(plan, phase)
@@ -540,7 +706,7 @@ def prepare_round(plan, phase, rounds, directory, *, cost_profile=None):
     for task, ordinals in design.groups():
         remaining = sum(not design.contains(i) for i in ordinals)
         if not remaining: continue
-        ci = cost_identity(task, design.contract)
+        ci = design.cost_identity(task)
         mean = estimator.mean_seconds(task.model, task.N, task.K, identity=ci)
         price = estimator.batch_seconds(task.model, task.N, task.K, identity=ci)
         coverage.append({'phase': phase, 'panel_id': task.panel_id, 'pipeline_id': task.pipeline_id,
@@ -557,14 +723,15 @@ def prepare_round(plan, phase, rounds, directory, *, cost_profile=None):
               'cost_profile_sha256': digest(cost_profile) if cost_profile is not None else None}
     if directory.exists():
         saved = read(directory / 'prepared.json'); manifest = read(directory / 'manifest.json')
-        if (manifest['identity'] != identity or manifest['sources'] != sources
+        if (manifest['identity'] != identity or _source_ids(manifest['sources']) != _source_ids(sources)
                 or saved['done'] != done or saved['remaining'] != report['remaining']
-                or read(directory / 'queue-id.json')['queue_id'] != digest(manifest)
-                or file_digest(directory / 'remaining.u32') != manifest['remaining_sha256']):
+                or read(directory / 'queue-id.json')['queue_id'] != digest(manifest)):
             raise QueueError('Prepared prediction round changed')
+        _read_remaining(directory / 'remaining.u32', design, report['remaining'])
         recovery = manifest.get('prediction_recovery')
-        if recovery and recovery.get('format') == 'prediction-recovery-v1' and (Path(recovery['path']).resolve() != (directory / 'recovery.sqlite').resolve()
-                         or recovery['sha256'] != file_digest(directory / 'recovery.sqlite')):
+        if recovery and recovery.get('format') == 'prediction-recovery-v1' and (
+                Path(recovery['path']).resolve() != (directory / 'recovery.sqlite').resolve()
+                or not (directory / 'recovery.sqlite').is_file()):
             raise QueueError('Prepared prediction recovery index changed')
         return {**report, 'queue_id': digest(manifest)}
     directory.parent.mkdir(parents=True, exist_ok=True)
@@ -590,9 +757,14 @@ def prepare_round(plan, phase, rounds, directory, *, cost_profile=None):
         handle.flush(); os.fsync(handle.fileno())
     manifest = {'format': 'direct-success-bitmap-v1', 'identity': identity,
         'count': report['remaining'], **transport_manifest(), 'max_attempts': 5,
-        'sources': sources, 'remaining_sha256': file_digest(temporary / 'remaining.u32'), 'fresh': True}
-    manifest['prediction_recovery'] = build_recovery_index(plan, temporary / 'recovery.sqlite',
-                                                          published_path=directory / 'recovery.sqlite')
+        'sources': sources, 'integrity': 'record-sha256-v1', 'fresh': True}
+    # Orphan recovery only pays for itself when THIS phase already had an
+    # allocation that could have left a durable record without an accepted
+    # score. A phase's first round has none, and a lookup is an exact identity
+    # match, so records of another phase can never answer one of its tasks.
+    if rounds:
+        manifest['prediction_recovery'] = build_recovery_index(plan, temporary / 'recovery.sqlite',
+                                                              published_path=directory / 'recovery.sqlite')
     report['queue_id'] = digest(manifest)
     atomic_json(temporary / 'manifest.json', manifest)
     atomic_json(temporary / 'queue-id.json', {'queue_id': report['queue_id']})
@@ -649,101 +821,55 @@ def build_recovery_index(plan, path, *, published_path=None):
         connection.commit()
     with path.open('r+b') as handle: os.fsync(handle.fileno())
     return {'format': 'prediction-recovery-v1', 'path': str(Path(published_path or path).resolve()),
-            'sha256': file_digest(path), 'plan_sha256': digest(plan),
+            'integrity': 'record-sha256-v1', 'plan_sha256': digest(plan),
             'workflow_sha256': digest(contract), 'records': count,
             'contains_legacy_fold_identities': contains_legacy_fold_identities}
 
 
 def verify_base_receipt(plan, *, verify_files=True):
-    """Confirm the sealed barrier. File bytes are reread only when asked.
-
-    The receipt's own identity is cheap and always checked. Rehashing the task
-    index and every cache index is not: at production repeat counts the index
-    alone is tens of gigabytes, and the controller calls this on every advance.
-    Those files are sealed under an exclusive lock and cannot change while the
-    run owns them, so callers pass ``verify_files`` for the transitions that
-    actually need it - sealing, controller restart, and consuming a cache this
-    run did not produce.
-    """
+    """Confirm phase identity/presence; each consumed record checks its content."""
     path = Path(plan['launch']['output']) / 'base-verified.json'
     if not path.exists(): raise QueueError('Base verification barrier is not sealed')
     receipt = read(path)
     if (receipt.get('plan_sha256') != digest(plan) or receipt.get('complete') is not True
             or receipt.get('workflow_sha256') != digest(plan['prediction_workflow'])):
         raise QueueError('Base verification receipt identity changed')
-    if verify_files and receipt.get('records_index_sha256') != file_digest(Path(plan['launch']['output']) / 'base-records.sqlite'):
-        raise QueueError('Verified base task-reference index changed; explicit repair required')
+    index_path = Path(plan['launch']['output']) / 'base-records.sqlite'
+    if receipt.get('records_index_format') in ('partitioned-base-index-v1', 'partitioned-base-reference-index-v1'):
+        if verify_files:
+            with closing(open_base_records(plan['prediction_workflow'], receipt=receipt, verify_files=True)):
+                pass
+    elif verify_files and (not index_path.is_file() or ('records_index_bytes' in receipt
+            and index_path.stat().st_size != receipt['records_index_bytes'])):
+        raise QueueError('Verified base task-reference index missing or resized; explicit repair required')
     from .prediction_evidence import verify_cache_evidence
     for item in receipt.get('cache_indexes', []) if verify_files else ():
         verify_cache_evidence(Path(plan['prediction_workflow']['cache_root']), item)
     return receipt
 
 
+def open_base_records(contract, *, receipt=None, verify_files=False):
+    """Open either the historical SQLite index or a parallel-built index."""
+    root = Path(contract['output_root'])
+    receipt = read(root / base_input_filename(contract)) if receipt is None else receipt
+    if receipt.get('records_index_format') in ('partitioned-base-index-v1', 'partitioned-base-reference-index-v1'):
+        from .parallel_verification import BaseRecordIndex
+        return BaseRecordIndex(contract, receipt, verify_files=verify_files)
+    return sqlite3.connect((root / 'base-records.sqlite').resolve().as_uri() + '?mode=ro&immutable=1',
+                          uri=True, check_same_thread=False)
+
+
 def seal_base(plan, rounds):
-    from .prediction_cache import seal_stopped_writers, encode_index_json
+    from .prediction_cache import seal_stopped_writers
     root = Path(plan['launch']['output']); path = root / 'base-verified.json'
     if path.exists(): return verify_base_receipt(plan)
     if plan['prediction_workflow'].get('storage', {}).get('layout') == 'shared-v1':
-        from .prediction_layout import compact_stopped
         cache = Path(plan['prediction_workflow']['cache_root'])
         seal_stopped_writers(cache, writer_revoked=True)
-        storage = plan['prediction_workflow']['storage']
-        compact_stopped(cache, temporary_byte_limit=min(storage.get('compaction_max_bytes', 512 * 1024**2),
-            storage.get('temporary_max_bytes', 512 * 1024**2)), readers_drained=True, directories=('shards',),
-            target_bytes=storage.get('shard_target_mib', 128) * 1024**2)
-    temporary = root / ('base-records-' + uuid.uuid4().hex + '.sqlite.tmp')
-    statuses = Counter(); record_hash = __import__('hashlib').sha256()
-    design = PredictionDesign(plan['prediction_workflow'], 'base')
-    with closing(sqlite3.connect(temporary)) as connection:
-        connection.execute('PRAGMA synchronous=FULL')
-        shared = plan['prediction_workflow'].get('storage', {}).get('layout') == 'shared-v1'
-        # Large compressed rows belong in a rowid table: WITHOUT ROWID spills
-        # payloads around half a SQLite page and can increase space substantially.
-        connection.execute('CREATE TABLE records(task_id TEXT PRIMARY KEY, reference TEXT NOT NULL, row BLOB NOT NULL)')
-        def accept(row):
-            statuses[row['status']] += 1
-            reference = row['prediction_cache_ref']
-            record_hash.update(canonical([design.task_at(design.ordinal(row)).id, reference['sha256']]) + b'\n')
-            connection.execute('INSERT INTO records VALUES (?,?,?)',
-                (design.task_at(design.ordinal(row)).id, canonical(reference).decode(),
-                 encode_index_json({k: v for k, v in row.items() if k != 'prediction_cache_ref'}) if shared else canonical(row).decode()))
-        completed, sources = scan(plan, 'base', rounds, accept)
-        count = sum(b.bit_count() for b in completed.bits)
-        if count != design.count: raise QueueError('All-panel base cache coverage incomplete')
-        connection.commit()
-        def refs():
-            for (raw,) in connection.execute('SELECT reference FROM records ORDER BY task_id'):
-                yield json.loads(raw)
-        # Only accepted records and their maps are touched. Never recursively
-        # scan TB of cache or truncate a writer that retains its exclusive lock.
-        seal_stopped_writers(Path(plan['prediction_workflow']['cache_root']),
-                             writer_revoked=True, references=refs())
-        scan(plan, 'base', rounds, sealed=True)
-        from .prediction_cache import verified_index_evidence
-        evidence = verified_index_evidence(Path(plan['prediction_workflow']['cache_root']), refs())
-        for item in evidence:
-            stat = (Path(plan['prediction_workflow']['cache_root']) / item['path']).stat()
-            item.update(bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
-        # A later same-size rewrite must not be able to reuse a sealed timestamp,
-        # or the receipt's timestamp fast path would skip its content check.
-        if evidence:
-            from .prediction_evidence import seal_mtime_barrier
-            seal_mtime_barrier(Path(plan['prediction_workflow']['cache_root']),
-                               max(item['mtime_ns'] for item in evidence))
-    with temporary.open('r+b') as handle: os.fsync(handle.fileno())
-    os.replace(temporary, root / 'base-records.sqlite')
-    # Durable accepted rows are the authority. Unsubmitted tails cannot satisfy
-    # coverage; generation leases cannot survive stopped, exclusively locked rounds.
-    receipt = {'format': FORMAT, 'complete': True, 'plan_sha256': digest(plan),
-        'workflow_sha256': digest(plan['prediction_workflow']), 'rows': count, 'expected_rows': design.count,
-        'panels': [p['panel_id'] for p in plan['prediction_workflow']['panels']],
-        'statuses': dict(statuses), 'sources': sources, 'cache_indexes': evidence,
-        'source_record_hashes_sha256': record_hash.hexdigest(),
-        'records_index_sha256': file_digest(root / 'base-records.sqlite'),
-        'score_complete': True, 'prediction_cache_complete': True, 'oof_complete': True,
-        'unfinished_leases': 0, 'unsubmitted_required_results': 0, 'unresolved_failures': 0}
-    atomic_json(path, receipt)
-    return receipt
+    # Resumable: coverage, reference index, sealed-shard presence and a seeded
+    # full-content sample. Every row's content was validated before its ACK.
+    from .base_seal import seal
+    return seal(plan, rounds)
 
 
 def base_record_for_task(contract, task, *, connection=None):
@@ -755,16 +881,22 @@ def base_record_for_task(contract, task, *, connection=None):
     if not isinstance(task, PredictionTask): task = PredictionTask(**task)
     if task.phase != 'base': raise QueueError('Base index requires an exact base task')
     root = Path(contract['output_root'])
-    path = root / 'base-records.sqlite'
-    uri = path.resolve().as_uri() + '?mode=ro&immutable=1'
     if connection is None:
-        with closing(sqlite3.connect(uri, uri=True)) as owned:
+        with closing(open_base_records(contract)) as owned:
             return base_record_for_task(contract, task, connection=owned)
+    elif hasattr(connection, 'lookup'):
+        found = connection.lookup(task)
     else:
         found = connection.execute('SELECT reference,row FROM records WHERE task_id=?', (task.id,)).fetchone()
     if found is None: raise QueueError('Required base record absent; explicit repair required')
+    if found[1] is None:
+        if not getattr(connection, 'reference_only', False):
+            raise QueueError('Legacy base index lost its result row')
+        return {'reference': json.loads(found[0]), 'row': None}
     from .prediction_cache import decode_index_json
     reference, row = json.loads(found[0]), decode_index_json(found[1])
+    if any(str(row.get(key)) != str(value) for key, value in asdict(task).items()):
+        raise QueueError('Base index returned another scientific task')
     row['prediction_cache_ref'] = reference
     return {'reference': reference, 'row': row}
 
@@ -785,11 +917,20 @@ def accepted_references(rounds):
 def finalize(plan, base_rounds, sl_rounds):
     from .prediction_cache import seal_stopped_writers
     root = Path(plan['launch']['output']); receipt_path = root / 'verified.json'
+    if deferred_base_audit(plan['prediction_workflow']) and not receipt_path.exists():
+        from . import parallel_verification as verification
+        directory = root / 'parallel-verification/final'
+        existing = directory / 'manifest.json'
+        block_bytes = read(existing)['identity']['block_bytes'] if existing.exists() else 64 * 1024**2
+        verification.prepare(plan, 'final', base_rounds, sl_rounds, directory, block_bytes=block_bytes)
+        return verification.run(directory, 1, launch=lambda folder, workers: verification.worker(folder, 0, 1))
     base = verify_base_receipt(plan)
     if receipt_path.exists():
         receipt = read(receipt_path)
+        final = root / 'final.csv'
         if (receipt['plan_sha256'] != digest(plan) or receipt['base_verified_sha256'] != digest(base)
-                or receipt['final_csv_sha256'] != file_digest(root / 'final.csv')):
+                or not final.is_file()
+                or ('final_csv_bytes' in receipt and final.stat().st_size != receipt['final_csv_bytes'])):
             raise QueueError('Final prediction workflow publication changed')
         return receipt
     # Seal only source shards referenced by stopped SL journals, not unrelated writers.
@@ -815,7 +956,8 @@ def finalize(plan, base_rounds, sl_rounds):
     os.replace(temporary, root / 'final.csv')
     receipt = {'format': FORMAT, 'complete': True, 'phase_rows': counts, 'rows': sum(counts.values()),
         'plan_sha256': digest(plan), 'base_verified_sha256': digest(base),
-        'final_csv_sha256': file_digest(root / 'final.csv'), 'score_complete': True,
+        'final_csv_sha256': file_digest(root / 'final.csv'),
+        'final_csv_bytes': (root / 'final.csv').stat().st_size, 'score_complete': True,
         'prediction_cache_complete': True, 'oof_complete': True}
     atomic_json(receipt_path, receipt)
     # Phase journals hold provenance/refs needed for recovery and stay independent

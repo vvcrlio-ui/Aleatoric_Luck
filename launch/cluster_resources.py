@@ -15,8 +15,20 @@ class CpuBudgetExhausted(ValueError):
     """The cumulative operational budget cannot admit another allocation."""
 
 
-def phase_spec(spec, workflow, phase, *, round_index=0):
+def phase_spec(spec, workflow, phase, *, round_index=0, policy=None):
     """Freeze separate lightweight SL resources, including a filesystem cap."""
+    if phase not in ('base', 'sl'):
+        raise ValueError('Unknown prediction workflow phase')
+    if policy is not None:
+        from aleatoric_nk_grid.scheduler_policy import validate_policy
+        common = validate_policy(policy)
+        if common['unified_compute']:
+            result = deepcopy(spec)
+            result['cluster'].update(memory_override=common['worker_memory'],
+                                     time_limit=common['worker_time_limit'])
+            result.setdefault('continuation', {})['worker_cap'] = common['worker_cap']
+            result['prediction_phase'] = phase
+            return result
     if phase == 'base':
         from aleatoric_nk_grid.prediction_workflow import validate_round_time_limits
         times = validate_round_time_limits(workflow, global_time_limit=spec['cluster']['time_limit'])
@@ -91,9 +103,61 @@ def workers_for_work(work_seconds, wall_seconds, *, headroom=1.25):
     return max(1, math.ceil(headroom * work_seconds / wall_seconds))
 
 
+def phase_allocation_options(policy, phase):
+    """Resolve phase-local geometry without changing the scientific plan.
+
+    Legacy runs keep their existing work-aware behaviour. Explicit SL capacity
+    mode uses the ordinary central scheduler's node, CPU, memory and quota gates,
+    but does not shrink the fleet from a possibly stale per-cell cost estimate.
+    The cost profile still determines task order and bounded claim batches.
+    """
+    from aleatoric_nk_grid.scheduler_policy import validate_policy
+    policy = validate_policy(policy)
+    options = {key: policy[key] for key in
+               ('worker_cap', 'worker_memory', 'target_round_seconds')}
+    options['worker_time_limit'] = policy['worker_time_limit'] if phase != 'sl' or policy['unified_compute'] else None
+    options['sizing_mode'] = policy['sizing_mode']
+    if phase == 'sl' and policy['sl_allocation'] is not None:
+        options.update(policy['sl_allocation'])
+        if options['sizing_mode'] == 'capacity':
+            options['target_round_seconds'] = None
+    return options
+
+
 def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
             cpu_hours_remaining=None, control_jobs_reserved=2, max_nodes=60,
-            worker_memory=None, worker_cap=None, run=base.query):
+            worker_memory=None, worker_cap=None, worker_time_limit=None, validation_processes=0, dispatcher_shards=1,
+            sizing_mode='work', run=base.query):
+    '''Size one round's allocation (see _resolve_round). Each dispatcher shard needs its own worker nodes besides the
+    controller's, so a round too small for its shards is sized without them.'''
+    if type(dispatcher_shards) is not int or not 1 <= dispatcher_shards <= 8:
+        raise ValueError('Invalid dispatcher shard count')
+    if dispatcher_shards > 1 and not validation_processes:
+        raise ValueError('Dispatcher shards need the reserved service step')
+    arguments = dict(work_seconds=work_seconds, target_round_seconds=target_round_seconds,
+                     cpu_hours_remaining=cpu_hours_remaining, control_jobs_reserved=control_jobs_reserved,
+                     max_nodes=max_nodes, worker_memory=worker_memory, worker_cap=worker_cap,
+                     worker_time_limit=worker_time_limit, validation_processes=validation_processes,
+                     sizing_mode=sizing_mode, run=run)
+    if dispatcher_shards > 1:
+        try:
+            result = _resolve_round(spec, remaining, dispatcher_shards=dispatcher_shards, **arguments)
+            if result['nodes'] > dispatcher_shards:
+                result['requested_dispatcher_shards'] = dispatcher_shards
+                return result
+        except ValueError:
+            pass        # too small (or too constrained) for every shard to have worker nodes: one dispatcher then
+    result = _resolve_round(spec, remaining, dispatcher_shards=1, **arguments)
+    result['requested_dispatcher_shards'] = dispatcher_shards
+    if dispatcher_shards > 1:
+        result['shard_admission_note'] = 'Allocation cannot provide a worker-node group for each requested shard; admitted one dispatcher'
+    return result
+
+
+def _resolve_round(spec, remaining, *, work_seconds=None, target_round_seconds=None,
+            cpu_hours_remaining=None, control_jobs_reserved=2, max_nodes=60,
+            worker_memory=None, worker_cap=None, worker_time_limit=None, validation_processes=0, dispatcher_shards=1,
+            sizing_mode='work', run=base.query):
     """Size one round's allocation. Geometry may be operational.
 
     ``worker_memory`` and ``worker_cap`` come from the round's policy snapshot
@@ -102,10 +166,25 @@ def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
     so a run can be resized between rounds instead of discarding finished
     cells. The frozen request remains the default when the policy is silent.
     """
+    if sizing_mode not in ('work', 'capacity'):
+        raise ValueError('Unknown allocation sizing_mode')
+    if sizing_mode == 'capacity' and (type(worker_cap) is not int or worker_cap < 1
+                                      or target_round_seconds is not None):
+        raise ValueError('Capacity sizing requires an explicit positive worker_cap and no time target')
     if type(max_nodes) is not int or max_nodes < 1:
         raise ValueError('Explicit total node cap must be a positive integer')
+    if type(validation_processes) is not int or not 0 <= validation_processes <= 32:
+        raise ValueError('Invalid validation process reservation')
+    if type(dispatcher_shards) is not int or not 1 <= dispatcher_shards <= 8:
+        raise ValueError('Invalid dispatcher shard count')
+    if dispatcher_shards > 1 and not validation_processes:
+        raise ValueError('Dispatcher shards need the reserved service step')
+    service_slots = dispatcher_shards * (1 + validation_processes)
+    task_width = service_slots if validation_processes else 1
     node_cap = max_nodes
     cluster = spec['cluster']
+    if worker_time_limit is not None:
+        cluster = {**cluster, 'time_limit': worker_time_limit}
     qos = cluster.get('qos') or default_qos(cluster['account'], run=run)
     live = base.snapshot(cluster['account'], qos, cluster['partition'], run=run)
     memory = worker_memory or cluster.get('memory_override') or '16G'
@@ -118,20 +197,25 @@ def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
         extra_submit=3, extra_running=2, single_allocation=True, control_memory=spec['plan_memory'])
     threads = max(int(n['threads']) for n in live['nodes'])
     cpu_per_task = max(threads, bound['allocated_cpu_per_worker_bound'])
+    if validation_processes:
+        # Discoverer Slurm 20 steps count logical CPUs even with a one-thread
+        # allocation hint. Keep the allocation CPU group large enough for the
+        # service step, then verify physical affinity before any fit.
+        task_width = service_slots * cpu_per_task
     mem = base.memory_mb(memory)
     overhead = base.memory_mb(spec['plan_memory'])
     slots = min(min(int(n['cpu']) // threads, int((float(n['mem']) - overhead) // mem))
                 for n in live['nodes'])
     if slots < 1: raise ValueError('No node can fit worker memory plus dispatcher reserve')
-    max_tasks = remaining + 1
-    if cap is not None: max_tasks = min(max_tasks, cap + 1)
+    max_tasks = remaining + service_slots
+    if cap is not None: max_tasks = min(max_tasks, cap + service_slots)
     wall_seconds = base.duration(bound['time_limit'])
     if target_round_seconds is not None:
         if (not math.isfinite(target_round_seconds) or target_round_seconds <= 0):
             raise ValueError('Target round seconds must be positive and finite')
     sizing_seconds = min(wall_seconds, target_round_seconds or wall_seconds)
-    needed = workers_for_work(work_seconds, sizing_seconds)
-    if needed is not None: max_tasks = min(max_tasks, needed + 1)
+    needed = workers_for_work(work_seconds, sizing_seconds) if sizing_mode == 'work' else None
+    if needed is not None: max_tasks = min(max_tasks, needed + service_slots)
     # Include every controller already journaled plus the worker's successor and
     # its recovery guard. Their full requested durations are charged until an
     # accounting-backed receipt can narrow them; no average runtime is assumed.
@@ -144,7 +228,7 @@ def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
         task_budget = math.floor(max(0., cpu_hours_remaining - control_hours) * 3600
                                  / (wall_seconds * cpu_per_task))
         max_tasks = min(max_tasks, task_budget)
-        if max_tasks < 2:
+        if max_tasks < service_slots + 1:
             raise CpuBudgetExhausted('CPU-hour budget cannot fit worker, dispatcher and control reserves')
     per_job = [base.tres(r['MaxTRES']) for r in live['qos_rows']]
     # Associations may carry a per-job limit inherited from a parent account.
@@ -165,6 +249,10 @@ def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
     max_cpu_mem = base.finite(live['partition'].get('MaxMemPerCPU', ''))
     if max_node_mem not in (None, 0): slots = min(slots, int((max_node_mem - overhead) // mem))
     if slots < 1: raise ValueError('Per-job limits cannot fit worker and dispatcher memory')
+    if task_width > 1:
+        slots = (slots // task_width) * task_width
+        if slots < task_width:
+            raise ValueError('Node cannot fit the reserved service CPU group')
     max_nodes = base.finite(live['partition'].get('MaxNodes', ''))
     if max_nodes is not None: max_tasks = min(max_tasks, max_nodes * slots)
     max_tasks = min(max_tasks, node_cap * slots)
@@ -174,7 +262,8 @@ def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
     node_memory = math.ceil(slots * mem + overhead)
     # Binary search a monotone conservative bound using full last-node billing.
     def fits(tasks):
-        nodes = math.ceil(tasks / slots)
+        reserved_slots = math.ceil(tasks / task_width) * task_width
+        nodes = math.ceil(reserved_slots / slots)
         request = {'node': nodes, 'cpu': nodes * slots * cpu_per_task, 'mem': nodes * node_memory}
         if any(request[limit['resource']] > limit['available'] for limit in bound['resource_constraints']):
             return False
@@ -193,13 +282,20 @@ def resolve(spec, remaining, *, work_seconds=None, target_round_seconds=None,
         mid = (low + high + 1) // 2
         if fits(mid): low = mid
         else: high = mid - 1
-    if low < 2: raise ValueError('No live capacity for one worker plus dispatcher and control reserves')
-    nodes = math.ceil(low / slots)
-    return {'workers': low - 1, 'nodes': nodes, 'max_nodes': node_cap, 'tasks_per_node': slots,
+    if low < service_slots + 1: raise ValueError('No live capacity for worker, dispatcher and validator reserves')
+    groups = math.ceil(low / task_width)
+    nodes = math.ceil(groups * task_width / slots)
+    return {'workers': low - service_slots, 'nodes': nodes, 'max_nodes': node_cap, 'tasks_per_node': slots,
+            'controller_task_slots': service_slots, 'validation_processes': validation_processes,
+            'dispatcher_shards': dispatcher_shards,
+            'allocation_task_width': task_width, 'allocation_tasks': groups,
+            'allocation_tasks_per_node': slots // task_width,
+            'cpu_per_task': cpu_per_task, 'worker_step_memory_mb': math.ceil(slots * mem),
+            'controller_memory_mb': math.ceil(overhead),
             'memory_mb_per_node': node_memory, 'time_limit': bound['time_limit'], 'qos': qos,
             'allocated_cpu_bound': nodes * slots * cpu_per_task,
             'control_cpu_bound': cpu_per_task, 'target_round_seconds': target_round_seconds,
-            'work_seconds': work_seconds,
+            'work_seconds': work_seconds, 'sizing_mode': sizing_mode,
             'reserved_cpu_hours': nodes * slots * cpu_per_task * wall_seconds / 3600,
             'reserved_control_cpu_hours': control_hours,
             'qos_remaining_cpu_minutes': budgets, 'live_worker_bound': bound}

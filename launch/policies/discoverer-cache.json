@@ -1,0 +1,21 @@
+{
+  "unified_compute": true,
+  "sizing_mode": "capacity",
+  "max_nodes": 302,
+  "worker_cap": 17994,
+  "worker_memory": "3G",
+  "worker_time_limit": "10:00:00",
+  "dispatcher_shards": 4,
+  "validation_processes": 2,
+  "node_relay": true,
+  "rpc_keepalive": true,
+  "max_connections": 1024,
+  "max_submissions": 256,
+  "dispatcher_fast_path": true,
+  "validation_fast_reads": true,
+  "parallel_verification": true,
+  "protocol_metrics": true,
+  "protocol_metrics_sample_modulo": 128,
+  "max_cpu_hours": null,
+  "drain_enabled": false
+}

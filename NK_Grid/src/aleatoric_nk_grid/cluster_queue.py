@@ -24,6 +24,27 @@ def read(path):
     return json.loads(Path(path).read_bytes())
 
 
+def initialize_launch_policy(launch, root):
+    """Publish initial CLI policy once; never reset a later operational edit."""
+    value = launch.get('scheduler_policy')
+    if value is None: return
+    from .scheduler_policy import validate_policy
+    value = validate_policy(value); root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    path, initial = root / 'scheduler-policy.json', root / 'scheduler-policy.initial.json'
+    if initial.exists():
+        if read(initial) != value:
+            raise QueueError('Initial launch policy changed')
+        if not path.exists():
+            raise QueueError('Published operational policy is missing')
+        return
+    if (root / 'plan.json').exists():
+        raise QueueError('Prepared plan lacks its initial launch-policy receipt')
+    if path.exists() and read(path) != value:
+        raise QueueError('Existing scheduler policy conflicts with launch options')
+    atomic_json(path, value); atomic_json(initial, value)
+
+
 def prepare(config, launch, repo):
     from .prediction_contract import normalize_prediction_options
     options, execution = normalize_prediction_options(getattr(config, 'prediction_cache', None),
@@ -33,6 +54,7 @@ def prepare(config, launch, repo):
     from . import nk_grid as nk
     from .execution_contract import CellExecutionSpec
     root = Path(launch['output'])
+    initialize_launch_policy(launch, root)
     with nk.NKGridExecutionSession.open_from_config(config) as session:
         task_kind = session.task
         prediction_dimensions = None
@@ -101,6 +123,7 @@ def prepare_joint(plans, launch, *, phase_round_limits, sl_resources):
            p['cell_spec'].get('git_commit') != first['cell_spec'].get('git_commit') for p in plans):
         raise QueueError('Joint panels must use the same frozen runtime/code')
     root = Path(launch['output']).resolve()
+    initialize_launch_policy(launch, root)
     contract = joint_contract([p['prediction_workflow'] for p in plans], output_root=root,
                              phase_round_limits=phase_round_limits, sl_resources=sl_resources)
     validate_round_time_limits(contract, global_time_limit=launch['cluster']['time_limit'])

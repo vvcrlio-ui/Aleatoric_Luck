@@ -7,6 +7,7 @@ Only successful/failed result receipts are durable; leases are generation-local.
 import argparse
 from array import array
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime
 import errno
@@ -20,6 +21,7 @@ import re
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -37,6 +39,80 @@ from aleatoric_nk_grid.scheduler_policy import TailMonitor, validate_policy
 
 def read(path):
     return json.loads(Path(path).read_bytes())
+
+
+class CompletedJournalIndex(Mapping):
+    """Small durable-result locators; full task/result bodies live only in the journal.
+
+    Publication happens after fsync. A lost-ACK replay reads and verifies precisely
+    the originally committed bytes, without retaining them for the whole round.
+    This index is generation-local; restart still uses the ordinary success scan.
+    """
+    record = struct.Struct('<QI32s')   # offset, byte length, original journal-line checksum
+
+    def __init__(self, path, design, queue_id):
+        self.entries = {}
+        self.workers = {}  # RPC decoding creates fresh equal strings; keep one owner string per worker.
+        self.design, self.queue_id = design, queue_id
+        self.reader = Path(path).open('rb', buffering=0)
+        self.read_lock = threading.Lock()
+
+    @staticmethod
+    def _key(task_id):
+        if not isinstance(task_id, str) or len(task_id) != 64:
+            return None
+        try:
+            key = bytes.fromhex(task_id)
+        except ValueError:
+            return None
+        return key if key.hex() == task_id else None
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __iter__(self):
+        return (key.hex() for key in self.entries)
+
+    def __contains__(self, task_id):
+        return self._key(task_id) in self.entries
+
+    def owner(self, task_id):
+        entry = self.entries.get(self._key(task_id))
+        return entry[1] if entry is not None else None
+
+    def add(self, task_id, offset, length, worker, checksum):
+        key = self._key(task_id)
+        if key is None or key in self.entries:
+            raise QueueError('Invalid or repeated completed-result locator')
+        owner = self.workers.setdefault(worker, worker)
+        self.entries[key] = (self.record.pack(offset, length, checksum), owner)
+
+    def __getitem__(self, task_id):
+        entry = self.entries.get(self._key(task_id))
+        if entry is None:
+            raise KeyError(task_id)
+        locator, worker = entry
+        offset, length, checksum = self.record.unpack(locator)
+        # Separate descriptor: duplicate reads must never move the append cursor.
+        # Serialize seek/read for Windows as well as POSIX; normal commits do no reads.
+        with self.read_lock:
+            self.reader.seek(offset)
+            raw = self.reader.read(length)
+        if len(raw) != length or hashlib.sha256(raw).digest() != checksum:
+            raise QueueError('Completed journal record changed or truncated')
+        entry = json.loads(raw)
+        result = entry['result']
+        task = task_at(self.design, self.design.ordinal(result))
+        if (entry['task_id'] != task_id or task.id != task_id
+                or entry['origin']['queue_id'] != self.queue_id):
+            raise QueueError('Completed journal record identity changed')
+        return {'id': task_id, 'task': canonical(asdict(task)).decode(),
+                'state': 'failed' if result['status'] == 'failed' else 'done',
+                'worker': worker, 'accepted_token': entry['token'],
+                'result': canonical(result).decode()}
+
+    def close(self):
+        self.reader.close()
 
 
 def task_at(design, ordinal):
@@ -242,9 +318,16 @@ def prepare_flat(base, output):
 class FlatDispatcher(Dispatcher):
     """Compact pending list, bounded active leases, append-only result receipts."""
     def __init__(self, root, *, clock=time.time, fleet=1, policy=None,
-                 cost_profile=None, work_seconds=None):
+                 cost_profile=None, work_seconds=None, service_binding=None):
         if type(fleet) is not int or fleet < 1: raise QueueError('Invalid fleet size')
         self.fleet = fleet; self.policy = validate_policy(policy)
+        from .protocol_metrics import ProtocolMetrics
+        self.metrics = ProtocolMetrics(self.policy["protocol_metrics"])
+        self.validation_pool = None
+        self.service_binding = service_binding
+        self.worker_bindings = {}
+        self.worker_core_owners = {}
+        self.binding_ready = service_binding is None
         self.estimator = CostEstimator(profile=cost_profile)
         if work_seconds is not None and (not math.isfinite(work_seconds) or work_seconds < 0):
             raise QueueError('Invalid remaining work estimate')
@@ -260,19 +343,37 @@ class FlatDispatcher(Dispatcher):
             self.manifest = read(self.root / 'manifest.json'); self.queue_id = digest(self.manifest)
             if read(self.root / 'queue-id.json')['queue_id'] != self.queue_id:
                 raise QueueError('Manifest changed')
-            if file_digest(self.root / 'remaining.u32') != self.manifest['remaining_sha256']:
+            self.shard = self.manifest.get('shard')
+            if self.shard is not None:
+                # A shard serves a slice of its round's tasks. On the wire and in its journal it carries the round's
+                # queue id, so the merged journals are exactly what an unsharded round would have written.
+                parent = read(self.root / 'parent-manifest.json')
+                if (digest(parent) != self.shard['parent_queue_id']
+                        or {k: v for k, v in self.manifest.items() if k not in ('shard', 'count', 'remaining_sha256')}
+                        != {k: v for k, v in parent.items() if k not in ('count', 'remaining_sha256')}):
+                    raise QueueError('Shard does not belong to its round')
+                self.queue_id = self.shard['parent_queue_id']
+            workflow = self.manifest['identity'].get('prediction_workflow')
+            if not workflow and file_digest(self.root / 'remaining.u32') != self.manifest['remaining_sha256']:
                 raise QueueError('Remaining list changed')
-            from .prediction_workflow import design_for
+            from .prediction_workflow import design_for, ResultCacheValidator
             self.design = design_for(self.manifest['identity'])
-            self.order = array('I'); self.order.frombytes((self.root / 'remaining.u32').read_bytes())
-            if sys.byteorder != 'little': self.order.byteswap()
+            self.result_cache_validator = ResultCacheValidator(self.manifest['identity'],
+                                                               fast_reads=self.policy['validation_fast_reads'])
+            if workflow:
+                from .prediction_workflow import _read_remaining
+                self.order, _ = _read_remaining(self.root / 'remaining.u32', self.design, self.manifest['count'])
+            else:
+                self.order = array('I'); self.order.frombytes((self.root / 'remaining.u32').read_bytes())
+                if sys.byteorder != 'little': self.order.byteswap()
             if len(self.order) != self.manifest['count']:
                 raise QueueError('Remaining count mismatch')
             # A generation is started once. Resume creates a new success scan,
             # never replays old lease events or silently discards prior results.
             self.journal = (self.root / 'results.jsonl').open('xb', buffering=0)
             self.cursor = 0; self.retry = deque(); self.active = {}; self.by_worker = {}
-            self.completed = {}; self.attempts = {}; self.exhausted = 0
+            self.completed = CompletedJournalIndex(self.root / 'results.jsonl', self.design, self.queue_id)
+            self.attempts = {}; self.exhausted = 0
             self.expiries = []; self.expired_leases = 0
             self.fsync_seconds = 0.; self.fsync_count = 0
             self.heartbeats_ok = 0
@@ -280,6 +381,12 @@ class FlatDispatcher(Dispatcher):
             self.done = self.failed = 0; self.paused = False; self.epoch = uuid.uuid4().hex
             self.worker_status = {}; self.retired_leases = {}
             self.draining = False; self.drain_reason = None
+            if self.policy['validation_processes']:
+                from .validation_pool import ValidationPool
+                self.validation_pool = ValidationPool(self.manifest['identity'], self.policy['validation_processes'],
+                    self.policy['validation_timeout_seconds'],
+                    cpu_ids=service_binding['validator_cpus'] if service_binding else None,
+                    fast_reads=self.policy['validation_fast_reads'])
         except BaseException:
             self.close(); raise
 
@@ -336,7 +443,7 @@ class FlatDispatcher(Dispatcher):
             return {'version': 2, 'max_batch': p['max_batch_tasks'],
                     'submit_bytes': p['submit_bytes'], 'max_request_bytes': 1024 * 1024,
                     'flush_seconds': p['flush_seconds'], 'status_seconds': p['status_seconds'],
-                    'drain': self.draining}
+                    'drain': self.draining, 'heartbeat_many': True}
 
     def _status(self, worker, status):
         if worker not in self.worker_status: return
@@ -355,8 +462,7 @@ class FlatDispatcher(Dispatcher):
             if type(chunks) is not int or chunks < 0: raise QueueError('Invalid unacknowledged chunks')
             if state == 'computing' and (task_id not in self.active or self.active[task_id]['worker'] != worker):
                 # A concurrent submit may have just committed this status's cell.
-                row = self.completed.get(task_id)
-                if row is None or row['worker'] != worker: raise LeaseLostError('Status refers to another lease')
+                if self.completed.owner(task_id) != worker: raise LeaseLostError('Status refers to another lease')
                 state = 'submitting'; task_id = None
             current.update(state=state, task_id=task_id, cell_elapsed_seconds=elapsed,
                            unacknowledged_chunks=chunks)
@@ -380,6 +486,54 @@ class FlatDispatcher(Dispatcher):
                 row['expiry'] = expiry; row['last_heartbeat'] = now
             self.heartbeats_ok += 1
             return {'state': 'active', 'expiry': expiry, 'drain': self.draining}
+
+    def heartbeat_many(self, hostname, items):
+        if not isinstance(hostname, str) or not isinstance(items, list) or not 0 < len(items) <= 128:
+            raise QueueError('Invalid aggregated heartbeat')
+        replies = []
+        for item in items:
+            try:
+                if not isinstance(item, dict) or set(item) - {'worker', 'token', 'status'}:
+                    raise QueueError('Invalid heartbeat item')
+                with self.mutex:
+                    owner = self.worker_status.get(item.get('worker'), {})
+                    if not owner or owner.get('hostname') != hostname:
+                        raise QueueError('Heartbeat node differs from registered worker')
+                replies.append(self.heartbeat_batch(**item))
+            except LeaseLostError as exc:
+                replies.append({'error': str(exc), 'code': 'lease_lost'})
+            except (QueueError, KeyError, TypeError, ValueError) as exc:
+                replies.append({'error': str(exc), 'code': 'invalid_heartbeat'})
+        self.metrics.add('heartbeat_aggregate_calls')
+        self.metrics.add('heartbeat_aggregate_items', count=len(items))
+        return {'items': replies}
+
+    def worker_binding(self, worker, binding):
+        with self.mutex:
+            if self.service_binding is None:
+                raise QueueError('CPU binding registration not enabled')
+            if worker not in self.worker_status or not isinstance(binding, dict):
+                raise QueueError('Worker protocol registration required')
+            host = binding.get('hostname'); cores = binding.get('cores')
+            if (host != self.worker_status[worker]['hostname'] or not isinstance(cores, list)
+                    or len(cores) != 1 or not isinstance(cores[0], str)):
+                raise QueueError('Worker must have one explicitly bound physical core')
+            if host == self.service_binding['hostname'] and cores[0] in self.service_binding['cores']:
+                raise QueueError('Worker overlaps a reserved service core')
+            if worker in self.worker_bindings:
+                if self.worker_bindings[worker] != binding:
+                    raise QueueError('Worker binding changed during this generation')
+                return {'ready': self.binding_ready}
+            if (host, cores[0]) in self.worker_core_owners:
+                raise QueueError('Two workers overlap a physical core')
+            if len(self.worker_bindings) >= self.fleet:
+                raise QueueError('Unexpected worker beyond admitted fleet')
+            self.worker_bindings[worker] = binding
+            self.worker_core_owners[(host, cores[0])] = worker
+            if len(self.worker_bindings) == self.fleet:
+                atomic_json(self.root / 'worker-bindings.json', self.worker_bindings)
+                self.binding_ready = True
+            return {'ready': self.binding_ready}
 
     def drain(self, reason):
         with self.mutex:
@@ -424,7 +578,16 @@ class FlatDispatcher(Dispatcher):
             if self.draining: return {'state': 'draining'}
             if worker in self.by_worker:
                 return self._batch_payload(self.by_worker[worker])  # lost reply, same lease
+            if not self.binding_ready:
+                return {'state': 'wait', 'retry_after_seconds': min(60., max(1., self.fleet / 100.)),
+                        'reason': 'binding_barrier'}
             if self.paused: return {'state': 'paused'}
+            claim_limit = self.policy['max_claimed_tasks']
+            if claim_limit is not None:
+                if self.leased_cells >= claim_limit:
+                    self.paused = True
+                    return {'state': 'paused', 'reason': 'allocation_task_limit'}
+                count = min(count, claim_limit - self.leased_cells)
             pending = len(self.order) - self.cursor + len(self.retry)
             if not pending:
                 reply = {'state': 'wait' if self.active else ('blocked' if self.failed or self.exhausted else 'complete')}
@@ -459,7 +622,8 @@ class FlatDispatcher(Dispatcher):
                 else: break
                 task = task_at(self.design, ordinal); task_id = task.id
                 from .prediction_workflow import cost_identity
-                ci = cost_identity(task, getattr(self.design, 'contract', None))
+                ci = (self.design.cost_identity(task) if hasattr(self.design, 'cost_identity')
+                      else cost_identity(task, getattr(self.design, 'contract', None)))
                 pricing = {'identity': ci} if ci is not None else {}
                 price = self.estimator.batch_seconds(task.model, task.N, task.K, **pricing) if v2 else None
                 if v2:
@@ -545,23 +709,45 @@ class FlatDispatcher(Dispatcher):
                 raise QueueError('Repeated task id in one batch submission')
             deferred = None; prepared = []
             try:
-                for task_id, result in zip(task_ids, results):
-                    payload = canonical(result)
-                    if result.get('status') != 'failed':
-                        from .prediction_workflow import task_kind, validate_result_cache
-                        validate_scientific_result(result, task_kind=task_kind(self.manifest['identity'], result))
-                        spec = (self.design.panels[result['panel_id']][2]['cell_spec']
-                                if hasattr(self.design, 'panels') else self.manifest['identity']['cell_spec'])
-                        if result.get('algorithm_version') != spec['algorithm_version']:
-                            raise QueueError('Scientific identity changed')
-                        validate_result_cache(self.manifest['identity'], result)
-                    prepared.append((task_id, result, payload,
-                        canonical({'result': result, 'origin': {'queue_id': self.queue_id},
-                                   'token': token, 'task_id': task_id}) + b'\n'))
+                self.metrics.add('received_records', count=len(results))
+                encoded = None
+                if self.policy['dispatcher_fast_path']:
+                    try:                     # the journal needs these exact bytes; validators can decode them instead of unpickling dicts
+                        encoded = [canonical(result) for result in results]
+                    except (TypeError, ValueError):
+                        encoded = None       # take the normal path so it raises its own error
+                with self.metrics.span('validation'):
+                    if self.validation_pool is not None:
+                        try:
+                            if encoded is not None:
+                                self.validation_pool.validate_encoded(encoded)
+                            else:
+                                self.validation_pool.validate(results)
+                        except OSError:
+                            if self.validation_pool.failed:
+                                self.drain('validation_pool_failed')
+                            raise
+                    else:
+                        from .validation_pool import validate_rows
+                        validate_rows(self.manifest['identity'], self.result_cache_validator, self.design, results)
+                for index, (task_id, result) in enumerate(zip(task_ids, results)):
+                    if encoded is not None:
+                        # Byte-for-byte what canonical() gives for this dict (keys sorted: origin, result, task_id, token),
+                        # without serializing the result a second time.
+                        payload = encoded[index]
+                        line = (b'{"origin":{"queue_id":' + canonical(self.queue_id) + b'},"result":' + payload +
+                                b',"task_id":' + canonical(task_id) + b',"token":' + canonical(token) + b'}\n')
+                    else:
+                        payload = canonical(result)
+                        line = canonical({'result': result, 'origin': {'queue_id': self.queue_id},
+                                          'token': token, 'task_id': task_id}) + b'\n'
+                    prepared.append((task_id, result, payload, line, hashlib.sha256(line).digest()))
             except (QueueError, ValueError, TypeError, KeyError) as exc:
                 deferred = exc
             duplicate = [False] * len(task_ids); writing = []
+            lock_started = time.monotonic()
             with self.submit_mutex:
+                self.metrics.add("submit_lock_wait", time.monotonic() - lock_started)
                 with self.mutex:
                     if self.closed or self.poisoned: raise QueueError('Dispatcher stopped')
                     for task_id in task_ids:
@@ -569,7 +755,7 @@ class FlatDispatcher(Dispatcher):
                             self._check_lease(task_id, token, worker)
                     if deferred is not None: raise deferred
                     try:
-                        for index, (task_id, result, payload_bytes, raw) in enumerate(prepared):
+                        for index, (task_id, result, payload_bytes, raw, checksum) in enumerate(prepared):
                             payload = payload_bytes.decode()
                             row = self.validate_result(task_id, result, payload=payload_bytes)
                             if row['state'] in ('done', 'failed'):
@@ -579,7 +765,7 @@ class FlatDispatcher(Dispatcher):
                                     raise LeaseLostError('Completed task belongs to another lease')
                                 raise QueueError('Conflicting completed result')
                             row['committing'] = True
-                            writing.append((row, result, payload, raw))
+                            writing.append((row, result, payload, raw, checksum))
                     except BaseException:
                         # A rejected batch must not leave its earlier cells pinned,
                         # or reaping would never reclaim them.
@@ -588,6 +774,10 @@ class FlatDispatcher(Dispatcher):
                 sequence = self.written_seq
                 if writing:
                     try:
+                        offset = self.journal.tell()
+                        for row, _, _, raw, _ in writing:
+                            row['_journal_offset'] = offset
+                            offset += len(raw)
                         pending = memoryview(b''.join(entry[3] for entry in writing))
                         while pending:
                             written = self.journal.write(pending)
@@ -622,12 +812,12 @@ class FlatDispatcher(Dispatcher):
                 self.commits += len(writing)
                 if flushed:
                     self.fsync_count += 1; self.fsync_seconds += elapsed
-                for row, result, payload, _ in writing:
+                for row, result, payload, raw, checksum in writing:
                     row.pop('committing', None)
-                    row.update(state='failed' if result['status'] == 'failed' else 'done',
-                        accepted_token=token, result=payload)
+                    row['state'] = 'failed' if result['status'] == 'failed' else 'done'
+                    self.completed.add(row['id'], row.pop('_journal_offset'), len(raw), row['worker'], checksum)
                     del self.active[row['id']]; self._release(worker, row['id'])
-                    self.completed[row['id']] = row
+                    self.attempts.pop(row['ordinal'], None)
                     if row['state'] == 'done':
                         self.done += 1
                         if self.remaining_work_seconds is not None:
@@ -635,6 +825,7 @@ class FlatDispatcher(Dispatcher):
                     else: self.failed += 1
                 if writing and worker not in self.by_worker and self.retired_leases.get(worker) != (token, 'lost'):
                     self.retired_leases[worker] = (token, 'complete')
+                self.metrics.add('committed_records', count=len(writing))
                 return {'accepted': True, 'duplicate': duplicate}
 
         try:
@@ -684,11 +875,16 @@ class FlatDispatcher(Dispatcher):
                 'done': self.done, 'failed': self.failed, 'leased': len(self.active),
                 'pending': len(self.order) - self.cursor + len(self.retry), 'exhausted': self.exhausted,
                 'total': len(self.order), 'paused': self.paused, 'queue_id': self.queue_id,
+                'shard': self.shard['index'] if self.shard else None,
                 'expired_leases': self.expired_leases, 'fsync_count': self.fsync_count,
                 'fsync_seconds': self.fsync_seconds, 'heartbeats_ok': self.heartbeats_ok,
                 'commits': self.commits, 'leased_batches': self.leased_batches,
                 'cells_per_batch': self.leased_cells / self.leased_batches if self.leased_batches else 0.,
                 'results_per_fsync': self.commits / self.fsync_count if self.fsync_count else 0.,
+                'protocol_metrics': self.metrics.snapshot(),
+                'validation_pool_failed': bool(self.validation_pool and self.validation_pool.failed),
+                'validation_pool_metrics': self.validation_pool.snapshot() if self.validation_pool else None,
+                'binding_ready': self.binding_ready, 'registered_bindings': len(self.worker_bindings),
                 'fleet': self.fleet, 'registered_workers': len(self.worker_status),
                 'computing_workers': computing, 'submitting_workers': submitting,
                 'idle_workers': idle, 'unknown_workers': unknown, 'straggler_workers': stragglers,
@@ -702,6 +898,8 @@ class FlatDispatcher(Dispatcher):
                 'active_heartbeat_older_than_1800s': sum(age > 1800 for age in ages)}
 
     def close(self):
+        if self.validation_pool is not None:
+            self.validation_pool.close(); self.validation_pool = None
         with self.submit_mutex, self.fsync_mutex:
             with self.mutex:
                 if self.closed: return
@@ -713,6 +911,8 @@ class FlatDispatcher(Dispatcher):
                 except OSError:
                     pass  # Unflushed results stay unacknowledged, never falsely accepted.
             if journal is not None: journal.close()
+            completed = getattr(self, 'completed', None)
+            if completed is not None: completed.close()
             self._owner.__exit__(None, None, None)
 
 
@@ -771,6 +971,17 @@ def write_progress(path, dispatcher, server, *, previous_errors=0, monitor=None,
         atomic_json(path, {'stats': stats, 'observed_at': now, 'efficiency': observation,
                           'rpc': server.connection_stats(),
                           'progress_write_errors': previous_errors})
+        if stats.get('protocol_metrics'):
+            try:
+                # Overlapping 120-second windows preserve bursts between operator
+                # checks. Telemetry failures never poison durable acceptance.
+                with Path(path).with_name('protocol-history.jsonl').open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps({'observed_at': now, 'done': stats['done'],
+                        'protocol_metrics': stats['protocol_metrics'],
+                        'validation_pool_metrics': stats['validation_pool_metrics'],
+                        'rpc': server.connection_stats()}, separators=(',', ':')) + '\n')
+            except OSError:
+                dispatcher.metrics.add('telemetry_write_error')
     except OSError as exc:
         if exc.errno not in (errno.EMFILE, errno.ENFILE):
             raise
@@ -822,13 +1033,26 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800,
     from aleatoric_nk_grid.queue_service import make_server
     from aleatoric_nk_grid.queue_readiness import publish_ready
     policy = validate_policy(policy)
+    if int((allocation or {}).get('dispatcher_shards', 1)) > 1:
+        from .dispatcher_shards import run_sharded
+        return run_sharded(root, repo, old, workers, validate_only, max_seconds=max_seconds, policy=policy,
+                           cost_profile=cost_profile, allocation=allocation, continuation_allowed=continuation_allowed)
     entered = time.time()
     job_started, elapsed_source, elapsed_evidence = allocation_start_time(entered, max_seconds)
     job_end = min(job_started + max_seconds, float(os.environ.get('SLURM_JOB_END_TIME', job_started + max_seconds)))
     if not math.isfinite(job_end) or job_end <= entered: raise QueueError('Allocation has no time remaining')
     work_deadline = max(entered, job_end - policy['drain_grace_seconds'])
-    if int(os.environ['SLURM_NTASKS']) < workers + 1:
-        raise QueueError('Missing controller task')
+    service = None
+    service_slots = 1 + policy['validation_processes']
+    if policy['validation_processes']:
+        from .service_binding import service_layout
+        if (allocation or {}).get('controller_task_slots') != service_slots:
+            raise QueueError('Validation CPU reservation missing from allocation')
+        service = service_layout(policy['validation_processes'])
+        os.sched_setaffinity(0, set(service['dispatcher_cpus']) if policy['dispatcher_smt'] else {service['dispatcher_cpu']})
+    admitted_slots = (service['job_task_slots'] if service else int(os.environ['SLURM_NTASKS']))
+    if admitted_slots < workers + service_slots:
+        raise QueueError('Missing worker/controller/validator task reservations')
     manifest = read(root / 'manifest.json')
     commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
     if commit != manifest['identity']['cell_spec']['git_commit']:
@@ -837,9 +1061,13 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800,
         raise QueueError('Frozen checkout dirty')
     control = root / 'control'; control.mkdir(exist_ok=True, mode=0o700)
     with file_lock(control / 'round.lock'), FlatDispatcher(root, fleet=workers, policy=policy,
-            cost_profile=cost_profile, work_seconds=(allocation or {}).get('work_seconds')) as dispatcher:
+            cost_profile=cost_profile, work_seconds=(allocation or {}).get('work_seconds'),
+            service_binding=service) as dispatcher:
         generation = uuid.uuid4().hex; attempt = control / generation; attempt.mkdir(mode=0o700)
         fault_dir = attempt / 'faults'; fault_dir.mkdir()
+        if service is not None:
+            atomic_json(attempt / 'service-binding.json', {**service, 'dispatcher_affinity': sorted(os.sched_getaffinity(0)),
+                'validators': dispatcher.validation_pool.binding_proof})
         host = socket.gethostname(); token = attempt / 'token'; token.write_text(uuid.uuid4().hex + uuid.uuid4().hex)
         token.chmod(0o600); cert = attempt / 'ca.crt'; key = attempt / 'server.key'
         cert_days = str(max(7, (int(max_seconds) + 86399) // 86400 + 1))
@@ -850,9 +1078,16 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800,
         key.chmod(0o600)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(cert, key)
+        # A larger connection budget needs descriptors to match; the default 128 needs no change.
+        if policy['max_connections'] > 128:
+            from aleatoric_nk_grid.queue_service import raise_nofile_limit
+            raise_nofile_limit(policy['max_connections'])
         server = make_server(dispatcher, token=token.read_text(), host='0.0.0.0', port=0,
                              tls_context=context, threaded_tls_handshake=True,
-                             max_submissions=MAX_SUBMISSIONS)
+                             max_connections=policy['max_connections'],
+                             keepalive_idle_seconds=policy['keepalive_idle_seconds'],
+                             max_submissions=policy['max_submissions'], keepalive=policy["rpc_keepalive"],
+                             fast_http=policy['dispatcher_fast_path'])
         serving = threading.Thread(target=server.serve_forever); serving.start()
         child = None
         try:
@@ -864,17 +1099,30 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800,
                 job_id=os.environ['SLURM_JOB_ID'], source_commit=commit, workers=workers,
                 recover_stale_leases=True, max_seconds=max_seconds, deadline_epoch=work_deadline,
                 protocol_version=2, fault_dir=str(fault_dir.resolve()),
-                startup_jitter_seconds=min(30., workers / 100.))
+                rpc_keepalive=policy["rpc_keepalive"], protocol_metrics=policy["protocol_metrics"],
+                node_relay=policy["node_relay"],
+                # The relay must drop an idle upstream connection before the server does.
+                node_relay_idle_seconds=round(.8 * policy["keepalive_idle_seconds"], 3),
+                protocol_metrics_sample_modulo=policy['protocol_metrics_sample_modulo'],
+                require_cpu_binding=service is not None,
+                heartbeat_aggregate_seconds=policy["heartbeat_aggregate_seconds"],
+                startup_jitter_seconds=min(300. if service is not None else 30., workers / 100.))
             atomic_json(attempt / 'launch.json', launch); atomic_json(control / 'latest.json', launch)
             atomic_json(attempt / 'admission.json', {'stats': dispatcher.stats(), 'sqlite': False,
                                                    'rpc': server.connection_stats()})
             def interrupted(signum, frame): raise InterruptedError('Interrupted ' + str(signum))
             signal.signal(signal.SIGTERM, interrupted); signal.signal(signal.SIGINT, interrupted)
-            child = subprocess.Popen(['srun', '--ntasks=' + str(workers), '--cpus-per-task=1',
-                '--ntasks-per-core=1', '--distribution=cyclic', '--kill-on-bad-exit=1',
+            step = ['srun', '--ntasks=' + str(workers), '--cpus-per-task=1', '--ntasks-per-core=1']
+            step_env = os.environ.copy()
+            if service is not None:
+                from .service_binding import worker_step
+                step, step_env = worker_step(allocation, service, workers, attempt / 'worker-hosts.txt')
+            else:
+                step += ['--distribution=cyclic']
+            child = subprocess.Popen(step + ['--kill-on-bad-exit=1',
                 '--output=' + str(attempt / 'worker-%t.out'), '--error=' + str(attempt / 'worker-%t.err'),
                 sys.executable, '-m', 'aleatoric_nk_grid.slurm_queue_round', 'worker',
-                '--launch', str(attempt / 'launch.json')])
+                '--launch', str(attempt / 'launch.json')], env=step_env)
             progress_errors = 0; drain_started = None
             monitor = TailMonitor(policy, started=job_started)
             while child.poll() is None:
@@ -913,15 +1161,18 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800,
                 if fault.get('queue_id') != dispatcher.queue_id: raise QueueError('Worker fault queue changed')
                 dispatcher.worker_fault(fault['worker'], fault['code'], fault.get('message', ''))
             stats = dispatcher.stats()
+            bounded_complete = (policy['max_claimed_tasks'] is not None and stats['paused']
+                and not stats['leased'] and not stats['failed'] and child is not None and child.returncode == 0)
             atomic_json(control / 'round-result.json', {'stats': stats, 'worker_exit': child.returncode if child else None,
                 'complete': stats['done'] == stats['total'], 'generation': generation,
-                'state': 'complete' if stats['done'] == stats['total'] else ('drained' if dispatcher.draining else 'incomplete'),
+                'state': 'complete' if stats['done'] == stats['total'] else
+                    ('bounded_complete' if bounded_complete else ('drained' if dispatcher.draining else 'incomplete')),
                 'job_id': os.environ['SLURM_JOB_ID'], 'elapsed_seconds': max(0., time.time() - job_started),
                 'elapsed_source': elapsed_source, 'elapsed_evidence': elapsed_evidence,
                 'job_started_epoch': job_started, 'queue_id': dispatcher.queue_id,
                 'allocation_cpu': (allocation or {}).get('allocated_cpu_bound'),
                 'drain_reason': dispatcher.drain_reason})
-        if stats['done'] != stats['total'] and not (dispatcher.draining and validate_only):
+        if stats['done'] != stats['total'] and not (validate_only and (dispatcher.draining or bounded_complete)):
             raise QueueError('Incomplete round; retain result receipts for next direct success scan')
     if not validate_only:
         merge(root, old)

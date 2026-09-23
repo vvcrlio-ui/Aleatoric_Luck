@@ -35,6 +35,9 @@ panels:
       workflow: base_then_sl
       barrier_scope: submission_plan
       protocol_version: 2
+      # Build only an accepted-reference lookup before SL; audit data globally
+      # once at final publication. Historical frozen plans remain unchanged.
+      verification_schedule: final_only
       phase_round_limits: {base: 2, sl: 1}
       # The 30-minute default is sized for acceptance fixtures. At production
       # repeat counts the combiner alone needs hours, so both phases get an

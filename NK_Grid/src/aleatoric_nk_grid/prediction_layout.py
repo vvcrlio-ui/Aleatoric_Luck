@@ -16,7 +16,7 @@ import uuid
 
 from .prediction_cache import (CacheBusyError, CacheIntegrityError, CacheStorageError,
     PredictionCacheWriter, safe_cache_path, _atomic_json, _sync_directory,
-    _index_path, _load_index, _sealed_file_hash, _file_signature, read_record)
+    _index_path, _load_index, _file_signature, read_record)
 from .shared_queue import file_lock
 
 
@@ -28,11 +28,23 @@ def _catalogs(root, signature):
     return tuple(pointer['generations'])
 
 
+@lru_cache(maxsize=4)
+def _routes(root, signature):
+    """Index immutable generations by source shard, once per pointer revision."""
+    routes, legacy = {}, []
+    for position, item in enumerate(_catalogs(root, signature)):
+        entry = (position, json.dumps(item, sort_keys=True))
+        if 'sources' not in item:
+            legacy.append(entry)
+        else:
+            for source in item['sources']:
+                routes.setdefault(source, []).append(entry)
+    return routes, legacy
+
+
 @lru_cache(maxsize=16384)
 def _lookup(root, generation, path, offset, sha256):
     catalog = safe_cache_path(root, generation['path'])
-    if _sealed_file_hash(catalog) != generation['sha256']:
-        raise CacheIntegrityError('Location catalog changed')
     with closing(sqlite3.connect(catalog.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
         row = db.execute('SELECT reference FROM locations WHERE path=? AND offset=? AND sha256=?',
                          (path, offset, sha256)).fetchone()
@@ -44,15 +56,23 @@ def resolve_reference(root, reference):
     if not pointer.exists():
         return reference
     current = dict(reference)
-    # Generations are chronological, so an address can move more than once.
-    for item in _catalogs(str(root), _file_signature(pointer)):
-        # Cache keys use an immutable serialization, not a mutable dictionary.
-        replacement = _lookup_cached(str(root), json.dumps(item, sort_keys=True),
-                                     current['path'], current['offset'], current['sha256'])
-        if replacement is not None:
-            if any(current.get(k) != replacement.get(k) for k in ('sha256', 'identity', 'length', 'status')):
-                raise CacheIntegrityError('Location generation changed frame identity')
-            current = replacement
+    routes, legacy = _routes(str(root), _file_signature(pointer))
+    position = -1
+    while True:
+        candidates = sorted(routes.get(current['path'], []) + legacy)
+        for index, serialized in candidates:
+            if index <= position:
+                continue
+            position = index
+            replacement = _lookup_cached(str(root), serialized,
+                                         current['path'], current['offset'], current['sha256'])
+            if replacement is not None:
+                if any(current.get(k) != replacement.get(k) for k in ('sha256', 'identity', 'length', 'status')):
+                    raise CacheIntegrityError('Location generation changed frame identity')
+                current = replacement
+                break  # Follow a later move of this new address.
+        else:
+            break
     return current
 
 
@@ -97,19 +117,20 @@ def compact_stopped(root, *, temporary_byte_limit, readers_drained=False,
                         shard_target_bytes=target_bytes) as writer:
                     for index in batch:
                         source = safe_cache_path(root, index['path'])
-                        if source.stat().st_size != index['bytes'] or _sealed_file_hash(source) != index['sha256']:
+                        if source.stat().st_size != index['bytes']:
                             raise CacheIntegrityError('Compaction source changed after sealing')
                         with source.open('rb') as handle:
                             for old in index['records']:
                                 handle.seek(old['offset']); frame = handle.read(old['length'])
-                                new = writer.append_frame(frame, old, directory=index['path'].split('/')[0])
+                                new = writer.append_frame(frame, old, directory=index['path'].split('/')[0],
+                                                          sync=False)
                                 db.execute('INSERT INTO locations VALUES (?,?,?,?)',
                                     (old['path'], old['offset'], old['sha256'], json.dumps(new)))
                 db.commit()
             with catalog.open('r+b') as handle:
                 os.fsync(handle.fileno())
             _sync_directory(location_dir)
-            item = {'path': catalog.relative_to(root).as_posix(), 'sha256': _sealed_file_hash(catalog),
+            item = {'path': catalog.relative_to(root).as_posix(), 'integrity': 'record-sha256-v1',
                     'sources': [i['path'] for i in batch], 'source_bytes': size,
                     'new_shards': writer.sealed_shards, 'generation': generation}
             # New shards, indexes and catalog have all been fsynced. This is the
@@ -138,15 +159,25 @@ def compact_stopped(root, *, temporary_byte_limit, readers_drained=False,
 
 def _retire(root, generation):
     catalog = safe_cache_path(root, generation['path'])
-    if _sealed_file_hash(catalog) != generation['sha256']:
-        raise CacheIntegrityError('Cannot retire sources without the durable original location catalog')
     if not any(safe_cache_path(root, name).exists() for name in generation['sources']):
         return
-    for relative in generation['new_shards']:
-        path = safe_cache_path(root, relative)
-        index, _ = _load_index(_index_path(root, relative))
-        if path.stat().st_size != index['bytes'] or _sealed_file_hash(path) != index['sha256']:
-            raise CacheIntegrityError('Packed shard is not durable and intact')
+    # Prove every old record has a durable, identical destination before any
+    # original is removed. The catalog itself no longer needs a whole-file hash.
+    with closing(sqlite3.connect(catalog.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+        for relative in generation['sources']:
+            if not safe_cache_path(root, relative).exists():
+                continue
+            index, _ = _load_index(_index_path(root, relative))
+            for old in index['records']:
+                found = db.execute('SELECT reference FROM locations WHERE path=? AND offset=? AND sha256=?',
+                                   (old['path'], old['offset'], old['sha256'])).fetchone()
+                if found is None:
+                    raise CacheIntegrityError('Packed record destination missing; retain original shard')
+                new = json.loads(found[0])
+                if new.get('path') not in generation['new_shards'] or any(
+                        old.get(key) != new.get(key) for key in ('sha256', 'identity', 'length', 'status')):
+                    raise CacheIntegrityError('Packed record identity changed; retain original shard')
+                read_record(root, new, require_sealed=True)
     for relative in generation['sources']:
         path = safe_cache_path(root, relative)
         if path.parent.name not in ('shards', 'meta-results') or path.suffix != '.pcshard':

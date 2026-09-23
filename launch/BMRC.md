@@ -28,6 +28,13 @@ Grid dimensions are resolved against available samples and sources. A full 15-pa
 
 ## Shared resource file
 
+This suite/raw-data scheduler does not currently accept `--dispatcher-shards` or
+`--scheduler-policy`; these options fail explicitly instead of being ignored.
+They belong to the [prepared-data shared single-model entry](README.md#dispatcher-shards-and-initial-policy),
+which also serves BMRC. Its cache audit/index decoupling is shared code, but the
+Lustre quota adapter and service CPU binding have not been validated on BMRC.
+Do not reuse the Discoverer resource preset as a BMRC resource file.
+
 The first compute-node bootstrap resolves node geometry from matching hardware and account, partition and QoS hard limits. It saves node count, constraint, workers, tasks per node, CPU settings, memory, partition and QoS in `--resources`. The worker cap excludes the dispatcher. Memory defaults to 16 GiB per worker; geometry conservatively includes dispatcher memory and two separate controller reservations. Slurm rank zero runs the dispatcher; other ranks run one worker each with one CPU per task and core binding. See Slurm's [CPU management guide](https://slurm.schedmd.com/cpu_management.html) for the allocation and binding distinction.
 
 `timing_full` and `production` use exactly the same resource file. Actual workers can be fewer than the initial cap when whole-node geometry or hard limits require it. Geometry is never recalculated by preset or reduced because few cells remain or the cluster is busy. Temporary contention leaves the fixed job queued, or the controller waits for a submission slot. Changed hard limits produce an explicit error. When no cells remain, no worker allocation is submitted.

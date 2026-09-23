@@ -63,6 +63,8 @@ def normalize_prediction_options(cache=None, execution=None):
             raise ValueError("base_then_sl requires OOF and holdout predictions")
         if workflow.get("barrier_scope") != "submission_plan" or workflow.get("protocol_version") != 2:
             raise ValueError("base_then_sl requires submission_plan barrier and protocol_version=2")
+        if workflow.get('verification_schedule', 'before_sl') not in ('before_sl', 'final_only'):
+            raise ValueError('verification_schedule must be before_sl or final_only')
     elif workflow.get("workflow") not in {None, "capture"}:
         raise ValueError("Unknown prediction workflow")
     return result, workflow

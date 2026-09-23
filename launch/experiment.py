@@ -96,6 +96,9 @@ def parser():
     p.add_argument("--workers", type=positive, help="Worker cap; Discoverer timing_full/production resolves live capacity by default")
     p.add_argument("--rounds", type=positive, help="Maximum continuation rounds; all clusters submit only the current worker allocation")
     p.add_argument("--memory", help="Optional worker memory request, e.g. 16G")
+    p.add_argument('--dispatcher-shards', type=int, choices=range(1, 9), metavar='1..8',
+                   help='New shared Slurm run: requested dispatcher shards for both base and SL; >1 defaults to two validators per shard')
+    p.add_argument('--scheduler-policy', help='New shared Slurm run: operational policy JSON; explicit shard option overrides this file')
     p.add_argument("--plan-memory")
     p.add_argument("--plan-time", help="Planning job time; production 8h, other presets 1h")
     p.add_argument("--request", help=argparse.SUPPRESS)
@@ -116,7 +119,8 @@ def launch_spec(args):
         raise ValueError("--resume accepts a Slurm plan; local runs use the engine checkpoint entry point")
     if args.resume and (args.output or args.schema or args.models or args.preset != "dev"
                         or args.manifest != "FFCWS/panels.yaml" or args.panel != "ffc_median_mode_gpa"
-                        or any((args.workers, args.rounds, args.partition, args.time_limit, args.memory))):
+                        or any((args.workers, args.rounds, args.partition, args.time_limit, args.memory,
+                                args.dispatcher_shards, args.scheduler_policy))):
         raise ValueError("resume reuses frozen design/resources; do not combine it with design/resource overrides")
     if args.target == "slurm" and (not args.account or not args.account.strip()):
         raise ValueError("Slurm requires explicit --account YOUR_PROJECT_ACCOUNT (including resume); no default account is used")
@@ -153,6 +157,20 @@ def launch_spec(args):
                                   "max_control_jobs": 4 * (args.rounds or 2) + 8}
     if args.target == 'slurm':
         result['scheduler'] = 'single-model-slurm-v1'
+    if args.dispatcher_shards is not None or args.scheduler_policy is not None:
+        if args.target != 'slurm' or args.resume:
+            raise ValueError('Dispatcher options apply to a new shared Slurm run; existing rounds retain their snapshot')
+        policy = json.loads(path_from_repo(args.scheduler_policy).read_text(encoding='utf-8')) if args.scheduler_policy else {}
+        if not isinstance(policy, dict): raise ValueError('Scheduler policy must be a JSON object')
+        if args.dispatcher_shards is not None:
+            policy['dispatcher_shards'] = args.dispatcher_shards
+            if args.dispatcher_shards > 1 and 'validation_processes' not in policy:
+                policy['validation_processes'] = 2
+        # The policy module and its shared-queue types have only stdlib imports.
+        package = str(Path(__file__).resolve().parents[1] / 'NK_Grid/src')
+        if package not in sys.path: sys.path.insert(0, package)
+        from aleatoric_nk_grid.scheduler_policy import validate_policy
+        result['scheduler_policy'] = validate_policy(policy)
     return result
 
 
@@ -356,6 +374,8 @@ def resume_legacy(args, path, plan):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser().parse_args(argv)
+    if args.target != 'slurm' and (args.dispatcher_shards is not None or args.scheduler_policy is not None):
+        raise ValueError('Dispatcher options apply to new shared Slurm launches')
     if args.target == "status" or args.suite or (args.profile == "bmrc" and args.ffc_data_dir) or (args.resume and path_from_repo(args.resume).is_dir()):
         from suite import entry
         entry(args, argv)

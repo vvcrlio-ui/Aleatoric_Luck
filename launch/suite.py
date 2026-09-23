@@ -364,6 +364,8 @@ def status(root):
 
 
 def entry(args, argv):
+    if getattr(args, 'dispatcher_shards', None) is not None or getattr(args, 'scheduler_policy', None) is not None:
+        raise ValueError('Dispatcher options use the shared single-model launcher; the BMRC raw-data/suite scheduler has not been adapted and will not ignore them')
     if args.target == "status":
         if not args.run:
             raise ValueError("status requires --run RUN_DIR")

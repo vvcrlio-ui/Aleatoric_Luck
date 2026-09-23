@@ -29,6 +29,9 @@ def read(path):
 
 def worker(args):
     ready = read(args.launch)
+    if ready.get('shards'):
+        from .dispatcher_shards import resolve_shard
+        ready = resolve_shard(ready, socket.gethostname())
     # Spread cross-node readiness/TLS admission after a large srun launch.
     time.sleep(random.uniform(0., ready.get('startup_jitter_seconds', 0.)))
     root = Path(ready['queue'])
@@ -40,6 +43,15 @@ def worker(args):
                '--ca-file', ready['ca_file'], '--spool', str(slot),
                '--max-seconds', str(ready.get('max_seconds', 172800)),
                '--protocol-version', str(ready.get('protocol_version', 1))]
+    for flag in ('rpc_keepalive', 'protocol_metrics', 'require_cpu_binding', 'node_relay'):
+        if ready.get(flag):
+            command.append('--' + flag.replace('_', '-'))
+    if ready.get('node_relay'):
+        command.extend(['--node-relay-idle-seconds', str(ready.get('node_relay_idle_seconds', .5))])
+    if ready.get('protocol_metrics_sample_modulo', 1) != 1:
+        command.extend(['--protocol-metrics-sample-modulo', str(ready['protocol_metrics_sample_modulo'])])
+    if ready.get('heartbeat_aggregate_seconds', 0):
+        command.extend(['--heartbeat-aggregate-seconds', str(ready['heartbeat_aggregate_seconds'])])
     if ready.get('recover_stale_leases', False):
         command.append('--recover-stale-leases')
     if ready.get('deadline_epoch') is not None:

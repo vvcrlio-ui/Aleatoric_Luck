@@ -24,7 +24,9 @@ build/
 *.egg-info/
 .pytest_cache/
 
-# Tests are maintained locally and are not published with the repository.
+# Legacy tests and checks/ are maintained locally, outside published source.
+# NK_Grid/validation/ is intentionally visible to Git for source review;
+# visibility does not mean its current files have been staged or committed.
 tests/
 test/
 __tests__/
@@ -32,6 +34,7 @@ test_*.py
 *_test.py
 conftest.py
 /pytest.ini
+/NK_Grid/validation/
 
 # R
 .Rhistory
@@ -52,6 +55,7 @@ plans/
 reports/
 
 # Local implementation/review notes
+/WORKSPACE.md
 /checks/
 /NK_Grid/slurm/validate_single_model_scheduler.sbatch
 /*_VALIDATION.md
@@ -61,6 +65,7 @@ reports/
 # Keep launch/ source tracked; docs/ is maintained locally only.
 /docs/
 /AGENTS.md
+/stage_v4.py
 NK_Grid/CODE_REVIEW_REPORT_*.md
 NK_Grid/ADAPTER_TO_NK_GRID_WORKFLOW_HARDENING_PROPOSAL_*.md
 NK_Grid/RISK_REMEDIATION_REVIEW_*.md

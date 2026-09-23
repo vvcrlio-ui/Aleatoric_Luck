@@ -60,74 +60,114 @@ def run(args):
         raise QueueError("Required prediction cache is unsupported by this legacy queue identity")
     if spec.payload["model_n_jobs"] != 1:
         raise QueueError("First scheduler version requires one numerical thread")
-    client = Client(args.url, args.token_file.read_text().strip(), queue_id, ca_file=args.ca_file)
-    if manifest["identity"].get("prediction_workflow"):
-        if protocol_version != 2:
-            raise QueueError("Prediction workflow requires incremental protocol 2")
-        from .prediction_worker import PredictionTaskExecutor
-        from .shared_queue import atomic_json
-        with worker_slot(args.spool, queue_id) as worker, threadpool_limits(1):
-            def storage_fault(error):
-                fault = dict(queue_id=queue_id, worker=worker, code="prediction_storage_failed",
-                             message=str(error))
-                # Either durable marker or RPC can stop the controller. Preserve
-                # the original I/O exception even if the same disk is still full.
-                for directory, filename in ((args.spool, "worker-fault"),
-                    (getattr(args, 'fault_dir', None), digest(worker) + '.json')):
-                    if directory is not None:
-                        try:
-                            Path(directory).mkdir(parents=True, exist_ok=True)
-                            atomic_json(Path(directory) / filename, fault)
-                        except OSError:
-                            pass
-                try:
-                    client.call("worker_fault", worker=worker, code=fault["code"], message=fault["message"])
-                except Exception:
-                    pass
-            with PredictionTaskExecutor(manifest["identity"], worker=worker,
-                                        repo_root=args.repo_root, on_storage_fault=storage_fault,
-                                        recovery_reference=manifest.get("prediction_recovery")) as executor:
-                report = execute_batch_worker(client, worker, executor, spool=args.spool,
-                    heartbeat_seconds=heartbeat_seconds, max_batch=max_batch, protocol_version=2,
+    from .protocol_metrics import ProtocolMetrics
+    sample_modulo = getattr(args, 'protocol_metrics_sample_modulo', 1)
+    if type(sample_modulo) is not int or not 1 <= sample_modulo <= 1024:
+        raise QueueError('Invalid metrics sampling modulo')
+    sampled = int(os.environ.get('SLURM_LOCALID', '0')) % sample_modulo == 0
+    metrics = ProtocolMetrics(getattr(args, 'protocol_metrics', False) and sampled)
+    client = Client(args.url, args.token_file.read_text().strip(), queue_id, ca_file=args.ca_file,
+                    keepalive=getattr(args, 'rpc_keepalive', False), metrics=metrics)
+    if getattr(args, 'node_relay', False):
+        from .node_relay import attach_node_relay, relay_stats_path
+        leader = os.environ.get('SLURM_LOCALID') == '0'
+        # One small file per node, next to the protocol metrics, so a running relay can be watched.
+        relay_stats = relay_stats_path(args.spool) if leader and getattr(args, 'protocol_metrics', False) else None
+        attach_node_relay(client, ca_file=args.ca_file, idle_seconds=getattr(args, 'node_relay_idle_seconds', .5),
+                          leader=leader, stats_file=relay_stats)
+    aggregate = getattr(args, 'heartbeat_aggregate_seconds', 0.)
+    if not math.isfinite(aggregate) or not 0 <= aggregate <= 5:
+        raise QueueError('Heartbeat aggregate window must be within 0..5 seconds')
+    if aggregate:
+        client.relay_options = dict(ca_file=args.ca_file, window=min(aggregate, heartbeat_seconds / 4),
+                                    leader=os.environ.get('SLURM_LOCALID') == '0')
+    def register_binding(worker):
+        if getattr(args, 'require_cpu_binding', False):
+            if protocol_version != 2:
+                raise QueueError('Explicit CPU binding requires protocol 2')
+            from .service_binding import process_binding
+            binding = process_binding()
+            client.call('protocol', worker=worker, version=2, hostname=binding['hostname'])
+            client.call('worker_binding', worker=worker, binding=binding)
+    try:
+        if manifest["identity"].get("prediction_workflow"):
+            if protocol_version != 2:
+                raise QueueError("Prediction workflow requires incremental protocol 2")
+            from .prediction_worker import PredictionTaskExecutor
+            from .shared_queue import atomic_json
+            with worker_slot(args.spool, queue_id) as worker, threadpool_limits(1):
+                register_binding(worker)
+                def storage_fault(error):
+                    fault = dict(queue_id=queue_id, worker=worker, code="prediction_storage_failed",
+                                 message=str(error))
+                    # Either durable marker or RPC can stop the controller. Preserve
+                    # the original I/O exception even if the same disk is still full.
+                    for directory, filename in ((args.spool, "worker-fault"),
+                        (getattr(args, 'fault_dir', None), digest(worker) + '.json')):
+                        if directory is not None:
+                            try:
+                                Path(directory).mkdir(parents=True, exist_ok=True)
+                                atomic_json(Path(directory) / filename, fault)
+                            except OSError:
+                                pass
+                    try:
+                        client.call("worker_fault", worker=worker, code=fault["code"], message=fault["message"])
+                    except Exception:
+                        pass
+                with PredictionTaskExecutor(manifest["identity"], worker=worker,
+                                            repo_root=args.repo_root, on_storage_fault=storage_fault,
+                                            recovery_reference=manifest.get("prediction_recovery")) as executor:
+                    executor.writer.protocol_metrics = metrics
+                    from .protocol_metrics import write_import_proof
+                    write_import_proof('numerical-worker')
+                    if executor.fold_writer is not None:
+                        executor.fold_writer.protocol_metrics = metrics
+                        executor.fold_writer.metric_prefix = 'fold'
+                    report = execute_batch_worker(client, worker, executor, spool=args.spool,
+                        heartbeat_seconds=heartbeat_seconds, max_batch=max_batch, protocol_version=2,
+                        deadline_epoch=getattr(args, 'deadline_epoch', None),
+                        fault_dir=getattr(args, 'fault_dir', None),
+                        recover_stale_leases=getattr(args, 'recover_stale_leases', False),
+                        stop=lambda: executor.writer.failed or bool(args.stop_file and args.stop_file.exists()),
+                        deadline_seconds=max(0., args.max_seconds - (time.monotonic() - entered)))
+                    report.update(cache=dict(executor.stats), worker=worker,
+                                  phase=executor.phase)
+                    if executor.writer.failed:
+                        storage_fault("Prediction persistence failed; stopped claiming work")
+                        report["state"] = "prediction_storage_failed"
+                    return report
+        with worker_slot(args.spool, queue_id) as worker, threadpool_limits(1), \
+                NKGridExecutionSession.open(spec, repo_root=args.repo_root) as session:
+            register_binding(worker)
+            store = None
+            if args.node_cache:
+                store = NodeInputStore(args.node_cache, namespace=session_namespace(session), max_bytes=args.disk_cache_mib * 1024**2)
+            cached = CachedSession(session, max_bytes=args.memory_cache_mib * 1024**2, store=store)
+            try:
+                def execute(value):
+                    if args.memory_cache_mib or store is not None:
+                        row = cached.run(ModelTask(**value))
+                    else:
+                        row = session.run_cell_group(seed=value["seed"], draw=value["draw"],
+                            n_samples=value["N"], k_features=value["K"], models=(value["model"],))[0]
+                    return json_result(row)
+                report = execute_batch_worker(client, worker, execute,
+                    spool=args.spool, cached_cells=lambda: cached.cached_cells,
+                    heartbeat_seconds=heartbeat_seconds,
+                    max_batch=max_batch,
+                    protocol_version=protocol_version,
                     deadline_epoch=getattr(args, 'deadline_epoch', None),
                     fault_dir=getattr(args, 'fault_dir', None),
                     recover_stale_leases=getattr(args, 'recover_stale_leases', False),
-                    stop=lambda: executor.writer.failed or bool(args.stop_file and args.stop_file.exists()),
+                    stop=lambda: bool(args.stop_file and args.stop_file.exists()),
                     deadline_seconds=max(0., args.max_seconds - (time.monotonic() - entered)))
-                report.update(cache=dict(executor.stats), worker=worker,
-                              phase=executor.phase)
-                if executor.writer.failed:
-                    storage_fault("Prediction persistence failed; stopped claiming work")
-                    report["state"] = "prediction_storage_failed"
+                report["cache"] = cached.stats; report["worker"] = worker
                 return report
-    with worker_slot(args.spool, queue_id) as worker, threadpool_limits(1), \
-            NKGridExecutionSession.open(spec, repo_root=args.repo_root) as session:
-        store = None
-        if args.node_cache:
-            store = NodeInputStore(args.node_cache, namespace=session_namespace(session), max_bytes=args.disk_cache_mib * 1024**2)
-        cached = CachedSession(session, max_bytes=args.memory_cache_mib * 1024**2, store=store)
-        try:
-            def execute(value):
-                if args.memory_cache_mib or store is not None:
-                    row = cached.run(ModelTask(**value))
-                else:
-                    row = session.run_cell_group(seed=value["seed"], draw=value["draw"],
-                        n_samples=value["N"], k_features=value["K"], models=(value["model"],))[0]
-                return json_result(row)
-            report = execute_batch_worker(client, worker, execute,
-                spool=args.spool, cached_cells=lambda: cached.cached_cells,
-                heartbeat_seconds=heartbeat_seconds,
-                max_batch=max_batch,
-                protocol_version=protocol_version,
-                deadline_epoch=getattr(args, 'deadline_epoch', None),
-                fault_dir=getattr(args, 'fault_dir', None),
-                recover_stale_leases=getattr(args, 'recover_stale_leases', False),
-                stop=lambda: bool(args.stop_file and args.stop_file.exists()),
-                deadline_seconds=max(0., args.max_seconds - (time.monotonic() - entered)))
-            report["cache"] = cached.stats; report["worker"] = worker
-            return report
-        finally:
-            cached.close()
+            finally:
+                cached.close()
+
+    finally:
+        client.close()
 
 
 def main():
@@ -146,6 +186,15 @@ def main():
     worker.add_argument("--ca-file", type=Path, help="Trust the private dispatcher CA; hostname verification remains enabled")
     worker.add_argument("--spool", type=Path, required=True,
         help="Durable directory unique to this logical slot; reuse it after a process/node restart")
+    worker.add_argument('--protocol-metrics', action='store_true')
+    worker.add_argument('--protocol-metrics-sample-modulo', type=int, default=1)
+    worker.add_argument('--require-cpu-binding', action='store_true')
+    worker.add_argument('--rpc-keepalive', action='store_true')
+    worker.add_argument('--heartbeat-aggregate-seconds', type=float, default=0.)
+    worker.add_argument('--node-relay', action='store_true',
+        help="Forward this worker's requests through the node-local relay (opt-in)")
+    worker.add_argument('--node-relay-idle-seconds', type=float, default=.5,
+        help="Relay upstream idle limit; keep it below the server keep-alive wait")
     worker.add_argument("--node-cache", type=Path)
     worker.add_argument("--memory-cache-mib", type=int, default=0, help="Opt in after workload-specific benchmarks")
     worker.add_argument("--disk-cache-mib", type=int, default=1024)

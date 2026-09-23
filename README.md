@@ -107,7 +107,7 @@ The workflow applies to local and cluster execution. Use the same environment pr
 | BMRC | `bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT` |
 | Discoverer | `bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT` |
 
-Replace `YOUR_ACCOUNT` with your account. All Slurm profiles use the same single-model queue and per-round continuation. Other Slurm clusters use `bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION --constraint none --qos YOUR_QOS`, with a compatible Python environment and site-appropriate resource options. Slurm submission uses a clean, committed checkout. See [cluster requirements and resource checks](launch/README.md).
+Replace `YOUR_ACCOUNT` with your account. Prepared-data Slurm launches share the single-model queue and per-round continuation; BMRC suite/raw-data launches use the separate suite scheduler. The shared entry accepts `--dispatcher-shards 4` for both base and SL, plus `--scheduler-policy PATH.json` for the initial operational policy. Other Slurm clusters use `bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION --constraint none --qos YOUR_QOS`, with a compatible Python environment and site-appropriate resource options. Slurm submission uses a clean, committed checkout. See [cluster requirements, shard options and site limits](launch/README.md).
 
 The launcher creates or checks the Python environment and installs locked dependencies. Local execution supports Python 3.11–3.14; use WSL on Windows.
 

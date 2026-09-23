@@ -14,9 +14,11 @@ import math
 import os
 import re
 import struct
+import threading
 import time
 import uuid
 import zlib
+from collections import OrderedDict
 from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -116,6 +118,95 @@ def safe_cache_path(root: Path | str, relative: str) -> Path:
     if target == base or not target.is_relative_to(base):
         raise CacheIntegrityError("cache reference escapes its designated root")
     return target
+
+
+class ReadContext:
+    """Memo for repeated reads inside ONE reader phase (opt-in; the default is no context).
+
+    A validator re-reads many records of the same few shard files. Without a context each read
+    re-resolves the root and the target (about a hundred lstat calls), re-opens and closes the shard.
+    A context remembers only what cannot change inside a reader phase: the resolved root, the safe path
+    of a shard, and open shard descriptors. The controller already builds a new validator (hence a new
+    context) whenever writers are stopped or locations are compacted.
+
+    Nothing about verification is relaxed: every frame is still read in full and compared with its
+    recorded checksum, and a shard that was replaced (different inode) or truncated fails exactly as
+    before. A descriptor is reused only after stat shows the same device and inode.
+    """
+
+    def __init__(self, max_open: int = 128):
+        self.max_open = int(max_open)
+        self._roots: dict[str, Path] = {}
+        self._paths: dict[tuple[str, str], Path] = {}
+        self._fds: "OrderedDict[str, tuple[int, int, int]]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def root(self, root) -> Path:
+        key = str(root)
+        cached = self._roots.get(key)
+        if cached is None:
+            cached = self._roots[key] = Path(root).resolve()
+        return cached
+
+    def safe_path(self, root, relative: str) -> Path:
+        key = (str(root), relative)
+        cached = self._paths.get(key)
+        if cached is None:
+            cached = self._paths[key] = safe_cache_path(self.root(root), relative)   # same checks, done once
+        return cached
+
+    def resolve(self, root, reference):
+        """resolve_reference with one stat instead of resolving the root again."""
+        root_resolved = self.root(root)
+        if not os.path.exists(os.path.join(str(root_resolved), "locations.json")):
+            return reference
+        from .prediction_layout import resolve_reference
+        return resolve_reference(root_resolved, reference)
+
+    def read(self, path, offset: int, length: int) -> bytes:
+        key = str(path)
+        status = os.stat(key)
+        with self._lock:
+            entry = self._fds.get(key)
+            if entry is not None and (entry[1], entry[2]) != (status.st_dev, status.st_ino):
+                os.close(self._fds.pop(key)[0])
+                entry = None
+            if entry is None:
+                descriptor = os.open(key, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                entry = self._fds[key] = (descriptor, status.st_dev, status.st_ino)
+                while len(self._fds) > self.max_open:
+                    os.close(self._fds.popitem(last=False)[1][0])
+            else:
+                self._fds.move_to_end(key)
+            descriptor = entry[0]
+            chunks = []
+            if hasattr(os, "pread"):
+                position = int(offset)
+                while length > 0:
+                    part = os.pread(descriptor, length, position)
+                    if not part:
+                        break
+                    chunks.append(part)
+                    position += len(part)
+                    length -= len(part)
+            else:                                                                   # Windows has no pread
+                os.lseek(descriptor, int(offset), os.SEEK_SET)
+                while length > 0:
+                    part = os.read(descriptor, length)
+                    if not part:
+                        break
+                    chunks.append(part)
+                    length -= len(part)
+            return b"".join(chunks)
+
+    def close(self) -> None:
+        with self._lock:
+            for descriptor, _, _ in self._fds.values():
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self._fds.clear()
 
 
 def _sync_directory(path: Path) -> None:
@@ -291,7 +382,7 @@ def _integer(value: object, label: str, maximum: int) -> int:
     return value
 
 
-def _decode(frame: bytes, reference: Mapping[str, object]) -> CacheRecord:
+def _decode(frame: bytes, reference: Mapping[str, object], *, frame_verified: bool = False) -> CacheRecord:
     if len(frame) < FRAME.size:
         raise CacheIntegrityError("truncated prediction frame")
     magic, header_bytes, payload_bytes, checksum = FRAME.unpack(frame[:FRAME.size])
@@ -301,7 +392,10 @@ def _decode(frame: bytes, reference: Mapping[str, object]) -> CacheRecord:
     if FRAME.size + header_bytes + payload_bytes != len(frame) or len(frame) > MAX_RECORD_BYTES:
         raise CacheIntegrityError("invalid prediction frame length")
     body = frame[FRAME.size:]
-    if hashlib.sha256(body).digest() != checksum:
+    # A reference-verified full frame already covers its header, payload and
+    # embedded checksums. Recovery scans without a trusted reference still
+    # validate the embedded hashes below.
+    if not frame_verified and hashlib.sha256(body).digest() != checksum:
         raise CacheIntegrityError("prediction frame checksum mismatch")
     encoded_header = body[:header_bytes]
     if magic == MAGIC:
@@ -331,7 +425,7 @@ def _decode(frame: bytes, reference: Mapping[str, object]) -> CacheRecord:
         raise CacheIntegrityError("invalid compressed prediction block") from exc
     if len(raw) != raw_size or not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
         raise CacheIntegrityError("compressed block length/boundary violation")
-    if hashlib.sha256(raw).hexdigest() != header.get("raw_sha256"):
+    if not frame_verified and hashlib.sha256(raw).hexdigest() != header.get("raw_sha256"):
         raise CacheIntegrityError("uncompressed prediction checksum mismatch")
     specs = header.get("arrays")
     if not isinstance(specs, dict) or len(specs) > 1024:
@@ -389,14 +483,6 @@ def _index_path(root: Path, relative: str) -> Path:
     return root / "indexes" / f"{shard.parent.name}-{shard.name}.json"
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _file_signature(path: Path) -> tuple[int, int, int]:
     stat = path.stat()
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
@@ -405,8 +491,19 @@ def _file_signature(path: Path) -> tuple[int, int, int]:
 @lru_cache(maxsize=8)
 def _cached_index(path: str, signature: tuple[int, int, int]) -> tuple[dict, frozenset]:
     index = json.loads(Path(path).read_text(encoding="utf-8"))
+    # Coverage of the sealed byte range prevents a truncated index from silently
+    # dropping records during compaction; each frame keeps its own checksum.
+    records = index.get('records', [])
+    cursor = 0
+    for row in records:
+        if (row.get('path') != index.get('path') or row.get('offset') != cursor
+                or type(row.get('length')) is not int or row['length'] < FRAME.size):
+            raise CacheIntegrityError('Shard index record coverage changed')
+        cursor += row['length']
+    if cursor != index.get('bytes') or len(records) != index.get('record_count'):
+        raise CacheIntegrityError('Shard index record coverage incomplete')
     entries = frozenset((row.get("offset"), row.get("length"), row.get("sha256"))
-                        for row in index.get("records", []))
+                        for row in records)
     return index, entries
 
 
@@ -414,25 +511,18 @@ def _load_index(path: Path) -> tuple[dict, frozenset]:
     return _cached_index(str(path.resolve()), _file_signature(path))
 
 
-@lru_cache(maxsize=4096)
-def _cached_file_hash(path: str, signature: tuple[int, int, int]) -> str:
-    return _sha256_file(Path(path))
-
-
-def _sealed_file_hash(path: Path) -> str:
-    """Read a sealed file once per stable filesystem identity in this process."""
-    return _cached_file_hash(str(path.resolve()), _file_signature(path))
-
-
 def read_record(root: Path | str, reference: Mapping[str, object], *,
                 expected_identity: Mapping[str, object] | str | None = None,
-                require_sealed: bool = False) -> CacheRecord:
+                require_sealed: bool = False, context: ReadContext | None = None) -> CacheRecord:
     root = Path(root)
     original_reference = reference
     from .prediction_layout import resolve_reference
-    reference = resolve_reference(root, reference)
+    if context is None:
+        reference = resolve_reference(root, reference)
+    else:
+        reference = context.resolve(root, reference)
     relative = reference.get("path")
-    path = safe_cache_path(root, relative)
+    path = safe_cache_path(root, relative) if context is None else context.safe_path(root, relative)
     offset = _integer(reference.get("offset"), "record offset", 2**63 - 1)
     length = _integer(reference.get("length"), "record length", MAX_RECORD_BYTES)
     digest = reference.get("sha256")
@@ -446,14 +536,17 @@ def read_record(root: Path | str, reference: Mapping[str, object], *,
         if not index.get("sealed") or index.get("path") != relative or (offset, length, digest) not in entries:
             raise CacheIntegrityError("prediction reference is absent from sealed index")
     try:
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            frame = handle.read(length)
+        if context is None:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                frame = handle.read(length)
+        else:
+            frame = context.read(path, offset, length)
     except OSError as exc:
         raise CacheIntegrityError(f"required cache record unavailable: {relative}") from exc
     if len(frame) != length or hashlib.sha256(frame).hexdigest() != digest:
         raise CacheIntegrityError("prediction reference length/checksum mismatch")
-    record = _decode(frame, original_reference)
+    record = _decode(frame, original_reference, frame_verified=True)
     expected = cache_identity(expected_identity) if isinstance(expected_identity, Mapping) else expected_identity
     if expected is not None and record.reference["identity"] != expected:
         raise CacheIntegrityError("prediction pipeline/sample/data identity mismatch")
@@ -496,6 +589,8 @@ class PredictionCacheWriter:
         self.closed = False
         self.bytes_written = 0
         self.write_seconds = 0.0
+        self.protocol_metrics = None
+        self.metric_prefix = "prediction"
         self.sealed_shards = []
 
     def __enter__(self):
@@ -524,22 +619,24 @@ class PredictionCacheWriter:
         self._refs[directory] = []
         return handle, relative
 
+    def _record_fsync(self, handle):
+        metrics = self.protocol_metrics
+        if metrics is None or not metrics.enabled:
+            return os.fsync(handle.fileno())
+        with metrics.span(self.metric_prefix + '_fsync'):
+            return os.fsync(handle.fileno())
+
     def _seal(self, directory: str) -> None:
         entry = self._handles.get(directory)
         if entry is None:
             return
         handle, relative = entry
         handle.flush()
-        os.fsync(handle.fileno())
+        self._record_fsync(handle)
         size = os.fstat(handle.fileno()).st_size
-        # Read on the owning handle: Windows locks byte 0 against other opens.
-        handle.seek(0)
-        digest = hashlib.sha256()
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
         _atomic_json(_index_path(self.root, relative), {
             "format": FORMAT, "sealed": True, "path": relative, "bytes": size,
-            "sha256": digest.hexdigest(), "record_count": len(self._refs[directory]),
+            "integrity": "record-sha256-v1", "record_count": len(self._refs[directory]),
             "records": self._refs[directory]})
         _unlock(handle)
         handle.close()
@@ -555,7 +652,11 @@ class PredictionCacheWriter:
         if kind not in {"prediction", "sample_map", "meta_result"}:
             raise CacheIntegrityError("unsupported prediction record kind")
         started = time.perf_counter()
-        frame, header = _encode(identity, arrays, metadata or {}, kind=kind, record_encoding=self.record_encoding)
+        if self.protocol_metrics is not None and self.protocol_metrics.enabled:
+            with self.protocol_metrics.span(self.metric_prefix + '_encode'):
+                frame, header = _encode(identity, arrays, metadata or {}, kind=kind, record_encoding=self.record_encoding)
+        else:
+            frame, header = _encode(identity, arrays, metadata or {}, kind=kind, record_encoding=self.record_encoding)
         if remaining_bytes is not None and len(frame) > remaining_bytes:
             self.failed = True
             raise CacheStorageError("prediction append exceeds its remaining storage reservation")
@@ -569,7 +670,7 @@ class PredictionCacheWriter:
             handle, relative = self._handles.get(directory) or self._open(directory)
             offset = handle.tell()
             _write_all(handle, frame)
-            os.fsync(handle.fileno())
+            self._record_fsync(handle)
             reference = {"path": relative, "offset": offset, "length": len(frame),
                          "sha256": hashlib.sha256(frame).hexdigest(),
                          "identity": header["identity_sha256"], "status": header["status"]}
@@ -603,7 +704,7 @@ class PredictionCacheWriter:
             self._sample_refs[key] = self.append(identity, arrays, metadata, kind="sample_map")
         return dict(self._sample_refs[key])
 
-    def append_frame(self, frame, reference, *, directory):
+    def append_frame(self, frame, reference, *, directory, sync=True):
         """Copy a sealed frame byte-for-byte; no re-encoding of scientific data."""
         if self.closed or self.failed or directory not in ('shards', 'meta-results'):
             raise CacheStorageError('Raw append requires an open prediction writer')
@@ -615,7 +716,11 @@ class PredictionCacheWriter:
                 self._seal(directory)
         handle, relative = self._handles.get(directory) or self._open(directory)
         updated = {**reference, 'path': relative, 'offset': handle.tell()}
-        _write_all(handle, frame); os.fsync(handle.fileno())
+        _write_all(handle, frame)
+        # Compaction publishes references only AFTER close() seals and fsyncs
+        # every destination. Ordinary callers retain per-record durability.
+        if sync:
+            self._record_fsync(handle)
         self._refs[directory].append(updated); self.bytes_written += len(frame)
         return updated
 
@@ -707,13 +812,9 @@ def rebuild_index(root: Path | str, relative: str, *, writer_revoked: bool = Fal
                     raise CacheIntegrityError(f"prediction shard corruption: {scan.tail_error}")
                 handle.truncate(scan.valid_bytes)
                 os.fsync(handle.fileno())
-            handle.seek(0)
-            digest = hashlib.sha256()
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
             _atomic_json(_index_path(root, relative), {
                 "format": FORMAT, "sealed": True, "path": relative,
-                "bytes": scan.valid_bytes, "sha256": digest.hexdigest(),
+                "bytes": scan.valid_bytes, "integrity": "record-sha256-v1",
                 "record_count": len(scan.references), "records": list(scan.references),
                 "recovered": True, "repaired_tail_bytes": scan.file_bytes - scan.valid_bytes})
             return scan
@@ -785,9 +886,9 @@ def verify_coverage(root: Path | str, expected_identities: Iterable[Mapping[str,
                 if relative not in shard_hashes:
                     index, _ = _load_index(_index_path(root, relative))
                     path = safe_cache_path(root, relative)
-                    if path.stat().st_size != index["bytes"] or _sealed_file_hash(path) != index["sha256"]:
-                        raise CacheIntegrityError("sealed prediction shard checksum mismatch")
-                    shard_hashes[relative] = index["sha256"]
+                    if path.stat().st_size != index["bytes"]:
+                        raise CacheIntegrityError("sealed prediction shard size mismatch")
+                    shard_hashes[relative] = {"bytes": index["bytes"], "integrity": "record-sha256-v1"}
     missing, unexpected = sorted(expected - seen.keys()), sorted(seen.keys() - expected)
     complete = not (missing or unexpected or conflicts or failures)
     report = {"format": FORMAT, "prediction_cache_complete": complete,
@@ -853,9 +954,10 @@ def check_storage_admission(*, used_bytes: int, soft_quota_bytes: int, pending_r
 
 def verify_reference(root: Path | str, reference: Mapping[str, object], *,
                      expected_identity: Mapping[str, object] | str | None = None,
-                     require_sealed: bool = False) -> dict[str, object]:
+                     require_sealed: bool = False, context: ReadContext | None = None) -> dict[str, object]:
     """Dispatcher adapter. Only use arrays locally, never return them via RPC."""
-    record = read_record(root, reference, expected_identity=expected_identity, require_sealed=require_sealed)
+    record = read_record(root, reference, expected_identity=expected_identity, require_sealed=require_sealed,
+                         context=context)
     return {"metadata": record.metadata, "arrays": record.arrays, "identity": record.identity,
             "reference": record.reference, "status": record.status, "kind": record.kind}
 
@@ -913,11 +1015,11 @@ def verified_index_evidence(root: Path | str, references: Iterable[Mapping[str, 
         path = safe_cache_path(root, relative)
         index_path = _index_path(root, relative)
         index, _ = _load_index(index_path)
-        digest = _sealed_file_hash(path)
-        if digest != index.get("sha256") or path.stat().st_size != index.get("bytes"):
+        if path.stat().st_size != index.get("bytes"):
             raise CacheIntegrityError("sealed shard differs from its batch index")
-        evidence.extend([{"path": relative, "sha256": digest},
-                         {"path": index_path.relative_to(root).as_posix(), "sha256": _sealed_file_hash(index_path)}])
+        evidence.extend([{"path": relative, "bytes": index["bytes"], "integrity": "record-sha256-v1"},
+                         {"path": index_path.relative_to(root).as_posix(),
+                          "bytes": index_path.stat().st_size, "integrity": "record-sha256-v1"}])
     return evidence
 
 

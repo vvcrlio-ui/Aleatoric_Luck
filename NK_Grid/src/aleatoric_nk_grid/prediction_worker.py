@@ -23,7 +23,7 @@ from .prediction_cache import (PredictionCacheWriter, WriterRecoveryIndex, Cache
                                cache_identity, read_record, seal_stopped_writers,
                                retire_private_fold_shards, safe_cache_path, fold_record_identity,
                                FORMAT as CACHE_FORMAT)
-from .shared_queue import QueueError, digest, file_digest
+from .shared_queue import QueueError, digest
 
 
 def array_identity(arrays):
@@ -85,8 +85,6 @@ class PredictionTaskExecutor:
                 recovery_path = Path(catalog["path"]).resolve()
                 if not recovery_path.is_relative_to(Path(self.contract["output_root"]).resolve()):
                     raise QueueError("Cross-round recovery index escapes the submission output root")
-                if file_digest(recovery_path) != catalog.get("sha256"):
-                    raise QueueError("Cross-round recovery index checksum changed")
                 connection = sqlite3.connect(recovery_path.as_uri() + "?mode=ro&immutable=1",
                                               uri=True, check_same_thread=False)
                 self.stack.callback(connection.close)
@@ -149,23 +147,31 @@ class PredictionTaskExecutor:
 
     def _verify_sl_receipt(self, identity):
         """Validate the frozen barrier once before any SL task/index lookup."""
+        from .prediction_workflow import (base_input_filename, base_input_digest_key,
+                                          deferred_base_audit, BASE_READY_FORMAT)
         output = Path(self.contract["output_root"])
-        receipt_path = output / "base-verified.json"
+        receipt_path = output / base_input_filename(self.contract)
         if not receipt_path.is_file():
-            raise QueueError("SL worker cannot start before the verified base barrier")
+            raise QueueError("SL worker cannot start before its frozen base input receipt")
         receipt = json.loads(receipt_path.read_bytes())
-        if (receipt.get("complete") is not True or receipt.get("plan_sha256") != identity.get("plan_sha256")
+        ready = ((receipt.get('format') == BASE_READY_FORMAT and receipt.get('index_ready') is True
+                  and receipt.get('audit_complete') is False and receipt.get('complete') is not True)
+                 if deferred_base_audit(self.contract) else receipt.get('complete') is True)
+        if (not ready or receipt.get("plan_sha256") != identity.get("plan_sha256")
                 or receipt.get("workflow_sha256") != self._workflow_sha256
-                or digest(receipt) != self.workflow.get("base_receipt_sha256")):
+                or digest(receipt) != self.workflow.get(base_input_digest_key(self.contract))):
             raise QueueError("SL worker base receipt differs from its immutable queue")
-        if file_digest(output / "base-records.sqlite") != receipt.get("records_index_sha256"):
-            raise QueueError("SL worker verified base record index changed")
         from .prediction_evidence import verify_cache_evidence
         for evidence in receipt.get("cache_indexes", []):
             verify_cache_evidence(self.root, evidence)
-        self.base_records = sqlite3.connect((output / 'base-records.sqlite').resolve().as_uri() + '?mode=ro&immutable=1',
-                                            uri=True, check_same_thread=False)
+        from .prediction_workflow import open_base_records
+        self.base_records = open_base_records(self.contract, receipt=receipt)
         self.stack.callback(self.base_records.close)
+        # pread of exactly each frame: a buffered open() on Lustre fills a 4 MiB
+        # st_blksize buffer per read. The same checksum/sealed-index checks apply.
+        from .prediction_cache import ReadContext
+        self.read_context = ReadContext()
+        self.stack.callback(self.read_context.close)
 
     def _prune_folds(self):
         if self.fold_writer is None:
@@ -393,12 +399,18 @@ class PredictionTaskExecutor:
                 model=recipe["model"], phase="base", panel_id=task.panel_id, pipeline_id=pipeline_id,
                 variant_id="", base_library_id=task.base_library_id)
             saved = base_record_for_task(self.contract, base_task, connection=getattr(self, 'base_records', None))
-            record = read_record(self.root, saved["reference"], require_sealed=True)
+            record = read_record(self.root, saved["reference"], require_sealed=True, context=getattr(self, 'read_context', None))
             if (record.metadata.get("task") != asdict(base_task)
                     or record.metadata.get("pipeline_sha256") != self._frozen_digest(panel, recipe)
                     or record.metadata.get("input_spec_sha256") != self._frozen_digest(panel)):
                 raise QueueError("Base cache provenance does not match the frozen SL input")
-            records.append(record); rows.append(saved["row"])
+            source_row = saved['row']
+            if source_row is None:
+                source_row = record.metadata.get('result')
+                if (not isinstance(source_row, dict)
+                        or any(source_row.get(k) != v for k, v in asdict(base_task).items())):
+                    raise QueueError('Reference-only index requires the authoritative result row in the prediction record')
+            records.append(record); rows.append(source_row)
         self.stats["cache_read_seconds"] += time.perf_counter() - started
         identity = {"format": "prediction-task-v1", "task": asdict(task), "variant": variant,
                     "source_record_hashes": [r.reference["sha256"] for r in records],
@@ -416,7 +428,7 @@ class PredictionTaskExecutor:
                        _base_nonconverged=convergence["base_nonconverged"])
             return row
         training = read_record(self.root, records[0].metadata["sample_map_refs"]["training"],
-                               require_sealed=True)
+                               require_sealed=True, context=getattr(self, 'read_context', None))
         y_train = training.arrays["y_train"]
         names = [r.metadata["model_name"] for r in records]
         row = dict(rows[0])
@@ -451,7 +463,7 @@ class PredictionTaskExecutor:
         else:
             # Deliberately read evaluation labels only after the combiner fit.
             evaluation = read_record(self.root, records[0].metadata["sample_map_refs"]["evaluation"],
-                                     require_sealed=True)
+                                     require_sealed=True, context=getattr(self, 'read_context', None))
             from .nk_grid import compute_regression_metrics, compute_classification_metrics
             metric = compute_classification_metrics if panel["task_kind"] == "classification" else compute_regression_metrics
             row.update(metric(evaluation.arrays["y_holdout"], answer["holdout_prediction"], y_train))

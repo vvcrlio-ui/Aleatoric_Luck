@@ -31,6 +31,7 @@ execution:
   workflow: base_then_sl
   barrier_scope: submission_plan
   protocol_version: 2
+  verification_schedule: final_only
   phase_round_limits: {base: 2, sl: 1}
   sl_resources:
     worker_cap: 2
@@ -79,11 +80,31 @@ explicitly to combine a different subset; each subset needs its own variant ID.
 available as a control. SL4 and SL8 remain separately named variants; results
 from different variants are never pooled.
 
-The controller completes every base task across the complete submission plan,
-verifies sealed cache coverage, writes `base-verified.json` and a read-only
-`base-records.sqlite`, then creates the SL queue. SL workers only read verified
-predictions, fit the combiner and score. Required missing columns cause a failure
-or an explicitly frozen variant skip. They cannot trigger base training.
+The controller completes every base task across the submission plan. With the
+frozen `execution.verification_schedule: final_only` setting, it builds a
+partitioned read-only task-to-reference index and writes `base-input-ready.json`.
+This receipt certifies index readiness, not a completed data audit. Index workers
+scan accepted journal metadata without decoding prediction arrays or copying
+full score rows into the index. Completed chunks can be reused after interruption.
+Stopped writers must still be sealed; repairing an interrupted writer can require
+additional reads before indexing.
+
+SL then reads and verifies each required record, checks exact sample/fold/order
+alignment, fits only the combiner, and scores. Base holdout and OOF predictions
+for all eight models, including OLS, remain stored. Required missing columns
+cause a failure or an explicitly frozen variant skip, never base training.
+After SL, distributed verification checks every accepted base and SL record,
+global unique-key coverage and sample maps, then publishes `base-verified.json`,
+the final CSV and `verified.json`. The CSV hash is computed while publishing.
+Indexing adds no synchronous per-result index write or new RPC to the producer.
+
+Omitting `verification_schedule` retains the historical `before_sl` behavior:
+the base audit and `base-verified.json` gate SL. The schedule is part of the
+frozen contract and cannot be changed by resuming an existing experiment.
+`FFCWS/panels-mh-cache.yaml` opts future runs into `final_only`; the completed MH
+run retains its original plan and receipts. Base and SL can share their compute
+policy using `unified_compute`; [launch options](README.md#dispatcher-shards-and-initial-policy)
+include the explicit dispatcher count and initial policy file.
 
 Classification predictions are positive-class probabilities with class mappings.
 Regression uses centered NNLS with an intercept, without coefficient normalization.
@@ -163,10 +184,11 @@ training. Existing token heartbeat, byte bounds, incremental result submission,
 submission journal, deadline and bounded continuation behavior remain active.
 Cache-hit and partially resumed observations remain visible in cost reports but
 cannot price cold training batches. Exact sample-map and fold alignment is
-required before acknowledging a successful result or opening the SL barrier.
+required before acknowledging a successful result and when SL consumes inputs.
 
 Monitor `cluster-state.json`, round `control/latest.json`, `storage-admission.json`,
-`base-verified.json` and final `verified.json`. Base completion alone is not final
+`base-input-ready.json` (for deferred audits), `base-verified.json` and final
+`verified.json`. Base completion or input-index readiness alone is not final
 completion. Read phase, pipeline and variant columns when analyzing `final.csv`;
 this new result directory also contains auxiliary formal-SL base pipeline rows.
 

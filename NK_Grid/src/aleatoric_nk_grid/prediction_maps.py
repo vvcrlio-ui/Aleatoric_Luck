@@ -16,7 +16,7 @@ import numpy as np
 
 from .prediction_cache import (PredictionCacheWriter, cache_identity, read_record,
                                _atomic_json, _sync_directory)
-from .shared_queue import QueueError, digest, file_digest, file_lock
+from .shared_queue import QueueError, digest, file_lock
 
 GROUPS = {'training': ('train_ids', 'train_positions', 'y_train', 'oof_fold'),
           'evaluation': ('holdout_ids', 'holdout_positions', 'y_holdout'),
@@ -45,7 +45,7 @@ def prepare_maps(plan, *, repo_root, session_factory=None):
     with file_lock(root / '.maps.lock'):
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_bytes())
-            if receipt['workflow_sha256'] != digest(contract) or file_digest(catalog) != receipt['sha256']:
+            if receipt['workflow_sha256'] != digest(contract) or not catalog.is_file():
                 raise QueueError('Shared map catalog differs from its sealed contract')
             return receipt
         temporary = root / ('maps-' + uuid.uuid4().hex + '.sqlite.tmp')
@@ -94,7 +94,7 @@ def prepare_maps(plan, *, repo_root, session_factory=None):
             os.fsync(handle.fileno())
         os.replace(temporary, catalog); _sync_directory(root)
         receipt = {'format': 'plan-sample-maps-v1', 'workflow_sha256': digest(contract),
-                   'sha256': file_digest(catalog), 'maps': count, 'selectors': selectors}
+                   'integrity': 'record-sha256-v1', 'maps': count, 'selectors': selectors}
         _atomic_json(receipt_path, receipt)
         return receipt
 
@@ -105,9 +105,8 @@ class SharedMaps:
         receipt = json.loads((self.root / 'maps-ready.json').read_bytes())
         if receipt['workflow_sha256'] != digest(contract):
             raise QueueError('Shared maps belong to another submission')
-        # Immutable catalog: verify once on open, not once per task.
-        if file_digest(self.root / 'maps.sqlite') != receipt['sha256']:
-            raise QueueError('Shared map catalog checksum changed')
+        # The catalog locates records; each used map is checked against the
+        # actual sample arrays and its content identity below. No whole-DB hash.
         self.db = sqlite3.connect((self.root / 'maps.sqlite').resolve().as_uri() + '?mode=ro&immutable=1',
                                  uri=True, check_same_thread=False)
         self.entries = OrderedDict(); self.bytes = 0; self.max_bytes = max_bytes

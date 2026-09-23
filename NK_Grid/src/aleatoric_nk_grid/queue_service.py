@@ -7,12 +7,14 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from contextlib import contextmanager
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
 import math
 import os
 import random
+import re
 import socket
 import ssl
 import sys
@@ -22,6 +24,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+
+from .protocol_metrics import ProtocolMetrics
 
 from .shared_queue import (Dispatcher, HEARTBEAT_SECONDS, LeaseLostError, MAX_BATCH_TASKS,
                            MAX_SUBMISSIONS, QueueError, TARGET_BATCH_SECONDS, atomic_json,
@@ -41,17 +45,60 @@ class SafeBoundaryDrain(BaseException):
 
 
 class Client:
-    def __init__(self, url, token, queue_id, *, ca_file=None, timeout=30):
+    def __init__(self, url, token, queue_id, *, ca_file=None, timeout=30, keepalive=False, metrics=None):
         self.url = url.rstrip("/"); self.token = token; self.queue_id = queue_id
         self.context = ssl.create_default_context(cafile=ca_file) if ca_file else None
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Request timeout must be positive and finite")
         self.timeout = timeout
+        self.metrics = metrics or ProtocolMetrics()
+        self.keepalive = bool(keepalive)
+        self.relay = None
+        self.node_relay = None
+        self.transport = None
+        if keepalive or self.metrics.enabled:
+            from .queue_transport import PooledTransport
+            self.transport = PooledTransport(self.url, context=self.context, timeout=timeout,
+                metrics=self.metrics, idle_seconds=.5 if keepalive else 0.)
+
+    def close(self):
+        if self.relay is not None:
+            self.relay.close()
+        if self.node_relay is not None:
+            self.node_relay.close()
+        if self.transport is not None:
+            self.transport.close()
 
     def call(self, operation, **arguments):
+        with self.metrics.span('rpc_' + operation):
+            try:
+                if operation == 'heartbeat_batch' and self.relay is not None:
+                    return self.relay.call(arguments)
+                return self._call(operation, **arguments)
+            except BaseException:
+                self.metrics.add('rpc_error_' + operation)
+                raise
+
+    def _call(self, operation, **arguments):
         raw = canonical({"queue_id": self.queue_id, **arguments})
         if len(raw) > 1024**2:
             raise PayloadTooLargeError("Request exceeds the 1 MiB limit")
+        if self.transport is not None:
+            status, body = self.transport.request(operation, raw,
+                {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'})
+            if status == 200:
+                return json.loads(body)
+            if status == 429 or status >= 500:
+                raise TransientServiceError('Dispatcher temporarily unavailable')
+            try:
+                error = json.loads(body)
+            except ValueError:
+                error = {}
+            if status == 409 and error.get('code') == 'lease_lost':
+                raise LeaseLostError(error.get('error', 'Lease lost'))
+            if status == 413:
+                raise PayloadTooLargeError(error.get('error', 'Payload too large'))
+            raise QueueError(body.decode(errors='replace'))
         request = urllib.request.Request(self.url + "/" + operation,
             data=raw,
             headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
@@ -73,6 +120,115 @@ class Client:
             if exc.code == 413 and isinstance(error, dict) and error.get("code") == "payload_too_large":
                 raise PayloadTooLargeError(error.get("error", "Payload too large")) from exc
             raise QueueError(raw) from exc
+
+
+class _LightHeaders:
+    """What do_POST reads from the request headers: a case-insensitive, first-value-wins ``get``."""
+    __slots__ = ("_values",)
+
+    def __init__(self, values):
+        self._values = values
+
+    def get(self, name, default=None):
+        return self._values.get(name.lower(), default)
+
+    def __getitem__(self, name):
+        return self._values[name.lower()]
+
+    def __contains__(self, name):
+        return name.lower() in self._values
+
+
+_HEADER_LINE = re.compile(rb"[\x21-\x39\x3b-\x7e]*:")
+
+
+def read_light_headers(rfile):
+    """Read HTTP headers without the email parser (the slowest part of ``BaseHTTPRequestHandler``).
+
+    Follows what ``http.client.parse_headers`` does: the same line and count limits (every line counts,
+    including folded ones and the terminator) and the same exceptions; a line that is not a header stops
+    the interpretation of what follows; the first value of a repeated header wins; values are stripped as
+    the email compat32 policy does (leading blanks, trailing line break), folded lines are appended.
+    """
+    values, last, count, stopped = {}, None, 0, False
+    while True:
+        line = rfile.readline(http.client._MAXLINE + 1)
+        if len(line) > http.client._MAXLINE:
+            raise http.client.LineTooLong("header line")
+        count += 1
+        if count > http.client._MAXHEADERS:
+            raise http.client.HTTPException("got more than %d headers" % http.client._MAXHEADERS)
+        if line in (b"\r\n", b"\n", b""):
+            break
+        if stopped:
+            continue
+        if line[:1] in (b" ", b"\t"):                    # obsolete line folding: the value continues
+            if last is not None:
+                values[last] += line.decode("iso-8859-1")
+            continue
+        if not _HEADER_LINE.match(line):
+            stopped = True
+            continue
+        name, _, value = line.partition(b":")
+        key = name.decode("iso-8859-1").lower()
+        last = key if key not in values else None
+        if last is not None:
+            values[key] = value.decode("iso-8859-1").lstrip(" \t")
+    return _LightHeaders({key: value.rstrip("\r\n") for key, value in values.items()})
+
+
+_stock_parse_headers = http.client.parse_headers
+
+
+def _parse_headers(fp, _class=http.client.HTTPMessage):
+    if _class is _LightHeaders:
+        return read_light_headers(fp)
+    return _stock_parse_headers(fp, _class=_class)
+
+
+def install_light_headers():
+    """Let handlers that set ``MessageClass = _LightHeaders`` skip the email parser; every other caller is untouched."""
+    if http.client.parse_headers is not _parse_headers:
+        http.client.parse_headers = _parse_headers
+
+
+_date_cache = [0, ""]
+
+
+def _http_date():
+    """The Date header, formatted once per second instead of once per response."""
+    now = int(time.time())
+    if _date_cache[0] != now:
+        from email.utils import formatdate
+        _date_cache[1] = formatdate(now, usegmt=True)
+        _date_cache[0] = now
+    return _date_cache[1]
+
+
+def raise_nofile_limit(requested, *, fd_reserve=64, headroom=192):
+    """Lift the soft descriptor limit so `requested` connections fit; never lower it.
+
+    Returns the soft limit in force afterwards, or None where the limit does not
+    exist (Windows). The hard limit is never exceeded; if it is too low the
+    connection budget is simply clamped by `connection_budget`, as before.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        return soft
+    wanted = int(requested) + fd_reserve + headroom
+    if soft >= wanted:
+        return soft
+    target = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    if target > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (ValueError, OSError):
+            return soft
+    return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
 
 
 def connection_budget(requested, *, fd_reserve=64):
@@ -103,28 +259,67 @@ def retry_delay(failures, base=2., cap=30.):
 
 def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None,
                 threaded_tls_handshake=False, max_connections=128, request_timeout=10.,
-                max_submissions=MAX_SUBMISSIONS):
+                max_submissions=MAX_SUBMISSIONS, keepalive=False, keepalive_idle_seconds=1., fast_http=False):
     # Keep threaded_tls_handshake for existing launchers; all TLS now uses the
     # bounded request threads, never a handshake on the single accept thread.
     if len(token) < 32:
         raise ValueError("Use a private random token of at least 32 characters")
     if not math.isfinite(request_timeout) or request_timeout <= 0:
         raise ValueError("Request timeout must be positive and finite")
+    if isinstance(keepalive_idle_seconds, bool) or not isinstance(keepalive_idle_seconds, (int, float)) \
+            or not math.isfinite(keepalive_idle_seconds) or keepalive_idle_seconds <= 0:
+        raise ValueError("keepalive_idle_seconds must be positive and finite")
     capacity = connection_budget(max_connections)
     if type(max_submissions) is not int or max_submissions < 1:
         raise ValueError("max_submissions must be a positive integer")
     submit_capacity = min(max_submissions, max(1, capacity // 2))
+    service_metrics = getattr(dispatcher, 'metrics', ProtocolMetrics())
+
+    if fast_http:
+        install_light_headers()
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1" if keepalive else "HTTP/1.0"
+
         def log_message(self, *args):
             pass  # Never log bearer tokens or payloads.
 
+        if fast_http:
+            MessageClass = _LightHeaders      # request line, Expect, Connection and error replies stay the stdlib's
+
         def reply(self, status, value):
             raw = canonical(value)
-            self.send_response(status); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+            if not fast_http:
+                self.send_response(status); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+            if status != 200:
+                self.close_connection = True
+            if not self.close_connection:
+                with self.server.metrics_lock:
+                    pressured = self.server.active_connections >= max(1, capacity // 2)
+                if pressured:
+                    # Idle keep-alives must not consume the control admission
+                    # reserve at large fleet sizes. The client honors close.
+                    self.close_connection = True
+                    service_metrics.add('keepalive_closed_for_admission')
+            if fast_http:
+                # The same bytes send_response/send_header/end_headers produce, in one write.
+                phrase = self.responses.get(status, ("", ""))[0]
+                head = ("%s %d %s\r\nServer: %s\r\nDate: %s\r\nContent-Type: application/json\r\n"
+                        "Content-Length: %d\r\nConnection: %s\r\n\r\n" % (
+                            self.protocol_version, status, phrase, self.version_string(), _http_date(), len(raw),
+                            "close" if self.close_connection else "keep-alive")).encode("latin-1", "strict")
+                self.wfile.write(head + raw); self.wfile.flush()
+            else:
+                self.send_header('Connection', 'close' if self.close_connection else 'keep-alive')
+                self.end_headers(); self.wfile.write(raw); self.wfile.flush()
+            if not self.close_connection:
+                # Release scarce admission slots while idle. One second suits thousands of
+                # per-worker connections; a node relay holds few, so it can ask for longer.
+                self.connection.settimeout(keepalive_idle_seconds)
 
         def do_POST(self):
+            self.close_connection = True  # Errors never leave unread framing on a reused connection.
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if length > 1024 * 1024:
@@ -132,11 +327,14 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
                     return
                 if length <= 0:
                     raise QueueError("Invalid request size")
+                self.connection.settimeout(request_timeout)
                 raw = self.rfile.read(length)
                 # Consume the bounded body before closing even a rejected
                 # connection, otherwise Windows can send RST instead of 401.
                 if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token):
                     self.reply(401, {"error": "Unauthorized"}); return
+                if len(raw) != length:
+                    raise QueueError("Truncated request")
                 value = json.loads(raw)
                 if value.pop("queue_id", None) != dispatcher.queue_id:
                     raise QueueError("Wrong queue identity")
@@ -145,11 +343,16 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
                            "/claim_batch": getattr(dispatcher, "claim_batch", None),
                            "/protocol": getattr(dispatcher, "protocol", None),
                            "/heartbeat_batch": getattr(dispatcher, "heartbeat_batch", None),
+                           "/heartbeat_many": getattr(dispatcher, "heartbeat_many", None),
+                           "/worker_binding": getattr(dispatcher, "worker_binding", None),
                            "/worker_fault": getattr(dispatcher, "worker_fault", None),
                            "/submit_batch": getattr(dispatcher, "submit_batch", None),
                            "/identity": lambda: {"queue_id": dispatcher.queue_id, "epoch": dispatcher.epoch}}
                 if methods.get(self.path) is None:
                     self.reply(404, {"error": "Unknown operation"}); return
+                service_metrics.add('requests_' + self.path[1:])
+                service_metrics.add('request_bytes', count=length)
+                self.close_connection = not keepalive or self.headers.get('Connection', '').lower() == 'close'
                 if self.path in ("/submit", "/submit_batch"):
                     # Do not let requests waiting on durable journal I/O occupy
                     # every connection and starve lease renewals.
@@ -218,6 +421,8 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
             try:
                 connection, address = super().get_request()
                 connection.settimeout(request_timeout)  # Includes HTTP headers.
+                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                service_metrics.add('accepted_connections')
                 with self.metrics_lock:
                     self.active_connections += 1
                     self.peak_connections = max(self.peak_connections, self.active_connections)
@@ -249,7 +454,8 @@ def make_server(dispatcher, *, token, host="127.0.0.1", port=0, tls_context=None
                 if tls_context is not None:
                     request = tls_context.wrap_socket(request, server_side=True,
                                                       do_handshake_on_connect=False)
-                    request.do_handshake()
+                    with service_metrics.span('server_tls_handshake'):
+                        request.do_handshake()
                 self.finish_request(request, address)
             except Exception:
                 self.handle_error(request, address)
@@ -442,12 +648,15 @@ def execute_batch_worker(client, worker, execute, *, spool, cached_cells=lambda:
     for compatibility tests and explicitly selected legacy callers.
     """
     if protocol_version == 2:
-        return _execute_incremental_worker(client, worker, execute, spool=spool,
-            cached_cells=cached_cells, heartbeat_seconds=heartbeat_seconds,
-            idle_seconds=idle_seconds, stop=stop, deadline_seconds=deadline_seconds,
-            deadline_epoch=deadline_epoch, recover_stale_leases=recover_stale_leases,
-            max_batch=max_batch, flush_seconds=flush_seconds, submit_bytes=submit_bytes,
-            max_buffer_bytes=max_buffer_bytes, max_spool_bytes=max_spool_bytes, fault_dir=fault_dir)
+        from .protocol_metrics import MetricsPublisher
+        path = Path(spool).parent / 'protocol-metrics' / (digest(worker) + '.json')
+        with MetricsPublisher(getattr(client, 'metrics', ProtocolMetrics()), path):
+            return _execute_incremental_worker(client, worker, execute, spool=spool,
+                cached_cells=cached_cells, heartbeat_seconds=heartbeat_seconds,
+                idle_seconds=idle_seconds, stop=stop, deadline_seconds=deadline_seconds,
+                deadline_epoch=deadline_epoch, recover_stale_leases=recover_stale_leases,
+                max_batch=max_batch, flush_seconds=flush_seconds, submit_bytes=submit_bytes,
+                max_buffer_bytes=max_buffer_bytes, max_spool_bytes=max_spool_bytes, fault_dir=fault_dir)
     if protocol_version != 1:
         raise QueueError("Unsupported worker protocol version")
     if deadline_epoch is not None:
@@ -612,6 +821,8 @@ class _ChunkSender:
         self.max_buffer_bytes = max_buffer_bytes; self.max_spool_bytes = max_spool_bytes
         self.idle_seconds = idle_seconds; self.recover_stale_leases = recover_stale_leases
         self.cv = threading.Condition(); self.pending = deque()
+        self.phase = "buffering"; self.wait_started = None; self.wait_seconds = {}
+        self.measure_wait = bool(getattr(getattr(client, "metrics", None), "enabled", False))
         self.pending_bytes = self.inflight_bytes = 0
         self.envelope_bytes = len(canonical(_batch_request(client.queue_id, worker, token, [], [], "0" * 32)))
         self.closed = False; self.force = False; self.error = None; self.receipt = None
@@ -650,10 +861,24 @@ class _ChunkSender:
                 self.error = PayloadTooLargeError("One result exceeds the request limit")
             self.cv.notify_all()
 
+    def set_phase(self, phase):
+        if not self.measure_wait:
+            return
+        with self.cv:
+            now = time.monotonic()
+            if self.wait_started is not None:
+                self.wait_seconds[self.phase] = self.wait_seconds.get(self.phase, 0.) + now - self.wait_started
+                self.wait_started = now
+            self.phase = phase
+
     def finish(self):
         with self.cv:
+            self.wait_started = time.monotonic() if self.measure_wait else None
             self.closed = True; self.cv.notify_all()
         self.thread.join()
+        self.set_phase('finished')
+        with self.cv:
+            self.wait_started = None
 
     def status(self):
         with self.cv:
@@ -684,8 +909,10 @@ class _ChunkSender:
                 return
             try:
                 started = time.monotonic()
+                self.set_phase("confirmation")
                 self.client.call("submit_batch", **{k: v for k, v in value.items() if k != "queue_id"})
                 self.submit_seconds += time.monotonic() - started
+                self.set_phase("receipt_cleanup")
                 path.unlink(); sync_directory(self.root)
                 self.accepted += len(value["task_ids"]); self.chunks += 1
                 return
@@ -694,6 +921,7 @@ class _ChunkSender:
                     self.fail(exc); return
                 delay = min(retry_delay(failures, self.idle_seconds),
                             max(0., self.until - time.monotonic()))
+                self.set_phase("retry_backoff")
                 with self.cv:
                     if self.error is None:
                         self.cv.wait(delay)
@@ -742,6 +970,7 @@ class _ChunkSender:
                 if on_disk + size + 1 > self.max_spool_bytes:
                     self.fail(QueueError("Result spool byte limit reached"))
                 started = time.monotonic()
+                self.set_phase("spool_persistence")
                 atomic_json(path, value)
                 self.spool_seconds += time.monotonic() - started
                 self.peak_spool_bytes = max(self.peak_spool_bytes, on_disk + size + 1)
@@ -759,6 +988,17 @@ class _ChunkSender:
             self.fail(exc)
 
 
+def effective_flush_seconds(policy, worker_value=None):
+    """How long finished results may wait before being submitted.
+
+    Without an explicit worker value the server policy decides (default 10 s, as
+    before). This used to be capped at a hard-coded 10 s, so raising the policy
+    had no effect; an explicit worker value can still only shorten it.
+    """
+    server = float(policy["flush_seconds"])
+    return min(server, float(worker_value) if worker_value is not None else server)
+
+
 def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
                                 heartbeat_seconds, idle_seconds, stop, deadline_seconds,
                                 deadline_epoch, recover_stale_leases, max_batch,
@@ -774,12 +1014,19 @@ def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
     accepted = recovered = chunks = 0
     peak_buffer = peak_spool = 0
     spool_seconds = submit_seconds = 0.
+    metrics = getattr(client, "metrics", ProtocolMetrics())
+
+    def pause(seconds, reason='producer_retry_backoff'):
+        with metrics.span(reason):
+            time.sleep(seconds)
 
     def report(state, **extra):
         value = dict(state=state, accepted=accepted, protocol_version=2,
                     chunks=chunks, recovered_leases=recovered,
                     peak_buffer_bytes=peak_buffer, peak_spool_bytes=peak_spool,
                     spool_seconds=spool_seconds, submit_seconds=submit_seconds, **extra)
+        if metrics.enabled:
+            value["protocol_metrics"] = metrics.snapshot()
         if state in {"payload_too_large", "spool_limit", "submission_rejected"}:
             # A terminal slot error must drain the whole allocation; otherwise
             # thousands of healthy idle slots can keep billing for this lease.
@@ -811,10 +1058,13 @@ def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
         except (OSError, urllib.error.URLError):
             if time.monotonic() >= until:
                 return report("unavailable")
-            time.sleep(min(retry_delay(failures, idle_seconds), max(0., until - time.monotonic())))
+            pause(min(retry_delay(failures, idle_seconds), max(0., until - time.monotonic())))
             failures += 1
     if policy.get("version") != 2:
         raise QueueError("Dispatcher did not acknowledge worker protocol 2")
+    if getattr(client, 'relay_options', None) and client.relay is None and policy.get('heartbeat_many'):
+        from .node_heartbeat import HeartbeatRelay
+        client.relay = HeartbeatRelay(client, **client.relay_options)
     fault_path = root / "worker-fault"
     if fault_path.exists():
         previous_fault = json.loads(fault_path.read_bytes())
@@ -826,8 +1076,7 @@ def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
     soft_bytes = min(512 * 1024, int(policy["submit_bytes"]),
                      int(submit_bytes) if submit_bytes is not None else 512 * 1024)
     cadence = min(float(policy["status_seconds"]), float(heartbeat_seconds))
-    flush = min(float(policy["flush_seconds"]),
-                float(flush_seconds) if flush_seconds is not None else 10.)
+    flush = effective_flush_seconds(policy, flush_seconds)
     count = min(int(policy["max_batch"]), max_batch)
     if (type(max_batch) is not int or count < 1 or not 0 < soft_bytes <= hard_bytes or
             not math.isfinite(cadence) or cadence <= 0 or not math.isfinite(flush) or flush <= 0 or
@@ -849,6 +1098,8 @@ def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
         peak_buffer = max(peak_buffer, sender.peak_buffer_bytes)
         peak_spool = max(peak_spool, sender.peak_spool_bytes)
         spool_seconds += sender.spool_seconds; submit_seconds += sender.submit_seconds
+        for name, seconds in sender.wait_seconds.items():
+            metrics.add("producer_finish_" + name, seconds)
 
     def error_report(sender):
         exc = sender.error
@@ -909,18 +1160,19 @@ def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
         if on_disk + max_buffer_bytes + hard_bytes > max_spool_bytes:
             return report("spool_limit", error="Result spool cannot reserve one bounded batch")
         try:
-            lease = client.call("claim_batch", worker=worker, count=count,
-                remaining_seconds=max(0., until - time.monotonic()), cached_cells=cached_cells(),
-                status={"state": "idle", "last_completed_at": last_completed})
+            with metrics.span('producer_claim'):
+                lease = client.call("claim_batch", worker=worker, count=count,
+                    remaining_seconds=max(0., until - time.monotonic()), cached_cells=cached_cells(),
+                    status={"state": "idle", "last_completed_at": last_completed})
         except (OSError, urllib.error.URLError):
-            time.sleep(min(retry_delay(failures, idle_seconds), max(0., until - time.monotonic())))
+            pause(min(retry_delay(failures, idle_seconds), max(0., until - time.monotonic())))
             failures += 1; continue
         failures = 0
         if lease["state"] in {"complete", "blocked", "paused", "draining", "drained"}:
             return report("drained" if lease["state"] in {"draining", "drained"} else lease["state"])
         if lease["state"] == "wait":
             delay = max(idle_seconds, min(30., float(lease.get("retry_after_seconds", 5.))))
-            time.sleep(min(delay * random.uniform(.8, 1.2), max(0., until - time.monotonic())))
+            pause(min(delay * random.uniform(.8, 1.2), max(0., until - time.monotonic())), "producer_no_task_wait")
             continue
         tasks = lease["tasks"]
         sender = sender_for(lease["token"])
@@ -959,7 +1211,9 @@ def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
         try:
             for task in tasks:
                 stopping = lambda: drain.is_set() or stop() or time.monotonic() >= until
-                if not sender.capacity(stopping):
+                with metrics.span("producer_buffer_admission"):
+                    has_capacity = sender.capacity(stopping)
+                if not has_capacity:
                     break
                 with state_lock:
                     current.update(task_id=task["id"], started=time.monotonic(), remaining=current["remaining"] - 1)
@@ -967,7 +1221,9 @@ def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
                     heartbeat_thread.start(); heartbeat_started = True
                 started = time.monotonic()
                 try:
-                    result = execute(task["task"])
+                    with metrics.span("producer_execute"):
+                        result = execute(task["task"])
+                    metrics.add("computed_records")
                 except SafeBoundaryDrain:
                     drain.set()
                     break
@@ -982,7 +1238,8 @@ def _execute_incremental_worker(client, worker, execute, *, spool, cached_cells,
             sender.finish()
             done.set()
             if heartbeat_started:
-                heartbeat_thread.join()
+                with metrics.span('producer_heartbeat_join'):
+                    heartbeat_thread.join()
         sender_report(sender)
         if sender.error:
             if recover_stale_leases and isinstance(sender.error, LeaseLostError):
