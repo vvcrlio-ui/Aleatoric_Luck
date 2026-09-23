@@ -1,3 +1,8 @@
+# One catalog for all 18 FFC experiments. Select one with --panel.
+# All entries inherit the cache/SL7 workflow below. The eight independent base
+# recipes are unchanged; SL7 combines their cached predictions except OLS.
+# Fresh runs use the shared single-model Slurm entry. Existing frozen runs keep
+# their own configuration and code.
 model_params: model_params.yaml
 preset: dev
 experiment_id: ffcws-aleatoric-v1
@@ -19,6 +24,25 @@ panels:
       - shallow_neural_network
       - extra_trees
       - super_learner
+    prediction_cache:
+      mode: holdout_oof
+      base_library: standalone8-v1
+      oof_folds: 5
+      # Keep all eight independent columns; do not train the separate SL4 control.
+      store_reported_sl_holdout: false
+    execution:
+      workflow: base_then_sl
+      barrier_scope: submission_plan
+      protocol_version: 2
+      verification_schedule: final_only
+      phase_round_limits: {base: 2, sl: 1}
+      # Fallback bounds when no unified operational compute policy is selected.
+      # The Discoverer policy supplies common base/SL resource limits instead.
+      sl_resources:
+        worker_cap: 24
+        io_concurrency: 8
+        memory: 4G
+        time_limit: '04:00:00'
     out: outputs/nk_grid_ffc_median_mode_gpa.csv
 
   - <<: *ffc_panel

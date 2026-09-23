@@ -1,7 +1,9 @@
 # FFC prediction cache and the two-stage controller
 
-New runs can opt into lossless float64 OOF/full prediction persistence. Existing
-configurations remain disabled, and existing frozen runs must retain their code.
+`FFCWS/panels.yaml` enables lossless float64 OOF/holdout prediction persistence
+for all 18 FFC panels. Select one with `--panel`; the shared Slurm launcher uses
+this manifest by default. Configurations without cache options remain disabled,
+and existing frozen runs must retain their code.
 The scientific defaults in `model_params.yaml` are unchanged.
 
 The batch entry pins `PYTHONPATH` to the checkout containing its scheduler entry.
@@ -101,8 +103,9 @@ Indexing adds no synchronous per-result index write or new RPC to the producer.
 Omitting `verification_schedule` retains the historical `before_sl` behavior:
 the base audit and `base-verified.json` gate SL. The schedule is part of the
 frozen contract and cannot be changed by resuming an existing experiment.
-`FFCWS/panels-mh-cache.yaml` opts future runs into `final_only`; the completed MH
-run retains its original plan and receipts. Base and SL can share their compute
+`FFCWS/panels.yaml` opts future runs of all 18 panels into `final_only`; the
+completed MH run retains its original plan and receipts. There is no separate
+MH-only manifest. Base and SL can share their compute
 policy using `unified_compute`; [launch options](README.md#dispatcher-shards-and-initial-policy)
 include the explicit dispatcher count and initial policy file.
 

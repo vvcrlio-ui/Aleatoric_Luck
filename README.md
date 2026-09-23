@@ -30,17 +30,24 @@ FFCWS retains the official train/test split and uses only the official training 
 
 ## Quick start
 
-To run the **BMRC non-GPA suite**, clone the `SMR&FFC` branch and run all fifteen panels with one command after making the raw FFC files available:
+`FFCWS/panels.yaml` contains all **18 FFC experiments**: six outcomes under three
+encodings. Select exactly one with `--panel`, for example
+`ffc_median_mode_gpa` or `ffc_tree_ordinal_materialHardship`. This is the default
+manifest, so the `--manifest FFCWS/panels.yaml` option can be omitted. A launch
+does not run the other 17 entries.
 
-```bash
-git clone --branch 'SMR&FFC' --single-branch https://github.com/OxfordDemSci/aleatoric_luck.git
-cd aleatoric_luck
-bash run.sh slurm --profile bmrc --suite ffc_non_gpa --preset timing_full \
-  --account YOUR_PROJECT_ACCOUNT --ffc-data-dir /path/to/FFC \
-  --resources FFCWS/outputs/bmrc-resources.json
-```
+Every FFC panel now saves the eight independent models' holdout and OOF
+predictions, fits SL7 from the seven cached columns other than OLS, and performs
+one global audit after SL. The controller runs base → reference index → SL →
+distributed final verification and CSV publication automatically. SL7 is a
+different recipe from the historical four-model Super Learner; the eight
+independent base recipes retain their existing definitions.
 
-The raw directory contains `background.dta`, `train.csv`, and `test.csv`. Environment installation and all data preparation run on compute nodes. Checkpoints are kept by default. `timing_full` and `production` reuse the same saved allocation; their default round limits are 24 hours and 10 days respectively. See the [BMRC suite guide](launch/BMRC.md) for production, keep/delete, status, resume, and native cluster validation steps. The single-panel commands below remain available.
+New FFC cache experiments use the shared Slurm entry. The examples below use
+Discoverer; the old local and BMRC suite/raw-data entries do not support this
+cache workflow. The [BMRC suite guide](launch/BMRC.md) remains available for
+historical runs using their original checkout. Existing frozen runs and their
+results retain their original configuration.
 
 The shared entry point is `run.sh`. Each stage starts with one command. The recommended sequence is:
 
@@ -58,26 +65,40 @@ Use dev for a quick trial and timing_full to assess resource requirements across
 
 ### 1. dry-run: preview the configuration
 
-The examples below run the FFC GPA panel locally on Linux/WSL. Run them from the repository root:
+Run these examples from a clean committed checkout on Discoverer, replacing
+`YOUR_PROJECT_ACCOUNT` with your authorized account:
 
 ```bash
-bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset timing_full --dry-run
+bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
+  --panel ffc_median_mode_gpa --preset timing_full \
+  --scheduler-policy launch/policies/discoverer-cache.json \
+  --dispatcher-shards 4 --dry-run
 ```
 
 `--dry-run` displays the launch configuration. Training starts in the next stage.
+The policy requests common base/SL resources, with up to 300 compute nodes;
+actual allocations depend on the remaining tasks and live admission. Select
+resource bounds appropriate to the run. A custom policy can live outside the
+checkout and be passed with `--scheduler-policy /absolute/path/my-policy.json`.
 
 ### 2. dev or timing_full: run a trial
 
 Use dev to check the path from input data through training to result output:
 
 ```bash
-bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset dev --checkpoints keep --output FFCWS/outputs/ffc-gpa-dev
+bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
+  --panel ffc_median_mode_gpa --preset dev \
+  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
+  --checkpoints keep --output FFCWS/outputs/ffc-gpa-dev
 ```
 
 Use timing_full to check memory use, runtime, convergence, and failures across the full N/K range:
 
 ```bash
-bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset timing_full --checkpoints keep --output FFCWS/outputs/ffc-gpa-timing
+bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
+  --panel ffc_median_mode_gpa --preset timing_full \
+  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
+  --checkpoints keep --output FFCWS/outputs/ffc-gpa-timing
 ```
 
 | Trial preset | Default size | Purpose |
@@ -92,19 +113,24 @@ Both use the panel's declared model list. timing_full assesses resource requirem
 Once trial results meet expectations, start the repeated experiment in a new directory:
 
 ```bash
-bash run.sh local --manifest FFCWS/panels.yaml --panel ffc_median_mode_gpa --preset production --allow-large-run --checkpoints keep --output FFCWS/outputs/ffc-gpa-production
+bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
+  --panel ffc_median_mode_gpa --preset production --allow-large-run \
+  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
+  --checkpoints keep --output FFCWS/outputs/ffc-gpa-production
 ```
 
 production defaults to 100 seeds × 50 draws on the full 20×20 grid. `--allow-large-run` enables this scale. Each stage runs independently and saves its own results.
 
 ### Choosing an execution environment
 
-The workflow applies to local and cluster execution. Use the same environment prefix across stages, keeping the panel and preset arguments:
+Use the same supported environment prefix across stages, keeping the panel and
+preset arguments. Local execution supports manifests without required caches,
+such as SMR; the unified FFC cache catalog requires the shared Slurm scheduler.
 
 | Environment | Command prefix |
 |---|---|
-| Local Linux/WSL | `bash run.sh local` |
-| BMRC | `bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT` |
+| Local Linux/WSL, non-cache manifests | `bash run.sh local` |
+| BMRC prepared-data shared entry; cache site validation pending | `bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT` |
 | Discoverer | `bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT` |
 
 Replace `YOUR_ACCOUNT` with your account. Prepared-data Slurm launches share the single-model queue and per-round continuation; BMRC suite/raw-data launches use the separate suite scheduler. The shared entry accepts `--dispatcher-shards 4` for both base and SL, plus `--scheduler-policy PATH.json` for the initial operational policy. Other Slurm clusters use `bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION --constraint none --qos YOUR_QOS`, with a compatible Python environment and site-appropriate resource options. Slurm submission uses a clean, committed checkout. See [cluster requirements, shard options and site limits](launch/README.md).

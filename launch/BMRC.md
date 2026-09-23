@@ -1,4 +1,13 @@
-# BMRC: fifteen non-GPA panels in one shared pool
+# Historical BMRC suite: fifteen non-GPA panels in one shared pool
+
+The current `FFCWS/panels.yaml` declares cache-only SL7 and final-only auditing
+for all 18 FFC panels. This suite/raw-data scheduler does not implement that
+workflow and rejects required cache configurations. New cache experiments use
+the prepared-data shared Slurm entry with `--panel`; BMRC quota and CPU-binding
+validation is still required. See the [current launch guide](README.md).
+
+The commands below describe the historical suite and require its original
+compatible checkout and manifest. Existing runs retain their frozen code.
 
 From a clean clone of OxfordDemSci/aleatoric_luck, branch `SMR&FFC`, run:
 

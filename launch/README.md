@@ -2,7 +2,7 @@
 
 The launch layer turns a selected panel, model list, and experiment size into a run. It prepares the environment, checks inputs, schedules computation, and records progress. The shared engine handles preprocessing and model training.
 
-The [BMRC suite entry](BMRC.md) adds `--suite ffc_non_gpa`: fifteen panels share one dispatcher and one fixed worker allocation. Its saved resource file, compact cell-difference recovery, directory resume, and status command are documented in that guide. The single-panel and historical recovery interfaces described here retain their own protocols.
+The [historical BMRC suite entry](BMRC.md) adds `--suite ffc_non_gpa`: fifteen panels share one dispatcher and one fixed worker allocation. It retains its own protocol and does not support the cache workflow now declared in `FFCWS/panels.yaml`. New FFC cache runs select one of the 18 panels through the shared single-model Slurm entry; historical suite recovery uses its original checkout.
 
 Start with a dry-run preview, then use dev for a small trial or timing_full to check out-of-memory (OOM) errors, runtime, and other execution issues across the full N/K range. Use production for the formal repeated experiment. Each stage is started explicitly.
 
@@ -10,7 +10,14 @@ Start with a dry-run preview, then use dev for a small trial or timing_full to c
 
 [experiment.py](experiment.py) reads the selected panel and determines the outcome, models, and N/K design. Once inputs are ready, the code checks the design against the available sample and source counts. Preview mode displays the launch request without reading analysis tables or starting training.
 
-Local runs call the engine directly. Prepared-data Slurm runs use the shared single-model scheduler, including BMRC, Discoverer, and explicitly configured other clusters. BMRC suite/raw-data launches use the separate scheduler described above. Each new experiment uses a separate output directory.
+`FFCWS/panels.yaml` is the single catalog for all 18 FFC panels and is the launch
+default, so `--manifest FFCWS/panels.yaml` may be omitted. `--panel` chooses one
+entry; listing 18 entries never submits all 18. Every FFC entry inherits complete
+holdout/OOF persistence, cache-only SL7, and `final_only` verification. The former
+MH-only manifest has been removed. Scientific task definitions and completed
+results in existing frozen runs are not migrated.
+
+Local runs call the engine directly and reject required prediction-cache configurations; this remains available for non-cache manifests such as SMR. Prepared-data Slurm runs use the shared single-model scheduler, including BMRC, Discoverer, and explicitly configured other clusters. BMRC suite/raw-data launches use the separate scheduler described above. Each new experiment uses a separate output directory.
 
 ## Preparing the environment and data
 
@@ -56,7 +63,7 @@ for base/SL, and distributed final verification:
 
 ```bash
 bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
-  --manifest FFCWS/panels-mh-cache.yaml --panel ffc_tree_ordinal_materialHardship \
+  --manifest FFCWS/panels.yaml --panel ffc_tree_ordinal_materialHardship \
   --preset timing_full --scheduler-policy launch/policies/discoverer-cache.json \
   --dispatcher-shards 4 --dry-run
 ```
