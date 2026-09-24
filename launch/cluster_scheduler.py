@@ -297,22 +297,39 @@ def scheduler(spec):
     return Slurm(spec['cluster']['account'], spec['cluster'].get('qos'))
 
 
-def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, policy, resource_resolver):
-    """Submit a separately admitted verification allocation, never a local pool."""
+def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, policy, resource_resolver,
+                                 *, wait=True, node_cap=None, dependency=None):
+    """Submit a separately admitted verification allocation, never a local pool.
+
+    ``wait=False`` submits no successor: an overlapped base audit is joined by the
+    controller that the concurrent SL allocation already wakes. ``node_cap`` bounds
+    it to the nodes that allocation leaves under the run's total cap.
+    """
     from copy import deepcopy
     from aleatoric_nk_grid import parallel_verification as verification
     from aleatoric_nk_grid import prediction_workflow as phases
     from aleatoric_nk_grid.shared_queue import digest
     state = journal.state; root = Path(plan['launch']['output'])
-    receipt = root / {'base': 'base-verified.json', 'index': 'base-input-ready.json', 'final': 'verified.json'}[mode]
+    receipt = root / {'base': 'base-verified.json', 'index': 'base-input-ready.json', 'final': 'verified.json',
+                      'final-base': 'parallel-verification/final-base/complete.json'}[mode]
     if receipt.exists():
         if mode == 'base': phases.verify_base_receipt(plan)
         elif mode == 'index': phases.verify_base_input_receipt(plan)
-        else: phases.finalize(plan, base_rounds, sl_rounds)
+        elif mode == 'final': phases.finalize(plan, base_rounds, sl_rounds)
         return True
     directory = root / 'parallel-verification' / mode
+    options = {}
+    if mode == 'final':
+        options['sl_block_bytes'] = policy['sl_verification_block_bytes']
+        existing = directory / 'manifest.json'
+        joined = root / 'parallel-verification' / 'final-base'
+        if existing.exists():   # a prepared final keeps whatever it joined
+            options['sl_block_bytes'] = read(existing)['identity'].get('sl_block_bytes')
+            options['base_part'] = read(existing)['identity'].get('base_part', {}).get('directory')
+        elif (joined / 'complete.json').exists() and not any(joined.glob('failure-*.json')):
+            options['base_part'] = joined
     manifest = verification.prepare(plan, mode, base_rounds, sl_rounds, directory,
-                                    block_bytes=policy['verification_block_bytes'])
+                                    block_bytes=policy['verification_block_bytes'], **options)
     failures = list(directory.glob('failure-*.json'))
     if failures:
         raise ValueError('Parallel verification failed: ' + str(read(failures[0])))
@@ -329,7 +346,8 @@ def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, po
         options = phase_allocation_options(policy, 'base')
         options.update(worker_cap=min(max(1, pending), options['worker_cap'] or max(1, pending)),
                        sizing_mode='capacity', target_round_seconds=None,
-                       max_nodes=state['max_nodes'] - 2, validation_processes=0, dispatcher_shards=1,
+                       max_nodes=min(state['max_nodes'] - 2, node_cap if node_cap is not None else state['max_nodes']),
+                       validation_processes=0, dispatcher_shards=1,
                        cpu_hours_remaining=cpu_budget(state, policy),
                        control_jobs_reserved=sum(k.startswith(('C', 'G')) for k in state['jobs']) + 2)
         parameters = inspect.signature(resource_resolver).parameters
@@ -355,10 +373,11 @@ def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, po
             'manifest_sha256': digest(manifest), 'policy': policy}
         history.append(prepared); journal.save()
     job = journal.submit(prepared['label'], batch_args(plan['launch'], 'check', root / 'plan.json',
-                           allocation=prepared['allocation'], policy=prepared['policy']))
+                           dependency=dependency, allocation=prepared['allocation'], policy=prepared['policy']))
     prepared['job_id'] = job; journal.save()
-    journal.submit('Gwait-' + job, batch_args(plan['launch'], 'control', root / 'plan.json',
-                                            dependency=job, policy=policy))
+    if wait:
+        journal.submit('Gwait-' + job, batch_args(plan['launch'], 'control', root / 'plan.json',
+                                                dependency=job, policy=policy))
     return False
 
 
@@ -441,11 +460,14 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         for label in list(state['jobs']):
             if label.startswith(('W', 'V')):
                 ended, job = terminal(journal, label)
-                if not ended: active.append(job)
+                if not ended: active.append((label, job))
         if active:
-            if len(active) != 1: raise ValueError('Overlapping worker allocations')
-            label = 'Gwait-' + active[0]
-            journal.submit(label, batch_args(spec, 'control', plan_path, dependency=active[0], policy=policy))
+            # Only an overlapped base audit may run beside another allocation.
+            overlapped = {r['label'] for r in state.get('verification_rounds', []) if r['mode'] == 'final-base'}
+            if len([l for l, _ in active if l not in overlapped]) > 1 or len([l for l, _ in active if l in overlapped]) > 1:
+                raise ValueError('Overlapping worker allocations')
+            for _, job in active:
+                journal.submit('Gwait-' + job, batch_args(spec, 'control', plan_path, dependency=job, policy=policy))
             return state
         for item in state['rounds']:
             if item['label'] not in state['jobs']: continue
@@ -710,7 +732,32 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         job = journal.submit(item['label'], batch_args(spec, 'work', plan_path,
             dependency=current, allocation=allocation, policy=policy))
         item['job_id'] = job; journal.save()
+        if workflow and phase == 'sl' and phase_index == 0:
+            overlap_base_audit(plan, state, journal, policy, resource_resolver, base_rounds, allocation, current)
         return state
+
+
+def overlap_base_audit(plan, state, journal, policy, resource_resolver, base_rounds, allocation, dependency):
+    """Start the stopped base rounds' content audit beside the first SL allocation.
+
+    Best effort: without room under the node cap, or on any admission refusal,
+    the final audit checks base itself exactly as before.
+    """
+    from aleatoric_nk_grid import prediction_workflow as phases
+    if (not policy['overlap_base_audit'] or not phases.deferred_base_audit(plan['prediction_workflow'])
+            or any(r['mode'] == 'final-base' for r in state.get('verification_rounds', []))):
+        return
+    spare = state['max_nodes'] - 2 - allocation['nodes']
+    if spare < 1:
+        state['overlap_base_audit'] = {'started': False, 'reason': 'SL allocation uses the whole node cap'}
+    else:
+        try:
+            ensure_parallel_verification(plan, 'final-base', base_rounds, [], journal, policy, resource_resolver,
+                                         wait=False, node_cap=spare, dependency=dependency)
+            state['overlap_base_audit'] = {'started': True, 'node_cap': spare}
+        except (ValueError, OSError) as exc:
+            state['overlap_base_audit'] = {'started': False, 'reason': str(exc)}
+    journal.save()
 
 
 def work(plan_path):

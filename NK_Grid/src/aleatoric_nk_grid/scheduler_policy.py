@@ -54,6 +54,10 @@ DEFAULTS = {
     'unified_compute': False, 'sizing_mode': 'work',
     'parallel_verification': False, 'verification_block_bytes': 64 * 1024**2,
     'verification_round_limit': 3,
+    # final_only runs: content-check the stopped base rounds while SL computes,
+    # inside the node cap left by the SL allocation, so the final audit only
+    # checks SL. Optional smaller SL ranges balance that last audit.
+    'overlap_base_audit': False, 'sl_verification_block_bytes': None,
 }
 
 
@@ -90,7 +94,7 @@ def validate_policy(value=None):
                     for n in item):
                 raise QueueError('exclude_nodes must be explicit node names')
             policy[key] = sorted(set(item))
-        elif key in ('drain_enabled', 'protocol_metrics', 'rpc_keepalive', 'node_relay', 'validation_fast_reads', 'dispatcher_fast_path', 'dispatcher_smt', 'unified_compute', 'parallel_verification', 'online_costs'):
+        elif key in ('drain_enabled', 'protocol_metrics', 'rpc_keepalive', 'node_relay', 'validation_fast_reads', 'dispatcher_fast_path', 'dispatcher_smt', 'unified_compute', 'parallel_verification', 'online_costs', 'overlap_base_audit'):
             if type(item) is not bool: raise QueueError(key + ' must be boolean')
         elif key in ('heartbeat_aggregate_seconds', 'validation_processes'):
             if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or item < 0:
@@ -156,6 +160,9 @@ def validate_policy(value=None):
         raise QueueError('worker_cap must be an integer')
     if not 1024 <= policy['verification_block_bytes'] <= 1024**3:
         raise QueueError('verification_block_bytes must be within 1 KiB..1 GiB')
+    if policy['sl_verification_block_bytes'] is not None and (type(policy['sl_verification_block_bytes']) is not int
+            or not 1024 <= policy['sl_verification_block_bytes'] <= 1024**3):
+        raise QueueError('sl_verification_block_bytes must be an integer within 1 KiB..1 GiB')
     if policy['unified_compute']:
         if policy['sl_allocation'] is not None:
             raise QueueError('Unified compute cannot also have an SL-specific allocation')

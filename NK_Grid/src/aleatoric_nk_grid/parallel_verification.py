@@ -58,11 +58,19 @@ def _members(directory, count):
     return values, np.packbits(bitmap, bitorder='little')
 
 
-def prepare(plan, mode, base_rounds, sl_rounds, directory, *, block_bytes=64 * 1024**2):
-    """Build only range/membership metadata; decoding is done by workers."""
+def prepare(plan, mode, base_rounds, sl_rounds, directory, *, block_bytes=64 * 1024**2,
+            sl_block_bytes=None, base_part=None):
+    """Build only range/membership metadata; decoding is done by workers.
+
+    ``final-base`` content-checks the stopped base rounds while SL still runs and
+    publishes nothing. A ``final`` given its completed ``base_part`` then checks
+    only SL chunks and joins both parts at reduction.
+    """
     from . import prediction_workflow as flow
     from .base_seal import audit_sample, DEFAULT_SAMPLE_RATE
-    if mode not in ('base', 'index', 'final') or type(block_bytes) is not int or block_bytes < 1:
+    if (mode not in ('base', 'index', 'final', 'final-base') or type(block_bytes) is not int or block_bytes < 1
+            or (sl_block_bytes is not None and (mode != 'final' or type(sl_block_bytes) is not int or sl_block_bytes < 1))
+            or (base_part is not None and mode != 'final')):
         raise QueueError('Invalid verification mode or range size')
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -70,6 +78,13 @@ def prepare(plan, mode, base_rounds, sl_rounds, directory, *, block_bytes=64 * 1
     expected = {'format': FORMAT, 'mode': mode, 'plan_sha256': digest(plan),
         'base_rounds': [str(Path(p).resolve()) for p in base_rounds],
         'sl_rounds': [str(Path(p).resolve()) for p in sl_rounds], 'block_bytes': block_bytes}
+    # Absent keys keep every earlier manifest's identity unchanged.
+    if sl_block_bytes is not None: expected['sl_block_bytes'] = sl_block_bytes
+    if base_part is not None:
+        part = _completed_base_part(plan, base_part)
+        if part['identity']['base_rounds'] != expected['base_rounds']:
+            raise QueueError('Completed base audit covers other base rounds')
+        expected['base_part'] = {'directory': str(Path(base_part).resolve()), 'manifest_sha256': digest(part)}
     if manifest_path.exists():
         existing = _read(manifest_path)
         if existing['identity'] != expected:
@@ -81,12 +96,15 @@ def prepare(plan, mode, base_rounds, sl_rounds, directory, *, block_bytes=64 * 1
     phase_sizes = {}
     sample, strata = set(), 0
     (directory / 'chunks').mkdir(exist_ok=True)
+    if base_part is not None:
+        phase_sizes['base'] = flow.PredictionDesign(plan['prediction_workflow'], 'base').count
     with ExitStack() as locks:
-        phases = [('base', base_rounds)] + ([('sl', sl_rounds)] if mode == 'final' else [])
+        phases = ([] if base_part is not None else [('base', base_rounds)]) + ([('sl', sl_rounds)] if mode == 'final' else [])
         for phase, rounds in phases:
             phase_identity = flow.phase_identity(plan, phase)
             design = flow.PredictionDesign(plan['prediction_workflow'], phase)
             phase_sizes[phase] = design.count
+            phase_block = sl_block_bytes if phase == 'sl' and sl_block_bytes is not None else block_bytes
             if mode == 'base':
                 sample, strata = audit_sample(design, rate=DEFAULT_SAMPLE_RATE, seed='base-audit:' + digest(plan))
             previous = []
@@ -108,9 +126,9 @@ def prepare(plan, mode, base_rounds, sl_rounds, directory, *, block_bytes=64 * 1
                           'members': member_path.name, 'members_sha256': file_digest(member_path),
                           'round_count': len(order), 'round_index': source_index}
                 sources.append(source)
-                for start in range(0, size, block_bytes):
+                for start in range(0, size, phase_block):
                     chunks.append({'index': len(chunks), 'kind': 'rows', 'source': number,
-                                   'start': start, 'end': min(size, start + block_bytes)})
+                                   'start': start, 'end': min(size, start + phase_block)})
                 previous.append({'root': str(root), 'queue_id': qid})
     if mode == 'base':
         cache = Path(plan['prediction_workflow']['cache_root'])
@@ -123,6 +141,32 @@ def prepare(plan, mode, base_rounds, sl_rounds, directory, *, block_bytes=64 * 1
                 'cache_locations': _layout_identity(plan)}
     atomic_json(manifest_path, manifest)
     return manifest
+
+
+def _completed_base_part(plan, directory):
+    """The manifest of a finished ``final-base`` audit of this plan, or refusal."""
+    directory = Path(directory); manifest = _read(directory / 'manifest.json')
+    done = _read(directory / 'complete.json')
+    if (manifest['identity']['mode'] != 'final-base' or manifest['identity']['plan_sha256'] != digest(plan)
+            or done.get('manifest_sha256') != digest(manifest) or any(directory.glob('failure-*.json'))):
+        raise QueueError('Base content audit is incomplete or belongs to another plan')
+    return manifest
+
+
+def _parts(directory, manifest):
+    """Every audit this reduction joins, in publication order, each source-checked."""
+    parts = []
+    joined = manifest['identity'].get('base_part')
+    if joined is not None:
+        base = Path(joined['directory'])
+        base_manifest = _completed_base_part(manifest['plan'], base)
+        if digest(base_manifest) != joined['manifest_sha256']:
+            raise QueueError('Joined base audit changed after the final audit was prepared')
+        parts.append((base, base_manifest))
+    parts.append((Path(directory), manifest))
+    for _, part_manifest in parts:
+        check_sources(part_manifest)
+    return parts
 
 
 def _layout_identity(plan):
@@ -240,7 +284,7 @@ def verify_chunk(directory, chunk, manifest=None):
                 if index_only:
                     from .base_seal import _reference_fields
                     _reference_fields(row['prediction_cache_ref'])
-                elif manifest['identity']['mode'] == 'final' or ordinal in sample:
+                elif manifest['identity']['mode'] in ('final', 'final-base') or ordinal in sample:
                     validator(row, sealed=True)
                     audited += 1
                 else:
@@ -300,36 +344,49 @@ def reduce(directory):
     """Global uniqueness/coverage, then a single atomic publication."""
     from . import prediction_workflow as flow
     directory = Path(directory); manifest = _read(directory / 'manifest.json'); plan = manifest['plan']
-    check_sources(manifest)
+    parts = _parts(directory, manifest)
     output = Path(plan['launch']['output']); mode = manifest['identity']['mode']
     seen = {phase: np.zeros(count, dtype=np.bool_) for phase, count in manifest['phase_sizes'].items()}
     routes = np.full(manifest['phase_sizes']['base'], np.iinfo(np.uint32).max, dtype='<u4') if mode in ('base', 'index') else None
-    receipts = {}; statuses = Counter(); audited = maps = 0
-    for chunk in manifest['chunks']:
-        receipt = _receipt(directory, chunk, manifest)
-        if receipt is None:
-            raise QueueError('Missing verification chunk; publication is blocked')
-        receipts[chunk['index']] = receipt
-        audited += receipt['audited']; maps += receipt['map_shards']
-        statuses.update(receipt['statuses'])
-    for index, source in enumerate(manifest['sources']):
-        phase = source['phase']; order, members = _members(source['root'], len(seen[phase]))
-        if hashlib.sha256(members.tobytes()).hexdigest() != source['members_sha256']:
-            raise QueueError('Stopped round membership changed')
-        if np.any(seen[phase][order]):
-            raise QueueError('Later round reclaimed a previously accepted task')
-        for chunk in (c for c in manifest['chunks'] if c.get('source') == index):
-            receipt = receipts[chunk['index']]
-            values = np.fromfile(_relative(directory, receipt['artifacts']['ordinals']['path']), dtype='<u4')
-            if (len(values) != receipt['rows'] or len(np.unique(values)) != len(values)
-                    or (len(values) and int(values.max()) >= len(seen[phase])) or np.any(seen[phase][values])):
-                raise QueueError('Duplicate or invalid verification coverage')
-            seen[phase][values] = True
-            if routes is not None:
-                routes[values] = chunk['index']
+    received = []; statuses = Counter(); audited = maps = 0
+    for part, part_manifest in parts:
+        got = {}
+        for chunk in part_manifest['chunks']:
+            receipt = _receipt(part, chunk, part_manifest)
+            if receipt is None:
+                raise QueueError('Missing verification chunk; publication is blocked')
+            got[chunk['index']] = receipt
+            audited += receipt['audited']; maps += receipt['map_shards']
+            statuses.update(receipt['statuses'])
+        received.append((part, part_manifest, got))
+    receipts = received[-1][2]
+    # Publication order is the joined base audit's chunks, then this audit's.
+    everything = {(n, i): r for n, (_, _, got) in enumerate(received) for i, r in got.items()}
+    for part, part_manifest, got in received:
+        for index, source in enumerate(part_manifest['sources']):
+            phase = source['phase']; order, members = _members(source['root'], len(seen[phase]))
+            if hashlib.sha256(members.tobytes()).hexdigest() != source['members_sha256']:
+                raise QueueError('Stopped round membership changed')
+            if np.any(seen[phase][order]):
+                raise QueueError('Later round reclaimed a previously accepted task')
+            for chunk in (c for c in part_manifest['chunks'] if c.get('source') == index):
+                receipt = got[chunk['index']]
+                values = np.fromfile(_relative(part, receipt['artifacts']['ordinals']['path']), dtype='<u4')
+                if (len(values) != receipt['rows'] or len(np.unique(values)) != len(values)
+                        or (len(values) and int(values.max()) >= len(seen[phase])) or np.any(seen[phase][values])):
+                    raise QueueError('Duplicate or invalid verification coverage')
+                seen[phase][values] = True
+                if routes is not None:
+                    routes[values] = chunk['index']
     counts = {phase: int(bits.sum()) for phase, bits in seen.items()}
     if counts != manifest['phase_sizes']:
         raise QueueError('Prediction workflow coverage incomplete')
+    if mode == 'final-base':
+        # Evidence for a later final audit only; the science is certified there.
+        receipt = {'format': FORMAT, 'stage': 'final-base', 'rows': counts['base'], 'statuses': dict(statuses),
+                   'chunks': len(receipts), 'sources': [{'root': s['root'], 'queue_id': s['queue_id']} for s in manifest['sources']]}
+        atomic_json(directory / 'complete.json', {'format': FORMAT, 'manifest_sha256': digest(manifest), 'receipt': receipt})
+        return receipt
     if mode in ('base', 'index'):
         if mode == 'base' and audited != len(manifest['sample_ordinals']):
             raise QueueError('Stratified base sample coverage differs')
@@ -366,26 +423,28 @@ def reduce(directory):
         atomic_json(output / 'base-audit-sample.json', {'format': FORMAT, 'ordinals': manifest['sample_ordinals']})
         atomic_json(output / 'base-verified.json', receipt)
     else:
-        base = publish_final_base_receipt(manifest, receipts, counts)
+        base = publish_final_base_receipt(manifest, everything, counts)
         final = output / ('final-' + uuid.uuid4().hex + '.tmp')
         from io import StringIO
         text = StringIO(newline=''); csv.writer(text, lineterminator='\n').writerow(manifest['columns'])
         header = text.getvalue().encode('utf-8'); hasher = hashlib.sha256()
         with final.open('xb') as handle:
             handle.write(header); hasher.update(header)
-            for chunk in manifest['chunks']:
-                part = _relative(directory, receipts[chunk['index']]['artifacts']['csv']['path'])
-                with part.open('rb') as source:
-                    while data := source.read(8 * 1024**2):
-                        handle.write(data); hasher.update(data)
+            for part, part_manifest, got in received:
+                for chunk in part_manifest['chunks']:
+                    fragment = _relative(part, got[chunk['index']]['artifacts']['csv']['path'])
+                    with fragment.open('rb') as source:
+                        while data := source.read(8 * 1024**2):
+                            handle.write(data); hasher.update(data)
             handle.flush(); os.fsync(handle.fileno())
-        check_sources(manifest)
+        for _, part_manifest in parts:
+            check_sources(part_manifest)
         os.replace(final, output / 'final.csv'); sync_directory(output)
         receipt = {'format': flow.FORMAT, 'complete': True, 'phase_rows': counts, 'rows': sum(counts.values()),
             'plan_sha256': digest(plan), 'base_verified_sha256': digest(base), 'final_csv_sha256': hasher.hexdigest(),
             'final_csv_bytes': (output / 'final.csv').stat().st_size, 'score_complete': True,
             'prediction_cache_complete': True, 'oof_complete': True,
-            'verification': {'format': FORMAT, 'chunks': len(receipts), 'content_checks': 'every accepted record and required sample map'}}
+            'verification': {'format': FORMAT, 'chunks': len(everything), 'content_checks': 'every accepted record and required sample map'}}
         atomic_json(output / 'verified.json', receipt)
     atomic_json(directory / 'complete.json', {'format': FORMAT, 'manifest_sha256': digest(manifest), 'receipt': receipt})
     return receipt
@@ -474,10 +533,15 @@ def run(directory, workers, *, launch=None):
         stack.enter_context(file_lock(directory / 'verification.lock'))
         cache = Path(manifest['plan']['prediction_workflow']['cache_root'])
         stack.enter_context(file_lock(cache / '.layout.lock'))
-        for source in manifest['sources']:
+        joined = manifest['identity'].get('base_part')
+        sources = manifest['sources'] + (_read(Path(joined['directory']) / 'manifest.json')['sources'] if joined else [])
+        for source in sources:
             stack.enter_context(file_lock(Path(source['root']) / 'dispatcher.lock'))
         check_sources(manifest)
-        seal_stopped_writers(cache, writer_revoked=True)
+        # A base audit overlaps live SL writers; the index run already sealed every
+        # stopped base writer, and each record here must be read from a sealed shard.
+        if manifest['identity']['mode'] != 'final-base':
+            seal_stopped_writers(cache, writer_revoked=True)
         if launch is None:
             command = ['srun', '--ntasks=' + str(workers), '--cpus-per-task=1', '--ntasks-per-core=1',
                        '--distribution=cyclic', '--kill-on-bad-exit=1',
