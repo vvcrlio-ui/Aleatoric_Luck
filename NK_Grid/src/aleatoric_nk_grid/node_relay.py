@@ -38,7 +38,7 @@ import time
 
 from .protocol_metrics import ProtocolMetrics
 from .queue_transport import PooledTransport
-from .shared_queue import QueueError, atomic_json
+from .shared_queue import QueueError, atomic_json, digest
 
 # Requests are at most 1 MiB (Client limit) and responses 4 MiB (Client read limit).
 FRAME_MAX = 5 * 1024 ** 2
@@ -81,10 +81,18 @@ def recv_frame(sock):
     return header, _exact(sock, body_size)
 
 
+def endpoint_identity(queue_id):
+    return {'queue_id': queue_id, 'hostname': socket.gethostname(),
+            'job_id': os.environ.get('SLURM_JOB_ID', 'local'),
+            'generation': os.environ.get('NKGRID_RELAY_GENERATION',
+                                         os.environ.get('SLURM_STEP_ID', 'local'))}
+
+
 def endpoint_path(queue_id):
-    """Private, node-local, job- and queue-specific rendezvous file."""
+    """Do not inherit a bootstrap TMPDIR on a shared project filesystem."""
     uid = getattr(os, 'getuid', lambda: 0)()
-    folder = Path(tempfile.gettempdir()) / ('nk-relay-%s-%s-%s' % (uid, os.environ.get('SLURM_JOB_ID', 'local'), queue_id[:20]))
+    base = Path('/tmp') if os.name == 'posix' else Path(tempfile.gettempdir())
+    folder = base / ('nk-relay-%s-%s' % (uid, digest(endpoint_identity(queue_id))))
     folder.mkdir(mode=0o700, exist_ok=True)
     if folder.is_symlink() or (hasattr(os, 'getuid') and folder.stat().st_uid != os.getuid()):
         raise QueueError('Unsafe node relay directory')
@@ -112,10 +120,17 @@ def relay_main(endpoint_file, url, ca_file, queue_id, idle_seconds, stop, stats_
     pools = {'control': [make() for _ in range(control_connections)],
              'submit': [make() for _ in range(submit_connections)]}
     secret = os.urandom(24).hex()
-    counters = {'requests': 0, 'errors': 0, 'rejected': 0, 'by_operation': {}}
+    counters = {'requests': 0, 'errors': 0, 'rejected': 0, 'by_operation': {},
+                'errors_by_type': {}, 'rejections_by_reason': {}}
     lock = threading.Lock()
     turn = {'control': 0, 'submit': 0}
     slots = threading.BoundedSemaphore(MAX_HANDLERS)
+
+    def reject(reason):
+        with lock:
+            counters['rejected'] += 1
+            reasons = counters['rejections_by_reason']
+            reasons[reason] = reasons.get(reason, 0) + 1
 
     def choose(channel):
         pool = pools[channel]
@@ -132,11 +147,11 @@ def relay_main(endpoint_file, url, ca_file, queue_id, idle_seconds, stop, stats_
                 self.request.settimeout(60)
                 header, body = recv_frame(self.request)
                 if not hmac.compare_digest(str(header.get('secret', '')), secret):
-                    with lock: counters['rejected'] += 1
+                    reject('secret_mismatch')
                     return
                 operation = header.get('operation')
                 if operation not in FORWARDED_OPERATIONS:
-                    with lock: counters['rejected'] += 1
+                    reject('operation_not_allowed')
                     return
                 headers = {k: v for k, v in (header.get('headers') or {}).items()
                            if k in FORWARDED_HEADERS and isinstance(v, str)}
@@ -146,11 +161,15 @@ def relay_main(endpoint_file, url, ca_file, queue_id, idle_seconds, stop, stats_
                 with lock:
                     counters['requests'] += 1
                     counters['by_operation'][operation] = counters['by_operation'].get(operation, 0) + 1
-            except Exception:
+            except Exception as exc:
                 # A network-facing handler must never take the relay down: any malformed frame,
                 # bad header type or upstream failure closes the connection unanswered and the
                 # caller follows its retry path.
-                with lock: counters['errors'] += 1
+                with lock:
+                    counters['errors'] += 1
+                    name = type(exc).__name__
+                    reasons = counters['errors_by_type']
+                    reasons[name] = reasons.get(name, 0) + 1
 
     class Server(socketserver.ThreadingTCPServer):
         daemon_threads = True
@@ -159,6 +178,7 @@ def relay_main(endpoint_file, url, ca_file, queue_id, idle_seconds, stop, stats_
 
         def process_request(self, request, address):
             if not slots.acquire(blocking=False):
+                reject('handler_capacity')
                 self.shutdown_request(request)         # over capacity: the caller retries
                 return
             try:
@@ -176,13 +196,13 @@ def relay_main(endpoint_file, url, ca_file, queue_id, idle_seconds, stop, stats_
     server = Server(('127.0.0.1', 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     cpu0, wall0 = time.process_time(), time.monotonic()
-    atomic_json(endpoint_file, {'queue_id': queue_id, 'port': server.server_address[1], 'secret': secret,
+    atomic_json(endpoint_file, {**endpoint_identity(queue_id), 'port': server.server_address[1], 'secret': secret,
                                 'pid': os.getpid()})
     def write_stats(final=False):
         counts = metrics.snapshot().get('counts', {})
         with lock:
-            snapshot = {**counters, 'by_operation': dict(counters['by_operation'])}
-        atomic_json(stats_file, {**snapshot, 'cpu_seconds': time.process_time() - cpu0,
+            snapshot = {k: dict(v) if isinstance(v, dict) else v for k, v in counters.items()}
+        atomic_json(stats_file, {**endpoint_identity(queue_id), **snapshot, 'cpu_seconds': time.process_time() - cpu0,
                                  'wall_seconds': time.monotonic() - wall0, 'final': final, 'pid': os.getpid(),
                                  'upstream_tls_handshakes': counts.get('tls_handshake', 0),
                                  'upstream_connections_reused': counts.get('connection_reused', 0)})
@@ -218,8 +238,8 @@ class RelayTransport:
         try:
             if self.endpoint is None:
                 endpoint = json.loads(self.endpoint_file.read_bytes())
-                if endpoint['queue_id'] != self.queue_id:
-                    raise KeyError('queue_id')
+                if any(endpoint.get(k) != v for k, v in endpoint_identity(self.queue_id).items()):
+                    raise KeyError('relay identity')
                 self.endpoint = endpoint
             return socket.create_connection(('127.0.0.1', int(self.endpoint['port'])), timeout=1.0)
         except (OSError, ValueError, KeyError, TypeError):
@@ -243,6 +263,7 @@ class RelayTransport:
         except (OSError, ValueError, KeyError, struct.error) as exc:
             # The request may already have reached the dispatcher: never replay it another way.
             self.metrics.add('node_relay_error')
+            self.endpoint = None  # The next caller retry must reread the current endpoint.
             raise OSError('Node relay failed after the request was sent') from exc
         self.metrics.add('node_relay_forwarded')
         return status, body

@@ -42,6 +42,7 @@ def refresh_cost_profile(plan, root, previous):
     Unpriced work still runs, one task per claim.
     """
     from aleatoric_nk_grid import prediction_profile
+    from aleatoric_nk_grid.scheduler_cost import CostEstimator
     from aleatoric_nk_grid.shared_queue import atomic_json
     root = Path(root)
     profile_path = root / 'cost-profile.json'
@@ -83,6 +84,7 @@ def refresh_cost_profile(plan, root, previous):
         if not candidate: continue
         try:
             profile = prediction_profile.build(plan, candidate)
+            CostEstimator(profile=profile)  # Empty/invalid observations cannot replace usable timing.
         except Exception:
             continue
         atomic_json(profile_path, profile)
@@ -92,7 +94,7 @@ def refresh_cost_profile(plan, root, previous):
 
 def operational_inputs(root, directory, item=None):
     """A submitted round reads its immutable snapshot, never a mutable profile."""
-    from aleatoric_nk_grid.scheduler_cost import CostEstimator
+    from aleatoric_nk_grid.scheduler_cost import CostEstimator, EmptyDurationProfile
     from aleatoric_nk_grid.scheduler_policy import validate_policy
     from aleatoric_nk_grid.shared_queue import digest
     path = Path(directory) / 'operational.json'
@@ -112,7 +114,11 @@ def operational_inputs(root, directory, item=None):
     policy = operational_policy(root)
     profile_path = Path(root) / 'cost-profile.json'
     profile = read(profile_path) if profile_path.exists() else None
-    if profile is not None: CostEstimator(profile=profile)
+    if profile is not None:
+        try:
+            CostEstimator(profile=profile)
+        except EmptyDurationProfile:
+            profile = None  # Recover older controllers' empty journals without changing the file.
     return {'format': 'scheduler-operational-v1', 'policy': policy,
             'policy_sha256': digest(policy), 'cost_profile': profile,
             'cost_profile_sha256': digest(profile) if profile is not None else None}
@@ -501,9 +507,13 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         # A restart inside the base barrier has only stopped base journals, which
         # the profile already priced when the barrier was entered: rebuilding it
         # would reparse every journal to reproduce the same file.
-        if workflow and prepared_item is None and state.get('workflow_state') not in ('BASE_VERIFYING', 'BASE_INDEXING'):
-            refresh_cost_profile(plan, root, previous)
-        operational = operational_inputs(root, queue_root, prepared_item)
+        try:
+            if workflow and prepared_item is None and state.get('workflow_state') not in ('BASE_VERIFYING', 'BASE_INDEXING'):
+                refresh_cost_profile(plan, root, previous)
+            operational = operational_inputs(root, queue_root, prepared_item)
+        except (ValueError, OSError) as exc:
+            state.update(status='repair_required', blocked_reason=str(exc))
+            journal.save(); return state
         policy, profile = operational['policy'], operational['cost_profile']
         try:
             if (workflow and phase == 'base' and state.get('workflow_state') in ('BASE_VERIFYING', 'BASE_INDEXING')):

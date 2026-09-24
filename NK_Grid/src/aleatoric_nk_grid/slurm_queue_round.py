@@ -32,6 +32,7 @@ def worker(args):
     if ready.get('shards'):
         from .dispatcher_shards import resolve_shard
         ready = resolve_shard(ready, socket.gethostname())
+    os.environ['NKGRID_RELAY_GENERATION'] = ready['generation']
     # Spread cross-node readiness/TLS admission after a large srun launch.
     time.sleep(random.uniform(0., ready.get('startup_jitter_seconds', 0.)))
     root = Path(ready['queue'])
