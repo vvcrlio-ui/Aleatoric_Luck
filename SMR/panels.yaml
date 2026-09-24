@@ -1,12 +1,13 @@
 # One catalog for both SMR experiments. Select one with --panel.
 # Like FFCWS/panels.yaml, every entry inherits the cache/SL7 workflow below:
 # holdout/OOF for all eight independent recipes, cache-only SL7 without OLS,
-# and one final audit. The independent-SL runs of 2026-09-14/15 keep their own
+# and one final audit. smr-ard-v2 adds the row identifier `smr_row_id` that the
+# cache requires. The independent-SL runs of 2026-09-14/15 keep their own
 # frozen configuration, code and results.
 model_params: model_params.yaml
 preset: dev
 experiment_id: smr-aleatoric-v1
-data_version: smr-ard-v1
+data_version: smr-ard-v2
 model_spec_version: nkgrid-models-v7-relative-lasso-3fold-1
 
 panels:
