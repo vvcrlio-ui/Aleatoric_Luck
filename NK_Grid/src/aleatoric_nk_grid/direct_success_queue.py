@@ -358,6 +358,16 @@ class FlatDispatcher(Dispatcher):
                 raise QueueError('Remaining list changed')
             from .prediction_workflow import design_for, ResultCacheValidator
             self.design = design_for(self.manifest['identity'])
+            self.online_costs = None
+            if self.policy['online_costs']:
+                from .online_cost import OnlineCosts
+                self.online_costs = OnlineCosts(self.queue_id,
+                    source=self.shard['index'] if self.shard else 0,
+                    sources=self.shard['of'] if self.shard else 1,
+                    minimum=self.policy['online_cost_min_observations'],
+                    safety_factor=self.policy['online_cost_safety_factor'],
+                    long_task_seconds=self.policy['target_batch_seconds'],
+                    refresh_seconds=self.policy['online_cost_refresh_seconds'])
             self.result_cache_validator = ResultCacheValidator(self.manifest['identity'],
                                                                fast_reads=self.policy['validation_fast_reads'])
             if workflow:
@@ -386,7 +396,7 @@ class FlatDispatcher(Dispatcher):
                 self.validation_pool = ValidationPool(self.manifest['identity'], self.policy['validation_processes'],
                     self.policy['validation_timeout_seconds'],
                     cpu_ids=service_binding['validator_cpus'] if service_binding else None,
-                    fast_reads=self.policy['validation_fast_reads'])
+                    fast_reads=self.policy['validation_fast_reads'], metrics=self.metrics)
         except BaseException:
             self.close(); raise
 
@@ -602,6 +612,8 @@ class FlatDispatcher(Dispatcher):
             v2 = worker in self.worker_status
             share = max(1, pending // max(self.fleet, len(self.by_worker) + 1))
             count = max(1, min(count, self.policy['max_batch_tasks'] if v2 else MAX_BATCH_TASKS, pending, share))
+            if self.online_costs is not None:
+                count = min(count, self.policy['online_cost_max_batch'])
             budget = self.policy['target_batch_seconds']
             if self.remaining_work_seconds is not None:
                 budget = min(budget, max(1., self.remaining_work_seconds / (2 * self.fleet)))
@@ -626,6 +638,10 @@ class FlatDispatcher(Dispatcher):
                       else cost_identity(task, getattr(self.design, 'contract', None)))
                 pricing = {'identity': ci} if ci is not None else {}
                 price = self.estimator.batch_seconds(task.model, task.N, task.K, **pricing) if v2 else None
+                if v2 and self.online_costs is not None:
+                    online_price = self.online_costs.price(task.model, task.N, task.K, ci)
+                    if online_price is not None:
+                        price = max(price or 0., online_price)
                 if v2:
                     if chosen and (price is None or used + price > budget): break
                     if not chosen and price is not None and remaining_seconds is not None and price > remaining_seconds:
@@ -778,11 +794,12 @@ class FlatDispatcher(Dispatcher):
                         for row, _, _, raw, _ in writing:
                             row['_journal_offset'] = offset
                             offset += len(raw)
-                        pending = memoryview(b''.join(entry[3] for entry in writing))
-                        while pending:
-                            written = self.journal.write(pending)
-                            if not written: raise OSError('Short result write')
-                            pending = pending[written:]
+                        with self.metrics.span('journal_append'):
+                            pending = memoryview(b''.join(entry[3] for entry in writing))
+                            while pending:
+                                written = self.journal.write(pending)
+                                if not written: raise OSError('Short result write')
+                                pending = pending[written:]
                         self.written_seq += len(writing)
                         sequence = self.written_seq
                     except BaseException:
@@ -796,13 +813,16 @@ class FlatDispatcher(Dispatcher):
             elapsed = 0.; flushed = False
             if writing:
                 try:
+                    lock_started = time.monotonic()
                     with self.fsync_mutex:
+                        self.metrics.add('journal_fsync_lock_wait', time.monotonic() - lock_started)
                         if self.synced_seq < sequence:
                             # Read the watermark under this lock: records written while
                             # the flush runs are not claimed by it.
                             target = self.written_seq
                             started = time.monotonic()
-                            os.fsync(self.journal.fileno())
+                            with self.metrics.span('journal_fsync'):
+                                os.fsync(self.journal.fileno())
                             elapsed = time.monotonic() - started
                             self.synced_seq = target; flushed = True
                 except BaseException:
@@ -816,6 +836,10 @@ class FlatDispatcher(Dispatcher):
                     row.pop('committing', None)
                     row['state'] = 'failed' if result['status'] == 'failed' else 'done'
                     self.completed.add(row['id'], row.pop('_journal_offset'), len(raw), row['worker'], checksum)
+                    if self.online_costs is not None:
+                        task = task_at(self.design, row['ordinal'])
+                        expected = self.design.cost_identity(task) if hasattr(self.design, 'cost_identity') else None
+                        self.online_costs.observe(result, expected)
                     del self.active[row['id']]; self._release(worker, row['id'])
                     self.attempts.pop(row['ordinal'], None)
                     if row['state'] == 'done':
@@ -871,7 +895,8 @@ class FlatDispatcher(Dispatcher):
                     else: tails.append(max(price, sum(assigned) - elapsed))
                 elif status['state'] == 'submitting': submitting += 1
                 else: idle += 1
-            return {'phase': getattr(self.design, 'phase', 'legacy'),
+            return {'online_costs': self.online_costs.stats() if self.online_costs is not None else None,
+                'phase': getattr(self.design, 'phase', 'legacy'),
                 'done': self.done, 'failed': self.failed, 'leased': len(self.active),
                 'pending': len(self.order) - self.cursor + len(self.retry), 'exhausted': self.exhausted,
                 'total': len(self.order), 'paused': self.paused, 'queue_id': self.queue_id,
@@ -959,6 +984,9 @@ def write_progress(path, dispatcher, server, *, previous_errors=0, monitor=None,
                    allocation=None, continuation_allowed=False):
     """Progress is advisory; durable result writes must still fail closed."""
     try:
+        if getattr(dispatcher, 'online_costs', None) is not None:
+            attempt = Path(path).parent.parent if dispatcher.shard else Path(path).parent
+            dispatcher.online_costs.refresh(attempt / 'online-costs')
         stats = dispatcher.stats(); now = time.time()
         observation = (monitor.observe(stats, now=now, allocation=allocation,
                          continuation_allowed=continuation_allowed) if monitor else {})

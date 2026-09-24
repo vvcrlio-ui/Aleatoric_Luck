@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from .shared_queue import QueueError
+from .protocol_metrics import ProtocolMetrics
 
 _identity = _validator = _design = _warm_barrier = None
 
@@ -66,11 +67,20 @@ def _validate(results):
             'fast_reads': getattr(_validator, 'context', None) is not None}
 
 
+def _timed_validate(function, argument, submitted_at):
+    queue_seconds = max(0., time.monotonic() - submitted_at)
+    result = function(argument)
+    result['queue_seconds'] = queue_seconds
+    return result
+
+
 class ValidationPool:
-    def __init__(self, identity, workers, timeout=120., cpu_ids=None, fast_reads=False):
+    def __init__(self, identity, workers, timeout=120., cpu_ids=None, fast_reads=False, metrics=None):
         self.timeout = timeout
         self.stats_lock = threading.Lock()
-        self.stats = {'successful_batches': 0, 'records': 0, 'cpu_seconds': 0., 'wall_seconds': 0., 'fast_reads': False}
+        self.stats = {'successful_batches': 0, 'records': 0, 'cpu_seconds': 0., 'wall_seconds': 0.,
+                      'queue_seconds': 0., 'fast_reads': False}
+        self.metrics = metrics or ProtocolMetrics()
         self.slots = threading.BoundedSemaphore(2 * workers)
         # Resolve at construction: controller isolation tests restore
         # sys.modules after mocks, which can invalidate an eagerly held pool
@@ -105,17 +115,20 @@ class ValidationPool:
     def _run(self, function, argument):
         if self.failed:
             raise OSError('Validation pool unavailable')
-        if not self.slots.acquire(timeout=self.timeout):
+        with self.metrics.span('validation_slot_wait'):
+            acquired = self.slots.acquire(timeout=self.timeout)
+        if not acquired:
             raise OSError('Validation queue busy')
         future = None
         try:
-            future = self.pool.submit(function, argument)
+            future = self.pool.submit(_timed_validate, function, argument, time.monotonic())
             # Keep the slot until actual completion, even when the caller times out.
             future.add_done_callback(lambda _: self.slots.release())
-            result = future.result(timeout=self.timeout)
+            with self.metrics.span('validation_roundtrip'):
+                result = future.result(timeout=self.timeout)
             with self.stats_lock:
                 self.stats['successful_batches'] += 1
-                for name in ('records', 'cpu_seconds', 'wall_seconds'):
+                for name in ('records', 'cpu_seconds', 'wall_seconds', 'queue_seconds'):
                     self.stats[name] += result[name]
                 self.stats['fast_reads'] = bool(result.get('fast_reads'))       # what the child actually runs
             return True

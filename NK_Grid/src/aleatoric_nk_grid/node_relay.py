@@ -125,6 +125,7 @@ def relay_main(endpoint_file, url, ca_file, queue_id, idle_seconds, stop, stats_
     lock = threading.Lock()
     turn = {'control': 0, 'submit': 0}
     slots = threading.BoundedSemaphore(MAX_HANDLERS)
+    inflight = {'control': 0, 'submit': 0}
 
     def reject(reason):
         with lock:
@@ -156,7 +157,12 @@ def relay_main(endpoint_file, url, ca_file, queue_id, idle_seconds, stop, stats_
                 headers = {k: v for k, v in (header.get('headers') or {}).items()
                            if k in FORWARDED_HEADERS and isinstance(v, str)}
                 channel = 'submit' if operation in SUBMIT_OPERATIONS else 'control'
-                status, reply = choose(channel).request(operation, body, headers)
+                with lock: inflight[channel] += 1
+                try:
+                    with metrics.span('relay_upstream_' + channel):
+                        status, reply = choose(channel).request(operation, body, headers)
+                finally:
+                    with lock: inflight[channel] -= 1
                 send_frame(self.request, {'status': status}, reply)
                 with lock:
                     counters['requests'] += 1
@@ -199,11 +205,15 @@ def relay_main(endpoint_file, url, ca_file, queue_id, idle_seconds, stop, stats_
     atomic_json(endpoint_file, {**endpoint_identity(queue_id), 'port': server.server_address[1], 'secret': secret,
                                 'pid': os.getpid()})
     def write_stats(final=False):
-        counts = metrics.snapshot().get('counts', {})
+        timing = metrics.snapshot(); counts = timing.get('counts', {})
         with lock:
             snapshot = {k: dict(v) if isinstance(v, dict) else v for k, v in counters.items()}
+            snapshot['inflight_handlers'] = dict(inflight)
         atomic_json(stats_file, {**endpoint_identity(queue_id), **snapshot, 'cpu_seconds': time.process_time() - cpu0,
                                  'wall_seconds': time.monotonic() - wall0, 'final': final, 'pid': os.getpid(),
+                                 'busy_upstream_connections': {k:sum(p.locks[k].locked() for p in pool) for k,pool in pools.items()},
+                                 'connection_limits': {k:len(pool) for k,pool in pools.items()},
+                                 'upstream_metrics': {k:timing.get(k,{}) for k in ('counts','seconds','duration_histograms')},
                                  'upstream_tls_handshakes': counts.get('tls_handshake', 0),
                                  'upstream_connections_reused': counts.get('connection_reused', 0)})
     try:

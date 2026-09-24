@@ -21,6 +21,9 @@ DEFAULTS = {
     # out of the frozen plan lets a run be resized between rounds instead of
     # discarding every cell it already finished.
     'protocol_metrics': False, 'rpc_keepalive': False,
+    'online_costs': False, 'online_cost_refresh_seconds': 15.,
+    'online_cost_min_observations': 100, 'online_cost_safety_factor': 1.25,
+    'online_cost_max_batch': 16,
     'heartbeat_aggregate_seconds': 0., 'validation_processes': 0,
     # Node relay (opt-in): each node forwards its workers' requests over a few
     # persistent connections. It needs a connection budget above the per-worker
@@ -87,7 +90,7 @@ def validate_policy(value=None):
                     for n in item):
                 raise QueueError('exclude_nodes must be explicit node names')
             policy[key] = sorted(set(item))
-        elif key in ('drain_enabled', 'protocol_metrics', 'rpc_keepalive', 'node_relay', 'validation_fast_reads', 'dispatcher_fast_path', 'dispatcher_smt', 'unified_compute', 'parallel_verification'):
+        elif key in ('drain_enabled', 'protocol_metrics', 'rpc_keepalive', 'node_relay', 'validation_fast_reads', 'dispatcher_fast_path', 'dispatcher_smt', 'unified_compute', 'parallel_verification', 'online_costs'):
             if type(item) is not bool: raise QueueError(key + ' must be boolean')
         elif key in ('heartbeat_aggregate_seconds', 'validation_processes'):
             if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or item < 0:
@@ -115,6 +118,14 @@ def validate_policy(value=None):
         if type(policy[key]) is not int: raise QueueError(key + ' must be an integer')
     if not 1 <= policy['max_connections'] <= 4096:
         raise QueueError('max_connections must be within 1..4096')
+    if type(policy['online_cost_min_observations']) is not int or policy['online_cost_min_observations'] < 100:
+        raise QueueError('Online costs require at least 100 complete cold observations')
+    if type(policy['online_cost_max_batch']) is not int or not 1 <= policy['online_cost_max_batch'] <= 64:
+        raise QueueError('Online batch cap must be within 1..64')
+    if policy['online_cost_safety_factor'] < 1:
+        raise QueueError('Online cost safety factor cannot discount observed runtimes')
+    if policy['online_cost_refresh_seconds'] < 5:
+        raise QueueError('Online cost summaries must not refresh more often than every five seconds')
     if not 1 <= policy['max_submissions'] <= 1024:
         raise QueueError('max_submissions must be within 1..1024')
     if not .1 <= policy['keepalive_idle_seconds'] <= 30.:
