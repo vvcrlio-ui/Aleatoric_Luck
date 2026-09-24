@@ -12,9 +12,12 @@ Weak-boundary selection and iteration-limit hits are recorded in worker logs;
 the search range does not silently expand for individual N/K cells.
 
 New runs must use a new identity and cannot import old absolute-alpha Lasso
-results as equivalent. `launch/fresh_single_model.py` prepares and verifies a
-fresh panel using the deployed direct-success dispatcher supplied by `--runtime`.
-Each model is an independent task with its own durable result receipt.
+results as equivalent. `launch/fresh_single_model.py` prepared the historical
+independent-SL runs with the deployed direct-success dispatcher supplied by
+`--runtime`, each model an independent task. `SMR/panels.yaml` now declares the
+same holdout/OOF cache and cache-only SL7 workflow as the FFC catalog; that
+score-only tool's workers refuse a required cache when they start, so new SMR
+runs use the shared Slurm scheduler.
 
 SMR uses the provider's existing `asample2_withlag.csv` analysis matrix. The adapter selects predictors and outcomes using fixed definitions, describes category groups, and passes them to the shared engine. It does not reconstruct wages, income, lagged variables, or existing missingness indicators.
 

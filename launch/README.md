@@ -17,7 +17,7 @@ holdout/OOF persistence, cache-only SL7, and `final_only` verification. The form
 MH-only manifest has been removed. Scientific task definitions and completed
 results in existing frozen runs are not migrated.
 
-Local runs call the engine directly and reject required prediction-cache configurations; this remains available for non-cache manifests such as SMR. Prepared-data Slurm runs use the shared single-model scheduler, including BMRC, Discoverer, and explicitly configured other clusters. BMRC suite/raw-data launches use the separate scheduler described above. Each new experiment uses a separate output directory.
+Local runs call the engine directly and reject required prediction-cache configurations; this remains available only for manifests without required caches. The FFC and SMR catalogs both require them. Prepared-data Slurm runs use the shared single-model scheduler, including BMRC, Discoverer, and explicitly configured other clusters. BMRC suite/raw-data launches use the separate scheduler described above. Each new experiment uses a separate output directory.
 
 ## Preparing the environment and data
 

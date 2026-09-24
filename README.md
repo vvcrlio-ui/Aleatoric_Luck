@@ -124,8 +124,9 @@ production defaults to 100 seeds × 50 draws on the full 20×20 grid. `--allow-l
 ### Choosing an execution environment
 
 Use the same supported environment prefix across stages, keeping the panel and
-preset arguments. Local execution supports manifests without required caches,
-such as SMR; the unified FFC cache catalog requires the shared Slurm scheduler.
+preset arguments. The FFC and SMR catalogs both declare required prediction
+caches and SL7, so they run through the shared Slurm scheduler; local execution
+only supports manifests without required caches.
 
 | Environment | Command prefix |
 |---|---|

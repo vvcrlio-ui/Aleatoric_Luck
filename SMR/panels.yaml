@@ -1,3 +1,8 @@
+# One catalog for both SMR experiments. Select one with --panel.
+# Like FFCWS/panels.yaml, every entry inherits the cache/SL7 workflow below:
+# holdout/OOF for all eight independent recipes, cache-only SL7 without OLS,
+# and one final audit. The independent-SL runs of 2026-09-14/15 keep their own
+# frozen configuration, code and results.
 model_params: model_params.yaml
 preset: dev
 experiment_id: smr-aleatoric-v1
@@ -5,10 +10,11 @@ data_version: smr-ard-v1
 model_spec_version: nkgrid-models-v7-relative-lasso-3fold-1
 
 panels:
-  - name: smr_hourlywage
+  - &smr_panel
+    name: smr_hourlywage
     schema: schema/asample2_withlag.json
     outcome: Cm_lhourlywage
-    models: &smr_models
+    models:
       - ols
       - ridge
       - lasso
@@ -18,10 +24,28 @@ panels:
       - shallow_neural_network
       - extra_trees
       - super_learner
+    prediction_cache:
+      mode: holdout_oof
+      base_library: standalone8-v1
+      oof_folds: 5
+      # Keep all eight independent columns; do not train the separate SL4 control.
+      store_reported_sl_holdout: false
+    execution:
+      workflow: base_then_sl
+      barrier_scope: submission_plan
+      protocol_version: 2
+      verification_schedule: final_only
+      phase_round_limits: {base: 2, sl: 1}
+      # Fallback bounds when no unified operational compute policy is selected.
+      # The Discoverer policy supplies common base/SL resource limits instead.
+      sl_resources:
+        worker_cap: 24
+        io_concurrency: 8
+        memory: 4G
+        time_limit: '04:00:00'
     out: outputs/nk_grid_smr_hourlywage.csv
 
-  - name: smr_totalincome
-    schema: schema/asample2_withlag.json
+  - <<: *smr_panel
+    name: smr_totalincome
     outcome: Cm_ltotalincome
-    models: *smr_models
     out: outputs/nk_grid_smr_totalincome.csv

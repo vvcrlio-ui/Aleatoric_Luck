@@ -58,6 +58,8 @@ DEFAULTS = {
     # inside the node cap left by the SL allocation, so the final audit only
     # checks SL. Optional smaller SL ranges balance that last audit.
     'overlap_base_audit': False, 'sl_verification_block_bytes': None,
+    # Worker ceiling for SL allocations only, also under unified_compute.
+    'sl_worker_cap': None,
 }
 
 
@@ -158,6 +160,8 @@ def validate_policy(value=None):
         raise QueueError('Claim limit must be an integer')
     if policy['worker_cap'] is not None and type(policy['worker_cap']) is not int:
         raise QueueError('worker_cap must be an integer')
+    if policy['sl_worker_cap'] is not None and type(policy['sl_worker_cap']) is not int:
+        raise QueueError('sl_worker_cap must be an integer')
     if not 1024 <= policy['verification_block_bytes'] <= 1024**3:
         raise QueueError('verification_block_bytes must be within 1 KiB..1 GiB')
     if policy['sl_verification_block_bytes'] is not None and (type(policy['sl_verification_block_bytes']) is not int
