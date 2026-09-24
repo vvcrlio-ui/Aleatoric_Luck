@@ -124,6 +124,33 @@ def operational_inputs(root, directory, item=None):
             'cost_profile_sha256': digest(profile) if profile is not None else None}
 
 
+def dispatcher_settled(plan, state, phase):
+    """True when the phase's last stopped round says it accepted every remaining task.
+
+    A routing hint only: it lets the controller skip reparsing tens of gigabytes
+    of stopped journals on one CPU. The parallel check that must follow rederives
+    provenance, uniqueness and coverage from those journals and publishes nothing
+    otherwise, so a wrong hint costs a refused check, never an unproven barrier.
+    """
+    from aleatoric_nk_grid.prediction_workflow import PredictionDesign
+    items = [r for r in state['rounds'] if r['label'] in state['jobs'] and r.get('phase') == phase]
+    if not items: return False
+    last = items[-1]; root = Path(last['root'])
+    try:
+        receipt = read(root / 'control' / 'round-result.json'); stats = receipt['stats']
+        queue_id = read(root / 'queue-id.json')['queue_id']
+        merged = receipt.get('journal_merge')
+        merged_ok = merged is None or (merged['lines'] == stats['done']
+                                       and all(s['dropped_tail_bytes'] == 0 for s in merged['shards']))
+        return (receipt['complete'] is True and merged_ok
+                and str(receipt['job_id']) == str(state['jobs'][last['label']].get('job_id'))
+                and receipt['queue_id'] == queue_id and stats.get('queue_id', queue_id) == queue_id
+                and stats['failed'] == 0 and stats['leased'] == 0 and stats['done'] == stats['total']
+                and last['done_before'] + stats['done'] == PredictionDesign(plan['prediction_workflow'], phase).count)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
 def worker_cpu_hours(state):
     """Charge stopped rounds once; missing receipt means the full reservation."""
     from discoverer_resources import duration
@@ -507,20 +534,31 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         # A restart inside the base barrier has only stopped base journals, which
         # the profile already priced when the barrier was entered: rebuilding it
         # would reparse every journal to reproduce the same file.
+        barrier = state.get('workflow_state') in ('BASE_VERIFYING', 'BASE_INDEXING')
         try:
-            if workflow and prepared_item is None and state.get('workflow_state') not in ('BASE_VERIFYING', 'BASE_INDEXING'):
+            settled = bool(workflow and prepared_item is None and not barrier
+                           and dispatcher_settled(plan, state, phase))
+            # A profile can only price another round of this same phase; a
+            # settled phase has none, so rebuilding it would only reparse journals.
+            if workflow and prepared_item is None and not barrier and not settled:
                 refresh_cost_profile(plan, root, previous)
             operational = operational_inputs(root, queue_root, prepared_item)
         except (ValueError, OSError) as exc:
             state.update(status='repair_required', blocked_reason=str(exc))
             journal.save(); return state
         policy, profile = operational['policy'], operational['cost_profile']
+        # Only a parallel check proves coverage before it publishes; the local
+        # seal and finalize paths keep the controller's own scan.
+        settled = settled and (policy['parallel_verification'] or phases.deferred_base_audit(workflow))
         try:
-            if (workflow and phase == 'base' and state.get('workflow_state') in ('BASE_VERIFYING', 'BASE_INDEXING')):
+            if (workflow and phase == 'base' and barrier):
                 expected = phases.PredictionDesign(plan['prediction_workflow'], 'base').count
                 if state.get('phase_completed', {}).get('base') != expected:
                     raise ValueError('Persisted base verification checkpoint has incomplete coverage')
                 report = {'done': expected, 'remaining': 0, 'phase': 'base'}
+            elif settled:
+                report = {'done': phases.PredictionDesign(plan['prediction_workflow'], phase).count,
+                          'remaining': 0, 'phase': phase}
             else:
                 report = (phases.prepare_round(plan, phase, previous, queue_root, cost_profile=profile) if workflow
                           else backend.prepare_round(plan, previous, queue_root, cost_profile=profile))

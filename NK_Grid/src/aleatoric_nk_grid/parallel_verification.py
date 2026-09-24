@@ -178,6 +178,7 @@ def verify_chunk(directory, chunk, manifest=None):
     old = _receipt(directory, chunk, manifest)
     if old is not None:
         return old
+    started, cpu_started, io_started = time.time(), time.thread_time(), _io_counters()
     plan = manifest['plan']; cache = Path(plan['prediction_workflow']['cache_root'])
     prefix = 'c%06d' % chunk['index']; attempt = directory / 'chunks' / (prefix + '.' + uuid.uuid4().hex)
     ordinals, statuses = [], Counter(); audited = 0; artifacts = {}
@@ -275,8 +276,24 @@ def verify_chunk(directory, chunk, manifest=None):
     value = {'identity': digest([manifest['identity'], chunk]), 'phase': phase, 'rows': len(ordinals),
              'statuses': dict(statuses), 'audited': audited, 'artifacts': artifacts,
              'map_shards': len(chunk.get('paths', [])), 'hostname': os.uname().nodename if hasattr(os, 'uname') else os.environ.get('COMPUTERNAME')}
+    # Operational only: which of disk and decoding bounds a chunk, never part of any receipt identity.
+    finished, io_finished = time.time(), _io_counters()
+    value['timing'] = {'started_epoch': started, 'finished_epoch': finished,
+        'wall_seconds': finished - started, 'thread_cpu_seconds': time.thread_time() - cpu_started,
+        'journal_range_bytes': chunk['end'] - chunk['start'] if chunk['kind'] == 'rows' else 0,
+        'process_io_delta': ({k: io_finished[k] - io_started[k] for k in io_finished}
+                             if io_started and io_finished else None)}
     atomic_json(directory / 'chunks' / (prefix + '.json'), value)
     return value
+
+
+def _io_counters():
+    """Linux per-process read counters; the process verifies one chunk at a time."""
+    try:
+        fields = dict(line.split(':', 1) for line in Path('/proc/self/io').read_text().splitlines())
+        return {k: int(fields[k]) for k in ('rchar', 'read_bytes')}
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def reduce(directory):
@@ -468,7 +485,13 @@ def run(directory, workers, *, launch=None):
             subprocess.run(command, check=True)
         else:
             launch(directory, workers)
-        return reduce(directory)
+        try:
+            return reduce(directory)
+        except QueueError as exc:
+            # Integrity refusals are deterministic: record one, as a failed chunk
+            # does, so the controller stops instead of resubmitting the check.
+            atomic_json(directory / 'failure-reduce.json', {'stage': 'reduce', 'error': repr(exc)})
+            raise
 
 
 def worker(directory, rank, workers):
