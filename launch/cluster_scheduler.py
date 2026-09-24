@@ -151,6 +151,61 @@ def dispatcher_settled(plan, state, phase):
         return False
 
 
+def calibration_evidence(item):
+    """Measured startup and steady commit rate of one stopped SL calibration round.
+
+    The commit span comes from the shards' own protocol metrics; without them the
+    whole allocation time counts as active, which only makes that arm look slower.
+    """
+    root = Path(item['root']) / 'control'
+    receipt = read(root / 'round-result.json')
+    done = receipt['stats']['done']; elapsed = float(receipt['elapsed_seconds'])
+    first = last = None; source = 'elapsed'
+    try:
+        shards = read(root / str(receipt['generation']) / 'progress.json')['shards']
+        spans = [s['stats']['protocol_metrics']['event_times']['committed_records'] for s in shards]
+        first = min(float(s['first_elapsed']) for s in spans); last = max(float(s['last_elapsed']) for s in spans)
+        source = 'commit_span'
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if first is None or not last > first:
+        first, last, source = 0., elapsed, 'elapsed'
+    return {'label': item['label'], 'job_id': str(receipt.get('job_id')), 'worker_cap': item['calibration']['worker_cap'],
+            'nodes': item['allocation']['nodes'], 'workers': item['allocation']['workers'],
+            'allocated_cpu': receipt.get('allocation_cpu') or item['allocation']['allocated_cpu_bound'],
+            'done': done, 'elapsed_seconds': elapsed, 'startup_seconds': first, 'active_seconds': last - first,
+            'throughput_per_second': done / (last - first) if done else 0., 'source': source}
+
+
+def choose_sl_worker_cap(arms, remaining):
+    """The measured cap whose projected CPU-seconds to finish ``remaining`` cells is least."""
+    projected = {a['worker_cap']: a['allocated_cpu'] * (a['startup_seconds'] + remaining / a['throughput_per_second'])
+                 for a in arms if a['throughput_per_second'] > 0}
+    if not projected: return None, {}
+    return min(projected, key=lambda cap: (projected[cap], cap)), projected
+
+
+def calibrate_sl_round(state, calibration, policy, remaining):
+    """Policy and round note for the next SL round: a bounded arm, then the chosen cap."""
+    sl = [r for r in state['rounds'] if r['label'] in state['jobs'] and r.get('phase') == 'sl']
+    arms = [r for r in sl if 'arm' in r.get('calibration', {})]
+    caps = calibration['worker_caps']
+    record = state.setdefault('sl_calibration', {'worker_caps': caps, 'tasks_per_arm': calibration['tasks_per_arm']})
+    if len(arms) < len(caps):
+        cap = caps[len(arms)]; tasks = min(calibration['tasks_per_arm'], remaining)
+        return {**policy, 'sl_worker_cap': cap, 'max_claimed_tasks': tasks}, {'arm': len(arms), 'worker_cap': cap, 'tasks': tasks}
+    evidence, errors = [], []
+    for arm in arms:
+        try: evidence.append(calibration_evidence(arm))
+        except (OSError, ValueError, KeyError, TypeError) as exc: errors.append({'label': arm['label'], 'error': str(exc)})
+    chosen, projected = choose_sl_worker_cap(evidence, remaining)
+    if chosen is None: chosen = policy.get('sl_worker_cap')   # nothing measured: keep the configured cap
+    record.update(arms=evidence, evidence_errors=errors, remaining_at_choice=remaining, chosen_worker_cap=chosen,
+                  projected_cpu_seconds={str(k): v for k, v in projected.items()},
+                  base_audit_overlap=[r['label'] for r in state.get('verification_rounds', []) if r['mode'] == 'final-base'])
+    return {**policy, 'sl_worker_cap': chosen}, {'chosen_worker_cap': chosen}
+
+
 def worker_cpu_hours(state):
     """Charge stopped rounds once; missing receipt means the full reservation."""
     from discoverer_resources import duration
@@ -636,6 +691,15 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         # Operational: how many allocations a phase may use, never what it computes.
         if workflow and policy.get(phase + '_round_limit') is not None:
             round_limit = policy[phase + '_round_limit']
+        calibration = policy.get('sl_calibration') if workflow and phase == 'sl' else None
+        if calibration:
+            round_limit = max(round_limit, len(calibration['worker_caps']) + 1)
+        round_note = prepared_item.get('calibration') if prepared_item else None
+        if calibration and prepared_item is None:
+            # The round's own snapshot carries its cap and claim bound, never the file.
+            from aleatoric_nk_grid.shared_queue import digest
+            policy, round_note = calibrate_sl_round(state, calibration, policy, report['remaining'])
+            operational.update(policy=policy, policy_sha256=digest(policy))
         if phase_index >= round_limit:
             state['status'] = 'round_budget_exhausted'; journal.save(); return state
         stalled = 0
@@ -713,6 +777,7 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
                 'continuation_allowed': phase_index + 1 < round_limit}
         if workflow:
             item.update(phase=phase, phase_index=phase_index)
+            if round_note is not None: item['calibration'] = round_note
             allocation.update(phase=phase)
             state['workflow_state'] = 'BASE_RUNNING' if phase == 'base' else 'SL_RUNNING'
         if len(rounds) == index: rounds.append(item)

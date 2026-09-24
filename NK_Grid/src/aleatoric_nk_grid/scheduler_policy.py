@@ -60,6 +60,10 @@ DEFAULTS = {
     'overlap_base_audit': False, 'sl_verification_block_bytes': None,
     # Worker ceiling for SL allocations only, also under unified_compute.
     'sl_worker_cap': None,
+    # In-run SL sizing: bounded SL rounds at each worker cap measure real
+    # throughput; the rest of SL runs at the cap projected cheapest in CPU time.
+    # {'worker_caps': [ascending ints], 'tasks_per_arm': int}
+    'sl_calibration': None,
 }
 
 
@@ -90,6 +94,16 @@ def validate_policy(value=None):
             if item['sizing_mode'] == 'capacity' and item.get('target_round_seconds') is not None:
                 raise QueueError('capacity sizing cannot also specify target_round_seconds')
             policy[key] = dict(item)
+        elif key == 'sl_calibration':
+            if item is None:
+                continue
+            caps = item.get('worker_caps') if isinstance(item, dict) else None
+            if (not isinstance(item, dict) or set(item) != {'worker_caps', 'tasks_per_arm'}
+                    or not isinstance(caps, list) or not 1 <= len(caps) <= 8
+                    or any(type(c) is not int or c < 1 for c in caps) or caps != sorted(set(caps))
+                    or type(item['tasks_per_arm']) is not int or item['tasks_per_arm'] < 1):
+                raise QueueError('sl_calibration needs ascending positive worker_caps (1..8) and a positive integer tasks_per_arm')
+            policy[key] = {'worker_caps': list(caps), 'tasks_per_arm': item['tasks_per_arm']}
         elif key == 'exclude_nodes':
             if not isinstance(item, list) or any(not isinstance(n, str) or not n
                     or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in n)
