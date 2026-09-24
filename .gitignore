@@ -24,9 +24,8 @@ build/
 *.egg-info/
 .pytest_cache/
 
-# Legacy tests and checks/ are maintained locally, outside published source.
-# NK_Grid/validation/ is intentionally visible to Git for source review;
-# visibility does not mean its current files have been staged or committed.
+# Tests, checks/ and NK_Grid/validation/ are maintained locally.
+# Keep their source and evidence in local backups; they are not published by Git.
 tests/
 test/
 __tests__/
