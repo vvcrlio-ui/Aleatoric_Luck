@@ -1,72 +1,79 @@
 # Aleatoric Luck
 
-This project studies how prediction quality changes with the number of training samples **N** and available variables **K**.
+This repository runs a repeated-sampling prediction experiment. For each outcome we ask how well it can be predicted from a training sample of N people using K of the available predictor variables, and how that changes as N and K grow. The same design is applied to two studies: the Fragile Families Challenge (`FFCWS/`) and a study of social rigidity (`SMR/`).
 
-An FFCWS or SMR adapter first prepares the data. The engine then repeatedly samples training sets and variable subsets of different sizes, fits models, and evaluates them on test data. K counts original variable sources: a categorical variable expanded into several one-hot columns still counts as one source.
+## Research questions
 
-## Overall workflow
+### Fragile Families Challenge
 
-```text
-Raw data → identify missing codes, screen variables, and encode categories
-         → analysis data with missing values preserved
-         → define train/test split and sample N rows and K sources
-         → impute, standardize, and tune within training samples and CV training folds
-         → refit on all N training rows → predict on the test set → save metrics
-```
+How accurately can outcomes at age 15 be predicted from information observed from birth through age 9? The application also checks whether the conclusions depend on how categorical values and missing information are represented. The training and test samples are the ones defined by the Challenge; the [special-collection introduction](https://pmc.ncbi.nlm.nih.gov/articles/PMC10260255/) describes the study design.
 
-FFCWS retains the official train/test split and uses only the official training pool for variable screening and category vocabularies. SMR uses an existing analysis matrix and fixed feature definitions; the engine performs a random train/test split. Neither adapter imputes the full table in advance.
+### Social rigidity
 
-## Reading guide
+How accurately can midlife socioeconomic outcomes be predicted from earlier-life and family-background information? The application follows the predictive approach of Zheng and Cheng, ["Social Rigidity Across and Within Generations: A Predictive Approach"](https://doi.org/10.1177/00491241251347984). It describes how persistent and predictable these outcomes are; the causal effects of individual predictors are outside its scope.
 
-| Topic | Documentation |
-|---|---|
-| Responsibilities of data preparation and model training | [Adapter principles](Adapter/README.md) |
-| FFC row and column screening and missing values | [FFCWS adapter](FFCWS/adapter/README.md) |
-| Differences among the three FFC encodings | [Encoding methods](FFCWS/adapter/src/ffcws_data_processor/strategies/README.md) |
-| Fixed variable definitions in SMR | [SMR adapter](SMR/adapter/README.md) |
-| N/K sampling, model training, and metrics | [Experiment methods](NK_Grid/README.md) |
-| How the core code connects these steps | [Core code](NK_Grid/src/aleatoric_nk_grid/README.md) |
-| Launching, distributing, and resuming experiments | [Launch flow](launch/README.md), [cluster execution](NK_Grid/slurm/README.md) |
+### Outcomes
+
+| Study | Outcome | Column | Type |
+|---|---|---|---|
+| FFCWS | Grade point average | `gpa` | Continuous |
+| FFCWS | Grit | `grit` | Continuous |
+| FFCWS | Household material hardship | `materialHardship` | Continuous |
+| FFCWS | Household eviction | `eviction` | Binary |
+| FFCWS | Caregiver layoff | `layoff` | Binary |
+| FFCWS | Caregiver job training | `jobTraining` | Binary |
+| SMR | Log hourly wage | `Cm_lhourlywage` | Continuous |
+| SMR | Log total personal income | `Cm_ltotalincome` | Continuous |
+
+## Data
+
+FFCWS predictors come from the background survey collected before the age-15 outcomes. Which variables are kept, and how their categories are coded, is decided from the Challenge's training sample only; the test sample is used only to score predictions. Each FFCWS outcome is run under three encodings of the same variables, which differ in how categories and missing values are represented ([the three encodings](FFCWS/adapter/src/ffcws_data_processor/strategies/README.md)).
+
+SMR uses the numeric analysis matrix of the NLSY-based replication: 4,252 columns that represent 497 predictor variables. There is no predefined test sample, so for each seed the engine sets aside a random 30% of the people with an observed outcome as the test set.
+
+In both studies K counts variables, not columns. The dummy columns of a categorical variable, together with any missingness indicators attached to it, enter and leave the model as one unit and count once.
+
+Missing values stay missing in the prepared data. Imputation, scaling and model tuning are learned from the sampled training rows only, and inside cross-validation from each training fold only, so a small training sample does not borrow information from the rest of the data or from the test set ([why](Adapter/README.md#why-imputation-happens-during-training)).
+
+## Experimental design
+
+### The N × K grid
+
+Each axis has 20 sizes spaced evenly on a log scale. N runs from 10 up to the whole training sample, and K from 1 up to all predictor variables.
+
+### Nested samples
+
+For each seed and draw, the training rows are put in one random order and the predictor variables in another. The training data for a grid point are the first N rows and the first K variables in those orders. Within a draw, a smaller sample is therefore always part of a larger one, and moving along the grid adds data instead of switching to an unrelated subset.
+
+### Repetition
+
+The production design repeats the grid for 100 seeds with 50 draws each. In SMR, each seed also makes a new train/test split; in FFCWS the Challenge's test sample is the same in every seed. With 400 grid points this gives 2,000,000 training samples per model and 18,000,000 result rows per panel across the nine models. The spread across seeds and draws shows how much prediction quality at a given N and K depends on which people and variables happen to be drawn.
+
+## Models
+
+Eight models are fit separately on every training sample: OLS, Ridge, Lasso, random forest, extra trees, XGBoost, LightGBM and a neural network with one hidden layer. For binary outcomes, OLS, Ridge and Lasso are logistic regressions with different penalties.
+
+For continuous outcomes, Ridge, Lasso and the neural network choose their penalty, and the two boosting models their number of rounds, by cross-validation within the training sample, and are then refit on all N rows. For binary outcomes these models use fixed settings. Each study's settings are in its `model_params.yaml`.
+
+The ninth model, the Super Learner (SL7), combines the seven models other than OLS. Besides its fit on all N rows, each of the seven is fit five more times, each time on about four fifths of the training sample, to predict the remaining rows. This gives an out-of-fold prediction for every training row. SL7 finds the nonnegative weights, plus an intercept, that best predict the training outcome from these out-of-fold predictions, and applies the same weights to the seven models' test predictions. For binary outcomes it combines predicted probabilities with a logistic regression. SL7 does not see test outcomes and does not retrain any model.
+
+## Reading the results
+
+Each row of `final.csv` is one model fitted at one seed, draw, N and K. `status` is `ok` for a completed fit, `skipped` when the sampled data do not allow a fit (for example, a binary outcome with only one class in the training sample), and `failed` when fitting failed. `K_expanded` is the number of model columns behind the K variables.
+
+For continuous outcomes, `mse` is the mean squared error on the test set. `r2_test` compares it with predicting the training-sample mean for everyone; `r2_test_mean` compares it with the test-sample mean, which is the usual test R². For binary outcomes the table has `roc_auc`, `brier`, `log_loss` and `accuracy`. A metric that cannot be computed for a particular sample is stored as NaN, which is different from a failed fit.
 
 ## Quick start
 
-`FFCWS/panels.yaml` contains all **18 FFC experiments**: six outcomes under three
-encodings. Select exactly one with `--panel`, for example
-`ffc_median_mode_gpa` or `ffc_tree_ordinal_materialHardship`. This is the default
-manifest, so the `--manifest FFCWS/panels.yaml` option can be omitted. A launch
-does not run the other 17 entries.
+Each experiment is one panel: one outcome under one encoding. `FFCWS/panels.yaml` lists the 18 FFCWS panels and `SMR/panels.yaml` the two SMR panels. A run goes through a dry-run that only prints the launch settings, a small `dev` run or a `timing_full` run that covers the full grid once, and then `production`.
 
-Every FFC panel now saves the eight independent models' holdout and OOF
-predictions, fits SL7 from the seven cached columns other than OLS, and performs
-one global audit after SL. The controller runs base → reference index → SL →
-distributed final verification and CSV publication automatically. SL7 is a
-different recipe from the historical four-model Super Learner; the eight
-independent base recipes retain their existing definitions.
+| Preset | Seeds × draws | Grid |
+|---|---|---|
+| dev | 3 × 3 | 3 × 3, N and K at most 100 |
+| timing_full | 1 × 1 | full 20 × 20 |
+| production | 100 × 50 | full 20 × 20 |
 
-New FFC cache experiments use the shared Slurm entry. The examples below use
-Discoverer; the old local and BMRC suite/raw-data entries do not support this
-cache workflow. The [BMRC suite guide](launch/BMRC.md) remains available for
-historical runs using their original checkout. Existing frozen runs and their
-results retain their original configuration.
-
-The shared entry point is `run.sh`. Each stage starts with one command. The recommended sequence is:
-
-```text
-dry-run: preview the launch configuration
-    ↓
-dev: run a small trial
-    or
-timing_full: cover the full N/K range and check OOM errors, runtime, and other issues
-    ↓
-production: run the formal repeated experiment
-```
-
-Use dev for a quick trial and timing_full to assess resource requirements across the full N/K range. You can also run dev before timing_full.
-
-### 1. dry-run: preview the configuration
-
-Run these examples from a clean committed checkout on Discoverer, replacing
-`YOUR_PROJECT_ACCOUNT` with your authorized account:
+A dry-run of the FFCWS GPA panel on Discoverer:
 
 ```bash
 bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
@@ -75,81 +82,18 @@ bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
   --dispatcher-shards 4 --dry-run
 ```
 
-`--dry-run` displays the launch configuration. Training starts in the next stage.
-The policy requests common base/SL resources, with up to 300 compute nodes;
-actual allocations depend on the remaining tasks and live admission. Select
-resource bounds appropriate to the run. A custom policy can live outside the
-checkout and be passed with `--scheduler-policy /absolute/path/my-policy.json`.
+[How runs are carried out](launch/README.md) explains the stages and what happens on the cluster. [launch/OPERATIONS.md](launch/OPERATIONS.md) lists all commands and options, including other clusters, data preparation, resuming and output locations.
 
-### 2. dev or timing_full: run a trial
+## Where to read more
 
-Use dev to check the path from input data through training to result output:
-
-```bash
-bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
-  --panel ffc_median_mode_gpa --preset dev \
-  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep --output FFCWS/outputs/ffc-gpa-dev
-```
-
-Use timing_full to check memory use, runtime, convergence, and failures across the full N/K range:
-
-```bash
-bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
-  --panel ffc_median_mode_gpa --preset timing_full \
-  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep --output FFCWS/outputs/ffc-gpa-timing
-```
-
-| Trial preset | Default size | Purpose |
-|---|---|---|
-| dev | 3 seeds × 3 draws; 3×3 grid; N and K each capped at 100 | Check the workflow on a small scale |
-| timing_full | 1 seed × 1 draw; 20×20 grid covering full training capacity and all sources | Check OOM errors, runtime, and other issues for large training combinations |
-
-Both use the panel's declared model list. timing_full assesses resource requirements for production.
-
-### 3. production: run the full experiment
-
-Once trial results meet expectations, start the repeated experiment in a new directory:
-
-```bash
-bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
-  --panel ffc_median_mode_gpa --preset production --allow-large-run \
-  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep --output FFCWS/outputs/ffc-gpa-production
-```
-
-production defaults to 100 seeds × 50 draws on the full 20×20 grid. `--allow-large-run` enables this scale. Each stage runs independently and saves its own results.
-
-### Choosing an execution environment
-
-Use the same supported environment prefix across stages, keeping the panel and
-preset arguments. The FFC and SMR catalogs both declare required prediction
-caches and SL7, so they run through the shared Slurm scheduler; local execution
-only supports manifests without required caches.
-
-| Environment | Command prefix |
+| Topic | Document |
 |---|---|
-| Local Linux/WSL, non-cache manifests | `bash run.sh local` |
-| BMRC prepared-data shared entry; cache site validation pending | `bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT` |
-| Discoverer | `bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT` |
-
-Replace `YOUR_ACCOUNT` with your account. Prepared-data Slurm launches share the single-model queue and per-round continuation; BMRC suite/raw-data launches use the separate suite scheduler. The shared entry accepts `--dispatcher-shards 4` for both base and SL, plus `--scheduler-policy PATH.json` for the initial operational policy. Other Slurm clusters use `bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION --constraint none --qos YOUR_QOS`, with a compatible Python environment and site-appropriate resource options. Slurm submission uses a clean, committed checkout. See [cluster requirements, shard options and site limits](launch/README.md).
-
-The launcher creates or checks the Python environment and installs locked dependencies. Local execution supports Python 3.11–3.14; use WSL on Windows.
-
-### Data preparation and panel selection
-
-The general entry point expects the panel schema to reference analysis data prepared by the adapter. Existing inputs can be used directly, or `--schema` can select another prepared input definition. For SMR, use `--manifest SMR/panels.yaml --panel smr_hourlywage`.
-
-On Discoverer, `--prepare-ffc --ffc-data-dir YOUR_DATA_DIRECTORY` prepares the selected FFC panel on a compute node. The source directory contains `background.dta`, `train.csv`, `test.csv`, and labels for the selected outcome. See the reading guide above for each adapter's methods.
-
-### Viewing results
-
-The shared entry point writes results to `final.csv` in the selected run directory. After a trial, check process or scheduler logs for OOM errors and timeouts, and inspect the result columns `status` and `error`.
-
-`ok` means fitting completed, `skipped` means the combination was skipped because of data conditions, and `failed` means execution failed. New cluster runs record overall status in `cluster-state.json`; `verified.json` confirms complete, validated publication. Historical Discoverer runs retain their original `continuation.json` protocol.
-
-Each row represents one model at a particular seed, draw, N, and K. `K_expanded` is the actual input column count. For regression, start with `mse`. `r2_test` uses the current training-sample mean as its baseline; R² relative to the test mean is stored separately as `r2_test_mean`.
-
-Use a new output directory for each stage. Omitting `--output` creates `<manifest directory>/outputs/<panel>-<unique ID>/` automatically, with the validated result in `final.csv`. FFC GPA defaults to `FFCWS/outputs/ffc_median_mode_gpa-<unique ID>/`; SMR panels default to `SMR/outputs/<panel>-<unique ID>/`. These paths are inside the repository. An explicit `--output` overrides the default. To resume an existing Slurm run, use the original environment and account with `--resume PATH_TO_RUN/plan.json`.
+| What adapters do, and why imputation waits for the training sample | [Adapter principles](Adapter/README.md) |
+| Writing an adapter for a new dataset | [Adapter specification](Adapter/ADAPTER.md) |
+| FFCWS variable screening and missing values | [FFCWS adapter](FFCWS/adapter/README.md) |
+| The three FFCWS encodings | [Encodings](FFCWS/adapter/src/ffcws_data_processor/strategies/README.md) |
+| SMR variable definitions | [SMR adapter](SMR/adapter/README.md) |
+| Sampling, preprocessing, models and metrics in detail | [Experiment methods](NK_Grid/README.md) |
+| How the code carries out one experiment | [Core code](NK_Grid/src/aleatoric_nk_grid/README.md) |
+| How runs are carried out | [Running experiments](launch/README.md) |
+| Commands, clusters and recovery | [Operations](launch/OPERATIONS.md) |

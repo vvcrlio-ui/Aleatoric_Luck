@@ -2,7 +2,7 @@
 
 FFCWS inputs comprise a background-variable table and official train/test outcome tables. The code joins them by `challengeID`, preserving the official split and the row order of each outcome table. Only the official training pool determines variable retention and encoding; the same rules are then applied to test data.
 
-The sequence is: **identify missing values → screen variables in the training pool → determine variable types and category vocabularies → generate three representations → join the selected outcome → validate and pass inputs to the training engine.**
+The steps are: identify missing values, screen variables in the training pool, determine variable types and category vocabularies, build the three representations, join the selected outcome, and validate the inputs before they go to the training engine.
 
 ## 1. Row and column handling
 
@@ -27,14 +27,7 @@ If a prepared column is entirely NaN, the engine reports an input problem.
 
 Numbers can represent quantities or category identifiers. For example, 1, 2, and 3 children are counts, whereas marital-status codes 1, 2, and 3 identify categories.
 
-The code determines types in this order:
-
-| Available information | Treatment |
-|---|---|
-| Explicit type in the configuration | `numeric` or `categorical` in `schema.variable_types` takes precedence over the 15-level heuristic |
-| No declared type | Treat a variable as categorical if it has at most 15 observed levels and either Stata value labels or exclusively integer values; otherwise, treat it as numeric |
-
-Type declarations should be checked against variable documentation. The default type map is currently empty, so the second rule still applies. The code does not automatically interpret variable descriptions. Category vocabularies are built only from the official training pool.
+A type declared in the configuration, `numeric` or `categorical` under `schema.variable_types`, takes precedence. Without a declaration, a variable is treated as categorical if it has at most 15 observed levels and either Stata value labels or only integer values, and as numeric otherwise. No types are declared at present, so this rule decides every variable; any declaration added later should be checked against the variable documentation. Category vocabularies are built only from the official training pool.
 
 The same retained sources are represented in three ways:
 
@@ -62,7 +55,7 @@ All three representations retain the same original sampling sources, although ex
 
 ## 3. When and how imputation occurs
 
-**The adapter identifies missing values and preserves NaN; imputation takes place during training.** The engine learns imputation rules after drawing the training sample. Each cross-validation training fold learns its own rules, which are then applied to its validation or test data.
+The adapter identifies missing values and keeps them as NaN; imputation takes place during training. The engine learns imputation rules after drawing the training sample. Each cross-validation training fold learns its own rules, which are then applied to its validation or test data.
 
 | Type | Training-time treatment |
 |---|---|
@@ -85,6 +78,4 @@ Coverage is checked again for each outcome. A category may occur in the official
 
 [pipeline.py](src/ffcws_data_processor/pipeline.py) coordinates the process. [common/schema.py](src/ffcws_data_processor/common/schema.py) identifies missingness, screens variables, and defines their representations. [common/io.py](src/ffcws_data_processor/common/io.py) joins official outcome tables. [contract.py](src/ffcws_data_processor/contract.py) handles category coverage for rows with observed outcomes and generates engine input definitions.
 
-A new data version is published after all selected input checks pass. Reports record screening reasons and unknown categories, showing which variables were discarded and which test values became missing. See the [root quick start](../../README.md) for execution instructions.
-
-Subsequent FFC panels use these rules when inputs are regenerated with the updated code. Existing ARD and schema files retain the preprocessing used when they were created. Select a `median_missing_indicator` panel to include missingness indicators.
+A new data version is published only after all selected input checks pass. Reports record why each variable was discarded and which test values became missing. Prepared data keep the rules in force when they were built; regenerating the inputs applies the current rules.
