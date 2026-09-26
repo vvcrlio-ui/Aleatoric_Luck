@@ -106,7 +106,7 @@ class Slurm:
         result = {}
         for row in historic + queued:
             if (row["name"] != name or row["account"] != self.account
-                    or row["user"] != self.user or row["qos"] != self.qos):
+                    or row["user"] != self.user or (self.qos is not None and row["qos"] != self.qos)):
                 continue
             root = re.split(r"[_.]", row["id"])[0]
             if root.isdigit():
@@ -482,8 +482,11 @@ def main():
     elif args.action == "recover-bootstrap":
         print("Bootstrap job: " + submit_bootstrap(args.path))
     else:
-        spec = read(args.path.parent / "prepared-launch.json")
-        start(spec, args.path)
+        if read(args.path).get('format') == 'single-model-slurm-v1':
+            from cluster_scheduler import start as start_single_model
+            start_single_model(args.path)
+        else:
+            start(read(args.path.parent / "prepared-launch.json"), args.path)
 
 
 if __name__ == "__main__":

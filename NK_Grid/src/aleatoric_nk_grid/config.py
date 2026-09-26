@@ -51,6 +51,12 @@ class NKGridConfig:
     checkpoint_retention: str = "default"
     # Applied to the full source grid; frozen three-point grids stay unchanged.
     grid_selection: str = "all"
+    prediction_cache: Mapping[str, Any] | None = None
+    execution: Mapping[str, Any] | None = None
+
+    def __post_init__(self):
+        from .prediction_contract import normalize_prediction_options
+        normalize_prediction_options(self.prediction_cache, self.execution)
 
 
 def resolve_repeat_pairs(config: NKGridConfig) -> tuple[tuple[int, int], ...]:

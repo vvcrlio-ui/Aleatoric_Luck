@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
+from .robust_linear import LinearRegression
 from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -137,12 +137,13 @@ class BatchSearchMLP(RegressorMixin, BaseEstimator):
 
 class SerialBatchStack(RegressorMixin, BaseEstimator):
     """Regression stacking with diagnostics from actual OOF fits, without replay."""
-    def __init__(self, estimators, cv, positive, passthrough, diagnostics=False):
+    def __init__(self, estimators, cv, positive, passthrough, diagnostics=False, capture_predictions=False):
         self.estimators = estimators
         self.cv = cv
         self.positive = positive
         self.passthrough = passthrough
         self.diagnostics = diagnostics
+        self.capture_predictions = capture_predictions
 
     @staticmethod
     def _mlp_diagnostics(fitted):
@@ -194,7 +195,7 @@ class SerialBatchStack(RegressorMixin, BaseEstimator):
             raise ValueError("nonfinite stacking OOF predictions")
         design = np.column_stack((oof, X)) if self.passthrough else oof
         self.final_estimator_ = LinearRegression(positive=self.positive).fit(design, y)
-        if self.diagnostics:
+        if self.diagnostics or self.capture_predictions:
             # Preserve exactly the predictions consumed by the meta-learner.
             # The O(N * learners) array is opt-in and never enters RESULT JSON.
             self.oof_predictions_ = oof
