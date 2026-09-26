@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -14,10 +15,21 @@ from .validation import ensure_unique_ids
 
 
 def file_sha256(path: Path) -> str:
+    path = Path(path).resolve()
+    stat = path.stat()
+    return _file_sha256_cached(str(path), stat.st_size, stat.st_mtime_ns)
+
+
+@lru_cache(maxsize=512)
+def _file_sha256_cached(path: str, size: int, mtime_ns: int) -> str:
+    """One read per unchanged input across outcomes/encodings in this process."""
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    stat = Path(path).stat()
+    if (stat.st_size, stat.st_mtime_ns) != (size, mtime_ns):
+        raise ValueError(f"Input changed while reading: {path}")
     return digest.hexdigest()
 
 

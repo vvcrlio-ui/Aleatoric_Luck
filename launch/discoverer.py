@@ -1,7 +1,7 @@
-"""Discoverer CPU bootstrap, sharing the BMRC experiment and dynamic queue engine.
+"""Discoverer CPU bootstrap for the shared single-model cluster scheduler.
 
 Only standard-library code runs on the login node. Numerical imports, pip,
-FFC preparation and task-table generation run inside the bootstrap allocation.
+FFC preparation and task-design generation run inside the bootstrap allocation.
 """
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import uuid
 
 import experiment as common
 
@@ -117,24 +116,23 @@ def resumed_spec(args, plan_path):
 
 def launch(args, spec):
     if args.resume:
-        spec = resumed_spec(args, common.path_from_repo(args.resume))
-    else:
-        output = Path(spec["output"])
-        # A per-run venv avoids reusing a partially installed/cancelled setup or
-        # mutating an environment used by a previous queued/running experiment.
-        spec["bootstrap"] = {
-            "venv": str(common.path_from_repo(args.venv)) if args.venv else str(output / "venv"),
-            "refresh_env": args.refresh_env,
-            "python_module": os.environ.get("PYTHON_MODULE", DEFAULT_MODULE),
-            "prepare_ffc": args.prepare_ffc,
-            "ffc_data_dir": str(common.path_from_repo(args.ffc_data_dir or "FFCWS/data/private")),
-        }
+        from cluster_scheduler import resume
+        return resume(args)
+    output = Path(spec["output"])
+    # A per-run venv avoids mutating an environment used by another experiment.
+    spec["bootstrap"] = {
+        "venv": str(common.path_from_repo(args.venv)) if args.venv else str(output / "venv"),
+        "refresh_env": args.refresh_env,
+        "python_module": os.environ.get("PYTHON_MODULE", DEFAULT_MODULE),
+        "prepare_ffc": args.prepare_ffc,
+        "ffc_data_dir": str(common.path_from_repo(args.ffc_data_dir or "FFCWS/data/private")),
+    }
     if args.dry_run:
         print(json.dumps({"launch": spec, "actions": ["submit compute-node bootstrap",
-              "install/validate environment", "prepare FFC if requested", "freeze task design", "start cluster-resident per-round continuation"],
+              "install/validate environment", "prepare FFC if requested", "freeze single-model design", "start shared single-model scheduler"],
               "live_resources": {"workers": "unresolved until each round", "qos_account_partition_limits": "unresolved",
                                  "existing_jobs": "unresolved", "effective_wall_time": "unresolved"},
-              "note": "No data reads, installation or submission. The planning placeholder worker count is not a resource decision. Each round resolves live limits and submits one array; --workers is an optional cap and --rounds a hard bound."}, indent=2))
+              "note": "No data reads, installation or submission. The planning placeholder worker count is not a resource decision. Each round resolves live limits and CPU-minute headroom, then submits one worker allocation; --workers is an optional cap and --rounds a hard bound."}, indent=2))
         return
     if sys.platform == "win32":
         raise ValueError("Run this command in a Linux cluster login shell; --dry-run works locally")
@@ -142,32 +140,18 @@ def launch(args, spec):
     if source["dirty"]:
         raise ValueError("Discoverer requires a clean committed checkout; commit changes before submission")
     output = Path(spec["output"])
-    if args.resume:
-        common.validate_source(spec)
-        from discoverer_continuation import start
-        prepared = json.loads((output / "prepared-launch.json").read_text(encoding="utf-8"))
-        if not (output / "continuation.json").is_file():
-            raise ValueError("Legacy runs cannot be adopted by automatic continuation; preserve their frozen scheduler")
-        python = Path(prepared["bootstrap"]["venv"]) / "bin/python"
-        if not python.is_file():
-            raise ValueError("Frozen continuation Python is unavailable")
-        os.environ.update(PYTHON=str(python), VENV=prepared["bootstrap"]["venv"],
-                          ENGINE_DIR=str(common.ROOT / "NK_Grid"), PYTHON_MODULE=prepared["bootstrap"]["python_module"])
-        start(prepared, Path(spec["resume_plan"]))
-        return
-    else:
-        if output.exists():
-            raise FileExistsError(f"run directory already exists: {output}")
-        if output.is_relative_to(common.ROOT):
-            result = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=common.ROOT)
-            if result.returncode:
-                raise ValueError("Discoverer output inside the checkout must be Git-ignored (use runs/)")
-        spec.update(source=source, manifest_sha256=common.sha256(spec["manifest"]))
-        if spec["schema"]:
-            spec["schema_sha256"] = common.sha256(spec["schema"])
-        output.mkdir(parents=True)
-        (output / "logs").mkdir()
-    request = output / ("resume-" + uuid.uuid4().hex + ".json" if args.resume else "launch.json")
+    if output.exists():
+        raise FileExistsError(f"run directory already exists: {output}")
+    if output.is_relative_to(common.ROOT):
+        result = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=common.ROOT)
+        if result.returncode:
+            raise ValueError("Discoverer output inside the checkout must be Git-ignored (use runs/)")
+    spec.update(source=source, manifest_sha256=common.sha256(spec["manifest"]))
+    if spec["schema"]:
+        spec["schema_sha256"] = common.sha256(spec["schema"])
+    output.mkdir(parents=True)
+    (output / "logs").mkdir()
+    request = output / "launch.json"
     common.atomic_json(request, spec)
     from discoverer_continuation import submit_bootstrap
     job = submit_bootstrap(request)
@@ -237,7 +221,7 @@ def bootstrap(request):
     if spec.get("resume_plan"):
         if common.sha256(spec["resume_plan"]) != spec["resume_plan_sha256"]:
             raise ValueError("resume plan changed while queued")
-        common.command([python, common.ROOT / "launch/discoverer_continuation.py", "start", spec["resume_plan"]],
+        common.command([python, common.ROOT / "launch/cluster_scheduler.py", "start", spec["resume_plan"]],
                        cwd=Path(spec["resume_plan"]).parent, env=environment)
         return
     # Relaunch inside the verified venv before importing adapter/engine modules.

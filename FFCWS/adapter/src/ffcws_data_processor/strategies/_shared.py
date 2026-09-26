@@ -19,7 +19,9 @@ def categorical_state(
     numeric, _raw, blank, coded = numeric_values(frame[source.source_column])
     known = numeric.isin(source.levels)
     unknown = numeric.notna() & ~known
-    structural_missing = blank | coded
+    # numeric_values also coerces nonnumeric raw text to NaN. Every column
+    # in its categorical group must stay missing, rather than encode all zero.
+    structural_missing = blank | coded | numeric.isna()
     return numeric, known, unknown, structural_missing
 
 

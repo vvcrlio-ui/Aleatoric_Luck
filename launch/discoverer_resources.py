@@ -114,13 +114,15 @@ def snapshot(account, qos, partition="cn", *, run=query, user=None):
 
 
 def capacity(live, *, remaining, memory, requested_time, worker_cap=None,
-             extra_submit=2, extra_running=1):
+             extra_submit=2, extra_running=1, single_allocation=False, control_memory=None):
     """Bound additional workers, reserving only actual pending control roles.
 
     All existing jobs, including this controller and pending jobs, count against
     their scoped limits. Reserving pending work is deliberately conservative.
     extra_submit covers the successor and recovery guard; extra_running covers
     the brief guard/worker overlap. Admission remains Slurm's responsibility.
+    single_allocation keeps job-count gates separate from CPU/memory/node
+    headroom: an allocation containing many worker tasks is still one job.
     """
     user, account, qos = live["user"], live["account"], live["qos"]
     part, config, jobs = live["partition"], live["config"], live["jobs"]
@@ -150,18 +152,36 @@ def capacity(live, *, remaining, memory, requested_time, worker_cap=None,
     threads = max(int(n["threads"]) for n in live["nodes"])
     allocated_cpu = threads if "CR_CORE" in config.get("SelectTypeParameters", "").upper() else 1
     request = {"cpu": allocated_cpu, "mem": memory_mb(memory), "node": 1}
+    if type(single_allocation) is not bool:
+        raise ValueError('single_allocation must be boolean')
+    if single_allocation and any(type(value) is not int or value < 0 for value in (extra_submit, extra_running)):
+        raise ValueError('Control job reserves must be nonnegative integers')
+    control_request = {'cpu': max(threads, allocated_cpu),
+                       'mem': memory_mb(control_memory or memory), 'node': 1}
+    if single_allocation and (not math.isfinite(control_request['mem']) or control_request['mem'] <= 0):
+        raise ValueError('Control memory must be positive and finite')
+    job_constraints, resource_constraints = [], []
     choices = [(int(remaining), "remaining executable task groups")]
     if worker_cap:
         choices.append((int(worker_cap), "explicit worker cap"))
-    maximum_array = finite(config.get("MaxArraySize", ""))
-    if maximum_array is None:
-        raise ValueError("Cannot resolve MaxArraySize")
-    choices.append((maximum_array, "Slurm MaxArraySize"))
+    if not single_allocation:
+        maximum_array = finite(config.get("MaxArraySize", ""))
+        if maximum_array is None:
+            raise ValueError("Cannot resolve MaxArraySize")
+        choices.append((maximum_array, "Slurm MaxArraySize"))
     walls = [duration(requested_time)]
     def count_limit(value, scope, label, reserve):
         limit = finite(value)
         if limit is not None:
-            choices.append((limit - len(scope) - reserve, label))
+            available = limit - len(scope) - reserve
+            if single_allocation:
+                job_constraints.append({'source': label, 'limit': limit, 'existing_jobs': len(scope),
+                    'reserved_control_jobs': reserve, 'required_allocation_jobs': 1,
+                    'available_jobs': available})
+                if available < 1:
+                    raise ValueError('No worker capacity: ' + label)
+            else:
+                choices.append((available, label))
     def tres_limit(value, scope, label):
         limits = tres(value)
         for key in ("cpu", "mem", "node"):
@@ -170,8 +190,16 @@ def capacity(live, *, remaining, memory, requested_time, worker_cap=None,
             # Pending requests also reserve headroom. Group node usage is an
             # upper bound because multiple jobs may share the same node.
             used = sum(job_memory_mb(j) if key == "mem" else float(j[key]) for j in scope)
-            choices.append((math.floor((limits[key] - used) / request[key]) - extra_running,
-                            label + "/" + key))
+            if single_allocation:
+                if not math.isfinite(limits[key]) or limits[key] < 0 or not math.isfinite(used) or used < 0:
+                    raise ValueError('Invalid scoped allocation resource headroom: ' + label + '/' + key)
+                reserved = extra_running * control_request[key]
+                resource_constraints.append({'resource': key, 'source': label + '/' + key,
+                    'limit': limits[key], 'used': used, 'reserved_control': reserved,
+                    'available': limits[key] - used - reserved})
+            else:
+                choices.append((math.floor((limits[key] - used) / request[key]) - extra_running,
+                                label + "/" + key))
     def per_job(value, label):
         for key, limit in tres(value).items():
             if key in request and request[key] > limit:
@@ -213,12 +241,19 @@ def capacity(live, *, remaining, memory, requested_time, worker_cap=None,
         needed = request["mem"] / request["cpu"] if key.endswith("CPU") else request["mem"]
         if maximum not in (None, 0) and needed > maximum:
             raise ValueError(f"Worker memory exceeds partition {key}")
+        control_needed = control_request['mem'] / control_request['cpu'] if key.endswith('CPU') else control_request['mem']
+        if single_allocation and maximum not in (None, 0) and control_needed > maximum:
+            raise ValueError(f'Control memory exceeds partition {key}')
     workers, binding = min(choices)
     if workers < 1:
         raise ValueError("No worker capacity: " + binding)
-    return {"workers": workers, "time_limit": clock_string(min(w for w in walls if w is not None)),
+    result = {"workers": workers, "time_limit": clock_string(min(w for w in walls if w is not None)),
             "allocated_cpu_per_worker_bound": allocated_cpu, "memory_mb": request["mem"],
             "binding_limit": binding, "limits": [{"available_workers": n, "source": label} for n, label in choices],
             "queried_at_utc": live["queried_at_utc"], "existing_user_jobs": sum(j["user"] == user for j in jobs),
             "reserved_extra_submit_jobs": extra_submit, "reserved_extra_running_jobs": extra_running,
             "note": "Conservative scoped admission bound; immediate resource allocation is not guaranteed."}
+    if single_allocation:
+        result.update(admission_mode='single_allocation', job_count_constraints=job_constraints,
+                      resource_constraints=resource_constraints, reserved_control_request=control_request)
+    return result
