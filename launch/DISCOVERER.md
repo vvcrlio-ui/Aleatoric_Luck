@@ -1,6 +1,8 @@
 # Discoverer CPU 流水线
 
-使用与 BMRC 相同的 `run.sh` 入口、任务表、动态 worker、WAL、close、verify 和 finalize 协议。新增 `--profile discoverer`，将安装依赖、可选 FFC 数据准备和计划生成全部放进 Slurm bootstrap 作业。登录节点只检查提交条件、写启动请求并提交一个 bootstrap 作业。
+新运行与 BMRC 的 prepared-data 入口相同，由共享 single-model 调度器（[cluster_scheduler.py](cluster_scheduler.py)）执行；调度、恢复和状态文件见[启动指南](README.md)。`--profile discoverer` 额外把安装依赖、可选 FFC 数据准备和计划生成放进一个 Slurm bootstrap 作业。登录节点只检查提交条件、写启动请求并提交这个 bootstrap 作业。
+
+> 本文关于 worker array、控制作业链、`continuation.json`、`rounds/N/` 的段落，以及“验证范围”一节，描述的是 2026-09-08 引入的旧续跑协议。该协议现在只用于恢复带有 `continuation.json` 的历史运行；新运行的状态记录在 `cluster-state.json` 和 `verified.json` 中。
 
 ## 首次运行 FFC GPA timing_full
 
@@ -25,7 +27,7 @@ bash run.sh slurm --profile discoverer \
 
 Discoverer 现在只提交当前轮的一个 worker array 及必要控制/恢复作业。控制作业封存并验证上一轮，完成则验证后发布；有剩余可执行任务才准备下一轮。每轮查询 QoS、用户和账户祖先关联、分区、Slurm 配置及已有作业，并在准备后提交 worker 前再次检查。worker 数取有效运行/提交数、CPU/内存/节点资源、剩余任务组的保守交集，计入实际辅助作业，不为未来轮次预留 array。700/1000 快照且没有其他限制或作业时通常约 698 workers；实际决策写入收据，不保证立即调度。显式 `--workers` 设置自动容量上限。
 
-资源调整只改变 execution plan ID，保持 analysis ID、任务表、模型参数及设计不变。dry-run 将实时 worker、QoS/关联/分区和有效 wall time 显示为 unresolved；未传 `--workers` 的 timing_full/production 初始计划使用 `cluster.workers=1` 占位，实际 array 使用本轮冻结快照中的 worker 数。BMRC 保留旧提交器。
+资源调整只改变 execution plan ID，保持 analysis ID、任务表、模型参数及设计不变。dry-run 将实时 worker、QoS/关联/分区和有效 wall time 显示为 unresolved；未传 `--workers` 的 timing_full/production 初始计划使用 `cluster.workers=1` 占位，实际 array 使用本轮冻结快照中的 worker 数。BMRC 的 prepared-data 入口使用同一共享调度器；只有 BMRC `--suite` 或 `--ffc-data-dir` 启动走独立的历史 suite 调度器（见 [BMRC.md](BMRC.md)）。
 
 ## 默认资源与环境
 
@@ -67,6 +69,14 @@ SMR 使用 `--manifest SMR/panels.yaml --panel ... --schema ...` 指向已经准
 
 ## CV 与动态均衡分批方法版本
 
+现行版本：FFC 参数文件为 `nk-grid-v10-all-linear-fallback-1`，panel 方法身份仍为
+`nkgrid-models-v6-balanced-batch-1`；SMR 为
+`nk-grid-v11-relative-lasso-3fold-all-linear-fallback-1`，panel 方法身份为
+`nkgrid-models-v7-relative-lasso-3fold-1`。v10 在下述 v9 规则之上，让所有线性
+拟合在 LAPACK 不收敛时改用 gesvd、gelss 或带主元的 QR 恢复，正常路径不变；
+v11 另把 SMR 的 Lasso 改为逐折相对 alpha 的三折 CV（见
+[SMR 数据准备说明](../SMR/adapter/README.md)）。以下是 v8 和 v9 引入的规则。
+
 `nk-grid-v8-ridge-5fold-1` 将生产路径的独立回归 Ridge 和 Super Learner
 内部 Ridge 改为完整预处理流水线的 5 折交叉验证。每折只在训练行上拟合
 填补和标准化，以一次 SVD 搜索原有 63 个 alpha；按各折 MSE 的等权均值
@@ -76,7 +86,7 @@ SMR 使用 `--manifest SMR/panels.yaml --panel ... --schema ...` 指向已经准
 这是调参方法变更，不能与此前逐行留一验证的结果混为同一算法版本。
 新实验使用新输出目录；正在运行的旧实验须保持其源码和参数不变。
 
-当前 `nk-grid-v9-balanced-batch-1` 保留上述 Ridge 规则；panel 方法身份为
+`nk-grid-v9-balanced-batch-1` 保留上述 Ridge 规则；panel 方法身份为
 `nkgrid-models-v6-balanced-batch-1`。三份生产参数的 MLP/SL 均采用
 `mlp_batch_size: balanced`：对每次实际训练的 m 行，分为 ceil(m/200) 批，
 批大小最多相差 1，较大批在前，每轮恰好使用所有行一次。例如 201 行分为
@@ -153,7 +163,7 @@ bash run.sh slurm --profile discoverer \
 
 生产规模仍要求显式 `--allow-large-run`。检查点沿用共享引擎的保留/恢复协议。可在首次启动时传 `--checkpoints delete`，只在验证成功后清理检查点并保留最终 CSV；`--checkpoints keep` 显式保留。恢复时不能更改已冻结的策略。
 
-## 验证范围
+## 验证范围（旧续跑协议，2026-09-08）
 
 本地 35 项调度测试覆盖模拟上限、剩余任务缩容、依赖、部分提交恢复、响应丢失、重复触发、guard 锁竞争、OOM 与无进展/预算停止。Linux 集成测试使用真实任务表、资源合约、OLS 训练、WAL、封存验证与发布，仅模拟 Slurm。2026-09-08 的有界计算节点验证通过 217 项模型/调度/引擎测试，随后当前源码快照通过另外 50 项测试，其中只读 WAL 观察测试使用真实结果增长、冻结身份校验，并确认不获取文件锁、不改写运行文件。第二份快照包含 controller 的目录重入修正；它不是对真实 Slurm 控制链的端到端验证。
 
