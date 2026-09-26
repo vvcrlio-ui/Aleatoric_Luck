@@ -23,9 +23,12 @@ cd "$ROOT"
 # Status never loads a cluster module or installs dependencies.
 if [ "${ARGS[0]:-}" = status ]; then PREVIEW=1; fi
 if [ "$UPDATE" = 1 ] && [ "$PREVIEW" = 0 ]; then
-  [ "$(git branch --show-current)" = 'SMR&FFC' ] || { echo 'Update requires branch SMR&FFC; switch explicitly first.' >&2; exit 2; }
+  # Fast-forward the checked-out branch from origin; forks and upstream clones
+  # use different branch names, so none is hard-coded here.
+  BRANCH="$(git branch --show-current)"
+  [ -n "$BRANCH" ] || { echo 'Update requires a checked-out branch, not a detached HEAD.' >&2; exit 2; }
   [ -z "$(git status --porcelain)" ] || { echo 'Update refused: worktree has changes.' >&2; exit 2; }
-  git pull --ff-only origin 'SMR&FFC'
+  git pull --ff-only origin "$BRANCH"
   exec bash "$ROOT/run.sh" "${ARGS[@]}"
 fi
 if [ "$PREVIEW" = 0 ] && [ -n "${PYTHON_MODULE:-}" ]; then
