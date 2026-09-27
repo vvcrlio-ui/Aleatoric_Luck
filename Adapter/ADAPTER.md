@@ -112,7 +112,7 @@ inputs in a temporary directory. They then publish complete immutable bundles
 under `data/ard/<dataset>/.releases/<content-hash>/`, and feature universes under
 `schema/.universes/<content-hash>/`. The stable `schema/<dataset>.json` entry is
 replaced atomically only after its referenced files are complete. Read the paths
-from that schema; do not assume the older flat ARD layout shown in the example.
+from that schema; the flat ARD layout shown in the example is simplified.
 
 A failed build leaves existing schema entries and their inputs unchanged.
 Publication switches each schema independently: interruption during the final
@@ -127,7 +127,7 @@ The FFCWS work directory contains derived reports, not authoritative engine inpu
 `provenance.json` is optional audit metadata. Its location is fixed by the
 engine: it must sit in the same directory as the **training table** referenced by
 `table`, and its filename cannot change. If the file is present the engine reads
-it and rejects the run when it is not valid JSON; it no longer validates
+it and rejects the run when it is not valid JSON; it does not validate
 `schema_sha256` or any other digest from it. Do not record raw IDs or absolute
 paths.
 

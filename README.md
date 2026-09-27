@@ -34,7 +34,7 @@ The ninth model, the Super Learner (SL7), combines the seven models other than O
 
 ## Reading the results
 
-Each row of `final.csv` is one model fitted at one seed, draw, N and K. `status` is `ok` for a completed fit, `skipped` when the sampled data do not allow a fit (for example, a binary outcome with only one class in the training sample), and `failed` when fitting failed. `K_expanded` is the number of model columns behind the K variables.
+Every run writes to a new directory in its dataset folder, `<dataset>/outputs/<panel>-<ID>/`, which Git ignores. Each row of `final.csv` there is one model fitted at one seed, draw, N and K. `status` is `ok` for a completed fit, `skipped` when the sampled data do not allow a fit (for example, a binary outcome with only one class in the training sample), and `failed` when fitting failed. `K_expanded` is the number of model columns behind the K variables.
 
 For continuous outcomes, `mse` is the mean squared error on the test set. `r2_test` compares it with predicting the training-sample mean for everyone; `r2_test_mean` compares it with the test-sample mean, which is the usual test R². For binary outcomes the table has `roc_auc`, `brier`, `log_loss` and `accuracy`. A metric that cannot be computed for a particular sample is stored as NaN, which is different from a failed fit.
 
