@@ -443,7 +443,7 @@ def main(argv=None):
                           "note": "Read-only preview; input availability and resolved cell count checked at execution."}, indent=2))
         return
     if sys.platform == "win32":
-        raise ValueError("Full local execution requires Linux/WSL; use run.ps1 with an installed WSL distribution")
+        raise ValueError("Full local execution requires Linux; on Windows, run run.sh inside a WSL distribution")
     if not (3, 11) <= sys.version_info[:2] < (3, 15):
         raise ValueError("Python 3.11–3.14 required; select the cluster module or NKGRID_BOOTSTRAP_PYTHON")
     source = frozen_source()
