@@ -14,7 +14,7 @@
 __pycache__/
 *.py[cod]
 .venv/
-# Named local environments, including .venv-linux and .venv-remediation
+# Named local environments such as .venv-remediation
 .venv-*/
 *.nkgrid-env.lock
 venv/
@@ -56,7 +56,6 @@ reports/
 # Local implementation/review notes
 /WORKSPACE.md
 /checks/
-/NK_Grid/slurm/validate_single_model_scheduler.sbatch
 /*_VALIDATION.md
 /LOAD_BALANCE_698.md
 /SCHEDULER_DEVELOPMENT.md

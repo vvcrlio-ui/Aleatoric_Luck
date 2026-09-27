@@ -5,7 +5,6 @@ FFC preparation and task-design generation run inside the bootstrap allocation.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 from pathlib import Path
@@ -51,8 +50,8 @@ def configure(args):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.qos):
         raise ValueError("Discoverer QoS must be a simple account/QoS name")
     if args.resume:
-        if args.prepare_ffc or args.ffc_data_dir or args.refresh_env:
-            raise ValueError("resume reuses prepared inputs and environment; no preparation or refresh allowed")
+        if args.prepare_ffc or args.ffc_data_dir:
+            raise ValueError("resume reuses prepared inputs and environment; no preparation allowed")
         if args.plan_time or args.plan_memory:
             raise ValueError("resume reuses bootstrap resources; do not override --plan-time/--plan-memory")
         return
@@ -109,37 +108,14 @@ def submit_bootstrap(request, *, slurm=None):
         return journal.submit("B0", arguments)
 
 
-def resumed_spec(args, plan_path):
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    spec = json.loads((plan_path.parent / "launch.json").read_text(encoding="utf-8"))
-    if spec.get("profile") != "discoverer":
-        raise ValueError("resume requires a Discoverer launch.json beside plan.json")
-    for field in ("account", "qos"):
-        if getattr(args, field) != plan["submission"].get(field):
-            raise ValueError(f"resume cannot override frozen {field}")
-    if args.constraint not in (None, "none"):
-        raise ValueError("resume cannot override frozen constraint")
-    if args.venv and str(common.path_from_repo(args.venv)) != spec["bootstrap"]["venv"]:
-        raise ValueError("resume cannot override frozen venv")
-    spec["resume_plan"] = str(plan_path)
-    spec["resume_plan_sha256"] = common.sha256(plan_path)
-    spec["bootstrap"]["refresh_env"] = False
-    return spec
-
-
 def launch(args, spec):
     if args.resume:
         from cluster_scheduler import resume
         return resume(args)
-    output = Path(spec["output"])
-    if args.refresh_env and not args.venv:
-        raise ValueError("--refresh-env applies to an explicit --venv; shared environments are never modified")
-    # Without --venv, the bootstrap reuses the shared environment for these exact
-    # locked dependencies, or creates it once; project code comes from this checkout.
+    # The bootstrap reuses the shared environment for these exact locked
+    # dependencies, or creates it once; project code comes from this checkout.
     spec["bootstrap"] = {
-        "venv": str(common.path_from_repo(args.venv)) if args.venv else None,
         "shared_env_root": str(common.shared_env_root()),
-        "refresh_env": args.refresh_env,
         "python_module": os.environ.get("PYTHON_MODULE", DEFAULT_MODULE),
         "prepare_ffc": args.prepare_ffc,
         "ffc_data_dir": str(common.path_from_repo(args.ffc_data_dir or "FFCWS/data/private")),
@@ -230,21 +206,11 @@ def bootstrap(request):
     import tempfile
     tempfile.tempdir = None
     print(f"Bootstrap temporary directory: {temporary}", flush=True)
-    if options.get("venv"):
-        os.environ["PIP_CACHE_DIR"] = str(Path(spec["output"]) / "pip-cache")
-        python, venv = common.ensure_environment(argparse.Namespace(venv=options["venv"], refresh_env=options["refresh_env"]))
-    else:
-        os.environ["PIP_CACHE_DIR"] = str(Path(options["shared_env_root"]) / "pip-cache")
-        python, venv = common.ensure_shared_environment(options["shared_env_root"])
+    os.environ["PIP_CACHE_DIR"] = str(Path(options["shared_env_root"]) / "pip-cache")
+    python, venv = common.ensure_shared_environment(options["shared_env_root"])
     environment = batch_environment()
     environment.update(VENV=str(venv), PYTHON=str(python), ENGINE_DIR=str(common.ROOT / "NK_Grid"),
                        PYTHONPATH=str(common.ENGINE_SRC))
-    if spec.get("resume_plan"):
-        if common.sha256(spec["resume_plan"]) != spec["resume_plan_sha256"]:
-            raise ValueError("resume plan changed while queued")
-        common.command([python, common.ROOT / "launch/cluster_scheduler.py", "start", spec["resume_plan"]],
-                       cwd=Path(spec["resume_plan"]).parent, env=environment)
-        return
     # Relaunch inside the verified venv before importing adapter/engine modules.
     common.command([python, common.ROOT / "launch/discoverer.py", "prepare-execute", request], env=environment)
 

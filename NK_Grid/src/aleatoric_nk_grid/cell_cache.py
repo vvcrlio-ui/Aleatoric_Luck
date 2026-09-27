@@ -193,7 +193,7 @@ class CachedSession:
         return dict(X_sub_raw=X, X_test_raw=Xt,
                     y_sub=session.frame.loc[selected_rows, session.config.outcome],
                     y_test=test.loc[indexes.test_index, session.config.outcome],
-                    test_ids=indexes.test_ids, selected_groups=groups, unobserved=unobserved,
+                    selected_groups=groups, unobserved=unobserved,
                     prepared=prepared, n_train_total=len(indexes.train_index), n_test_total=len(indexes.test_index))
 
     def run(self, task):

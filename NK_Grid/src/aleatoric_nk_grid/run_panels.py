@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import argparse
-import json
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .helpers_logging import log_progress
 from .ingest import SCHEMA_FIELDS, load_schema
-from .config import DEFAULT_MODEL_PARAMS_PATH, NKGridConfig, config_to_json
+from .config import DEFAULT_MODEL_PARAMS_PATH, NKGridConfig
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,16 +46,11 @@ PRESETS: dict[str, dict[str, int]] = {
         "min_n": 10,
         "max_n": 0,
         "max_k": 0,
-        "batch_size": 20,
     },
     "production": {
         "n_seeds": 100,
         "n_draws": 50,
         **PRODUCTION_GRID,
-        # Keep the checkpoint/signal boundary small. Automatic WAL compaction
-        # controls the physical part count without making slow models redo
-        # 1,000 cells after a forced requeue.
-        "batch_size": 20,
     },
     "pilot": {
         "n_seeds": 84,
@@ -68,32 +59,18 @@ PRESETS: dict[str, dict[str, int]] = {
         # existing points on each axis. Panel grid overrides apply to both.
         **PRODUCTION_GRID,
     },
-    "dev-dynamic": {
-        "n_seeds": 3,
-        "n_draws": 1,
-        "n_sizes_n": 1,
-        "n_sizes_k": 1,
-        "min_n": 10,
-        "max_n": 100,
-        "max_k": 10,
-    },
 }
 DEFAULTS: dict[str, Any] = {
     "seed": 12345,
     "test_size": 0.3,
-    "batch_size": 20,
-    "checkpoint_retention": "default",
+    "checkpoint_retention": "keep",
     # Panel resolution must not depend on the submit host's environment.
     # Slurm workers replace this scheduler-only value from their allocation.
     "n_jobs": 4,
     "model_params": DEFAULT_MODEL_PARAMS_PATH,
-    "failed_abs_threshold": 50,
-    "failed_ratio_threshold": 0.05,
     "native_process_max_attempts": 2,
     "native_process_timeout_seconds": 21_600,
     "allow_large_run": False,
-    "dry_run": False,
-    "rerun_completed": True,
     "experiment_id": "nkgrid-dev-v1",
     "data_version": "dev-data-v1",
     "model_spec_version": "nkgrid-models-v3",
@@ -113,15 +90,10 @@ PANEL_FIELDS = frozenset(
         "min_n",
         "max_n",
         "max_k",
-        "batch_size",
         "checkpoint_retention",
         "n_jobs",
         "test_size",
         "allow_large_run",
-        "dry_run",
-        "rerun_completed",
-        "failed_abs_threshold",
-        "failed_ratio_threshold",
         "native_process_max_attempts",
         "native_process_timeout_seconds",
         "outcome",
@@ -132,7 +104,6 @@ PANEL_FIELDS = frozenset(
         "repeat_plan",
         "n_grid",
         "k_grid",
-        "prediction_export_cells",
         "prediction_cache",
         "execution",
     }
@@ -218,25 +189,9 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
             if not isinstance(values[grid_name], list) or not values[grid_name]:
                 raise ValueError(f"Panel {name} {grid_name} must be a non-empty list")
             values[grid_name] = tuple(int(value) for value in values[grid_name])
-    export_cells = values.get("prediction_export_cells", ())
-    if not isinstance(export_cells, (list, tuple)):
-        raise ValueError(
-            f"Panel {name} prediction_export_cells must be a list"
-        )
-    normalized_export_cells: list[tuple[str, int, int]] = []
-    for entry in export_cells:
-        if not isinstance(entry, dict) or set(entry) != {"model", "N", "K"}:
-            raise ValueError(
-                f"Panel {name} prediction_export_cells entries require exactly "
-                "model, N and K"
-            )
-        normalized_export_cells.append(
-            (str(entry["model"]), int(entry["N"]), int(entry["K"]))
-        )
-    values["prediction_export_cells"] = tuple(normalized_export_cells)
     retention = values["checkpoint_retention"]
-    if type(retention) is not str or retention not in {"default", "keep", "delete"}:
-        raise ValueError(f"Panel {name} checkpoint_retention must be default, keep, or delete")
+    if type(retention) is not str or retention not in {"keep", "delete"}:
+        raise ValueError(f"Panel {name} checkpoint_retention must be keep or delete")
     extra = sorted(set(values) - CONFIG_FIELDS)
     if extra:
         raise ValueError(f"Panel {name} did not resolve cleanly: {extra}")
@@ -275,54 +230,3 @@ def resolved_panels(
             values["preset"] = preset
         panels.append(resolve_panel(values, Path(manifest_path).parent))
     return panels
-
-
-def main(argv: list[str] | None = None) -> None:
-    from .nk_grid import estimate_run_size, run_nk_grid
-
-    parser = argparse.ArgumentParser(description="Run declared N×K grid panels.")
-    parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--only", nargs="+", default=None)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--max-jobs", type=int, default=None)
-    parser.add_argument("--checkpoints", choices=("keep", "delete"), default=None)
-    # ``default=None`` keeps an absent flag from overriding a panel that already
-    # declares ``allow_large_run``; passing the flag still authorizes every panel.
-    parser.add_argument("--allow-large-run", action="store_true", default=None)
-    args = parser.parse_args(argv)
-    panels = resolved_panels(
-        args.manifest, only=set(args.only) if args.only else None
-    )
-    if args.checkpoints is not None:
-        panels = [(name, replace(config, checkpoint_retention=args.checkpoints)) for name, config in panels]
-    if args.dry_run:
-        print(
-            json.dumps(
-                {
-                    "manifest": str(args.manifest),
-                    "panels": [
-                        {
-                            "name": name,
-                            "config": config_to_json(config),
-                            "estimate": estimate_run_size(config),
-                        }
-                        for name, config in panels
-                    ],
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return
-    for name, config in panels:
-        log_progress(f"panel {name} starting out={config.out}")
-        run_nk_grid(
-            config,
-            max_jobs=args.max_jobs,
-            allow_large_run=args.allow_large_run,
-        )
-        log_progress(f"panel {name} finished out={config.out}")
-
-
-if __name__ == "__main__":
-    main()

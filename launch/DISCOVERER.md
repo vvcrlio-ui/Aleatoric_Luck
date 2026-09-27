@@ -47,7 +47,7 @@ bash run.sh slurm --profile discoverer \
 
 bootstrap 和 controller 在模块/Python 初始化前显式进入运行目录，以处理本站计算节点偶发的 Slurm 初始工作目录回退；worker 的 `--chdir`、Python、引擎和 snapshot 均绑定该次运行的绝对路径。
 
-需要单独的环境时，可显式 `--venv /绝对路径`。环境不匹配时会拒绝运行；`--refresh-env` 只能用于这种显式环境，会重新安装，仅在确认没有其他作业使用该环境后使用。共享环境从不原地修改。恢复模式不接受环境刷新。
+共享环境从不原地修改。
 
 ## 数据准备与复用
 

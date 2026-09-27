@@ -1,6 +1,6 @@
-"""Opt-in single-model dispatcher. One owner, durable journal, local SQLite index.
+"""Single-model dispatcher. One owner, durable journal, local SQLite index.
 
-No Slurm submission or modification of the legacy engine occurs in this module.
+No Slurm submission occurs in this module.
 The journal/immutable task manifest may live on shared storage; the rebuildable
 SQLite index must live on the dispatcher's local scratch, never be shared by workers.
 """
@@ -151,6 +151,72 @@ class ModelTask:
     @property
     def cell(self):
         return digest([self.seed, self.draw, self.N, self.K])
+
+
+class Design:
+    """Dense ordinals over the frozen K × N × repeat × model design, with a done bitset."""
+
+    def __init__(self, spec):
+        self.spec = spec
+        self.ns = tuple(spec['resolved_n_grid'])
+        self.ks = tuple(spec['resolved_k_grid'])
+        self.repeats = tuple(tuple(x) for x in spec['resolved_repeat_plan'])
+        self.models = tuple(spec['models'])
+        dimensions = (self.ks, self.ns, self.repeats, self.models)
+        if any(not v or len(set(v)) != len(v) for v in dimensions):
+            raise QueueError('Design dimensions must be nonempty and unique')
+        self.maps = tuple({v: i for i, v in enumerate(values)} for values in dimensions)
+        self.count = len(self.ks) * len(self.ns) * len(self.repeats) * len(self.models)
+        self.bits = bytearray((self.count + 7) // 8)
+
+    def ordinal(self, row):
+        values = []
+        for name in ('seed', 'draw', 'N', 'K'):
+            value = row.get(name)
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise QueueError('Invalid integer task key')
+            try:
+                values.append(int(value))
+            except ValueError as exc:
+                raise QueueError('Invalid integer task key') from exc
+        task = ModelTask(*values, row.get('model'))
+        try:
+            k, n, r, m = (index[value] for index, value in zip(self.maps,
+                (task.K, task.N, (task.seed, task.draw), task.model)))
+        except KeyError as exc:
+            raise QueueError('Result outside frozen design') from exc
+        return ((k * len(self.ns) + n) * len(self.repeats) + r) * len(self.models) + m
+
+    def contains(self, ordinal):
+        return bool(self.bits[ordinal // 8] & (1 << (ordinal % 8)))
+
+    def mark(self, ordinal):
+        self.bits[ordinal // 8] |= 1 << (ordinal % 8)
+
+
+def validate_scientific_result(row, *, task_kind):
+    if task_kind not in ("regression", "classification"):
+        raise QueueError("Unknown frozen task kind")
+    status = row.get("status")
+    if status == "failed":
+        return False
+    if status == "skipped":
+        if not row.get("error"):
+            raise QueueError("Skipped result has no declared reason")
+        return True
+    if status != "ok":
+        raise QueueError("Unknown result status")
+    metrics = ("mse", "rmse", "mae") if task_kind == "regression" else ("brier", "accuracy")
+    for metric in metrics:
+        try:
+            value = float(row[metric])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise QueueError(f"Invalid metric: {metric}") from exc
+        if not math.isfinite(value) or value < 0:
+            raise QueueError(f"Nonfinite/negative metric: {metric}")
+        if task_kind == "classification" and value > 1:
+            raise QueueError(f"Classification metric outside [0,1]: {metric}")
+    return True
 
 
 class Dispatcher:

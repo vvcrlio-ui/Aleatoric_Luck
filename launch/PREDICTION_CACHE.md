@@ -15,7 +15,6 @@ submitting a bounded repair; do not overwrite its frozen batch entry.
 Resource admission counts one worker allocation plus its control jobs against
 job-count limits. CPU, memory and node requests are checked separately against
 every applicable live scope; a job-count limit is not a worker-count limit.
-Legacy array launchers retain their original per-job accounting.
 
 ```yaml
 prediction_cache:
@@ -118,9 +117,7 @@ Holdout labels are loaded by the scoring step after fitting the combiner.
 
 Use the ordinary `launch/experiment.py slurm` command with a new FFC manifest
 containing the above options. `cluster_queue.prepare_joint` accepts explicitly
-prepared panel plans and creates one multi-panel barrier. The flat-task-table
-and local full-run paths reject required cache configurations.
-They do not silently fall back to mixed full SL training.
+prepared panel plans and creates one multi-panel barrier.
 
 An isolated native acceptance run can be prepared without submitting jobs:
 

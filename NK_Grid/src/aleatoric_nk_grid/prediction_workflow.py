@@ -20,10 +20,8 @@ import sys
 import threading
 import uuid
 
-from .pending_resume import Design
-from .shared_queue import (ModelTask, QueueError, atomic_json, canonical, digest,
-                           file_digest, file_lock, transport_manifest)
-from .result_migration import validate_scientific_result
+from .shared_queue import (Design, ModelTask, QueueError, atomic_json, canonical, digest,
+                           file_digest, file_lock, transport_manifest, validate_scientific_result)
 
 FORMAT = 'prediction-workflow-v1'
 BASE_READY_FORMAT = 'base-input-ready-v1'

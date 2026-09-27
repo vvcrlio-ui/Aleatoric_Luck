@@ -16,7 +16,7 @@ Every panel in both catalogs saves the eight base models' test and out-of-fold p
 | timing_full | 1 × 1 | 20 × 20 over the full training sample and all sources | Check memory, run time and failures across the full range |
 | production | 100 × 50 | 20 × 20 | The full experiment; requires `--allow-large-run` |
 
-`--preset` also accepts `medium`, `pilot` and `dev-dynamic`. All presets use the panel's model list.
+`--preset` also accepts `medium` and `pilot`. All presets use the panel's model list.
 
 Start with `--dry-run`, which prints the launch configuration without installing anything, reading data or submitting jobs. Each run gets its own new directory under the catalog's `outputs/` (see below). Submit Slurm runs from a clean, committed checkout. On Discoverer:
 
@@ -46,16 +46,15 @@ A custom policy can live outside the checkout and be passed with `--scheduler-po
 
 ## Where runs can execute
 
-The FFCWS and SMR catalogs require the prediction cache, so they run through the shared Slurm scheduler. Local runs call the engine directly and work only for manifests without a required cache.
+Every run goes through the shared Slurm scheduler.
 
 | Environment | Command prefix |
 |---|---|
-| Local Linux or WSL, manifests without a required cache | `bash run.sh local` |
 | Discoverer | `bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT` |
 | BMRC, prepared data | `bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT` |
 | Other Slurm clusters | `bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION --constraint none --qos YOUR_QOS` |
 
-Other clusters also take `--time`, and need a compatible Python environment loaded first. On every Slurm cluster the launcher keeps one Python environment per set of locked dependencies (`NK_Grid/requirements.txt`), Python module and CPU type, in `nkgrid-envs/` beside the checkout or in `NKGRID_ENV_ROOT`. The first run with a new combination creates it, with the pip cache in the same place; later runs, from any checkout, reuse it unchanged, and every run imports the engine from its own checkout. `--venv` selects a separate environment instead, and only such an environment can be rebuilt with `--refresh-env`. Local runs use `.venv-linux` in the checkout. The launcher needs Python 3.11–3.14, and on Windows it runs under WSL. Site profiles in `profiles/` set Python modules, constraints, partitions and accounts; `--qos` works with any profile.
+Other clusters also take `--time`, and need a compatible Python environment loaded first. On every Slurm cluster the launcher keeps one Python environment per set of locked dependencies (`NK_Grid/requirements.txt`), Python module and CPU type, in `nkgrid-envs/` beside the checkout or in `NKGRID_ENV_ROOT`. The first run with a new combination creates it, with the pip cache in the same place; later runs, from any checkout, reuse it unchanged, and every run imports the engine from its own checkout. The launcher needs Python 3.11–3.14 on a Linux login node; `--dry-run` also works elsewhere. Site profiles in `profiles/` set Python modules, constraints, partitions and accounts; `--qos` works with any profile.
 
 The compute nodes must share the run directory, allow TLS connections from workers to the dispatcher, and provide `srun` and `openssl`. The submitting account needs read access to its Slurm association and QoS limits and usage (`sacctmgr`, `scontrol show assoc_mgr`); submission stops if a limit cannot be read. The cache admission code expects Lustre project paths and `lfs` project-quota commands. On BMRC and other clusters the cache workflow still needs site validation of quota handling and CPU binding.
 
@@ -93,11 +92,11 @@ bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT \
 
 ## Results and output locations
 
-Every run is created at `<manifest directory>/outputs/<panel>-<unique ID>/`, with the validated result in `final.csv`. For the FFCWS GPA panel this is `FFCWS/outputs/ffc_median_mode_gpa-<unique ID>/`; SMR panels use `SMR/outputs/<panel>-<unique ID>/`. These paths are inside the repository. `outputs/` is ignored by Git, so the checkout stays clean. A resumed run keeps its original directory; `--output` exists only for the rare case that needs another location.
+Every run is created at `<manifest directory>/outputs/<panel>-<unique ID>/`, with the validated result in `final.csv`. For the FFCWS GPA panel this is `FFCWS/outputs/ffc_median_mode_gpa-<unique ID>/`; SMR panels use `SMR/outputs/<panel>-<unique ID>/`. These paths are inside the repository. `outputs/` is ignored by Git, so the checkout stays clean. A resumed run keeps its original directory.
 
 After a trial, check the process or scheduler logs for out-of-memory errors and timeouts, and look at the `status` and `error` columns. `cluster-state.json` records a cluster run's controller receipts, rounds and status; `complete` means validation, publication and the selected checkpoint handling have finished. `verified.json` ties the final CSV to the exact task count and the source receipts. With `--checkpoints delete`, only the run's `rounds/` checkpoint directory is removed, after publication; the plan, final CSV and verification receipts stay.
 
 ## Resuming
 
-Resume with the original profile and account and `--resume /absolute/run/plan.json`. The resumed run reuses the original inputs and parameters, reads the saved results and schedules only the remaining tasks; training whose results were not saved before the interruption is repeated. Single-panel plans have the format `single-model-slurm-v1`. A plan in the grouped task-table format is passed to the scripts in [NK_Grid/slurm](../NK_Grid/slurm/README.md). The launcher does not change the settings of an existing run in place.
+Resume with the original profile and account and `--resume /absolute/run/plan.json`. The resumed run reuses the original inputs and parameters, reads the saved results and schedules only the remaining tasks; training whose results were not saved before the interruption is repeated. The launcher does not change the settings of an existing run in place, and a run is resumed only from the checkout that started it.
 

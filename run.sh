@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# One entry point for Linux/WSL and Slurm. No shell-evaluated user arguments.
+# One entry point for Slurm clusters. No shell-evaluated user arguments.
 set -euo pipefail
 SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 [ "$SCRIPT_DIR" != "${BASH_SOURCE[0]}" ] || SCRIPT_DIR=.
 ROOT="$(cd "$SCRIPT_DIR" && pwd)"
-PROFILE="local"; UPDATE=0; PREVIEW=0; ARGS=()
+PROFILE=""; UPDATE=0; PREVIEW=0; ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --profile) [ "$#" -ge 2 ] || { echo '--profile needs a name' >&2; exit 2; }; PROFILE="$2"; ARGS+=("$1" "$2"); shift 2 ;;
@@ -14,10 +14,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$PROFILE" in
-  local) ;;
+  "") ;;
   bmrc) source "$ROOT/launch/profiles/bmrc.sh" ;;
   discoverer) source "$ROOT/launch/profiles/discoverer.sh" ;;
-  *) echo "Unknown profile: $PROFILE (choose local, bmrc or discoverer)" >&2; exit 2 ;;
+  *) echo "Unknown profile: $PROFILE (choose bmrc or discoverer)" >&2; exit 2 ;;
 esac
 cd "$ROOT"
 if [ "$UPDATE" = 1 ] && [ "$PREVIEW" = 0 ]; then
@@ -33,13 +33,6 @@ if [ "$PREVIEW" = 0 ] && [ -n "${PYTHON_MODULE:-}" ]; then
   command -v module >/dev/null 2>&1 || { echo "module command unavailable; use a cluster login shell for $PYTHON_MODULE" >&2; exit 2; }
   module purge
   module load "$PYTHON_MODULE"
-fi
-if [ "$PROFILE" = bmrc ] && [ -z "${VENV:-}" ]; then
-  # Resolve AFTER module load: its CPU ABI can differ across cluster nodes.
-  if [ "$PREVIEW" = 0 ]; then
-    : "${MODULE_CPU_TYPE:?Python module did not set MODULE_CPU_TYPE; set VENV explicitly}"
-  fi
-  export VENV="$ROOT/venv/aleatoric-${MODULE_CPU_TYPE:-module-cpu}"
 fi
 export ENGINE_DIR="$ROOT/NK_Grid"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1

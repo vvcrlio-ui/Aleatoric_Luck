@@ -13,14 +13,11 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import sys
 import time
+import uuid
 
 import experiment as common
 import discoverer_resources as resources
-
-sys.path.insert(0, str(common.ROOT / "NK_Grid/slurm"))
-from submission_journal import _lock, _write
 
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
 
@@ -31,6 +28,52 @@ def now():
 
 def read(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _write(path, value):
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _lock(path):
+    # Persistent inode; Windows uses its real byte-range lock for portable
+    # launcher tests, while the production POSIX path uses flock.
+    with Path(path).open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            if handle.seek(0, os.SEEK_END) == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager

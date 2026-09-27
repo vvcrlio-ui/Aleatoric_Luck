@@ -1,31 +1,17 @@
 """Shared, article-agnostic N×K grid engine."""
 
 from importlib import import_module
-from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
+# Every process imports the engine from its own checkout through PYTHONPATH.
 _PACKAGE_PATH = Path(__file__).resolve()
-_PACKAGE_DIR = _PACKAGE_PATH.parent
-_SOURCE_LAYOUT = (
-    _PACKAGE_PATH.parents[1].name == "src"
-    and (_PACKAGE_PATH.parents[2] / "pyproject.toml").is_file()
-)
-_INSTALLED_LAYOUT = False
-if not _SOURCE_LAYOUT:
-    try:
-        _DIST = distribution("aleatoric-nk-grid")
-    except PackageNotFoundError:
-        _DIST = None
-    if _DIST is not None:
-        _INSTALLED_LAYOUT = (
-            Path(_DIST.locate_file("aleatoric_nk_grid")).resolve() == _PACKAGE_DIR
-        )
-if _PACKAGE_DIR.name != "aleatoric_nk_grid" or not (
-    _SOURCE_LAYOUT or _INSTALLED_LAYOUT
+if (
+    _PACKAGE_PATH.parent.name != "aleatoric_nk_grid"
+    or _PACKAGE_PATH.parents[1].name != "src"
+    or not (_PACKAGE_PATH.parents[2] / "pyproject.toml").is_file()
 ):
     raise RuntimeError(
-        f"aleatoric_nk_grid resolved outside the installed shared engine: "
-        f"{_PACKAGE_PATH}"
+        f"aleatoric_nk_grid resolved outside a checkout's NK_Grid/src: {_PACKAGE_PATH}"
     )
 
 __all__ = [
@@ -34,7 +20,6 @@ __all__ = [
     "NKGridConfig",
     "load_input",
     "load_schema",
-    "run_nk_grid",
 ]
 
 _EXPORT_MODULES = {
@@ -43,7 +28,6 @@ _EXPORT_MODULES = {
     "NKGridConfig": ".config",
     "load_input": ".ingest",
     "load_schema": ".ingest",
-    "run_nk_grid": ".nk_grid",
 }
 
 

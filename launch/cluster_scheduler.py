@@ -271,12 +271,16 @@ def release_prediction_storage(plan, state, journal):
     return True
 
 
+def read_plan(path):
+    plan = read(path)
+    if plan.get('format') != FORMAT:
+        raise ValueError('Plan was not created by this scheduler; resume it from the checkout that created it')
+    return plan
+
+
 def load(plan_path):
     plan_path = Path(plan_path).resolve()
-    plan = read(plan_path)
-    if plan.get('format') != FORMAT:
-        raise ValueError('Legacy grouped plan cannot be submitted by the new scheduler. '
-                         'Use its frozen checkout for recovery or explicitly migrate sealed results.')
+    plan = read_plan(plan_path)
     if Path(plan['launch']['output']).resolve() != plan_path.parent:
         raise ValueError('Plan output directory changed')
     common.validate_source(plan['launch'])
@@ -865,9 +869,7 @@ def work(plan_path):
 def resume(args):
     path = common.path_from_repo(args.resume)
     # Identity and resource checks are also performed during a dry-run.
-    plan = read(path)
-    if plan.get('format') != FORMAT:
-        return common.resume_legacy(args, path, plan)
+    plan = read_plan(path)
     spec = plan['launch']
     if (path.parent / 'verified.json').exists() or (path.parent / 'checkpoint-archive.json').exists():
         raise ValueError('Run already completed; final CSV is retained; do not resume training')
@@ -876,17 +878,13 @@ def resume(args):
         if value is not None and value != spec['cluster'].get(field):
             raise ValueError('resume cannot override frozen ' + field)
     if args.profile != spec['profile']: raise ValueError('resume cannot change cluster profile')
-    frozen_retention = plan.get('checkpoint_retention', 'default')
-    if args.checkpoints and args.checkpoints != ('keep' if frozen_retention == 'default' else frozen_retention):
+    if args.checkpoints and args.checkpoints != plan['checkpoint_retention']:
         raise ValueError('resume cannot override frozen checkpoint policy')
-    if args.refresh_env: raise ValueError('resume cannot refresh the frozen environment')
     environment = spec.get('worker_environment') or read(path.parent / 'cluster-environment.json')
     python = Path(environment['python'])
-    if args.venv and common.path_from_repo(args.venv) != python.parent.parent:
-        raise ValueError('resume cannot change frozen environment')
     if args.dry_run:
         print(json.dumps({'scheduler': FORMAT, 'plan': str(path), 'python': str(python),
-                          'launch': {**spec, 'checkpoint_retention': frozen_retention},
+                          'launch': {**spec, 'checkpoint_retention': plan['checkpoint_retention']},
                           'actions': ['verify stopped rounds', 'resume missing single-model tasks']}, indent=2))
         return
     load(path)
@@ -900,8 +898,7 @@ def main():
     p.add_argument('plan', type=Path)
     args = p.parse_args()
     if args.command == 'preview':
-        plan = read(args.plan)
-        if plan.get('format') != FORMAT: raise ValueError('Legacy grouped plan; use its frozen checkout')
+        plan = read_plan(args.plan)
         print(json.dumps({'scheduler': FORMAT, 'submission': plan['submission']}, indent=2))
     else:
         {'start': start, 'control': advance, 'work': work, 'check': check}[args.command](args.plan.resolve())

@@ -4,21 +4,16 @@ from __future__ import annotations
 from .phase_timing import timed_phase
 from .grid_contract import select_grid_points, validate_size_grid
 from .config import (
-    DEFAULT_MODEL_PARAMS_PATH, NKGridConfig,
+    NKGridConfig,
     execution_groups_for_models, group_repeat_pairs_by_seed, resolve_repeat_pairs,
 )
 
-import argparse
 import json
-import os
-import re
 import resource
-import shutil
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -30,6 +25,7 @@ from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
     brier_score_loss,
+    d2_absolute_error_score,
     explained_variance_score,
     f1_score,
     log_loss,
@@ -42,19 +38,6 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-try:
-    from sklearn.metrics import d2_absolute_error_score
-except ImportError:
-
-    def d2_absolute_error_score(y_true, y_pred) -> float:
-        y_true = np.asarray(y_true, dtype=float)
-        y_pred = np.asarray(y_pred, dtype=float)
-        numerator = np.sum(np.abs(y_true - y_pred))
-        denominator = np.sum(np.abs(y_true - np.median(y_true)))
-        if denominator == 0:
-            return np.nan
-        return 1.0 - numerator / denominator
-
 ROOT = Path(__file__).resolve().parents[2]
 
 from .evaluation import r2_against_training_mean, regression_denominators, METRIC_DEFINITION_VERSION
@@ -66,29 +49,11 @@ from .execution_contract import (
     sha256_file,
 )
 from .experiment import (
-    CHECKPOINT_COMPACTION_LOOSE_PARTS,
-    CHECKPOINT_KEY_COLUMNS,
-    CheckpointSummary,
     SERIAL_OUTER_MODELS,
     add_metadata,
     build_experiment_metadata,
-    checkpoint_parts,
-    checkpoint_parts_dir,
-    core_environment,
-    diagnostics_summary,
     git_state,
-    load_checkpoint_index,
-    manifest_path,
-    merge_checkpoint_parts,
     model_run_settings,
-    output_run_lock,
-    rows_for_experiment,
-    seed_checkpoint_parts_from_csv,
-    retire_checkpoint_parts,
-    utc_now,
-    verify_materialized_checkpoint,
-    write_checkpoint_part,
-    write_json_atomic,
 )
 from .helpers_logging import log_progress
 from .ingest import LoadedInput, load_input
@@ -109,26 +74,13 @@ from .preprocessing import (
     preprocess_cell,
     sampling_units,
 )
-from .prediction_export import (
-    materialize_prediction_export_atomic,
-    prediction_export_part_path,
-    prediction_export_parts_dir,
-    prediction_export_path,
-    prediction_export_schema,
-    write_prediction_part_atomic,
-)
 from .validate_input import REGRESSION_CV_MIN_N, validate_input
 
 
 LARGE_RUN_THRESHOLD = 250_000
-PREDICTION_EXPORT_DYNAMIC_ERROR = (
-    "Per-row prediction export is not supported by the dynamic queue/WAL "
-    "path; see plans/per-row-prediction-export.md"
-)
 
 # Row-level metadata is deliberately scalar-only. The complete artifact-level
-# identity and semantic contract belong in the sidecar manifest, where
-# _manifest_payload() records them once instead of once per checkpoint row.
+# identity and semantic contract are recorded once per run, not once per row.
 ROW_METADATA_FIELDS = (
     "experiment_id",
     "experiment_kind",
@@ -138,11 +90,6 @@ ROW_METADATA_FIELDS = (
     "split_mode",
     "split_seed",
 )
-
-# Super Learner fits each of its 4 base learners once per CV fold plus one final
-# refit on the full subsample: 4 x (cv + 1) with cv=5. This counts only
-# outer base-estimator calls, not their nested hyperparameter searches.
-SUPER_LEARNER_FITS_PER_CELL = 24
 
 
 _NATIVE_RUNNER_LOCK = threading.Lock()
@@ -222,21 +169,6 @@ STABLE_DIAGNOSTIC_RESULT_COLUMNS = (
     "_preprocess_vectorized",
 )
 
-# These fields describe one process invocation rather than a scientific cell.
-# They are useful in local checkpoint diagnostics, but must never participate
-# in a durable RESULT identity: a perfectly legitimate retry will have new
-# timings (and often a new RSS high-water mark).  Keeping this list separate
-# from ``public_result_columns`` gives the WAL and local materializer one
-# stable public projection.
-TRANSIENT_RESULT_COLUMNS = (
-    "_fit_seconds", "_best_rounds", "_preprocess_seconds", "_preprocess_computed",
-    "_slice_seconds", "_cell_wall_seconds", "_peak_rss_bytes",
-)
-
-# Compatibility name for local diagnostics code which still constructs every
-# field before its checkpoint reducer drops transient values.
-DIAGNOSTIC_RESULT_COLUMNS = (*STABLE_DIAGNOSTIC_RESULT_COLUMNS, *TRANSIENT_RESULT_COLUMNS)
-
 
 def public_result_columns(task: str) -> tuple[str, ...]:
     """Return the byte-serialized result schema for one immutable analysis."""
@@ -282,29 +214,12 @@ def _frozen_input_provenance_for_schema(schema: Any) -> dict[str, dict[str, str]
     return frozen
 
 
-def _local_cell_spec_root(config: NKGridConfig, provenance: Mapping[str, Mapping[str, str]]) -> Path:
-    """Use the Git root for real runs; retain test-only local fixture roots."""
-
-    repository = git_repository_root(ROOT)
-    candidates = [Path(config.schema).resolve(), Path(config.model_params).resolve()]
-    candidates.extend(Path(str(entry["path"])).resolve() for entry in provenance.values())
-    try:
-        for candidate in candidates:
-            candidate.relative_to(repository)
-    except ValueError:
-        # Unit fixtures deliberately reside in pytest's temporary directory.
-        # The local runner has no portable contract artefact; dynamic plans
-        # always use the real Git root above.
-        return Path(os.path.commonpath([str(candidate) for candidate in candidates])).resolve()
-    return repository
-
-
 def project_public_result(row: Mapping[str, object], *, header: Sequence[str]) -> dict[str, object]:
     """Project one computed row into the immutable public result codec.
 
     Session computation intentionally returns local diagnostic telemetry too.
-    The dynamic WAL must never choose a different subset or preserve whatever
-    dict order happened to be produced by a model; this one projection is the
+    Workers must never choose a different subset or preserve whatever dict
+    order happened to be produced by a model; this one projection is the
     boundary shared with ``public_result_columns`` and final CSV equality.
     """
 
@@ -322,8 +237,6 @@ class SplitData:
     X_test: pd.DataFrame
     y_train: pd.Series
     y_test: pd.Series
-    train_ids: pd.Series | None = None
-    test_ids: pd.Series | None = None
 
 
 @dataclass(frozen=True)
@@ -339,18 +252,10 @@ class SplitIndexes:
     train_index: pd.Index
     test_index: pd.Index
     external_test: bool
-    train_ids: pd.Series | None = None
-    test_ids: pd.Series | None = None
 
 
 class SplitIndexManager:
-    """Lazily cache only train/test labels for each seed.
-
-    The old ``split_frame`` remains public for checkpoint compatibility.  New
-    sessions use this class, whose internal-random construction is the same
-    sklearn call/order as ``split_frame`` but never keeps seed × predictor
-    frames alive.
-    """
+    """Lazily cache only train/test labels for each seed, never seed × predictor frames."""
 
     def __init__(
         self,
@@ -361,7 +266,6 @@ class SplitIndexManager:
         outcome: str,
         test_size: float,
         task: str,
-        id_column: str | None = None,
     ) -> None:
         self.frame = frame
         self.external_frame = external_frame
@@ -369,7 +273,6 @@ class SplitIndexManager:
         self.outcome = str(outcome)
         self.test_size = float(test_size)
         self.task = str(task)
-        self.id_column = id_column
         self._cache: dict[int, SplitIndexes] = {}
         if external_frame is not None:
             fixed = external_test_split(
@@ -377,14 +280,11 @@ class SplitIndexManager:
                 external_frame,
                 self.predictors,
                 self.outcome,
-                id_column=self.id_column,
             )
             self._external = SplitIndexes(
                 train_index=fixed.X_train.index.copy(),
                 test_index=fixed.X_test.index.copy(),
                 external_test=True,
-                train_ids=fixed.train_ids,
-                test_ids=fixed.test_ids,
             )
         else:
             self._external = None
@@ -406,16 +306,6 @@ class SplitIndexManager:
             pd.Index(train_index),
             pd.Index(test_index),
             False,
-            (
-                self.frame.loc[train_index, self.id_column]
-                if self.id_column is not None
-                else None
-            ),
-            (
-                self.frame.loc[test_index, self.id_column]
-                if self.id_column is not None
-                else None
-            ),
         )
         self._cache[int(seed)] = frozen
         return frozen
@@ -465,41 +355,11 @@ def log2_size_grid(
     return out
 
 
-def split_frame(
-    frame: pd.DataFrame,
-    predictors: Sequence[str],
-    outcome: str,
-    *,
-    test_size: float,
-    seed: int,
-    task: str = "regression",
-    id_column: str | None = None,
-) -> SplitData:
-    y = frame[outcome]
-    X_train, X_test, y_train, y_test = train_test_split(
-        frame.loc[:, list(predictors)],
-        y,
-        test_size=test_size,
-        random_state=seed,
-        stratify=y if task == "classification" else None,
-    )
-    return SplitData(
-        X_train=X_train,
-        X_test=X_test,
-        y_train=y_train,
-        y_test=y_test,
-        train_ids=(frame.loc[X_train.index, id_column] if id_column else None),
-        test_ids=(frame.loc[X_test.index, id_column] if id_column else None),
-    )
-
-
 def external_test_split(
     train_frame: pd.DataFrame,
     test_frame: pd.DataFrame,
     predictors: Sequence[str],
     outcome: str,
-    *,
-    id_column: str | None = None,
 ) -> SplitData:
     for label, frame in (("training data", train_frame), ("test data", test_frame)):
         if outcome not in frame:
@@ -516,8 +376,6 @@ def external_test_split(
         X_test=test_complete.loc[:, predictor_list],
         y_train=train_complete[outcome],
         y_test=test_complete[outcome],
-        train_ids=(train_complete[id_column] if id_column else None),
-        test_ids=(test_complete[id_column] if id_column else None),
     )
 
 
@@ -883,356 +741,13 @@ def _model_seed(seed: int, draw: int, n_samples: int, k_features: int) -> int:
     )
 
 
-def _completed_jobs_for_experiment(existing: pd.DataFrame, experiment_id: str) -> set[tuple]:
-    current = rows_for_experiment(existing, experiment_id)
-    if current.empty:
-        return set()
-    ok = (
-        current[current["status"].isin(("ok", "skipped"))]
-        if "status" in current
-        else current
-    )
-    return set(
-        zip(
-            ok["model"],
-            ok["seed"].astype(int),
-            ok["draw"].astype(int),
-            ok["N"].astype(int),
-            ok["K"].astype(int),
-        )
-    )
-
-
-def _completed_job_statuses_for_experiment(
-    existing: pd.DataFrame, experiment_id: str
-) -> dict[tuple[str, int, int, int, int], str]:
-    current = rows_for_experiment(existing, experiment_id)
-    if current.empty:
-        return {}
-    if "status" not in current:
-        return {
-            (str(row.model), int(row.seed), int(row.draw), int(row.N), int(row.K)): "ok"
-            for row in current.itertuples(index=False)
-        }
-    return {
-        (str(row.model), int(row.seed), int(row.draw), int(row.N), int(row.K)): str(row.status)
-        for row in current.itertuples(index=False)
-        if str(row.status) in {"ok", "skipped"}
-    }
-
-
-def _prediction_part_for_job(out_path: Path, job: tuple) -> Path:
-    model, seed, draw, n_samples, k_features = job
-    return prediction_export_part_path(
-        out_path,
-        model=str(model),
-        seed=int(seed),
-        draw=int(draw),
-        n_samples=int(n_samples),
-        k_features=int(k_features),
-    )
-
-
-def _selected_prediction_job(config: NKGridConfig, job: tuple) -> bool:
-    return prediction_export_selected(
-        config,
-        model=str(job[0]),
-        n_samples=int(job[3]),
-        k_features=int(job[4]),
-    )
-
-
-def _prediction_export_is_complete(
-    config: NKGridConfig,
-    out_path: Path,
-    jobs: Sequence[tuple],
-    completed_statuses: Mapping[tuple, str],
-) -> bool:
-    if not prediction_export_enabled(config):
-        return True
-    if not prediction_export_path(out_path).is_file():
-        return False
-    try:
-        prior = json.loads(manifest_path(out_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    expected_cells = [
-        {"model": model, "N": int(n_samples), "K": int(k_features)}
-        for model, n_samples, k_features in config.prediction_export_cells
-    ]
-    prior_export = prior.get("prediction_export") if isinstance(prior, dict) else None
-    if not isinstance(prior_export, dict) or prior_export.get("cells") != expected_cells:
-        return False
-    return all(
-        completed_statuses.get(job) != "ok" or _prediction_part_for_job(out_path, job).is_file()
-        for job in jobs
-        if _selected_prediction_job(config, job)
-    )
-
-
-def _checkpoint_index_exactly_matches_jobs(
-    existing: pd.DataFrame,
-    experiment_id: str,
-    jobs: list[tuple],
-    completed: set[tuple],
-) -> bool:
-    """Reject duplicate, failed, missing, or out-of-design rows on fast reuse."""
-
-    current = rows_for_experiment(existing, experiment_id)
-    if len(current) != len(jobs):
-        return False
-    if current.duplicated(CHECKPOINT_KEY_COLUMNS).any():
-        return False
-    if "status" not in current or not current["status"].isin(("ok", "skipped")).all():
-        return False
-    return len(completed) == len(jobs) and all(job in completed for job in jobs)
-
-
-def _identity_path_segment(experiment_id: str) -> str:
-    """Validate that experiment_id is safe as a filename segment."""
-
-    if experiment_id in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._-]+", experiment_id):
-        raise ValueError(
-            "experiment_id must be a non-empty filename segment containing only "
-            "ASCII letters, digits, dots, underscores, or hyphens"
-        )
-    return experiment_id
-
-
-def _timestamped_out_path(directory: Path, stem: str, segment: str, suffix: str) -> Path:
-    while True:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_path = directory / f"{stem}_{segment}_{timestamp}{suffix}"
-        if not any(
-            (
-                out_path.exists(),
-                manifest_path(out_path).exists(),
-                checkpoint_parts_dir(out_path).exists(),
-            )
-        ):
-            return out_path
-        time.sleep(1.0)
-
-
-def _select_output_path(
-    declared: Path,
-    *,
-    preset: str | None,
-    experiment_id: str,
-    jobs: list[tuple],
-    rerun_completed: bool,
-) -> Path:
-    if preset is None:
-        # This distinguishes direct CLI output from panel-managed output paths.
-        return declared
-
-    segment = _identity_path_segment(experiment_id)
-
-    # With a panel preset, config.out is only a template for directory/stem.
-    # Actual writes use experiment_id as their resumable namespace segment.
-    directory = declared.parent
-    stem = declared.stem
-    suffix = declared.suffix
-    candidates_by_path = {
-        path: path.stat().st_mtime
-        for path in directory.glob(f"{stem}_{segment}_*{suffix}")
-    }
-    for candidate_manifest in directory.glob(f"{stem}_{segment}_*.manifest.json"):
-        candidate = candidate_manifest.with_name(
-            candidate_manifest.name.removesuffix(".manifest.json") + suffix
-        )
-        candidates_by_path[candidate] = max(
-            candidates_by_path.get(candidate, float("-inf")),
-            candidate_manifest.stat().st_mtime,
-        )
-    for candidate_parts in directory.glob(f"{stem}_{segment}_*.parts"):
-        if not candidate_parts.is_dir():
-            continue
-        candidate = candidate_parts.with_suffix(suffix)
-        candidates_by_path[candidate] = max(
-            candidates_by_path.get(candidate, float("-inf")),
-            candidate_parts.stat().st_mtime,
-        )
-    candidates = sorted(
-        candidates_by_path,
-        key=lambda path: candidates_by_path[path],
-        reverse=True,
-    )
-    for candidate in candidates:
-        candidate_manifest_path = manifest_path(candidate)
-        candidate_manifest_id = None
-        if candidate_manifest_path.exists():
-            try:
-                candidate_manifest = json.loads(
-                    candidate_manifest_path.read_text(encoding="utf-8")
-                )
-            except (OSError, json.JSONDecodeError):
-                candidate_manifest = None
-            if isinstance(candidate_manifest, dict):
-                candidate_manifest_id = candidate_manifest.get("experiment_id")
-        if (
-            candidate_manifest_id is not None
-            and candidate_manifest_id != experiment_id
-        ):
-            continue
-        try:
-            existing = load_checkpoint_index(candidate)
-        except ValueError:
-            if candidate_manifest_id == experiment_id:
-                raise
-            log_progress(
-                "ignoring unreadable preset candidate without a matching "
-                f"manifest identity: {candidate}"
-            )
-            continue
-        current = rows_for_experiment(existing, experiment_id)
-        if current.empty:
-            # A manifest is written before the first batch. Reuse that path
-            # after an early interruption, but only when no checkpoint rows
-            # contradict the manifest's identity.
-            if existing.empty and _read_prior_manifest(
-                manifest_path(candidate), experiment_id
-            ) is not None:
-                return candidate
-            continue
-        completed = _completed_jobs_for_experiment(existing, experiment_id)
-        if not all(job in completed for job in jobs):
-            # Matching rows are resumable even when every prior attempt failed:
-            # failed cells remain pending and a successful retry supersedes
-            # them during checkpoint deduplication.
-            return candidate
-        if not rerun_completed:
-            log_progress(
-                f"already complete; reusing prior preset output: {candidate}"
-            )
-            return candidate
-        log_progress(
-            "already complete; rerun_completed=true so a new timestamped "
-            f"output will be created instead of reusing {candidate}"
-        )
-        # The newest matching run is complete. Do not fall through and revive
-        # an older partial run when the caller explicitly requested a rerun.
-        return _timestamped_out_path(directory, stem, segment, suffix)
-    return _timestamped_out_path(directory, stem, segment, suffix)
-
-
-def estimate_run_size(config: NKGridConfig) -> dict[str, int | str | None]:
-    """Return a conservative pre-data estimate for panel dry-runs."""
-
-    _validate_config(config)
-    n_count = len(config.n_grid) if config.n_grid is not None else config.n_sizes_n
-    k_count = len(config.k_grid) if config.k_grid is not None else config.n_sizes_k
-    if config.grid_selection == "min_middle_max":
-        n_count = k_count = 3
-    top_level = (
-        len(config.models)
-        * len(resolve_repeat_pairs(config))
-        * n_count
-        * k_count
-    )
-    super_cells = (
-        top_level // len(config.models)
-        if "super_learner" in config.models
-        else 0
-    )
-    checkpoint_writes = int(np.ceil(top_level / config.batch_size))
-    compact_parts, loose_parts = divmod(
-        checkpoint_writes,
-        CHECKPOINT_COMPACTION_LOOSE_PARTS,
-    )
-    stable_checkpoint_parts = compact_parts + loose_parts
-    peak_checkpoint_parts = max(
-        stable_checkpoint_parts,
-        (
-            compact_parts + CHECKPOINT_COMPACTION_LOOSE_PARTS
-            if compact_parts
-            else checkpoint_writes
-        ),
-    )
-    if config.checkpoint_retention == "keep":
-        stable_checkpoint_parts = peak_checkpoint_parts = checkpoint_writes
-    return {
-        "top_level_model_cells": int(top_level),
-        "expected_output_rows": int(top_level),
-        "estimated_super_learner_internal_fits": int(
-            super_cells * SUPER_LEARNER_FITS_PER_CELL
-        ),
-        "super_learner_fit_estimate_scope": (
-            "4 base learners x (5 OOF folds + 1 full fit); excludes inner "
-            "parameter search and meta-learner, not a total MLP fit count"
-        ),
-        "estimated_checkpoint_writes": checkpoint_writes,
-        # Backward-compatible key now describes the stable physical shard
-        # count after automatic WAL compaction, not the number of writes.
-        "estimated_checkpoint_parts": stable_checkpoint_parts,
-        "estimated_peak_checkpoint_parts": peak_checkpoint_parts,
-        "checkpoint_compaction_loose_parts": (
-            None if config.checkpoint_retention == "keep" else CHECKPOINT_COMPACTION_LOOSE_PARTS
-        ),
-        "checkpoint_retention": config.checkpoint_retention,
-        "max_uncheckpointed_cells": min(
-            int(config.batch_size),
-            int(top_level),
-        ),
-        "materialization_backend": "sqlite_streaming",
-    }
-
-
-def prediction_export_enabled(config: NKGridConfig) -> bool:
-    return bool(config.prediction_export_cells)
-
-
-def prediction_export_selected(
-    config: NKGridConfig,
-    *,
-    model: str,
-    n_samples: int,
-    k_features: int,
-) -> bool:
-    return (str(model), int(n_samples), int(k_features)) in set(
-        config.prediction_export_cells
-    )
-
-
-def reject_dynamic_prediction_export(config: NKGridConfig) -> None:
-    if prediction_export_enabled(config):
-        raise ValueError(PREDICTION_EXPORT_DYNAMIC_ERROR)
-
-
-def validate_prediction_export_grid(
-    config: NKGridConfig,
-    *,
-    n_grid: Sequence[int],
-    k_grid: Sequence[int],
-) -> None:
-    """Reject every exact export selector absent from the resolved design."""
-
-    resolved_n = {int(value) for value in n_grid}
-    resolved_k = {int(value) for value in k_grid}
-    unmatched = [
-        (model, int(n_samples), int(k_features))
-        for model, n_samples, k_features in config.prediction_export_cells
-        if int(n_samples) not in resolved_n or int(k_features) not in resolved_k
-    ]
-    if unmatched:
-        entries = ", ".join(
-            f"(model={model!r}, N={n_samples}, K={k_features})"
-            for model, n_samples, k_features in unmatched
-        )
-        raise ValueError(
-            "prediction_export_cells contains entries that do not match the "
-            f"resolved N/K grid: {entries}; resolved N={sorted(resolved_n)}, "
-            f"K={sorted(resolved_k)}"
-        )
-
-
 def _validate_config(config: NKGridConfig) -> None:
     """Reject invalid run controls before dry-run arithmetic or data loading."""
 
     if config.grid_selection not in ("all", "min_middle_max"):
         raise ValueError("grid_selection must be all or min_middle_max")
-    if type(config.checkpoint_retention) is not str or config.checkpoint_retention not in {"default", "keep", "delete"}:
-        raise ValueError("checkpoint_retention must be default, keep, or delete")
+    if type(config.checkpoint_retention) is not str or config.checkpoint_retention not in {"keep", "delete"}:
+        raise ValueError("checkpoint_retention must be keep or delete")
 
     for name in ("n_grid", "k_grid"):
         if getattr(config, name) is not None:
@@ -1249,7 +764,6 @@ def _validate_config(config: NKGridConfig) -> None:
         "n_sizes_n",
         "n_sizes_k",
         "min_n",
-        "batch_size",
     ):
         if int(getattr(config, field)) < 1:
             raise ValueError(f"{field} must be at least 1")
@@ -1264,35 +778,6 @@ def _validate_config(config: NKGridConfig) -> None:
     unknown_models = sorted(set(config.models) - set(SUPPORTED_MODEL_NAMES))
     if unknown_models:
         raise ValueError(f"Unknown model(s): {', '.join(unknown_models)}")
-    seen_export_cells: set[tuple[str, int, int]] = set()
-    for entry in config.prediction_export_cells:
-        if (
-            not isinstance(entry, tuple)
-            or len(entry) != 3
-            or not isinstance(entry[0], str)
-            or not entry[0]
-            or isinstance(entry[1], bool)
-            or not isinstance(entry[1], int)
-            or isinstance(entry[2], bool)
-            or not isinstance(entry[2], int)
-        ):
-            raise ValueError(
-                "prediction_export_cells entries must be (model, N, K) tuples"
-            )
-        model, n_samples, k_features = entry
-        if model not in config.models:
-            raise ValueError(
-                f"prediction_export_cells model {model!r} is not in configured models"
-            )
-        if n_samples < 1 or k_features < 1:
-            raise ValueError("prediction_export_cells N and K must be positive")
-        if entry in seen_export_cells:
-            raise ValueError("prediction_export_cells must not contain duplicates")
-        seen_export_cells.add(entry)
-    if config.failed_abs_threshold < 0:
-        raise ValueError("failed_abs_threshold must be non-negative")
-    if not 0.0 <= config.failed_ratio_threshold <= 1.0:
-        raise ValueError("failed_ratio_threshold must be in [0, 1]")
     if config.native_process_max_attempts < 1:
         raise ValueError("native_process_max_attempts must be at least 1")
     if config.native_process_timeout_seconds <= 0:
@@ -1302,392 +787,6 @@ def _validate_config(config: NKGridConfig) -> None:
         if not isinstance(value, str) or not value or len(value) > 80 or not value.isascii() or not all(char.isalnum() or char in "._-" for char in value):
             raise ValueError(f"{field} must contain 1-80 ASCII letters, digits, dots, underscores or hyphens")
     group_repeat_pairs_by_seed(resolve_repeat_pairs(config))
-
-
-def _relative_path(path: Path) -> str:
-    try:
-        return os.path.relpath(path.resolve(), ROOT)
-    except OSError:
-        return str(path)
-
-
-def _parallelism_payload(config: NKGridConfig) -> dict[str, Any]:
-    """Describe the scheduler policy actually used by one array worker."""
-
-    selected = set(config.models)
-    native = selected & set(SERIAL_OUTER_MODELS)
-    super_learner = selected == {"super_learner"}
-    return {
-        "outer_cell_n_jobs": 1,
-        "model_internal_n_jobs": int(config.n_jobs) if super_learner else 1,
-        "base_estimator_n_jobs": 1,
-        "configured_outer_n_jobs": 1,
-        "chunk_policy": {
-            "parallel_unit": "cell_group",
-            "prefer": "serial",
-            "contains_native": bool(native),
-            "n_jobs_rule": "one array worker executes its groups serially",
-            "native_calls_serialized": bool(native),
-        },
-        "native_process_isolated_models": sorted(native),
-        "native_process_max_attempts": int(config.native_process_max_attempts),
-        "native_process_timeout_seconds": float(
-            config.native_process_timeout_seconds
-        ),
-    }
-
-
-def _manifest_payload(
-    *,
-    config: NKGridConfig,
-    metadata: dict,
-    out_path: Path,
-    data_path: Path,
-    test_path: Path | None,
-    model_params_path: Path,
-    selected_model_params: dict,
-    frame: pd.DataFrame,
-    predictors: Sequence[str],
-    split_seeds: list[int],
-    execution_pairs: Sequence[tuple[int, int]],
-    splits: dict[int, SplitData],
-    n_grid: np.ndarray,
-    k_grid: np.ndarray,
-    expected_rows: int,
-    results: pd.DataFrame | None,
-    result_summary: CheckpointSummary | None = None,
-    started_at: str,
-    dataset: str,
-    task: str,
-    schema_path: Path,
-    semantic_contract: Mapping[str, Any],
-    seed_shard_execution: bool = False,
-) -> dict:
-    if result_summary is not None:
-        if result_summary.experiment_id != metadata["experiment_id"]:
-            raise ValueError("Checkpoint summary does not match the current experiment")
-        materialized_rows = int(result_summary.materialized_rows)
-        ok_count = int(result_summary.ok_rows)
-        skipped_count = int(result_summary.skipped_rows)
-        failed = int(result_summary.failed_rows)
-        completed = int(result_summary.completed_rows)
-        diagnostics = result_summary.diagnostics
-    else:
-        if results is None:
-            raise ValueError("results or result_summary is required")
-        current_results = rows_for_experiment(results, metadata["experiment_id"])
-        statuses = current_results.get("status", pd.Series(dtype=str))
-        materialized_rows = int(len(current_results))
-        ok_count = int(statuses.eq("ok").sum())
-        skipped_count = int(statuses.eq("skipped").sum())
-        failed = int(statuses.eq("failed").sum())
-        completed = ok_count + skipped_count
-        diagnostics = diagnostics_summary(current_results)
-    if materialized_rows != expected_rows:
-        completion_status = "incomplete"
-    elif failed:
-        completion_status = "complete_with_failures"
-    else:
-        completion_status = "complete"
-    return {
-        "schema_version": "1",
-        "experiment_id": metadata["experiment_id"],
-        "algorithm_version": metadata["algorithm_version"],
-        "created_at": started_at,
-        "updated_at": utc_now(),
-        "task": task,
-        "outcome": config.outcome,
-        "dataset": dataset,
-        "identity": metadata["identity"],
-        "semantic_contract": semantic_contract,
-        "schema": {
-            "path": _relative_path(schema_path),
-        },
-        "git": git_state(ROOT),
-        "data": {
-            "input_path": _relative_path(data_path),
-            "test_path": _relative_path(test_path) if test_path is not None else None,
-            "rows": int(len(frame)),
-            "features": int(len(predictors)),
-            "train_rows": int(len(next(iter(splits.values())).X_train)),
-            "test_rows": int(len(next(iter(splits.values())).X_test)),
-        },
-        "design": {
-            "preset": config.preset,
-            "test_size": float(config.test_size),
-            "split_mode": metadata["split_mode"],
-            "split_seeds": split_seeds,
-            "repeat_plan": [
-                {"seed": seed, "draw": draw} for seed, draw in resolve_repeat_pairs(config)
-            ],
-            "n_grid": [int(value) for value in n_grid],
-            "k_grid": [int(value) for value in k_grid],
-            "models": list(config.models),
-            "parallelism": _parallelism_payload(config),
-            "checkpointing": {
-                "batch_size": int(config.batch_size),
-                "loose_parts_per_compaction": (
-                    None if config.checkpoint_retention == "keep"
-                    else int(CHECKPOINT_COMPACTION_LOOSE_PARTS)
-                ),
-                "materialization_backend": "sqlite_streaming",
-            },
-        },
-        "execution": {
-            "mode": "seed-shard" if seed_shard_execution else "monolithic",
-            "seed": split_seeds[0] if len(split_seeds) == 1 else None,
-            "draws": [draw for _, draw in execution_pairs] if len(split_seeds) == 1 else None,
-            "expected_rows": int(expected_rows),
-        },
-        "model_parameters": {
-            "source": _relative_path(model_params_path),
-            "resolved": resolved_model_params(selected_model_params),
-        },
-        "environment": core_environment(),
-        **(
-            {
-                "prediction_export": {
-                    "cells": [
-                        {"model": model, "N": int(n_samples), "K": int(k_features)}
-                        for model, n_samples, k_features in config.prediction_export_cells
-                    ]
-                }
-            }
-            if prediction_export_enabled(config)
-            else {}
-        ),
-        "output": {
-            "csv": out_path.name,
-            "parts_directory": checkpoint_parts_dir(out_path).name,
-            "checkpoint_parts_deleted": False,
-            "checkpoint_retention": config.checkpoint_retention,
-            **(
-                {
-                    "predictions_parquet": prediction_export_path(out_path).name,
-                    "prediction_parts_directory": prediction_export_parts_dir(
-                        out_path
-                    ).name,
-                }
-                if prediction_export_enabled(config)
-                else {}
-            ),
-        },
-        "completion": {
-            "expected_rows": int(expected_rows),
-            "materialized_rows": materialized_rows,
-            "completed_rows": completed,
-            "failed_rows": failed,
-            "status": completion_status,
-        },
-        "failure_policy": {
-            "failed_abs_threshold": int(config.failed_abs_threshold),
-            "failed_ratio_threshold": float(config.failed_ratio_threshold),
-            "failed_count": failed,
-            "ok_count": ok_count,
-            "skipped_count": skipped_count,
-            "denominator": ok_count + failed,
-            "failed_ratio": (
-                float(failed / (ok_count + failed))
-                if ok_count + failed
-                else None
-            ),
-        },
-        "diagnostics": diagnostics,
-    }
-
-
-def _prune_checkpoint_parts(out_path: Path, manifest: dict) -> bool:
-    """Delete shards only after the persisted final artifacts pass QA."""
-
-    policy = manifest.get("output", {}).get("checkpoint_retention", "default")
-    if type(policy) is not str or policy not in {"default", "keep", "delete"}:
-        raise ValueError("checkpoint_retention must be default, keep, or delete")
-    if policy == "keep":
-        log_progress("checkpoint retention requested: all written parts are retained")
-        return False
-
-    completion = manifest["completion"]
-    status = completion["status"]
-    if status != "complete":
-        log_progress(
-            f"checkpoint cleanup skipped: completion status is {status!r}; "
-            "shards are retained for resume"
-        )
-        return False
-    expected = int(completion["expected_rows"])
-    counts_are_complete = (
-        int(completion["materialized_rows"]) == expected
-        and int(completion["completed_rows"]) == expected
-        and int(completion["failed_rows"]) == 0
-    )
-    if not counts_are_complete:
-        log_progress(
-            "checkpoint cleanup skipped: manifest row counts or failure count "
-            "did not pass verification"
-        )
-        return False
-    directory = checkpoint_parts_dir(out_path)
-    if not directory.exists():
-        return False
-
-    try:
-        verify_materialized_checkpoint(
-            out_path,
-            experiment_id=manifest["experiment_id"],
-            expected_rows=expected,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Final CSV streaming verification failed; checkpoint shards were "
-            "retained."
-        ) from exc
-
-    retired = retire_checkpoint_parts(out_path)
-    if retired is None:
-        return False
-    try:
-        shutil.rmtree(retired)
-        log_progress(
-            "deleted checkpoint shards after verified-complete run: "
-            f"{directory.name}"
-        )
-    except OSError as exc:
-        # The atomic rename already made the final CSV authoritative. A stale
-        # hidden tombstone is a storage leak, not a resume/data-loss hazard.
-        log_progress(
-            f"checkpoint shards retired but cleanup was incomplete: "
-            f"{retired.name} ({type(exc).__name__}: {exc})"
-        )
-    return True
-
-
-def _apply_completed_checkpoint_retention(
-    out_path: Path, manifest: dict, policy: str,
-) -> None:
-    """Apply an explicit storage request when reusing a verified complete run."""
-    if policy == "default":
-        return
-    if policy not in {"keep", "delete"}:
-        raise ValueError("checkpoint_retention must be default, keep, or delete")
-    if policy == "keep" and not checkpoint_parts(out_path):
-        raise ValueError(
-            "Completed run no longer has checkpoints; --checkpoints keep cannot "
-            "reconstruct deleted shards. Start a new output with keep enabled."
-        )
-    manifest["output"]["checkpoint_retention"] = policy
-    if _prune_checkpoint_parts(out_path, manifest):
-        manifest["output"]["checkpoint_parts_deleted"] = True
-
-
-def _resumed_checkpoint_config(config: NKGridConfig, prior: dict | None) -> NKGridConfig:
-    """An omitted flag must not revoke an earlier explicit retention request."""
-    if config.checkpoint_retention != "default" or prior is None:
-        return config
-    policy = prior.get("output", {}).get("checkpoint_retention", "default")
-    if type(policy) is not str or policy not in {"default", "keep", "delete"}:
-        raise ValueError("Existing manifest has invalid checkpoint_retention")
-    return replace(config, checkpoint_retention=policy)
-
-
-def _read_prior_manifest(path: Path, experiment_id: str) -> dict | None:
-    """Return the previous manifest for this experiment, if it is readable."""
-
-    if not path.exists():
-        return None
-    try:
-        prior = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        if path.exists():
-            log_progress(
-                f"warning: could not read existing prior manifest {path}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-        return None
-    if not isinstance(prior, dict):
-        return None
-    return prior if prior.get("experiment_id") == experiment_id else None
-
-
-def _first_contract_difference(previous: Any, current: Any, path: str = "semantic_contract") -> str | None:
-    if isinstance(previous, Mapping) and isinstance(current, Mapping):
-        for key in sorted(set(previous) | set(current)):
-            if key not in previous or key not in current:
-                return f"{path}.{key}: checkpoint={previous.get(key)!r} current={current.get(key)!r}"
-            difference = _first_contract_difference(previous[key], current[key], f"{path}.{key}")
-            if difference:
-                return difference
-        return None
-    if previous != current:
-        return f"{path}: checkpoint={previous!r} current={current!r}"
-    return None
-
-
-def _require_resumable_manifest(prior: dict, metadata: Mapping[str, Any]) -> None:
-    identity = prior.get("identity")
-    expected = metadata["identity"]
-    if not isinstance(identity, Mapping) or identity.get("mode") != "explicit-v1":
-        raise ValueError("Existing manifest is not explicit-v1 and cannot be resumed")
-    for field in ("experiment_id", "data_version", "model_spec_version"):
-        if identity.get(field) != expected[field]:
-            raise ValueError(f"identity.{field}: checkpoint={identity.get(field)!r} current={expected[field]!r}")
-    difference = _first_contract_difference(prior.get("semantic_contract"), metadata["semantic_contract"])
-    if difference:
-        raise ValueError(difference)
-
-
-def _verified_complete_artifacts(
-    out_path: Path,
-    experiment_id: str,
-    expected_rows: int,
-) -> bool:
-    prior = _read_prior_manifest(manifest_path(out_path), experiment_id)
-    if prior is None or not out_path.exists() or checkpoint_parts(out_path):
-        return False
-    completion = prior.get("completion")
-    design = prior.get("design")
-    if not isinstance(completion, dict) or not isinstance(design, dict):
-        return False
-    try:
-        return (
-            completion.get("status") == "complete"
-            and int(completion.get("completed_rows", -1)) == expected_rows
-            and int(completion.get("materialized_rows", -1)) == expected_rows
-        )
-    except (TypeError, ValueError):
-        return False
-
-
-def _preserve_prior_timings(payload: dict, prior: dict | None) -> dict:
-    """Carry per-model timings forward when shards can no longer supply them.
-
-    Timing diagnostics live only in checkpoint shards, so once the shards are
-    pruned a later merge cannot recompute them. Keep whatever the previous
-    manifest recorded instead of dropping the fields.
-    """
-
-    if prior is None:
-        return payload
-    prior_diagnostics = prior.get("diagnostics")
-    if not isinstance(prior_diagnostics, dict):
-        return payload
-    prior_models = prior_diagnostics.get("by_model")
-    if not isinstance(prior_models, dict):
-        return payload
-    for model, summary in payload.get("diagnostics", {}).get("by_model", {}).items():
-        prior_summary = prior_models.get(model, {})
-        if not isinstance(prior_summary, dict):
-            continue
-        for key in (
-            "fit_seconds_total",
-            "fit_seconds_median",
-            "preprocess_seconds_total",
-            "cell_wall_seconds_total",
-            "peak_rss_bytes_max",
-            "best_rounds",
-        ):
-            if key not in summary and key in prior_summary:
-                summary[key] = prior_summary[key]
-    return payload
 
 
 def _base_row(
@@ -1721,30 +820,6 @@ def _base_row(
         "n_expanded_features_total": int(n_expanded_features_total),
         "K_unobserved": np.nan,
     }
-
-
-class RunFailureThresholdExceeded(RuntimeError):
-    """Raised after artifacts are persisted and the run failure policy fails."""
-
-
-def _failure_policy_violation(payload: dict) -> str | None:
-    policy = payload["failure_policy"]
-    denominator = int(policy["denominator"])
-    failed = int(policy["failed_count"])
-    if denominator == 0:
-        return "failure-policy denominator is zero (no ok/failed cells)"
-    ratio = float(policy["failed_ratio"])
-    if failed > int(policy["failed_abs_threshold"]):
-        return (
-            f"failed_count={failed} exceeds "
-            f"failed_abs_threshold={policy['failed_abs_threshold']}"
-        )
-    if ratio > float(policy["failed_ratio_threshold"]):
-        return (
-            f"failed_ratio={ratio:.6f} exceeds "
-            f"failed_ratio_threshold={policy['failed_ratio_threshold']:.6f}"
-        )
-    return None
 
 
 def _positive_class_probability(model, X) -> np.ndarray:
@@ -1846,7 +921,7 @@ def resolve_input_grids(config, loaded, source_definitions):
     manager = SplitIndexManager(
         frame=loaded.train, external_frame=loaded.test if loaded.schema.split_mode == "external_test" else None,
         predictors=loaded.predictors, outcome=config.outcome,
-        test_size=config.test_size, task=loaded.schema.task, id_column=None,
+        test_size=config.test_size, task=loaded.schema.task,
     )
     seeds = tuple(dict.fromkeys(seed for seed, _ in resolve_repeat_pairs(config)))
     capacity = len(manager.for_seed(seeds[0]).train_index)
@@ -1867,8 +942,8 @@ class NKGridExecutionSession:
     """One validated input/model/native-runner lifetime for many cell groups.
 
     It has no output-path, manifest, checkpoint, lock, assignment, round, or
-    generation knowledge.  The local orchestrator and dynamic WAL worker both
-    use ``run_cell_group`` as their only numerical primitive.
+    generation knowledge.  Workers use ``run_cell_group`` as their only
+    numerical primitive.
     """
 
     def __init__(
@@ -1908,11 +983,6 @@ class NKGridExecutionSession:
             outcome=config.outcome,
             test_size=config.test_size,
             task=self.task,
-            id_column=(
-                self.schema.id_column
-                if prediction_export_enabled(config) or bool(getattr(config, "prediction_cache", None))
-                else None
-            ),
         )
         self.repeat_pairs = resolve_repeat_pairs(config)
         self.n_grid, self.k_grid = resolve_input_grids(config, loaded, source_definitions)
@@ -1967,7 +1037,7 @@ class NKGridExecutionSession:
                 raise ValueError("test_size must be strictly between 0 and 1")
             return validate_input(raw_loaded, config.outcome, models=config.models, min_n=config.min_n,
                 test_size=config.test_size, seed=config.seed,
-                require_id=prediction_export_enabled(config) or bool(getattr(config, "prediction_cache", None)))
+                require_id=bool(config.prediction_cache))
         # This contains validated raw frames and fixed source definitions only.
         # Fitted preprocessing remains exclusively inside the original folds.
         loaded, source_definitions = (input_store.load_or_build('validated-raw-input-v1', validated_input)[0]
@@ -2020,7 +1090,7 @@ class NKGridExecutionSession:
 
     @classmethod
     def open_from_config(cls, config: NKGridConfig) -> "NKGridExecutionSession":
-        """Local full-run entrypoint; no dynamic field is manufactured."""
+        """Open a session from a resolved config, as run preparation does."""
 
         return cls._open_config(config)
 
@@ -2132,7 +1202,7 @@ class NKGridExecutionSession:
                     model_name=model_name, position=position, seed=int(seed), draw=int(draw),
                     n_samples=int(n_samples), k_features=int(k_features), X_sub_raw=X_sub_raw,
                     y_sub=y_sub, X_test_raw=X_test_raw, y_test=y_test,
-                    test_ids=indexes.test_ids, selected_groups=selected_groups,
+                    selected_groups=selected_groups,
                     unobserved=unobserved, slice_seconds=slice_seconds, prepared=prepared,
                     preparation_errors=preparation_errors, n_train_total=len(indexes.train_index),
                     n_test_total=len(indexes.test_index),
@@ -2253,7 +1323,7 @@ class NKGridExecutionSession:
             result.append(add_metadata({**row, **metrics, **diagnostics, **({"task": self.task} if self.task == "classification" else {}), "status": "failed", "error": f"{type(exc).__name__}: {exc}"}, self.row_metadata))
         return result
 
-    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, test_ids: pd.Series | None, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> dict[str, object]:
+    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> dict[str, object]:
         if len(X_sub_raw) != n_samples or len(y_sub) != n_samples or len(sampling_units(selected_groups)) != k_features:
             raise ValueError("fit input does not match declared N/K")
         if X_sub_raw.shape[1] != sum(len(g.features) for g in selected_groups):
@@ -2328,35 +1398,6 @@ class NKGridExecutionSession:
             )
             if "prediction_cache_data" in fit:
                 completed["_prediction_cache_data"] = fit["prediction_cache_data"]
-            if prediction_export_selected(
-                self.config,
-                model=model_name,
-                n_samples=n_samples,
-                k_features=k_features,
-            ):
-                if test_ids is None:
-                    raise RuntimeError(
-                        "Prediction export selected a cell without test-row IDs"
-                    )
-                completed["_prediction_export_rows"] = [
-                    {
-                        "dataset": self.dataset,
-                        "model": model_name,
-                        "seed": int(seed),
-                        "draw": int(draw),
-                        "N": int(n_samples),
-                        "K": int(k_features),
-                        "row_id": row_id,
-                        "y_true": y_true,
-                        "y_pred": y_pred,
-                    }
-                    for row_id, y_true, y_pred in zip(
-                        test_ids.to_numpy(),
-                        y_test.to_numpy(),
-                        predictions,
-                        strict=True,
-                    )
-                ]
             return completed
         except Exception as exc:
             return result(empty_metrics, status="failed", error=f"{type(exc).__name__}: {exc}")
@@ -2372,825 +1413,3 @@ class NKGridExecutionSession:
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.close()
-
-
-def run_nk_grid(
-    config: NKGridConfig,
-    *,
-    execution_pairs: tuple[tuple[int, int], ...] | None = None,
-    defer_failure_policy: bool = False,
-    max_jobs: int | None = None,
-    allow_large_run: bool | None = None,
-    dry_run: bool | None = None,
-    stop_after_batch: Callable[[], bool] | None = None,
-    defer_materialization_on_stop: bool = False,
-    exact_output_path: bool = False,
-) -> Path | dict[str, int | str]:
-    """Run one output under an advisory cross-process writer lease."""
-
-    from .prediction_contract import reject_unsupported_prediction_backend
-    reject_unsupported_prediction_backend(config, "run_nk_grid legacy local execution")
-    effective_dry_run = config.dry_run if dry_run is None else dry_run
-    if effective_dry_run:
-        return _run_nk_grid_locked(
-            config,
-            max_jobs=max_jobs,
-            allow_large_run=allow_large_run,
-            dry_run=True,
-            stop_after_batch=stop_after_batch,
-            defer_materialization_on_stop=defer_materialization_on_stop,
-            exact_output_path=exact_output_path,
-            execution_pairs=execution_pairs,
-            defer_failure_policy=defer_failure_policy,
-        )
-    with output_run_lock(Path(config.out)):
-        return _run_nk_grid_locked(
-            config,
-            max_jobs=max_jobs,
-            allow_large_run=allow_large_run,
-            dry_run=False,
-            stop_after_batch=stop_after_batch,
-            defer_materialization_on_stop=defer_materialization_on_stop,
-            exact_output_path=exact_output_path,
-            execution_pairs=execution_pairs,
-            defer_failure_policy=defer_failure_policy,
-        )
-
-
-def _run_nk_grid_locked(
-    config: NKGridConfig,
-    *,
-    max_jobs: int | None = None,
-    allow_large_run: bool | None = None,
-    dry_run: bool | None = None,
-    stop_after_batch: Callable[[], bool] | None = None,
-    defer_materialization_on_stop: bool = False,
-    exact_output_path: bool = False,
-    execution_pairs: tuple[tuple[int, int], ...] | None = None,
-    defer_failure_policy: bool = False,
-) -> Path | dict[str, int | str]:
-    allow_large_run = config.allow_large_run if allow_large_run is None else allow_large_run
-    dry_run = config.dry_run if dry_run is None else dry_run
-    if max_jobs is not None and max_jobs < 0:
-        raise ValueError("max_jobs must be non-negative")
-    repeat_pairs = resolve_repeat_pairs(config)
-    shard_execution_requested = execution_pairs is not None
-    if execution_pairs is None:
-        execution_pairs = repeat_pairs
-    else:
-        execution_pairs = tuple(
-            (int(seed), int(draw)) for seed, draw in execution_pairs
-        )
-        if not execution_pairs or not set(execution_pairs).issubset(
-            set(repeat_pairs)
-        ):
-            raise ValueError(
-                "execution_pairs must be a non-empty subset of repeat_plan"
-            )
-        if len({seed for seed, _ in execution_pairs}) != 1:
-            raise ValueError(
-                "seed-shard execution_pairs must contain exactly one seed"
-            )
-    if exact_output_path and not shard_execution_requested:
-        raise ValueError(
-            "exact_output_path is reserved for explicit single-seed "
-            "shard execution"
-        )
-    declared_size = estimate_run_size(config)
-    if dry_run:
-        print(json.dumps(declared_size, indent=2, sort_keys=True))
-        return declared_size
-    if (
-        declared_size["top_level_model_cells"] > LARGE_RUN_THRESHOLD
-        and not allow_large_run
-    ):
-        raise ValueError(
-            "Large run requires --allow-large-run: declared grid contains "
-            f"{declared_size['top_level_model_cells']:,} top-level model cells, "
-            f"above the {LARGE_RUN_THRESHOLD:,} safety threshold."
-        )
-    model_params_path = Path(config.model_params)
-    raw_loaded = load_input(config.schema, config.outcome)
-    if (
-        raw_loaded.schema.split_mode == "internal_random"
-        and not 0.0 < config.test_size < 1.0
-    ):
-        raise ValueError("test_size must be strictly between 0 and 1")
-    loaded, source_definitions = validate_input(
-        raw_loaded,
-        config.outcome,
-        models=config.models,
-        min_n=config.min_n,
-        test_size=config.test_size,
-        seed=config.seed,
-        require_id=prediction_export_enabled(config),
-    )
-    schema = loaded.schema
-    task = schema.task
-    dataset = schema.dataset
-    data_path = schema.table
-    test_path = schema.test_table
-    frame = loaded.train
-    predictors = list(loaded.predictors)
-    feature_units = [unit.name for unit in sampling_units(source_definitions)]
-    selected_model_params = load_model_params(
-        model_params_path,
-        task=task,
-        models=config.models,
-    )
-    resolved_selected_model_params = resolved_model_params(selected_model_params)
-    algorithm_version = load_algorithm_version(model_params_path)
-    log_progress(
-        "loaded data "
-        f"path={data_path} rows={len(frame)} sources={len(feature_units)} "
-        f"predictors={len(predictors)} outcome={config.outcome} task={task}"
-    )
-    split_mode = schema.split_mode
-    fixed_split: SplitData | None = None
-    if split_mode == "external_test":
-        assert loaded.test is not None and test_path is not None
-        if not np.isclose(config.test_size, 0.3):
-            log_progress(
-                "external test schema supplied; ignoring test_size because the "
-                "test split is fixed by schema.test_table"
-            )
-        fixed_split = external_test_split(
-            frame,
-            loaded.test,
-            predictors,
-            config.outcome,
-            id_column=(schema.id_column if prediction_export_enabled(config) else None),
-        )
-        log_progress(
-            "loaded external test data "
-            f"path={test_path} rows={len(loaded.test)} "
-            f"usable_test_rows={len(fixed_split.X_test)}"
-        )
-
-    semantic_contract = {
-        "metric_definition_version": METRIC_DEFINITION_VERSION if task == "regression" else "classification-v1",
-        "kind": "nk_grid" if task == "regression" else "nk_grid_classification",
-        "algorithm_version": algorithm_version,
-        "dataset": dataset,
-        "outcome": config.outcome,
-        "task": task,
-        "split_mode": split_mode,
-        "split_seed": config.seed,
-        "test_size": config.test_size if split_mode == "internal_random" else None,
-        "predictors": predictors,
-        "model": list(config.models),
-        "resolved_model_params": resolved_selected_model_params,
-        "imputation": dict(schema.imputation),
-        "feature_universe": dict(schema.semantic_contract.get("feature_universe", {})),
-        "environment_overrides": model_run_settings(config.models),
-    }
-    metadata = build_experiment_metadata(
-        kind="nk_grid" if task == "regression" else "nk_grid_classification",
-        experiment_id=config.experiment_id,
-        data_version=config.data_version,
-        model_spec_version=config.model_spec_version,
-        outcome=config.outcome,
-        test_size=config.test_size,
-        split_seed=config.seed,
-        algorithm_version=algorithm_version,
-        semantic_contract=semantic_contract,
-        split_mode=split_mode,
-    )
-    row_metadata = {field: metadata[field] for field in ROW_METADATA_FIELDS}
-
-    split_seeds = sorted({seed for seed, _ in execution_pairs})
-    # Manifest metadata needs one representative split count only.  Retaining
-    # a full ``SplitData`` for every seed would keep seed × base-frame copies
-    # alive even though execution now uses ``SplitIndexManager`` lazily.
-    if fixed_split is None:
-        first_seed = split_seeds[0]
-        splits = {
-            first_seed: split_frame(
-                frame, predictors, config.outcome, test_size=config.test_size,
-                seed=first_seed, task=task,
-                id_column=(schema.id_column if prediction_export_enabled(config) else None),
-            )
-        }
-    else:
-        splits = {split_seeds[0]: fixed_split}
-    n_grid, k_grid = resolve_input_grids(config, loaded, source_definitions)
-    validate_prediction_export_grid(config, n_grid=n_grid, k_grid=k_grid)
-    prediction_sidecar_schema = None
-    if prediction_export_enabled(config):
-        assert schema.id_column is not None
-        id_frame = loaded.test if split_mode == "external_test" else frame
-        assert id_frame is not None
-        prediction_sidecar_schema = prediction_export_schema(
-            id_frame[schema.id_column]
-        )
-    log_progress(
-        "grid "
-        f"N={n_grid.tolist()} K={k_grid.tolist()} "
-        f"seeds={split_seeds} repeat_pairs={list(execution_pairs)} models={list(config.models)}"
-    )
-
-    state = git_state(ROOT)
-    if not isinstance(state.get("commit"), str) or len(str(state["commit"])) != 40:
-        raise ContractError("local CellExecutionSpec requires a resolvable immutable Git commit")
-    if config.preset == "production" and state.get("dirty") is not False:
-        raise ValueError(
-            "Production runs require a clean Git worktree; commit or stash changes first."
-        )
-    local_provenance = _frozen_input_provenance_for_schema(schema)
-    local_root = _local_cell_spec_root(config, local_provenance)
-    local_spec = CellExecutionSpec.from_config(
-        config,
-        repo_root=local_root,
-        resolved_n_grid=tuple(int(value) for value in n_grid),
-        resolved_k_grid=tuple(int(value) for value in k_grid),
-        resolved_repeat_plan=repeat_pairs,
-        model_n_jobs=config.n_jobs,
-        git_commit=str(state["commit"]),
-        algorithm_version=algorithm_version,
-        resolved_model_params=resolved_selected_model_params,
-        environment_overrides=model_run_settings(config.models),
-        execution_groups=[
-            {"k_features": int(k_features), "groups": [
-                {"group": group, "models": list(models)}
-                for group, models in execution_groups_for_models(config.models)
-            ]}
-            for k_features in k_grid
-        ],
-        input_provenance=local_provenance,
-        require_clean_worktree=config.preset == "production",
-    )
-    jobs = [
-        (model_name, seed, draw, int(n_samples), int(k_features))
-        for seed, draw in execution_pairs
-        for k_features in k_grid
-        for n_samples in n_grid
-        for model_name in config.models
-    ]
-    expected_rows = len(jobs)
-    if expected_rows > LARGE_RUN_THRESHOLD and not allow_large_run:
-        raise ValueError(
-            f"Large run requires --allow-large-run: {expected_rows:,} top-level model "
-            f"cells exceeds the {LARGE_RUN_THRESHOLD:,} safety threshold."
-        )
-
-    out_path = (
-        Path(config.out)
-        if exact_output_path
-        else _select_output_path(
-            Path(config.out),
-            preset=config.preset,
-            experiment_id=metadata["experiment_id"],
-            jobs=jobs,
-            rerun_completed=config.rerun_completed,
-        )
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if exact_output_path and manifest_path(out_path).exists():
-        try:
-            exact_prior = json.loads(
-                manifest_path(out_path).read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                "Existing exact-output manifest cannot be parsed"
-            ) from exc
-        if not isinstance(exact_prior, dict):
-            raise ValueError(
-                "Existing exact-output manifest must be a JSON object"
-            )
-        _require_resumable_manifest(exact_prior, metadata)
-    prior_manifest = _read_prior_manifest(
-        manifest_path(out_path), metadata["experiment_id"]
-    )
-    config = _resumed_checkpoint_config(config, prior_manifest)
-    existing_index = load_checkpoint_index(out_path)
-    indexed_completed = _completed_jobs_for_experiment(
-        existing_index,
-        metadata["experiment_id"],
-    )
-    completed_statuses = _completed_job_statuses_for_experiment(
-        existing_index,
-        metadata["experiment_id"],
-    )
-    prediction_jobs = [
-        job for job in jobs if _selected_prediction_job(config, job)
-    ]
-    # Preset reruns already received a new timestamped path above. A verified
-    # complete output at the selected path is reuse even when a direct caller
-    # leaves rerun_completed=True; its retention checks must not be bypassed.
-    if (
-        _verified_complete_artifacts(
-            out_path,
-            metadata["experiment_id"],
-            expected_rows,
-        )
-        and _prediction_export_is_complete(
-            config,
-            out_path,
-            jobs,
-            completed_statuses,
-        )
-    ):
-        if not _checkpoint_index_exactly_matches_jobs(
-            existing_index,
-            metadata["experiment_id"],
-            jobs,
-            indexed_completed,
-        ):
-            raise RuntimeError(
-                "Completed output failed projected-index integrity: expected "
-                "exactly one ok/skipped row for every current model-cell key "
-                "and no out-of-design keys. Refusing silent reuse or rewrite."
-            )
-        completed_manifest_path = manifest_path(out_path)
-        completed_manifest = json.loads(
-            completed_manifest_path.read_text(encoding="utf-8")
-        )
-        completed_manifest["updated_at"] = utc_now()
-        completed_manifest["design"]["parallelism"] = _parallelism_payload(
-            config
-        )
-        _apply_completed_checkpoint_retention(
-            out_path, completed_manifest, config.checkpoint_retention,
-        )
-        write_json_atomic(completed_manifest_path, completed_manifest)
-        log_progress(f"already complete; no-op reuse of verified output: {out_path}")
-        return out_path
-    # Resume planning needs only identity, cell keys and status. Avoid loading
-    # every metric column for a multi-million-row checkpoint.
-    existing = existing_index
-    completed = _completed_jobs_for_experiment(existing, metadata["experiment_id"])
-    pending = [
-        job
-        for job in jobs
-        if job not in completed
-        or (
-            _selected_prediction_job(config, job)
-            and completed_statuses.get(job) == "ok"
-            and not _prediction_part_for_job(out_path, job).is_file()
-        )
-    ]
-    if max_jobs is not None:
-        pending = pending[: int(max_jobs)]
-    if pending and not existing.empty and not checkpoint_parts(out_path):
-        seed_checkpoint_parts_from_csv(out_path)
-    started_at = utc_now()
-    current_manifest_path = manifest_path(out_path)
-    prior_manifest = _read_prior_manifest(
-        current_manifest_path, metadata["experiment_id"]
-    )
-    if prior_manifest is not None:
-        _require_resumable_manifest(prior_manifest, metadata)
-        started_at = prior_manifest.get("created_at", started_at)
-    initial_manifest = _manifest_payload(
-        config=config,
-        metadata=metadata,
-        out_path=out_path,
-        data_path=data_path,
-        test_path=test_path,
-        model_params_path=model_params_path,
-        selected_model_params=selected_model_params,
-        frame=frame,
-        predictors=predictors,
-        split_seeds=split_seeds,
-        execution_pairs=execution_pairs,
-        splits=splits,
-        n_grid=n_grid,
-        k_grid=k_grid,
-        expected_rows=expected_rows,
-        results=existing,
-        started_at=started_at,
-        dataset=dataset,
-        task=task,
-        schema_path=schema.path,
-        semantic_contract=semantic_contract,
-        seed_shard_execution=shard_execution_requested,
-    )
-    write_json_atomic(
-        current_manifest_path,
-        _preserve_prior_timings(initial_manifest, prior_manifest),
-    )
-    log_progress(
-        f"jobs total={expected_rows} completed={len(completed)} "
-        f"pending={len(pending)} batch_size={config.batch_size} "
-        f"chunk_policy={_parallelism_payload(config)['chunk_policy']}"
-    )
-    # The pending list is now authoritative. Release the full design list,
-    # projected index and completed-key set before model fitting so a resumed
-    # production task does not retain several duplicate multi-million-cell
-    # structures for the lifetime of the run.
-    del existing_index, indexed_completed, completed_statuses, existing, completed, jobs
-
-    # Open the native runner only after all manifest/checkpoint-resume work
-    # has succeeded.  From here every cell and checkpoint failure closes it
-    # before escaping this function.
-    execution_session = NKGridExecutionSession(
-        config=config, spec=local_spec, loaded=loaded,
-        repo_root=local_root,
-        source_definitions=source_definitions,
-        selected_model_params=selected_model_params,
-        algorithm_version=algorithm_version,
-    )
-
-    try:
-        prediction_parts_written = 0
-        prediction_write_seconds = 0.0
-
-        def write_session_checkpoint(rows: list[dict]) -> Path | None:
-            return write_checkpoint_part(rows, out_path, keep_all=config.checkpoint_retention == "keep")
-
-        def persist_cell_predictions(rows: list[dict[str, object]]) -> None:
-            nonlocal prediction_parts_written, prediction_write_seconds
-            for row in rows:
-                export_rows = row.pop("_prediction_export_rows", None)
-                job = (
-                    str(row["model"]),
-                    int(row["seed"]),
-                    int(row["draw"]),
-                    int(row["N"]),
-                    int(row["K"]),
-                )
-                if not _selected_prediction_job(config, job):
-                    continue
-                part_path = _prediction_part_for_job(out_path, job)
-                try:
-                    part_path.unlink(missing_ok=True)
-                    if row.get("status") != "ok":
-                        continue
-                    if not isinstance(export_rows, list):
-                        raise ValueError(
-                            "successful selected cell returned no prediction rows"
-                        )
-                    write_started = time.perf_counter()
-                    assert prediction_sidecar_schema is not None
-                    write_prediction_part_atomic(
-                        export_rows,
-                        part_path,
-                        schema=prediction_sidecar_schema,
-                    )
-                    prediction_write_seconds += time.perf_counter() - write_started
-                    prediction_parts_written += 1
-                except Exception as exc:
-                    row["status"] = "failed"
-                    row["error"] = (
-                        "prediction_export: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    log_progress(
-                        "prediction export part failed; cell remains resumable "
-                        f"model={job[0]} seed={job[1]} draw={job[2]} "
-                        f"N={job[3]} K={job[4]} error={exc}"
-                    )
-
-        pending_cell_groups: dict[
-            tuple[int, int, int, int], list[tuple[str, int, int, int, int]]
-        ] = {}
-        for job in pending:
-            pending_cell_groups.setdefault(job[1:], []).append(job)
-        total_batches = (
-            int(np.ceil(len(pending) / config.batch_size)) if pending else 0
-        )
-        graceful_stop = False
-        stop_before_materialization = False
-        processed_rows = 0
-        checkpoint_buffer: list[dict] = []
-        checkpoint_batch_index = 0
-        # Array workers are the only outer concurrency layer.  Keep one complete
-        # cell group together so its imputation cache remains shared, but execute
-        # groups serially: no joblib windows and therefore no window barrier.
-        for cell_key, cell_jobs in pending_cell_groups.items():
-            seed, draw, n_samples, k_features = cell_key
-            cell_rows = execution_session.run_cell_group(
-                seed=seed,
-                draw=draw,
-                n_samples=n_samples,
-                k_features=k_features,
-                models=tuple(job[0] for job in cell_jobs),
-            )
-            persist_cell_predictions(cell_rows)
-            checkpoint_buffer.extend(cell_rows)
-            while len(checkpoint_buffer) >= config.batch_size:
-                checkpoint_batch_index += 1
-                batch_rows = checkpoint_buffer[: config.batch_size]
-                del checkpoint_buffer[: config.batch_size]
-                log_progress(
-                    f"batch {checkpoint_batch_index}/{total_batches} starting "
-                    f"jobs={len(batch_rows)}"
-                )
-                part = write_session_checkpoint(batch_rows)
-                ok_count = sum(row.get("status") == "ok" for row in batch_rows)
-                failed_count = sum(
-                    row.get("status") == "failed" for row in batch_rows
-                )
-                skipped_count = sum(
-                    row.get("status") == "skipped" for row in batch_rows
-                )
-                log_progress(
-                    f"batch {checkpoint_batch_index}/{total_batches} wrote "
-                    f"checkpoint new_rows={len(batch_rows)} ok={ok_count} "
-                    f"failed={failed_count} skipped={skipped_count} "
-                    f"part={part.name if part else 'none'} out={out_path}"
-                )
-                processed_rows += len(batch_rows)
-                if stop_after_batch is not None and stop_after_batch():
-                    if processed_rows < len(pending):
-                        graceful_stop = True
-                        log_progress(
-                            "graceful stop requested; latest batch is checkpointed "
-                            "and remaining cells will resume on the next invocation"
-                        )
-                        break
-                    if defer_materialization_on_stop:
-                        graceful_stop = True
-                        stop_before_materialization = True
-                        log_progress(
-                            "graceful stop arrived after the final cell checkpoint; "
-                            "full CSV materialization is deferred to the next invocation"
-                        )
-                        break
-                    log_progress(
-                        "graceful stop arrived after the final pending batch; "
-                        "the run will finalize without requeue"
-                    )
-            if graceful_stop:
-                break
-        if checkpoint_buffer and not graceful_stop:
-            checkpoint_batch_index += 1
-            batch_rows = checkpoint_buffer
-            log_progress(
-                f"batch {checkpoint_batch_index}/{total_batches} starting "
-                f"jobs={len(batch_rows)}"
-            )
-            part = write_session_checkpoint(batch_rows)
-            ok_count = sum(row.get("status") == "ok" for row in batch_rows)
-            failed_count = sum(row.get("status") == "failed" for row in batch_rows)
-            skipped_count = sum(row.get("status") == "skipped" for row in batch_rows)
-            log_progress(
-                f"batch {checkpoint_batch_index}/{total_batches} wrote checkpoint "
-                f"new_rows={len(batch_rows)} ok={ok_count} failed={failed_count} "
-                f"skipped={skipped_count} "
-                f"part={part.name if part else 'none'} out={out_path}"
-            )
-            processed_rows += len(batch_rows)
-            if stop_after_batch is not None and stop_after_batch():
-                if defer_materialization_on_stop:
-                    graceful_stop = True
-                    stop_before_materialization = True
-                    log_progress(
-                        "graceful stop arrived after the final cell checkpoint; "
-                        "full CSV materialization is deferred to the next invocation"
-                    )
-                else:
-                    log_progress(
-                        "graceful stop arrived after the final pending batch; "
-                        "the run will finalize without requeue"
-                    )
-    finally:
-        execution_session.close()
-    if not pending:
-        log_progress("no pending jobs; checkpoint is already complete")
-    if (
-        not graceful_stop
-        and defer_materialization_on_stop
-        and stop_after_batch is not None
-        and stop_after_batch()
-    ):
-        graceful_stop = True
-        stop_before_materialization = True
-        log_progress(
-            "graceful stop observed before full CSV materialization; "
-            "finalization is deferred to the next invocation"
-        )
-    materialization_deferred = graceful_stop and defer_materialization_on_stop
-    if materialization_deferred:
-        # Slurm's advance-signal watchdog should wait only for the current
-        # atomic checkpoint, not a full multi-million-row CSV rewrite.
-        results = load_checkpoint_index(out_path)
-        result_summary = None
-    else:
-        materialization = merge_checkpoint_parts(
-            out_path,
-            experiment_id=metadata["experiment_id"],
-            drop_output_columns=list(TRANSIENT_RESULT_COLUMNS),
-        )
-        results = None
-        result_summary = materialization.summary
-    prediction_export_summary: dict[str, object] | None = None
-    if prediction_export_enabled(config) and not materialization_deferred:
-        prediction_index = load_checkpoint_index(out_path)
-        prediction_statuses = _completed_job_statuses_for_experiment(
-            prediction_index, metadata["experiment_id"]
-        )
-        authoritative_parts: list[Path] = []
-        missing_parts: list[tuple] = []
-        for job in prediction_jobs:
-            if prediction_statuses.get(job) != "ok":
-                continue
-            part_path = _prediction_part_for_job(out_path, job)
-            if part_path.is_file():
-                authoritative_parts.append(part_path)
-            else:
-                missing_parts.append(job)
-        merge_started = time.perf_counter()
-        prediction_path = materialize_prediction_export_atomic(
-            authoritative_parts,
-            out_path,
-            schema=prediction_sidecar_schema,
-        )
-        prediction_merge_seconds = time.perf_counter() - merge_started
-        try:
-            import pyarrow.parquet as pq
-
-            prediction_rows = int(
-                pq.ParquetFile(prediction_path).metadata.num_rows
-            )
-        except ImportError as exc:
-            raise ImportError(
-                "Prediction export requires the NK Grid parquet extra"
-            ) from exc
-        prediction_export_summary = {
-            "cells": [
-                {"model": model, "N": int(n_samples), "K": int(k_features)}
-                for model, n_samples, k_features in config.prediction_export_cells
-            ],
-            "requested_cells": len(prediction_jobs),
-            "materialized_cells": len(authoritative_parts),
-            "missing_parts": len(missing_parts),
-            "rows": prediction_rows,
-            "bytes": prediction_path.stat().st_size,
-            "part_write_seconds": prediction_write_seconds,
-            "parts_written_this_invocation": prediction_parts_written,
-            "merge_seconds": prediction_merge_seconds,
-        }
-    final_manifest = _manifest_payload(
-        config=config,
-        metadata=metadata,
-        out_path=out_path,
-        data_path=data_path,
-        test_path=test_path,
-        model_params_path=model_params_path,
-        selected_model_params=selected_model_params,
-        frame=frame,
-        predictors=predictors,
-        split_seeds=split_seeds,
-        execution_pairs=execution_pairs,
-        splits=splits,
-        n_grid=n_grid,
-        k_grid=k_grid,
-        expected_rows=expected_rows,
-        results=results,
-        result_summary=result_summary,
-        started_at=started_at,
-        dataset=dataset,
-        task=task,
-        schema_path=schema.path,
-        semantic_contract=semantic_contract,
-        seed_shard_execution=shard_execution_requested,
-    )
-    _preserve_prior_timings(final_manifest, prior_manifest)
-    if prediction_export_summary is not None:
-        final_manifest["prediction_export"] = prediction_export_summary
-        if prediction_export_summary["missing_parts"]:
-            final_manifest["completion"]["status"] = "incomplete"
-    if materialization_deferred:
-        final_manifest["output"]["csv_materialization_deferred"] = True
-        final_manifest["diagnostics"] = {
-            "deferred_until_completion": True,
-            "by_model": {},
-        }
-    if graceful_stop:
-        violation = None
-        if stop_before_materialization:
-            final_manifest["completion"]["status"] = "incomplete"
-            final_manifest["completion"]["checkpoint_rows_complete"] = True
-        final_manifest["failure_policy"]["passed"] = None
-        final_manifest["failure_policy"]["violation"] = None
-        final_manifest["termination"] = {
-            "reason": (
-                "graceful_stop_before_materialization"
-                if stop_before_materialization
-                else "graceful_stop_after_batch"
-            ),
-            "resumable": True,
-        }
-    else:
-        violation = None if defer_failure_policy else _failure_policy_violation(final_manifest)
-        final_manifest["failure_policy"]["passed"] = None if defer_failure_policy else violation is None
-        final_manifest["failure_policy"]["violation"] = None if defer_failure_policy else violation
-    write_json_atomic(current_manifest_path, final_manifest)
-    persisted_manifest = json.loads(current_manifest_path.read_text(encoding="utf-8"))
-    if violation is None and _prune_checkpoint_parts(out_path, persisted_manifest):
-        persisted_manifest["output"]["checkpoint_parts_deleted"] = True
-        write_json_atomic(current_manifest_path, persisted_manifest)
-    if violation is not None:
-        raise RunFailureThresholdExceeded(
-            f"{violation}; output and checkpoint shards were retained at {out_path}"
-        )
-    return out_path
-
-
-def parse_args() -> NKGridConfig:
-    parser = argparse.ArgumentParser(
-        description="Run joint log-scale N x K prediction-quality sweeps."
-    )
-    parser.add_argument("--schema", required=True, type=Path)
-    parser.add_argument("--outcome", required=True)
-    parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument(
-        "--models", nargs="+", default=["xgboost"], choices=SUPPORTED_MODEL_NAMES
-    )
-    parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--test-size", type=float, default=0.3)
-    parser.add_argument("--n-seeds", type=int, default=2)
-    parser.add_argument("--n-draws", type=int, default=2)
-    parser.add_argument("--n-sizes-n", type=int, default=4)
-    parser.add_argument("--n-sizes-k", type=int, default=4)
-    parser.add_argument("--min-n", type=int, default=10)
-    parser.add_argument("--max-n", type=int, default=100, help="Use <=0 for full train set.")
-    parser.add_argument("--max-k", type=int, default=100, help="Use <=0 for all features.")
-    parser.add_argument("--batch-size", type=int, default=20)
-    parser.add_argument("--checkpoints", dest="checkpoint_retention", choices=("keep", "delete"),
-                        default="default", help="Keep all checkpoints, or delete after verified success only.")
-    parser.add_argument("--failed-abs-threshold", type=int, default=50)
-    parser.add_argument("--failed-ratio-threshold", type=float, default=0.05)
-    parser.add_argument("--native-process-max-attempts", type=int, default=2)
-    parser.add_argument(
-        "--native-process-timeout-seconds",
-        type=float,
-        default=21_600.0,
-        help="Kill and retry an isolated native-model cell after this deadline.",
-    )
-    parser.add_argument("--model-params", default=str(DEFAULT_MODEL_PARAMS_PATH))
-    parser.add_argument("--allow-large-run", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--rerun-completed",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "For preset runs, create a new timestamped output when an identical "
-            "completed run exists (use --no-rerun-completed to reuse it)."
-        ),
-    )
-    parser.add_argument(
-        "--prediction-export-cell",
-        action="append",
-        default=[],
-        metavar="MODEL,N,K",
-        help=(
-            "Export per-row predictions for one exact model,N,K combination; "
-            "repeat for additional cells."
-        ),
-    )
-    parser.add_argument(
-        "--n-jobs",
-        type=int,
-        default=int(os.environ.get("SLURM_CPUS_PER_TASK", "4")),
-    )
-    args = parser.parse_args()
-    prediction_export_cells: list[tuple[str, int, int]] = []
-    for value in args.prediction_export_cell:
-        fields = value.split(",")
-        if len(fields) != 3:
-            parser.error("--prediction-export-cell requires MODEL,N,K")
-        try:
-            prediction_export_cells.append(
-                (fields[0], int(fields[1]), int(fields[2]))
-            )
-        except ValueError:
-            parser.error("--prediction-export-cell N and K must be integers")
-    return NKGridConfig(
-        schema=args.schema,
-        out=args.out,
-        outcome=args.outcome,
-        models=tuple(args.models),
-        seed=args.seed,
-        test_size=args.test_size,
-        n_seeds=args.n_seeds,
-        n_draws=args.n_draws,
-        n_sizes_n=args.n_sizes_n,
-        n_sizes_k=args.n_sizes_k,
-        min_n=args.min_n,
-        max_n=args.max_n,
-        max_k=args.max_k,
-        batch_size=args.batch_size,
-        checkpoint_retention=args.checkpoint_retention,
-        n_jobs=args.n_jobs,
-        model_params=Path(args.model_params),
-        failed_abs_threshold=args.failed_abs_threshold,
-        failed_ratio_threshold=args.failed_ratio_threshold,
-        native_process_max_attempts=args.native_process_max_attempts,
-        native_process_timeout_seconds=args.native_process_timeout_seconds,
-        allow_large_run=args.allow_large_run,
-        dry_run=args.dry_run,
-        rerun_completed=args.rerun_completed,
-        prediction_export_cells=tuple(prediction_export_cells),
-    )
-
-
-def main() -> None:
-    run_nk_grid(parse_args())
-
-
-if __name__ == "__main__":
-    main()

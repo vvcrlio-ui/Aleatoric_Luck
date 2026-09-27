@@ -82,8 +82,7 @@ worker processes as separate jobs, and `MaxArraySize` does not apply. Admission
 checks every scoped CPU, memory and node headroom independently against the
 whole allocation, including conservative billing for a partially filled last
 node. Per-job limits, live wall-time limits, QoS CPU-minute headroom and the
-cumulative run budget still apply. Legacy job-array admission retains its
-original worker-count behavior.
+cumulative run budget still apply.
 
 Automatic economic tail drain is disabled until measured migration costs are
 available. To enable it, supply positive `restart_overhead_seconds`,
