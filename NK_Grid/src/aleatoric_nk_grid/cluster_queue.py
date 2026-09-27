@@ -13,11 +13,9 @@ import sys
 import uuid
 
 from . import direct_success_queue as runtime
-from .pending_resume import Design
 from .scheduler_cost import CostEstimator
-from .shared_queue import (QueueError, atomic_json, digest, file_digest, file_lock,
-                           transport_manifest)
-from .result_migration import validate_scientific_result
+from .shared_queue import (Design, QueueError, atomic_json, digest, file_digest, file_lock,
+                           transport_manifest, validate_scientific_result)
 
 
 def read(path):
@@ -327,7 +325,7 @@ def finalize(plan, rounds):
 
 def cleanup(plan, receipt):
     """Delete only this run's round checkpoints, after verified publication."""
-    if plan.get('checkpoint_retention', 'default') != 'delete': return
+    if plan['checkpoint_retention'] != 'delete': return
     import shutil
     root = Path(plan['launch']['output']).resolve()
     target = root / 'rounds'

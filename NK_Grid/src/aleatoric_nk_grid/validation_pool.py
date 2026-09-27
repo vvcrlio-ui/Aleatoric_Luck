@@ -36,7 +36,7 @@ def _warm():
 
 
 def validate_rows(identity, validator, design, results):
-    from .result_migration import validate_scientific_result
+    from .shared_queue import validate_scientific_result
     from .prediction_workflow import task_kind
     for row in results:
         if row.get('status') == 'failed':

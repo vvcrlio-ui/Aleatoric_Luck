@@ -1,6 +1,6 @@
 # How the core code runs an experiment
 
-This package carries out one panel: it reads the prepared data, lays out every training combination, fits the models, and checks the results. The same numerical code runs locally and on a cluster.
+This package carries out one panel on a Slurm cluster: it reads the prepared data, lays out every training combination, fits the models, and checks the results.
 
 ## Reading the data and the design
 
@@ -19,7 +19,5 @@ Each base-model task saves its test predictions and out-of-fold training predict
 ## Running on a cluster
 
 [cluster_queue.py](cluster_queue.py) prepares a run and publishes its results. [shared_queue.py](shared_queue.py) holds the queue of model tasks and the record of accepted results. [single_model_worker.py](single_model_worker.py) takes a task, runs it and returns the result, and [slurm_queue_round.py](slurm_queue_round.py) starts the queue service and the workers inside one Slurm allocation. [scheduler_cost.py](scheduler_cost.py) and [cost_profile.py](cost_profile.py) estimate task durations from timings measured in the run, so the longest tasks can start first. [execution_contract.py](execution_contract.py) records the inputs, methods and design of a run, so results are only merged with results produced under the same settings.
-
-The earlier grouped-task protocol uses [flat_task_table.py](flat_task_table.py), [worker_event_wal.py](worker_event_wal.py) and [generation_control.py](generation_control.py); that code stays so runs started under it can be resumed.
 
 See the [experiment methods](../../README.md) and the [root README](../../../README.md).

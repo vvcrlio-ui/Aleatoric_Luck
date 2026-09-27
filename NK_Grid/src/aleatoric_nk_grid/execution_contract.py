@@ -1,10 +1,7 @@
-"""Canonical, fail-closed contracts for dynamic NK-grid execution.
+"""Canonical, fail-closed identity of the numeric cell contract.
 
-The dynamic queue has two deliberately different identities.  An analysis
-identity says that result rows may be combined; an execution-plan identity
-says who owns one immutable assignment and its WAL.  Keeping the codecs here
-prevents the worker, closer, and finalizer from each inventing a slightly
-different interpretation of JSON or paths.
+Keeping the JSON and path codecs here stops the planner, workers and verifier
+from each inventing a slightly different interpretation of the same contract.
 """
 
 from __future__ import annotations
@@ -22,9 +19,6 @@ from typing import Any, Mapping, Sequence
 
 
 CELL_SPEC_FORMAT_VERSION = 2
-ANALYSIS_CONTRACT_FORMAT_VERSION = 1
-EXECUTION_CONTRACT_FORMAT_VERSION = 1
-PUBLIC_RESULT_SERIALIZER_VERSION = 3
 
 
 class ContractError(ValueError):
@@ -77,44 +71,6 @@ def sha256_file(path: Path, *, chunk_bytes: int = 1024 * 1024) -> str:
                 digest.update(block)
     except OSError as exc:
         raise ContractError(f"cannot hash immutable artefact {path}: {exc}") from exc
-    return digest.hexdigest()
-
-
-def _write_all(descriptor: int, payload: bytes) -> None:
-    """Write an immutable contract fully before its durability barrier."""
-
-    view = memoryview(payload)
-    while view:
-        try:
-            written = os.write(descriptor, view)
-        except InterruptedError:
-            continue
-        if written is None or written <= 0:
-            raise ContractError("short write while publishing immutable artefact")
-        view = view[written:]
-
-
-def canonical_task_row_payload(row: Any) -> dict[str, object]:
-    """Return the logical TaskRow codec shared by planning and assignments."""
-
-    return {
-        "K": int(row.k_features),
-        "N": int(row.n_samples),
-        "draw": int(row.draw),
-        "group": str(row.group),
-        "models": [str(model) for model in row.models],
-        "row_id": str(row.row_id),
-        "seed": int(row.seed),
-    }
-
-
-def task_row_digest(rows: Sequence[Any] | Any) -> str:
-    """Hash a canonical TaskRow JSON-lines stream without materialising it."""
-
-    digest = hashlib.sha256()
-    for row in rows:
-        digest.update(canonical_json_bytes(canonical_task_row_payload(row)))
-        digest.update(b"\n")
     return digest.hexdigest()
 
 
@@ -188,8 +144,7 @@ class CellExecutionSpec:
     """The complete numeric contract consumed by ``NKGridExecutionSession``.
 
     The dataclass intentionally stores only JSON-shaped fields.  It has no
-    assignment, worker, round, result-store, or Slurm field, so a session can
-    be used by both the local runner and a dynamic worker.
+    assignment, worker, round, result-store, or Slurm field.
     """
 
     payload: Mapping[str, object]
@@ -353,166 +308,3 @@ class CellExecutionSpec:
             resolve_repo_locator(str(payload["schema_locator"]), str(payload["schema_file_sha256"]), repo_root=repo_root),
             resolve_repo_locator(str(payload["model_params_locator"]), str(payload["model_params_sha256"]), repo_root=repo_root),
         )
-
-
-@dataclass(frozen=True)
-class AnalysisContract:
-    payload: Mapping[str, object]
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        cell_execution_spec: CellExecutionSpec,
-        task_design_digest: str,
-        expected_task_rows: int,
-        expected_model_rows: int,
-        public_result_schema: Sequence[str],
-        protocol_limits: Mapping[str, int] | None = None,
-    ) -> "AnalysisContract":
-        if expected_task_rows < 1 or expected_model_rows < 1:
-            raise ContractError("analysis contract expected row counts must be positive")
-        schema = [str(column) for column in public_result_schema]
-        if not schema or len(schema) != len(set(schema)):
-            raise ContractError("public result schema must be ordered and unique")
-        schema_payload = {
-            "columns": schema,
-            "serializer_version": PUBLIC_RESULT_SERIALIZER_VERSION,
-            "protocol_limits": dict(protocol_limits or {}),
-        }
-        payload = {
-            "analysis_contract_format_version": ANALYSIS_CONTRACT_FORMAT_VERSION,
-            "cell_execution_spec": cell_execution_spec.to_payload(),
-            "cell_spec_sha256": cell_execution_spec.sha256,
-            "task_design_digest": str(task_design_digest),
-            "expected_task_rows": int(expected_task_rows),
-            "expected_model_rows": int(expected_model_rows),
-            "public_result_schema": schema_payload,
-            "public_result_schema_fingerprint": sha256_bytes(canonical_json_bytes(schema_payload)),
-        }
-        return cls(payload)
-
-    @property
-    def sha256(self) -> str:
-        return sha256_bytes(canonical_json_bytes(dict(self.payload)))
-
-    @property
-    def analysis_id(self) -> str:
-        return self.sha256
-
-    def to_payload(self) -> dict[str, object]:
-        payload = dict(self.payload)
-        payload["analysis_id"] = self.analysis_id
-        payload["analysis_contract_sha256"] = self.sha256
-        return payload
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, object]) -> "AnalysisContract":
-        candidate = dict(payload)
-        expected_id = candidate.pop("analysis_id", None)
-        expected_sha = candidate.pop("analysis_contract_sha256", None)
-        if candidate.get("analysis_contract_format_version") != ANALYSIS_CONTRACT_FORMAT_VERSION:
-            raise ContractError("unsupported analysis contract format")
-        public_schema = candidate.get("public_result_schema")
-        if not isinstance(public_schema, Mapping) or public_schema.get("serializer_version") != PUBLIC_RESULT_SERIALIZER_VERSION:
-            raise ContractError("unsupported public result serializer; do not mix metric schemas")
-        spec = CellExecutionSpec.from_payload(candidate.get("cell_execution_spec", {}))
-        if candidate.get("cell_spec_sha256") != spec.sha256:
-            raise ContractError("analysis contract cell execution spec checksum mismatch")
-        contract = cls(candidate)
-        if expected_id is not None and expected_id != contract.analysis_id:
-            raise ContractError("analysis contract ID checksum mismatch")
-        if expected_sha is not None and expected_sha != contract.sha256:
-            raise ContractError("analysis contract file checksum mismatch")
-        return contract
-
-
-@dataclass(frozen=True)
-class DynamicExecutionContract:
-    payload: Mapping[str, object]
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        analysis_contract: AnalysisContract,
-        task_table_path: str,
-        task_table_file_sha256: str,
-        task_table_rows: int,
-        worker_count: int,
-        initial_round_count: int,
-        resources: Mapping[str, object],
-        output_root: Path | str,
-        wal_limits: Mapping[str, int],
-    ) -> "DynamicExecutionContract":
-        if worker_count < 1 or initial_round_count < 1 or task_table_rows < 1:
-            raise ContractError("execution contract counts must be positive")
-        payload = {
-            "execution_contract_format_version": EXECUTION_CONTRACT_FORMAT_VERSION,
-            "analysis_id": analysis_contract.analysis_id,
-            "analysis_contract_sha256": analysis_contract.sha256,
-            "task_table_path": str(task_table_path),
-            "task_table_file_sha256": str(task_table_file_sha256),
-            "task_table_rows": int(task_table_rows),
-            "table_format": "task-table-v2",
-            "worker_count": int(worker_count),
-            "initial_round_count": int(initial_round_count),
-            "result_store_format": "worker-event-wal-v1",
-            "wal_protocol_limits": dict(wal_limits),
-            "resources": dict(resources),
-            "output_root": str(Path(output_root).resolve()),
-        }
-        return cls(payload)
-
-    @property
-    def sha256(self) -> str:
-        return sha256_bytes(canonical_json_bytes(dict(self.payload)))
-
-    @property
-    def execution_plan_id(self) -> str:
-        return self.sha256
-
-    def to_payload(self) -> dict[str, object]:
-        payload = dict(self.payload)
-        payload["execution_plan_id"] = self.execution_plan_id
-        payload["execution_contract_sha256"] = self.sha256
-        return payload
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, object]) -> "DynamicExecutionContract":
-        candidate = dict(payload)
-        expected_id = candidate.pop("execution_plan_id", None)
-        expected_sha = candidate.pop("execution_contract_sha256", None)
-        if candidate.get("execution_contract_format_version") != EXECUTION_CONTRACT_FORMAT_VERSION:
-            raise ContractError("unsupported execution contract format")
-        contract = cls(candidate)
-        if expected_id is not None and expected_id != contract.execution_plan_id:
-            raise ContractError("execution plan ID checksum mismatch")
-        if expected_sha is not None and expected_sha != contract.sha256:
-            raise ContractError("execution contract checksum mismatch")
-        return contract
-
-
-def immutable_json_bytes(path: Path, payload: Mapping[str, object]) -> None:
-    """Write an immutable contract with create-or-byte-identical semantics."""
-
-    target = Path(path)
-    encoded = canonical_json_bytes(dict(payload)) + b"\n"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
-    except FileExistsError:
-        existing = target.read_bytes()
-        if existing != encoded:
-            raise ContractError(f"immutable artefact differs: {target}")
-        return
-    try:
-        _write_all(descriptor, encoded)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    directory_fd = os.open(target.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)

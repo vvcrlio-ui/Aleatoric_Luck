@@ -1,7 +1,7 @@
 """Single-command bootstrap and shared single-model cluster orchestration.
 
-The bootstrap and dry run use only the standard library. Numerical work uses
-the installed shared engine, never Windows lock/process compatibility shims.
+The bootstrap and dry run use only the standard library. Numerical work runs in
+the shared dependency environment and imports the engine from this checkout.
 """
 from __future__ import annotations
 
@@ -71,22 +71,18 @@ def path_from_repo(value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("target", choices=("local", "slurm", "execute", "bootstrap"))
-    p.add_argument("--profile", choices=("local", "bmrc", "discoverer"), default="local")
+    p.add_argument("target", choices=("slurm", "execute", "bootstrap"))
+    p.add_argument("--profile", choices=("bmrc", "discoverer"))
     p.add_argument("--manifest", default="FFCWS/panels.yaml")
     p.add_argument("--panel", default="ffc_median_mode_gpa")
-    p.add_argument("--preset", choices=("dev", "medium", "timing_full", "production", "pilot", "dev-dynamic"), default="dev")
-    p.add_argument("--output", help="New run directory; defaults to <manifest directory>/outputs/<panel>-<unique ID>")
+    p.add_argument("--preset", choices=("dev", "medium", "timing_full", "production", "pilot"), default="dev")
     p.add_argument("--schema", help="Use existing prepared data via its schema; never rewrite tracked schema")
     p.add_argument("--models", nargs="+", help="Optional explicit subset of the panel's models")
-    p.add_argument("--venv", help="Environment path (or VENV); created only when absent")
-    p.add_argument("--refresh-env", action="store_true", help="Reinstall fixed dependencies into the selected environment")
     p.add_argument("--allow-large-run", action="store_true")
-    p.add_argument("--max-jobs", type=positive, help="Local-only bound on model cells")
     p.add_argument("--checkpoints", choices=("keep", "delete"),
                    help="Keep (default) or delete checkpoint data only after verified success")
     p.add_argument("--dry-run", action="store_true", help="Read-only launch preview; no installation, data reads or submission")
-    p.add_argument("--resume", help="Slurm: resume a single-panel plan JSON; grouped-protocol plans go to their original scripts")
+    p.add_argument("--resume", help="Resume a run from its plan.json")
     p.add_argument("--account", help="Required for Slurm, including resume; explicitly enter your authorized project account")
     p.add_argument("--qos", help="Slurm QoS; Discoverer defaults to the explicit account")
     p.add_argument("--prepare-ffc", action="store_true", help="Discoverer: prepare selected FFC panel on a compute node")
@@ -114,18 +110,14 @@ def launch_spec(args):
         raise ValueError("--prepare-ffc and --ffc-data-dir require --profile discoverer")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.panel):
         raise ValueError("panel name may contain only letters, digits, _, . and -")
-    if args.target == "slurm" and args.max_jobs:
-        raise ValueError("--max-jobs is local-only; use --preset dev for a small Slurm run")
-    if args.resume and args.target != "slurm":
-        raise ValueError("--resume accepts a Slurm plan; local runs use the engine checkpoint entry point")
-    if args.resume and (args.output or args.schema or args.models or args.preset != "dev"
+    if args.resume and (args.schema or args.models or args.preset != "dev"
                         or args.manifest != "FFCWS/panels.yaml" or args.panel != "ffc_median_mode_gpa"
                         or any((args.workers, args.rounds, args.partition, args.time_limit, args.memory,
                                 args.dispatcher_shards, args.scheduler_policy))):
         raise ValueError("resume reuses frozen design/resources; do not combine it with design/resource overrides")
-    if args.target == "slurm" and (not args.account or not args.account.strip()):
+    if not args.account or not args.account.strip():
         raise ValueError("Slurm requires explicit --account YOUR_PROJECT_ACCOUNT (including resume); no default account is used")
-    if args.target == "slurm" and not args.resume and not args.constraint:
+    if not args.resume and not args.constraint:
         raise ValueError("Slurm requires --profile bmrc or explicit --constraint")
     if args.preset == "production" and not args.allow_large_run and not args.dry_run:
         raise ValueError("production requires explicit --allow-large-run")
@@ -145,21 +137,19 @@ def launch_spec(args):
     manifest = path_from_repo(args.manifest)
     if not manifest.is_file():
         raise ValueError(f"manifest does not exist: {manifest}")
-    output = path_from_repo(args.output) if args.output else manifest.parent / "outputs" / (args.panel + "-" + uuid.uuid4().hex[:12])
-    result = dict(format_version=1, target=args.target, profile=args.profile, panel=args.panel, preset=args.preset,
+    output = manifest.parent / "outputs" / (args.panel + "-" + uuid.uuid4().hex[:12])
+    result = dict(format_version=1, profile=args.profile, panel=args.panel, preset=args.preset,
                 manifest=str(manifest), schema=str(path_from_repo(args.schema)) if args.schema else None,
                 models=args.models, output=str(output), allow_large_run=args.allow_large_run,
-                max_jobs=args.max_jobs, cluster=cluster, plan_memory=args.plan_memory or "16G",
+                cluster=cluster, plan_memory=args.plan_memory or "16G",
                 checkpoint_retention=args.checkpoints or "keep",
                 plan_time=args.plan_time or ("08:00:00" if production else "01:00:00"))
     if args.profile == "discoverer":
         result["continuation"] = {"worker_cap": args.workers, "max_rounds": args.rounds or 2,
                                   "max_no_progress_rounds": 2, "max_control_failures": 3,
                                   "max_control_jobs": 4 * (args.rounds or 2) + 8}
-    if args.target == 'slurm':
-        result['scheduler'] = 'single-model-slurm-v1'
     if args.dispatcher_shards is not None or args.scheduler_policy is not None:
-        if args.target != 'slurm' or args.resume:
+        if args.resume:
             raise ValueError('Dispatcher options apply to a new shared Slurm run; existing rounds retain their snapshot')
         policy = json.loads(path_from_repo(args.scheduler_policy).read_text(encoding='utf-8')) if args.scheduler_policy else {}
         if not isinstance(policy, dict): raise ValueError('Scheduler policy must be a JSON object')
@@ -168,81 +158,9 @@ def launch_spec(args):
             if args.dispatcher_shards > 1 and 'validation_processes' not in policy:
                 policy['validation_processes'] = 2
         # The policy module and its shared-queue types have only stdlib imports.
-        package = str(Path(__file__).resolve().parents[1] / 'NK_Grid/src')
-        if package not in sys.path: sys.path.insert(0, package)
         from aleatoric_nk_grid.scheduler_policy import validate_policy
         result['scheduler_policy'] = validate_policy(policy)
     return result
-
-
-def validate_resume_checkpoints(plan_path, requested=None):
-    """A resumed dynamic run keeps the policy frozen in its snapshot."""
-    plan_path = Path(plan_path)
-    if not plan_path.is_file():
-        raise ValueError(f"plan does not exist: {plan_path}")
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    snapshot_path = plan.get("snapshot")
-    if not snapshot_path:
-        if requested is None:
-            return
-        raise ValueError("cannot confirm frozen checkpoint policy: plan has no snapshot")
-    snapshot_path = Path(snapshot_path)
-    if not snapshot_path.is_absolute():
-        snapshot_path = plan_path.parent / snapshot_path
-    if not snapshot_path.is_file():
-        raise ValueError(f"cannot confirm frozen checkpoint policy: snapshot does not exist: {snapshot_path}")
-    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    output_dir = snapshot.get("output_dir")
-    if output_dir:
-        output_dir = Path(output_dir)
-        if not output_dir.is_absolute():
-            output_dir = snapshot_path.parent / output_dir
-        if (output_dir / "checkpoint-archive.json").exists():
-            raise ValueError("run already completed and its checkpoints were archived/deleted; final CSV is retained; do not resume training")
-    frozen = snapshot.get("config", {}).get("checkpoint_retention", "default")
-    if frozen not in ("default", "keep", "delete"):
-        raise ValueError(f"invalid frozen checkpoint_retention: {frozen!r}")
-    # Historical dynamic runs retain WAL when no retention policy was set.
-    effective = "keep" if frozen == "default" else frozen
-    if requested is not None and requested != effective:
-        raise ValueError(f"resume cannot override frozen checkpoint policy ({effective}); omit --checkpoints or use --checkpoints {effective}")
-    return effective
-
-
-def ensure_environment(args):
-    """Install only on first use or explicit refresh; bind to source and lock files."""
-    environment = path_from_repo(args.venv or os.environ.get("VENV", ".venv-linux"))
-    python = environment / "bin/python"
-    stamp = environment / ".nkgrid-launch-environment.json"
-    expected = {"repo": str(ROOT), "requirements": sha256(ROOT / "NK_Grid/requirements.txt"),
-                "project": sha256(ROOT / "NK_Grid/pyproject.toml"),
-                "python_module": os.environ.get("PYTHON_MODULE", ""),
-                "cpu_type": os.environ.get("MODULE_CPU_TYPE", "")}
-    with environment_lock(environment):
-        created = False
-        if not python.is_file():
-            if environment.exists():
-                raise ValueError(f"Existing directory is not a Linux venv: {environment}; choose --venv explicitly")
-            command([sys.executable, "-m", "venv", environment])
-            created = True
-        recorded = json.loads(stamp.read_text()) if stamp.exists() else None
-        probe = command([python, "-c", "import importlib.metadata as m,json; print(json.dumps({d.metadata['Name'].lower():d.version for d in m.distributions()}))"], capture=True)
-        installed = json.loads(probe.stdout)
-        required = dict(line.strip().lower().split("==") for line in
-                        (ROOT / "NK_Grid/requirements.txt").read_text().splitlines() if "==" in line)
-        matches = all(installed.get(name) == version for name, version in required.items())
-        if not created and not args.refresh_env and ((recorded is not None and recorded != expected) or not matches):
-            raise ValueError("Existing environment differs from this checkout/locked dependencies. Choose a new --venv, or use --refresh-env only when no running jobs use it.")
-        if created or args.refresh_env:
-            command([python, "-m", "pip", "install", "-r", ROOT / "NK_Grid/requirements.txt"])
-            command([python, "-m", "pip", "install", "--no-deps", "-e", ROOT / "NK_Grid"])
-        # Verify an existing unmarked environment without reinstalling into it.
-        probe_code = ("import pathlib,sys,aleatoric_nk_grid as n,lightgbm,xgboost; "
-                      "assert pathlib.Path(n.__file__).resolve()==pathlib.Path(sys.argv[1]).resolve(), 'editable installation points at another checkout'; print('NKGRID environment ready')")
-        command([python, "-c", probe_code, ROOT / "NK_Grid/src/aleatoric_nk_grid/__init__.py"])
-        command([python, "-m", "pip", "check"])
-        atomic_json(stamp, expected)
-    return python, environment
 
 
 @contextmanager
@@ -313,7 +231,7 @@ def validate_source(spec):
     if spec.get("schema") and sha256(spec["schema"]) != spec["schema_sha256"]:
         raise ValueError("schema changed after launch; create a new run")
     state = frozen_source()
-    if state["commit"] != spec["source"]["commit"] or (spec["target"] == "slurm" and state["dirty"]):
+    if state["commit"] != spec["source"]["commit"] or state["dirty"]:
         raise ValueError("checkout changed after submission or is dirty; use an immutable clean checkout")
 
 
@@ -333,9 +251,7 @@ def resolve_experiment(spec):
     config = replace(config, out=Path(spec["output"]) / "final.csv", models=models,
                      schema=Path(spec["schema"]) if spec["schema"] else config.schema,
                      n_jobs=1, allow_large_run=spec["allow_large_run"],
-                     checkpoint_retention=(config.checkpoint_retention
-                                           if spec.get("checkpoint_retention", "default") == "default"
-                                           else spec["checkpoint_retention"]))
+                     checkpoint_retention=spec["checkpoint_retention"])
     try:
         loaded = load_input(config.schema, config.outcome)
     except FileNotFoundError as exc:
@@ -356,15 +272,7 @@ def resolve_experiment(spec):
 
 def execute(spec):
     validate_source(spec)
-    if spec['target'] == 'slurm' and spec.get('scheduler') != 'single-model-slurm-v1':
-        raise ValueError('Legacy launch request requires its frozen checkout; do not change its scheduler in place')
     config = resolve_experiment(spec)
-    if spec["target"] == "local":
-        from aleatoric_nk_grid.prediction_contract import reject_unsupported_prediction_backend
-        reject_unsupported_prediction_backend(config, "legacy local launcher")
-        from aleatoric_nk_grid.nk_grid import run_nk_grid
-        run_nk_grid(config, max_jobs=spec["max_jobs"], allow_large_run=spec["allow_large_run"])
-        return
     from aleatoric_nk_grid.cluster_queue import prepare
     from cluster_scheduler import start
     output = Path(spec["output"])
@@ -388,23 +296,6 @@ def slurm_command(spec, request):
     return args + [str(ROOT / "launch/prepare_and_submit.sbatch"), str(request)]
 
 
-def resume_legacy(args, path, plan):
-    """Preserve historical recovery with its original snapshot and journal."""
-    validate_resume_checkpoints(path, args.checkpoints)
-    for field in ("account", "constraint"):
-        supplied = getattr(args, field)
-        if supplied is not None and supplied != plan.get("submission", {}).get(field):
-            raise ValueError("resume cannot override frozen " + field)
-    if args.dry_run:
-        print(json.dumps({"plan": str(path), "scheduler": "historical", "actions": ["recover original frozen protocol"]}, indent=2))
-        return
-    if args.profile == "discoverer":
-        raise ValueError("Discoverer continuation.json runs resume from their original frozen checkout")
-    python, venv = ensure_environment(args)
-    environment = {**os.environ, "PYTHON": str(python), "VENV": str(venv), "ENGINE_DIR": str(ROOT / "NK_Grid")}
-    command(["bash", ROOT / "NK_Grid/slurm/legacy_submit_flat_task_table.sh", "--submit", path], cwd=path.parent, env=environment)
-
-
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser().parse_args(argv)
@@ -420,12 +311,12 @@ def main(argv=None):
         if not args.request:
             raise ValueError("execute requires --request")
         if args.checkpoints is not None:
-            raise ValueError("execute reuses the frozen launch request; set --checkpoints on local or slurm instead")
+            raise ValueError("execute reuses the frozen launch request; set --checkpoints on slurm instead")
         if sys.platform == "win32":
             raise ValueError("Full engine execution requires Linux/WSL")
         execute(json.loads(Path(args.request).read_text(encoding="utf-8")))
         return
-    if args.target in ("local", "slurm") and not args.resume and not any(a == "--preset" or a.startswith("--preset=") for a in argv):
+    if not args.resume and not any(a == "--preset" or a.startswith("--preset=") for a in argv):
         raise ValueError("New runs require an explicit --preset")
     spec = launch_spec(args)
     if args.resume:
@@ -437,33 +328,26 @@ def main(argv=None):
         launch(args, spec)
         return
     if args.dry_run:
-        print(json.dumps({"launch": spec, "resume": args.resume, "venv": args.venv or os.environ.get("VENV", ".venv-linux"),
-                          "actions": ["validate/reuse or create environment", "reuse plan" if args.resume else
-                                      ("run locally" if args.target == "local" else "submit planning job, then shared single-model scheduler")],
+        print(json.dumps({"launch": spec,
+                          "actions": ["reuse or create the shared dependency environment",
+                                      "submit planning job, then shared single-model scheduler"],
                           "note": "Read-only preview; input availability and resolved cell count checked at execution."}, indent=2))
         return
     if sys.platform == "win32":
-        raise ValueError("Full local execution requires Linux; on Windows, run run.sh inside a WSL distribution")
+        raise ValueError("Run this command in a Linux cluster login shell; --dry-run works anywhere")
     if not (3, 11) <= sys.version_info[:2] < (3, 15):
         raise ValueError("Python 3.11–3.14 required; select the cluster module or NKGRID_BOOTSTRAP_PYTHON")
     source = frozen_source()
-    if args.target == "slurm" and source["dirty"]:
+    if source["dirty"]:
         raise ValueError("Slurm requires a clean committed checkout; commit changes before submission")
-    if not args.resume:
-        output = Path(spec["output"])
-        if output.exists():
-            raise FileExistsError(f"run directory already exists: {output}; choose a new --output or --resume its plan")
-        if args.target == "slurm" and output.is_relative_to(ROOT):
-            ignored = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=ROOT)
-            if ignored.returncode != 0:
-                raise ValueError("Slurm output inside the checkout must be Git-ignored (the default <catalog>/outputs/ is) so launching does not dirty the frozen checkout")
-    if args.target == "slurm" and not (args.venv or os.environ.get("VENV")):
-        # Every cluster: one environment per set of locked dependencies, shared by runs.
-        if args.refresh_env:
-            raise ValueError("--refresh-env applies to an explicit --venv; shared environments are never modified")
-        python, venv = ensure_shared_environment(shared_env_root())
-    else:
-        python, venv = ensure_environment(args)
+    output = Path(spec["output"])
+    if output.exists():
+        raise FileExistsError(f"run directory already exists: {output}")
+    ignored = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=ROOT)
+    if ignored.returncode != 0:
+        raise ValueError("Run directory must be Git-ignored (the default <catalog>/outputs/ is) so launching does not dirty the frozen checkout")
+    # Every cluster: one environment per set of locked dependencies, shared by runs.
+    python, venv = ensure_shared_environment(shared_env_root())
     environment = {**{k: v for k, v in os.environ.items() if not k.startswith('SBATCH_')},
                    "VENV": str(venv), "PYTHON": str(python), "ENGINE_DIR": str(ROOT / "NK_Grid"),
                    "PYTHONPATH": str(ENGINE_SRC), **{key: "1" for key in THREADS}}
@@ -476,25 +360,22 @@ def main(argv=None):
     request = output / "launch.json"
     atomic_json(request, spec)
     print(f"Run directory: {output}", flush=True)
-    if args.target == "local":
-        command([python, Path(__file__).resolve(), "execute", "--request", request], env=environment)
-    else:
-        from slurm_submission import Journal, Slurm, _lock
-        with _lock(output / '.planning.lock'):
-            state = {'run_id': uuid.uuid4().hex, 'jobs': {}}
-            journal = Journal(output / 'planning-journal.json', state,
-                              Slurm(spec['cluster']['account'], spec['cluster'].get('qos')))
-            # Journal submission uses a sanitized environment; preserve the
-            # freshly validated venv for the compute-node planning entry.
-            prior = dict(os.environ)
-            try:
-                os.environ.update(environment)
-                job_id = journal.submit('P0', [a for a in slurm_command(spec, request)[2:]
-                                               if not a.startswith('--job-name=')])
-            finally:
-                os.environ.clear(); os.environ.update(prior)
-        atomic_json(output / "submission.json", {"planning_job": job_id, "request": str(request)})
-        print(f"Planning job: {job_id}; after planning, the shared single-model scheduler starts automatically.")
+    from slurm_submission import Journal, Slurm, _lock
+    with _lock(output / '.planning.lock'):
+        state = {'run_id': uuid.uuid4().hex, 'jobs': {}}
+        journal = Journal(output / 'planning-journal.json', state,
+                          Slurm(spec['cluster']['account'], spec['cluster'].get('qos')))
+        # Journal submission uses a sanitized environment; preserve the
+        # freshly validated venv for the compute-node planning entry.
+        prior = dict(os.environ)
+        try:
+            os.environ.update(environment)
+            job_id = journal.submit('P0', [a for a in slurm_command(spec, request)[2:]
+                                           if not a.startswith('--job-name=')])
+        finally:
+            os.environ.clear(); os.environ.update(prior)
+    atomic_json(output / "submission.json", {"planning_job": job_id, "request": str(request)})
+    print(f"Planning job: {job_id}; after planning, the shared single-model scheduler starts automatically.")
 
 
 if __name__ == "__main__":

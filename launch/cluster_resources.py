@@ -198,7 +198,7 @@ def _resolve_round(spec, remaining, *, work_seconds=None, target_round_seconds=N
     # Keep job slots and every scoped CPU/memory/node headroom dimension separate.
     bound = base.capacity(live, remaining=2**63 - 1, memory=memory,
         requested_time=cluster['time_limit'], worker_cap=None,
-        extra_submit=3, extra_running=2, single_allocation=True, control_memory=spec['plan_memory'])
+        extra_submit=3, extra_running=2, control_memory=spec['plan_memory'])
     threads = max(int(n['threads']) for n in live['nodes'])
     cpu_per_task = max(threads, bound['allocated_cpu_per_worker_bound'])
     if validation_processes:

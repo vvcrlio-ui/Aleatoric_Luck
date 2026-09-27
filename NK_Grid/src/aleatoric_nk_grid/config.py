@@ -1,12 +1,10 @@
-"""Experiment configuration and snapshot codecs, independent of execution backends."""
+"""Experiment configuration, independent of execution backends."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-
-from .grid_contract import validate_size_grid
 
 
 DEFAULT_MODEL_PARAMS_PATH = Path(__file__).resolve().parents[2] / "model_params.yaml"
@@ -26,18 +24,13 @@ class NKGridConfig:
     n_sizes_k: int
     max_n: int
     max_k: int
-    batch_size: int
     n_jobs: int
     min_n: int = 10
     model_params: Path = DEFAULT_MODEL_PARAMS_PATH
-    failed_abs_threshold: int = 50
-    failed_ratio_threshold: float = 0.05
     native_process_max_attempts: int = 2
     native_process_timeout_seconds: float = 21_600.0
     preset: str | None = None
     allow_large_run: bool = False
-    dry_run: bool = False
-    rerun_completed: bool = True
     # Direct construction is used by the test/dev API. Production manifests
     # always override these explicit values.
     experiment_id: str = "nkgrid-test-v1"
@@ -46,9 +39,7 @@ class NKGridConfig:
     repeat_plan: tuple[tuple[int, int], ...] | None = None
     n_grid: tuple[int, ...] | None = None
     k_grid: tuple[int, ...] | None = None
-    prediction_export_cells: tuple[tuple[str, int, int], ...] = ()
-    # Compatibility default: local prunes verified-complete parts; dynamic keeps WAL.
-    checkpoint_retention: str = "default"
+    checkpoint_retention: str = "keep"
     # Applied to the full source grid; frozen three-point grids stay unchanged.
     grid_selection: str = "all"
     prediction_cache: Mapping[str, Any] | None = None
@@ -99,7 +90,7 @@ def group_repeat_pairs_by_seed(
 
 
 def execution_groups_for_models(models: Sequence[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """Return the ordered preprocessing groups used by the task-table codec."""
+    """Return the ordered preprocessing groups shared by the models of one cell."""
 
     selected = tuple(str(model) for model in models)
     if not selected or len(selected) != len(set(selected)):
@@ -111,52 +102,3 @@ def execution_groups_for_models(models: Sequence[str]) -> tuple[tuple[str, tuple
         for name, group in (("imputed_core", imputed), ("passthrough", passthrough))
         if group
     )
-
-
-def config_to_json(config: NKGridConfig) -> dict[str, Any]:
-    """Encode paths and nested tuple fields as JSON-native values."""
-
-    def encode(value: Any) -> Any:
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, tuple):
-            return [encode(item) for item in value]
-        return value
-
-    return {
-        field.name: encode(getattr(config, field.name))
-        for field in sorted(fields(config), key=lambda field: field.name)
-    }
-
-
-def config_from_json(
-    payload: Mapping[str, Any], *, strict: bool = False,
-) -> NKGridConfig:
-    """Restore configuration containers from a snapshot.
-
-    ``strict`` preserves the dynamic contract reader's existing grid validation
-    and scalar normalization. Static seed snapshots retain their existing
-    validation boundary in the engine. Model-parameter validation is unchanged.
-    """
-
-    values = dict(payload)
-    for key in ("schema", "out", "model_params"):
-        if strict:
-            values[key] = Path(str(values[key]))
-        elif values.get(key) is not None:
-            values[key] = Path(values[key])
-    values["models"] = tuple(str(value) for value in values["models"]) if strict else tuple(values["models"])
-    for key in ("n_grid", "k_grid"):
-        if values.get(key) is not None:
-            values[key] = validate_size_grid(values[key], key) if strict else tuple(values[key])
-    if values.get("repeat_plan") is not None:
-        values["repeat_plan"] = tuple(
-            (int(pair[0]), int(pair[1])) if strict else tuple(pair)
-            for pair in values["repeat_plan"]
-        )
-    if values.get("prediction_export_cells") is not None:
-        values["prediction_export_cells"] = tuple(
-            (str(cell[0]), int(cell[1]), int(cell[2])) if strict else tuple(cell)
-            for cell in values["prediction_export_cells"]
-        )
-    return NKGridConfig(**values)
