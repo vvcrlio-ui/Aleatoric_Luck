@@ -26,8 +26,8 @@ Rows with missing outcomes are initially retained. The engine checks and filters
 
 ## Passing data to the engine
 
-The analysis table contains numeric values, NaN, outcomes, and any required IDs. The feature manifest specifies column types and groups. The schema links these files and declares the task type and split method. Training starts from this schema.
+The analysis table contains numeric values, NaN, outcomes, and a row ID. The ID plays no part in sampling or splitting; it lets predictions from separately trained models be matched to the same person. The feature manifest specifies column types and groups. The schema links these files and declares the task type and split method. Training starts from this schema.
 
 Once data and feature definitions pass validation, the adapter saves a new version and updates the schema. Existing runs continue to use their original version.
 
-See the [root quick start](../README.md) for execution steps.
+[ADAPTER.md](ADAPTER.md) specifies the files, schema fields, and checks for writing a new adapter. See the [root quick start](../README.md) for execution steps.

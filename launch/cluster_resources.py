@@ -121,6 +121,10 @@ def phase_allocation_options(policy, phase):
         options.update(policy['sl_allocation'])
         if options['sizing_mode'] == 'capacity':
             options['target_round_seconds'] = None
+    # SL cells are short and bound by durable acknowledgement, not by workers:
+    # a cap sized to that service rate keeps the throughput and frees the nodes.
+    if phase == 'sl' and policy['sl_worker_cap'] is not None:
+        options['worker_cap'] = min(options['worker_cap'] or policy['sl_worker_cap'], policy['sl_worker_cap'])
     return options
 
 

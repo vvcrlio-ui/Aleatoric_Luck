@@ -18,6 +18,10 @@ DEFAULT_COST_WEIGHTS = {'ols': 1, 'ridge': 5, 'lasso': 5, 'random_forest': 1,
     'shallow_neural_network': 15, 'extra_trees': 1, 'super_learner': 40, 'xgboost': 5, 'lightgbm': 5}
 
 
+class EmptyDurationProfile(QueueError):
+    """A structurally valid profile has no observations usable for pricing."""
+
+
 class CostEstimator:
     def __init__(self, *, profile=None, weights=None,
                  min_batch_observations=DEFAULT_MIN_BATCH_OBSERVATIONS,
@@ -74,7 +78,7 @@ class CostEstimator:
             if (not self.by_model and not self.identity_samples and not self.untrusted_identity_samples
                     and not any(group.get('cost_identity') for group in profile.get('status_groups', ())
                                 if isinstance(group, dict))):
-                raise QueueError('Empty duration profile')
+                raise EmptyDurationProfile('Empty duration profile')
             for group in profile.get('status_groups', ()):
                 if not isinstance(group, dict):
                     raise QueueError('Malformed status timing group')

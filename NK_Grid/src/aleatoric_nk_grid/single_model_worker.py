@@ -35,6 +35,28 @@ def json_result(value):
     return value
 
 
+def register_worker_binding(client, worker, binding, *, timeout_seconds=300.):
+    """Only these idempotent startup operations may be retried after a lost reply."""
+    from .queue_service import retry_delay
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise TimeoutError('No time remains for worker binding registration')
+    until = time.monotonic() + timeout_seconds
+    failures = 0
+    while True:
+        try:
+            client.call('protocol', worker=worker, version=2, hostname=binding['hostname'])
+            return client.call('worker_binding', worker=worker, binding=binding)
+        except OSError as exc:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Worker binding registration did not recover') from exc
+            client.metrics.add('binding_registration_retry')
+            time.sleep(min(remaining, retry_delay(failures, base=.2, cap=5.)))
+            failures += 1
+            if time.monotonic() >= until:
+                raise TimeoutError('Worker binding registration did not recover') from exc
+
+
 def run(args):
     entered = time.monotonic()
     protocol_version = getattr(args, 'protocol_version', 1)
@@ -87,8 +109,10 @@ def run(args):
                 raise QueueError('Explicit CPU binding requires protocol 2')
             from .service_binding import process_binding
             binding = process_binding()
-            client.call('protocol', worker=worker, version=2, hostname=binding['hostname'])
-            client.call('worker_binding', worker=worker, binding=binding)
+            remaining = min(300., args.max_seconds - (time.monotonic() - entered))
+            if getattr(args, 'deadline_epoch', None) is not None:
+                remaining = min(remaining, args.deadline_epoch - time.time())
+            register_worker_binding(client, worker, binding, timeout_seconds=remaining)
     try:
         if manifest["identity"].get("prediction_workflow"):
             if protocol_version != 2:

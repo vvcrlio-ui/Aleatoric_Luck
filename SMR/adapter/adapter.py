@@ -22,7 +22,12 @@ from aleatoric_nk_grid.validate_input import (
 )
 
 
-ADAPTER_VERSION = "smr-adapter-v1"
+ADAPTER_VERSION = "smr-adapter-v2"
+# The provider matrix has no identifier. The prediction cache needs one that
+# survives outcome-specific row removal, so each record is identified by its
+# 1-based position among the source table's data records, fixed before any
+# filtering. Sampling and splits use row positions and never read it.
+ID_COLUMN = "smr_row_id"
 DEFAULT_CONTRACT = "asample2_withlag.json"
 MANIFEST_COLUMNS = (
     "source_column",
@@ -301,11 +306,14 @@ def _build_staged_adapter(
 
     header = pd.read_csv(source, nrows=0).columns.astype(str).tolist()
     _validate_source_header(header, outcomes=outcomes, predictors=predictors)
+    if ID_COLUMN in header:
+        raise ValueError(f"Source table already has a column named {ID_COLUMN!r}")
     projected = pd.read_csv(source, usecols=[*outcomes, *predictors])
     projected = projected.loc[:, [*outcomes, *predictors]]
     projected = _normalize_missing_codes(
         projected, dict(contract["missing_value_codes"])
     )
+    projected.insert(0, ID_COLUMN, range(1, len(projected) + 1))
 
     # Required generation order: ARD -> manifest -> universe -> schema.
     ard_dir = article_root / "data" / "ard" / dataset
@@ -337,7 +345,7 @@ def _build_staged_adapter(
         "split_mode": "internal_random",
         "task": "regression",
         "outcome_columns": outcomes,
-        "id_column": None,
+        "id_column": ID_COLUMN,
         "predictor_columns": predictors,
         "predictor_prefix": None,
         "feature_manifest": os.path.relpath(manifest_path, schema_dir),
@@ -385,6 +393,7 @@ def _build_staged_adapter(
             min_n=min_n,
             test_size=test_size,
             seed=seed,
+            require_id=True,
         )
     return AdapterResult(
         schema_path=schema_path,

@@ -39,7 +39,7 @@ Grid dimensions are resolved against available samples and sources. A full 15-pa
 
 This suite/raw-data scheduler does not currently accept `--dispatcher-shards` or
 `--scheduler-policy`; these options fail explicitly instead of being ignored.
-They belong to the [prepared-data shared single-model entry](README.md#dispatcher-shards-and-initial-policy),
+They belong to the [prepared-data shared single-model entry](OPERATIONS.md#dispatcher-shards-and-initial-policy),
 which also serves BMRC. Its cache audit/index decoupling is shared code, but the
 Lustre quota adapter and service CPU binding have not been validated on BMRC.
 Do not reuse the Discoverer resource preset as a BMRC resource file.

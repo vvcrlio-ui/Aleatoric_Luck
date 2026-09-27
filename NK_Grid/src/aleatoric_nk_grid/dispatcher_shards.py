@@ -352,9 +352,11 @@ class ShardSet:
 
 
 # ------------------------------------------------------------------ the sharded round
-def run_sharded(root, repo, old, workers, validate_only=False, *, max_seconds=172800, policy=None, cost_profile=None,
+def run_sharded(root, repo, old, workers, validate_only=True, *, max_seconds=172800, policy=None, cost_profile=None,
                 allocation=None, continuation_allowed=False, layout=None, shard_tls=True, poll_seconds=15.):
-    from .direct_success_queue import allocation_start_time, merge as final_merge
+    if not validate_only:
+        raise QueueError('Rounds only validate; the cluster scheduler publishes final results')
+    from .direct_success_queue import allocation_start_time
     from .service_binding import service_layout, worker_step
     policy = validate_policy(policy)
     shards = int((allocation or {}).get('dispatcher_shards', 1)); validators = policy['validation_processes']
@@ -499,5 +501,3 @@ def run_sharded(root, repo, old, workers, validate_only=False, *, max_seconds=17
         raise QueueError('Dispatcher shards left no final statistics; results retained in the shard journals')
     if stats['done'] != stats['total'] and not (validate_only and (stats['draining'] or bounded_complete)):
         raise QueueError('Incomplete round; retain result receipts for next direct success scan')
-    if not validate_only:
-        final_merge(root, old)

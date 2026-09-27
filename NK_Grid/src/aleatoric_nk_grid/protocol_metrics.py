@@ -1,8 +1,14 @@
 """Opt-in, bounded operational counters; never part of scientific rows."""
 from collections import defaultdict
+from bisect import bisect_left
 from contextlib import contextmanager
 import threading
 import time
+
+DURATION_BOUNDS = tuple(1e-6 * 2**i for i in range(48))
+DURATION_KEYS = frozenset({'connection_pool_wait_submit', 'rpc_submit_batch', 'validation',
+    'validation_slot_wait', 'validation_roundtrip', 'journal_fsync_lock_wait', 'journal_fsync',
+    'journal_append', 'submit_lock_wait', 'producer_finish_confirmation', 'relay_upstream_submit'})
 
 
 def write_import_proof(role):
@@ -35,6 +41,7 @@ class ProtocolMetrics:
         self.counts = defaultdict(int)
         self.windows = {}
         self.event_times = {}
+        self.histograms = {}
 
     def add(self, name, seconds=0., count=1):
         if not self.enabled:
@@ -43,6 +50,9 @@ class ProtocolMetrics:
         with self.lock:
             self.totals[name] += max(0., seconds)
             self.counts[name] += count
+            if name in DURATION_KEYS and count == 1:
+                bins = self.histograms.setdefault(name, [0] * (len(DURATION_BOUNDS) + 1))
+                bins[bisect_left(DURATION_BOUNDS, max(0., seconds))] += 1
             if count:
                 elapsed = time.monotonic() - self.started
                 span = self.event_times.setdefault(name, {'first_elapsed': elapsed, 'last_elapsed': elapsed})
@@ -77,6 +87,8 @@ class ProtocolMetrics:
                     'wall_seconds': time.monotonic() - self.started,
                     'process_cpu_seconds': time.process_time() - self.cpu_started,
                     'seconds': dict(self.totals), 'counts': dict(self.counts),
+                    'duration_histograms': {'upper_bounds_seconds': DURATION_BOUNDS,
+                        'counts': {k:list(v) for k,v in self.histograms.items()}},
                     'event_times': {k: dict(v) for k, v in self.event_times.items()},
                     'one_second_counts': {str(k): dict(v) for k, v in sorted(self.windows.items())},
                     'note': 'Background RPC spans overlap compute; do not sum them as idle time.'}

@@ -1,15 +1,12 @@
 # Writing an Adapter for the NK Grid Engine
 
-This document explains **how to transform the raw data from a paper into adapter
-artifacts that the engine can accept, audit, and reproduce.**
-
-This is the **complete specification** for the adapter side.
-
-It is **recommended to use AI tools** to assist in constructing the Adapter.
+This document explains how to turn a study's raw data into adapter artifacts that
+the engine can accept, audit, and reproduce. It is the complete specification for
+the adapter side.
 
 ## 0. Contract Summary
 
-Adapter artifacts must satisfy all nine constraints below. If any constraint is
+Adapter artifacts must satisfy all ten constraints below. If any constraint is
 not met, `validate_input` will reject the artifacts before sampling begins. Later
 sections provide the details.
 
@@ -24,6 +21,7 @@ sections provide the details.
 | 7 | The feature universe has a valid origin: internal splitting requires `fixed_a_priori`; under external splitting, the vocabulary can be learned only from the training table. |
 | 8 | `group_column` is `null`; `exchangeable` is `true`. |
 | 9 | `schema_version=1`; with a manifest, `feature_manifest_version=1`; otherwise it is `null`. |
+| 10 | Runs that export per-row predictions or use the prediction cache, as every current FFCWS and SMR panel does, require `id_column` under either split mode, with non-missing, unique IDs (Section 5). |
 
 ## 1. What an Adapter Is and Terminology
 
@@ -137,8 +135,8 @@ paths.
 
 An ARD is a flat table: each row corresponds to one observational unit, and
 columns are not nested. It contains only the outcomes declared in the schema
-(there may be more than one), predictors, and the ID column required by
-`external_test`.
+(there may be more than one), predictors, and the row-ID column described in
+Section 5.
 
 - **Deterministic row-wise behavior:** once the vocabulary is fixed, the output
   for each row may depend only on that row's raw values and the fixed vocabulary,
@@ -178,10 +176,9 @@ includes any subsequently added column with the same prefix.
 to learn vocabularies.
 
 **`internal_random`** — The adapter delivers one table, which the engine splits.
-`id_column` may be `null`. If the data already contains a stable identifier,
-retain it for provenance, although the engine will not use it. The feature
-universe must be `fixed_a_priori`, **which means that categorical vocabularies
-also must not be learned from this table.**
+It still needs a row ID for runs that use the prediction cache; see Row IDs
+below. The feature universe must be `fixed_a_priori`, **which means that
+categorical vocabularies also must not be learned from this table.**
 
 **`external_test`** — The data provider has already defined the training and test
 sets, as with an official competition split. The adapter must preserve that split
@@ -195,6 +192,22 @@ exactly, deliver two tables, and satisfy the following requirements:
 - Vocabularies and feature screening may be learned only from the training table.
   If the test table contains a category outside the training vocabulary, raise an
   error; do not expand the vocabulary using the test table.
+
+### Row IDs
+
+Runs that export per-row predictions or use the prediction cache require
+`id_column` under both split modes. Every panel in `FFCWS/panels.yaml` and
+`SMR/panels.yaml` uses the prediction cache, so give every new dataset an ID.
+IDs must be non-missing and unique within each table. The engine never uses them
+to sample or split; it records them to identify the rows behind each exported or
+cached prediction, and there is no fallback to row positions.
+
+Use a stable identifier from the data provider when one exists, as FFCWS does
+with `challengeID`. Otherwise, assign one deterministically from each record's
+position in the raw table before any filtering, so that a record keeps the same
+ID for every outcome; the SMR adapter does this with `smr_row_id`. `id_column`
+may be `null` only under `internal_random`, for runs without prediction export or
+the prediction cache.
 
 ## 6. Feature Universe
 
@@ -338,7 +351,7 @@ are absent from this table.
 | `split_mode` | `internal_random` or `external_test`. |
 | `task` | `regression` or `classification`; the latter is binary `{0,1}` only. |
 | `outcome_columns` | Nonempty list of unique strings. |
-| `id_column` | Required under `external_test`; must not also be an outcome. |
+| `id_column` | Required under `external_test`, and under either split mode for runs that export per-row predictions or use the prediction cache (Section 5); must not also be an outcome. |
 | `predictor_columns` / `predictor_prefix` | Both are lists of strings; set exactly one; neither may contain an outcome or ID. |
 | `feature_manifest` | See Section 7. |
 | `exchangeable` | Must be `true` and requires research justification. |
@@ -380,7 +393,8 @@ corresponding type.
 
 This example contains three sources: `age` (continuous), `sat` (ordinal, levels
 1–5), and `edu` (three categories, one-hot). The raw data contains sentinel
-missing-value codes and text categories.
+missing-value codes and text categories, and no identifier, so the adapter
+numbers the records as `row_id` (Section 5).
 
 **The required generation order is ARD → manifest → universe → schema**: the
 universe depends on the manifest, and the schema references the universe.
@@ -402,7 +416,10 @@ SAT_LEVELS = [1, 2, 3, 4, 5]
 raw = pd.read_csv("raw.csv")
 raw["age"] = raw["age"].replace(-9, np.nan)        # Missing-value sentinel -> NaN
 
-ard = pd.DataFrame({"y": raw["y"], "X_age": raw["age"], "O_sat": raw["sat"]})
+ard = pd.DataFrame({
+    "row_id": np.arange(1, len(raw) + 1),          # Row ID fixed before any filtering
+    "y": raw["y"], "X_age": raw["age"], "O_sat": raw["sat"],
+})
 missing_edu = raw["edu"].isna()                    # Missing category -> entire group is NaN
 for i, level in enumerate(EDU_LEVELS):
     ard[f"C_edu__{i}"] = np.where(
@@ -445,7 +462,7 @@ schema = {
     "schema_version": 1, "feature_manifest_version": 1,
     "dataset": "typed", "table": "data.csv", "test_table": None,
     "split_mode": "internal_random", "task": "regression",
-    "outcome_columns": ["y"], "id_column": None,
+    "outcome_columns": ["y"], "id_column": "row_id",
     "predictor_columns": predictors, "predictor_prefix": None,
     "feature_manifest": "feature_manifest.csv", "exchangeable": True,
     "feature_universe": {
@@ -464,7 +481,10 @@ Path("typed.json").write_text(json.dumps(schema, indent=2))
 ```
 
 If all predictors are mutually independent continuous columns, the manifest may
-be omitted. [`README.md`](README.md) provides a complete template for that case.
+be omitted: set `feature_manifest` and `feature_manifest_version` to `null`, and
+build the universe in step 3 from `source_groups(predictors, None, priors)` with
+`manifest=None`, where `priors` is the schema's `continuous_priors` or `{}`. Each
+predictor then becomes its own continuous source.
 
 ### Validation
 
@@ -472,7 +492,8 @@ be omitted. [`README.md`](README.md) provides a complete template for that case.
 by the validation call** and are unrelated to adapter artifacts. Use any
 registered model; it affects only the check of the training-row lower bound. Set
 `min_n` and `test_size` to the values planned for the experiment. Under
-`external_test`, `test_size` is ignored.
+`external_test`, `test_size` is ignored. Pass `require_id=True`, as runs with the
+prediction cache do, to include the row-ID check.
 
 `validate_input` checks that data tables are readable; version numbers are
 recognized; exactly one predictor rule is
@@ -484,7 +505,8 @@ missing outcomes are removed; required manifest fields are present and
 one-hot row has a valid state; `exchangeable` is true and `group_column` is null;
 and the feature-universe content matches. Under `external_test`,
 it additionally checks matching table structures, ID integrity, and class
-coverage.
+coverage. With `require_id=True`, it also rejects a `null` `id_column`, and under
+`internal_random` it checks that the IDs are non-missing and unique.
 
 Degenerate cases within training subsamples—constant columns, a single class,
 too few samples, or an entirely missing source—are not covered by this
@@ -497,7 +519,7 @@ from aleatoric_nk_grid.validate_input import validate_input
 
 loaded = load_input(Path("typed.json"), "y")
 _, groups = validate_input(loaded, "y", models=["ols"],
-                           min_n=10, test_size=0.3, seed=1)
+                           min_n=10, test_size=0.3, seed=1, require_id=True)
 print([(g.name, g.unit_type, len(g.features)) for g in groups])
 # [('age', 'continuous', 1), ('sat', 'ordinal', 1), ('edu', 'onehot_group', 3)]
 ```
@@ -511,6 +533,8 @@ print([(g.name, g.unit_type, len(g.features)) for g in groups])
       been performed.
 - [ ] Rows with missing outcomes have not been removed in advance.
 - [ ] The predictor rule cannot match an outcome or ID column.
+- [ ] `id_column` is set, and its IDs are non-missing and unique within each
+      table (Section 5).
 - [ ] The schema, manifest, universe, and actual predictors are synchronized
       exactly.
 - [ ] Under `internal_random`, perturbing row-level data leaves the fixed universe
@@ -521,6 +545,9 @@ print([(g.name, g.unit_type, len(g.features)) for g in groups])
 - [ ] If provenance is provided, it contains no raw IDs or absolute paths.
 - [ ] `validate_input` raises no errors.
 
-After the adapter artifacts pass validation, see
-[`../NK_Grid/README.md`](../NK_Grid/README.md) for experiment configuration and
-execution instructions.
+After the adapter artifacts pass validation, register the schema as a panel: add
+an entry whose `schema` field points to it in a panel manifest, as
+`FFCWS/panels.yaml` and `SMR/panels.yaml` do. Launch it with `--manifest` and
+`--panel` as described in the [root quick start](../README.md#quick-start) and the
+[launch flow](../launch/README.md). [`../NK_Grid/README.md`](../NK_Grid/README.md)
+explains how the engine samples N and K and fits models.

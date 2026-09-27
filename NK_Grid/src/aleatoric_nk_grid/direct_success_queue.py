@@ -1,10 +1,9 @@
-"""One success scan and compact remaining ordinals; no SQLite or lease replay.
+"""Flat single-model dispatcher and the per-allocation round runner; no SQLite or lease replay.
 
 Operational launcher outside the frozen scientific checkout. Numerical workers
 continue to execute the original CellExecutionSpec and original worker module.
 Only successful/failed result receipts are durable; leases are generation-local.
 """
-import argparse
 from array import array
 from collections import deque
 from collections.abc import Mapping
@@ -30,9 +29,7 @@ import uuid
 
 from aleatoric_nk_grid.shared_queue import (
     Dispatcher, LeaseLostError, MAX_BATCH_TASKS, MAX_SUBMISSIONS, ModelTask, QueueError,
-    atomic_json, canonical, digest, file_digest, file_lock, transport_manifest)
-from aleatoric_nk_grid.pending_resume import Design
-from aleatoric_nk_grid.result_migration import validate_scientific_result
+    atomic_json, canonical, digest, file_digest, file_lock)
 from aleatoric_nk_grid.scheduler_cost import CostEstimator
 from aleatoric_nk_grid.scheduler_policy import TailMonitor, validate_policy
 
@@ -125,196 +122,6 @@ def task_at(design, ordinal):
     return ModelTask(seed, draw, design.ns[n], design.ks[k], design.models[m])
 
 
-def prepare(base, output):
-    """Reuse hash-bound prior scan; scan only subsequent result journal once."""
-    if (base / 'manifest.json').exists():
-        return prepare_flat(base, output)
-    import numpy as np
-    from aleatoric_nk_grid.scheduler_cost import CostEstimator
-    started = time.monotonic()
-    ready = read(base / 'ready.json')
-    bm = read(base / 'base-manifest.json')
-    from .prediction_workflow import reject_unphased_cache
-    reject_unphased_cache(bm['cell_spec'])
-    if file_digest(base / 'base-manifest.json') != ready['base_manifest_sha256']:
-        raise QueueError('Base manifest changed')
-    bits = (base / 'completed.bits').read_bytes()
-    if hashlib.sha256(bits).hexdigest() != bm['bits_sha256']:
-        raise QueueError('Prior successful-key scan changed')
-    design = Design(bm['cell_spec']); design.bits[:] = bits
-    if sum(int(b).bit_count() for b in bits) != ready['old_valid_unique']:
-        raise QueueError('Prior success count mismatch')
-    for item in bm['workers']:
-        if Path(item['wal_path']).stat().st_size != item['captured_bytes']:
-            raise QueueError('Stopped base WAL size changed')
-    output.mkdir(exist_ok=False, parents=True)
-    accepted = {}; failed = 0; sequence = 0; previous = '0' * 64
-    source = base / 'queue/events.jsonl'
-    source_size = source.stat().st_size
-    sha = hashlib.sha256(); tail_bytes = 0
-    with source.open('rb') as handle, (output / 'prior-success.jsonl').open('xb') as out:
-        while True:
-            line = handle.readline(2 * 1024 * 1024 + 1)
-            if not line:
-                break
-            sha.update(line)
-            if not line.endswith(b'\n'):
-                if len(line) > 2 * 1024 * 1024:
-                    raise QueueError('Oversized event')
-                tail_bytes = len(line)
-                break
-            frame = json.loads(line); body = frame['body']
-            if (frame['sha256'] != digest(body) or body['sequence'] != sequence
-                    or body['previous'] != previous or body['queue_id'] != ready['queue_id']):
-                raise QueueError('Source journal integrity failure')
-            sequence += 1; previous = frame['sha256']
-            event = body['event']
-            if event['kind'] not in ('result', 'import'):
-                continue  # Do not replay lease/heartbeat/restart/pause events.
-            row = event['result']; ordinal = design.ordinal(row)
-            if task_at(design, ordinal).id != event['id']:
-                raise QueueError('Source result key mismatch')
-            if not validate_scientific_result(row, task_kind='regression'):
-                failed += 1; continue
-            if row['algorithm_version'] != bm['cell_spec']['algorithm_version']:
-                raise QueueError('Source scientific identity mismatch')
-            fingerprint = digest(row)
-            if design.contains(ordinal):
-                if accepted.get(ordinal) != fingerprint:
-                    raise QueueError('Conflicting/overlapping successful key')
-                continue
-            design.mark(ordinal); accepted[ordinal] = fingerprint
-            out.write(canonical({'result': row, 'origin': {'queue_id': ready['queue_id'],
-                'sequence': body['sequence'], 'event_sha256': frame['sha256']}}) + b'\n')
-        out.flush(); os.fsync(out.fileno())
-        if handle.tell() != source_size or source.stat().st_size != source_size:
-            raise QueueError('Source journal changed during scan')
-    (output / 'completed.bits').write_bytes(design.bits)
-    success = np.unpackbits(np.frombuffer(design.bits, dtype=np.uint8), bitorder='little')[:design.count]
-    remaining = np.flatnonzero(success == 0).astype('<u4')
-    estimator = CostEstimator(profile=bm['cost_profile'])
-    # Cost lookup has only K*N*model entries. Repeats share the same estimate.
-    costs = np.array([estimator.estimate(m, n, k) for k in design.ks
-        for n in design.ns for m in design.models], dtype=np.float64)
-    models = len(design.models); repeats = len(design.repeats)
-    lookup = (remaining // (models * repeats)) * models + remaining % models
-    remaining = remaining[np.argsort(-costs[lookup], kind='stable')]
-    remaining.tofile(output / 'remaining.u32')
-    manifest = {'format': 'direct-success-bitmap-v1',
-        'identity': {'cell_spec': bm['cell_spec'], 'base_manifest_sha256': ready['base_manifest_sha256'],
-            'prior_success_sha256': file_digest(output / 'prior-success.jsonl')},
-        'count': len(remaining), **transport_manifest(), 'max_attempts': 5,
-        'remaining_sha256': file_digest(output / 'remaining.u32'),
-        'completed_sha256': file_digest(output / 'completed.bits'),
-        'base': str(base.resolve()), 'old_valid_unique': ready['old_valid_unique'],
-        'prior_new_success': len(accepted), 'source_failed': failed,
-        'source_events': sequence, 'source_bytes': source_size,
-        'source_sha256': sha.hexdigest(), 'ignored_incomplete_tail_bytes': tail_bytes,
-        'expected_total': design.count}
-    if ready['old_valid_unique'] + len(accepted) + len(remaining) != design.count:
-        raise QueueError('Complement count mismatch')
-    atomic_json(output / 'manifest.json', manifest)
-    atomic_json(output / 'queue-id.json', {'queue_id': digest(manifest)})
-    atomic_json(output / 'prepared.json', {'seconds': time.monotonic() - started,
-        'old_success': ready['old_valid_unique'], 'new_success': len(accepted),
-        'remaining': len(remaining), 'queue_id': digest(manifest), 'sqlite': False})
-
-
-def prepare_flat(base, output):
-    """Carry prior success bits forward and scan this stopped round once."""
-    import numpy as np
-    started = time.monotonic()
-    parent = read(base / 'manifest.json'); parent_qid = digest(parent)
-    if parent.get('identity', {}).get('prediction_workflow'):
-        raise QueueError('Prediction workflows must resume through cluster_scheduler and its all-plan phase barrier')
-    from .prediction_workflow import reject_unphased_cache
-    reject_unphased_cache(parent['identity']['cell_spec'])
-    if read(base / 'queue-id.json')['queue_id'] != parent_qid:
-        raise QueueError('Parent identity changed')
-    if parent['format'] != 'direct-success-bitmap-v1':
-        raise QueueError('Unsupported parent format')
-    bits = (base / 'completed.bits').read_bytes()
-    if hashlib.sha256(bits).hexdigest() != parent['completed_sha256']:
-        raise QueueError('Parent successful bits changed')
-    design = Design(parent['identity']['cell_spec']); design.bits[:] = bits
-    if sum(int(x).bit_count() for x in bits) != parent['old_valid_unique'] + parent['prior_new_success']:
-        raise QueueError('Parent success count mismatch')
-    remaining_bytes = (base / 'remaining.u32').read_bytes()
-    if hashlib.sha256(remaining_bytes).hexdigest() != parent['remaining_sha256']:
-        raise QueueError('Parent remaining list changed')
-    ordinals = np.frombuffer(remaining_bytes, dtype='<u4')
-    if len(ordinals) != parent['count']: raise QueueError('Parent remaining count mismatch')
-    membership = bytearray(len(bits))
-    for ordinal in ordinals:
-        ordinal = int(ordinal)
-        if ordinal >= design.count or design.contains(ordinal):
-            raise QueueError('Parent task complement changed')
-        byte, shift = divmod(ordinal,8)
-        if membership[byte] & (1 << shift): raise QueueError('Duplicate parent task')
-        membership[byte] |= 1 << shift
-    output.mkdir(exist_ok=False, parents=True)
-    prior = base / 'prior-success.jsonl'; source = base / 'results.jsonl'
-    source_size = source.stat().st_size
-    fingerprints = {}; count = failed = tail_bytes = 0; sha = hashlib.sha256()
-    with (output / 'prior-success.jsonl').open('xb') as out:
-        prior_sha = hashlib.sha256()
-        with prior.open('rb') as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b''):
-                prior_sha.update(block); out.write(block)
-        if prior_sha.hexdigest() != parent['identity']['prior_success_sha256']:
-            raise QueueError('Parent prior-success export changed')
-        with source.open('rb') as handle:
-            while True:
-                line = handle.readline(2 * 1024 * 1024 + 1)
-                if not line: break
-                sha.update(line)
-                if not line.endswith(b'\n'):
-                    if len(line) > 2 * 1024 * 1024: raise QueueError('Oversized result')
-                    tail_bytes = len(line); break
-                entry = json.loads(line); row = entry['result']; ordinal = design.ordinal(row)
-                if entry['origin']['queue_id'] != parent_qid or entry['task_id'] != task_at(design,ordinal).id:
-                    raise QueueError('Parent result provenance/key mismatch')
-                if not membership[ordinal//8] & (1 << (ordinal%8)):
-                    raise QueueError('Result outside parent pending design')
-                if not validate_scientific_result(row, task_kind='regression'):
-                    failed += 1; continue
-                if row['algorithm_version'] != parent['identity']['cell_spec']['algorithm_version']:
-                    raise QueueError('Parent scientific identity mismatch')
-                fingerprint = digest(row)
-                if ordinal in fingerprints:
-                    if fingerprints[ordinal] != fingerprint: raise QueueError('Conflicting duplicate result')
-                    continue
-                fingerprints[ordinal] = fingerprint; design.mark(ordinal); count += 1
-                out.write(line)
-            if handle.tell() != source_size or source.stat().st_size != source_size:
-                raise QueueError('Parent results changed during scan')
-        out.flush(); os.fsync(out.fileno())
-    (output / 'completed.bits').write_bytes(design.bits)
-    success = np.unpackbits(np.frombuffer(design.bits,dtype=np.uint8),bitorder='little')[:design.count]
-    remaining = ordinals[success[ordinals] == 0]
-    remaining.tofile(output / 'remaining.u32')
-    original_qid = read(Path(parent['base']) / 'ready.json')['queue_id']
-    manifest = {**parent, 'count': len(remaining), **transport_manifest(),
-        'identity': {**parent['identity'], 'parent_manifest_sha256': parent_qid,
-            'prior_success_sha256': file_digest(output/'prior-success.jsonl')},
-        'remaining_sha256': file_digest(output/'remaining.u32'),
-        'completed_sha256': file_digest(output/'completed.bits'),
-        'prior_new_success': parent['prior_new_success'] + count,
-        'prior_source_queue_ids': list(dict.fromkeys(parent.get('prior_source_queue_ids',[original_qid]) + [parent_qid])),
-        'parent_root': str(base.resolve()), 'parent_result_sha256': sha.hexdigest(),
-        'parent_result_bytes': source_size, 'parent_failed': failed,
-        'ignored_incomplete_tail_bytes': tail_bytes}
-    if manifest['old_valid_unique'] + manifest['prior_new_success'] + manifest['count'] != design.count:
-        raise QueueError('Resumed complement count mismatch')
-    atomic_json(output/'parent-manifest.json',parent)
-    atomic_json(output/'manifest.json',manifest)
-    atomic_json(output/'queue-id.json',{'queue_id':digest(manifest)})
-    atomic_json(output/'prepared.json',{'seconds':time.monotonic()-started,'sqlite':False,
-        'previous_success': parent['old_valid_unique']+parent['prior_new_success'],
-        'new_success':count,'all_success':manifest['old_valid_unique']+manifest['prior_new_success'],
-        'remaining':len(remaining),'queue_id':digest(manifest)})
-
-
 class FlatDispatcher(Dispatcher):
     """Compact pending list, bounded active leases, append-only result receipts."""
     def __init__(self, root, *, clock=time.time, fleet=1, policy=None,
@@ -358,6 +165,16 @@ class FlatDispatcher(Dispatcher):
                 raise QueueError('Remaining list changed')
             from .prediction_workflow import design_for, ResultCacheValidator
             self.design = design_for(self.manifest['identity'])
+            self.online_costs = None
+            if self.policy['online_costs']:
+                from .online_cost import OnlineCosts
+                self.online_costs = OnlineCosts(self.queue_id,
+                    source=self.shard['index'] if self.shard else 0,
+                    sources=self.shard['of'] if self.shard else 1,
+                    minimum=self.policy['online_cost_min_observations'],
+                    safety_factor=self.policy['online_cost_safety_factor'],
+                    long_task_seconds=self.policy['target_batch_seconds'],
+                    refresh_seconds=self.policy['online_cost_refresh_seconds'])
             self.result_cache_validator = ResultCacheValidator(self.manifest['identity'],
                                                                fast_reads=self.policy['validation_fast_reads'])
             if workflow:
@@ -386,7 +203,7 @@ class FlatDispatcher(Dispatcher):
                 self.validation_pool = ValidationPool(self.manifest['identity'], self.policy['validation_processes'],
                     self.policy['validation_timeout_seconds'],
                     cpu_ids=service_binding['validator_cpus'] if service_binding else None,
-                    fast_reads=self.policy['validation_fast_reads'])
+                    fast_reads=self.policy['validation_fast_reads'], metrics=self.metrics)
         except BaseException:
             self.close(); raise
 
@@ -602,6 +419,8 @@ class FlatDispatcher(Dispatcher):
             v2 = worker in self.worker_status
             share = max(1, pending // max(self.fleet, len(self.by_worker) + 1))
             count = max(1, min(count, self.policy['max_batch_tasks'] if v2 else MAX_BATCH_TASKS, pending, share))
+            if self.online_costs is not None:
+                count = min(count, self.policy['online_cost_max_batch'])
             budget = self.policy['target_batch_seconds']
             if self.remaining_work_seconds is not None:
                 budget = min(budget, max(1., self.remaining_work_seconds / (2 * self.fleet)))
@@ -626,6 +445,10 @@ class FlatDispatcher(Dispatcher):
                       else cost_identity(task, getattr(self.design, 'contract', None)))
                 pricing = {'identity': ci} if ci is not None else {}
                 price = self.estimator.batch_seconds(task.model, task.N, task.K, **pricing) if v2 else None
+                if v2 and self.online_costs is not None:
+                    online_price = self.online_costs.price(task.model, task.N, task.K, ci)
+                    if online_price is not None:
+                        price = max(price or 0., online_price)
                 if v2:
                     if chosen and (price is None or used + price > budget): break
                     if not chosen and price is not None and remaining_seconds is not None and price > remaining_seconds:
@@ -778,11 +601,12 @@ class FlatDispatcher(Dispatcher):
                         for row, _, _, raw, _ in writing:
                             row['_journal_offset'] = offset
                             offset += len(raw)
-                        pending = memoryview(b''.join(entry[3] for entry in writing))
-                        while pending:
-                            written = self.journal.write(pending)
-                            if not written: raise OSError('Short result write')
-                            pending = pending[written:]
+                        with self.metrics.span('journal_append'):
+                            pending = memoryview(b''.join(entry[3] for entry in writing))
+                            while pending:
+                                written = self.journal.write(pending)
+                                if not written: raise OSError('Short result write')
+                                pending = pending[written:]
                         self.written_seq += len(writing)
                         sequence = self.written_seq
                     except BaseException:
@@ -796,13 +620,16 @@ class FlatDispatcher(Dispatcher):
             elapsed = 0.; flushed = False
             if writing:
                 try:
+                    lock_started = time.monotonic()
                     with self.fsync_mutex:
+                        self.metrics.add('journal_fsync_lock_wait', time.monotonic() - lock_started)
                         if self.synced_seq < sequence:
                             # Read the watermark under this lock: records written while
                             # the flush runs are not claimed by it.
                             target = self.written_seq
                             started = time.monotonic()
-                            os.fsync(self.journal.fileno())
+                            with self.metrics.span('journal_fsync'):
+                                os.fsync(self.journal.fileno())
                             elapsed = time.monotonic() - started
                             self.synced_seq = target; flushed = True
                 except BaseException:
@@ -816,6 +643,10 @@ class FlatDispatcher(Dispatcher):
                     row.pop('committing', None)
                     row['state'] = 'failed' if result['status'] == 'failed' else 'done'
                     self.completed.add(row['id'], row.pop('_journal_offset'), len(raw), row['worker'], checksum)
+                    if self.online_costs is not None:
+                        task = task_at(self.design, row['ordinal'])
+                        expected = self.design.cost_identity(task) if hasattr(self.design, 'cost_identity') else None
+                        self.online_costs.observe(result, expected)
                     del self.active[row['id']]; self._release(worker, row['id'])
                     self.attempts.pop(row['ordinal'], None)
                     if row['state'] == 'done':
@@ -871,7 +702,8 @@ class FlatDispatcher(Dispatcher):
                     else: tails.append(max(price, sum(assigned) - elapsed))
                 elif status['state'] == 'submitting': submitting += 1
                 else: idle += 1
-            return {'phase': getattr(self.design, 'phase', 'legacy'),
+            return {'online_costs': self.online_costs.stats() if self.online_costs is not None else None,
+                'phase': getattr(self.design, 'phase', 'legacy'),
                 'done': self.done, 'failed': self.failed, 'leased': len(self.active),
                 'pending': len(self.order) - self.cursor + len(self.retry), 'exhausted': self.exhausted,
                 'total': len(self.order), 'paused': self.paused, 'queue_id': self.queue_id,
@@ -916,49 +748,13 @@ class FlatDispatcher(Dispatcher):
             self._owner.__exit__(None, None, None)
 
 
-def merge(root, old):
-    """Use the existing strict final merger with an explicit queue bridge receipt."""
-    from types import SimpleNamespace
-    from aleatoric_nk_grid.direct_key_resume import merge as merge_original
-    import shutil
-    manifest = read(root / 'manifest.json'); base = Path(manifest['base'])
-    original_qid = read(base / 'ready.json')['queue_id']
-    target = root / 'final'; target.mkdir(exist_ok=False)
-    for name in ('base-manifest.json', 'ready.json', 'completed.bits'):
-        shutil.copyfile(base / name, target / name)
-    # Bind actual source queues/hashes separately; original strict merger checks
-    # key uniqueness, scientific rows, original WAL hashes and full 18M coverage.
-    sources = [(root / 'prior-success.jsonl', manifest.get('prior_source_queue_ids',[original_qid])),
-               (root / 'results.jsonl', [digest(manifest)])]
-    if file_digest(sources[0][0]) != manifest['identity']['prior_success_sha256']:
-        raise QueueError('Prior success export changed')
-    bridge = []
-    with (target / 'combined.jsonl').open('xb') as out:
-        for path, allowed_qids in sources:
-            sha = hashlib.sha256(); count = 0
-            with path.open('rb') as source:
-                for line in source:
-                    sha.update(line); entry = json.loads(line)
-                    expected_qid = entry['origin']['queue_id']
-                    if expected_qid not in allowed_qids:
-                        raise QueueError('Unexpected source queue')
-                    if not validate_scientific_result(entry['result'], task_kind='regression'):
-                        raise QueueError('Cannot finalize failed result')
-                    out.write(canonical({'result': entry['result'], 'origin': {'queue_id': original_qid,
-                        'source_queue_id': expected_qid, 'mapping': 'frozen-spec-success-key-bridge-v1'}}) + b'\n')
-                    count += 1
-            bridge.append({'path': str(path), 'queue_ids': allowed_qids, 'sha256': sha.hexdigest(), 'rows': count})
-        out.flush(); os.fsync(out.fileno())
-    atomic_json(target / 'queue-bridge.json', {'sources': bridge, 'target_queue': original_qid,
-        'frozen_spec_sha256': digest(manifest['identity']['cell_spec']),
-        'combined_sha256': file_digest(target / 'combined.jsonl')})
-    merge_original(SimpleNamespace(output=target, old=old, new_results=target / 'combined.jsonl'))
-
-
 def write_progress(path, dispatcher, server, *, previous_errors=0, monitor=None,
                    allocation=None, continuation_allowed=False):
     """Progress is advisory; durable result writes must still fail closed."""
     try:
+        if getattr(dispatcher, 'online_costs', None) is not None:
+            attempt = Path(path).parent.parent if dispatcher.shard else Path(path).parent
+            dispatcher.online_costs.refresh(attempt / 'online-costs')
         stats = dispatcher.stats(); now = time.time()
         observation = (monitor.observe(stats, now=now, allocation=allocation,
                          continuation_allowed=continuation_allowed) if monitor else {})
@@ -1028,8 +824,10 @@ def allocation_start_time(entered, max_seconds, *, environ=None, query=None):
     return entered, 'runtime_only', {'source': 'unavailable'}
 
 
-def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800,
+def run(root, repo, old, workers, validate_only=True, *, max_seconds=172800,
         policy=None, cost_profile=None, allocation=None, continuation_allowed=False):
+    if not validate_only:
+        raise QueueError('Rounds only validate; the cluster scheduler publishes final results')
     from aleatoric_nk_grid.queue_service import make_server
     from aleatoric_nk_grid.queue_readiness import publish_ready
     policy = validate_policy(policy)
@@ -1174,39 +972,3 @@ def run(root, repo, old, workers, validate_only=False, *, max_seconds=172800,
                 'drain_reason': dispatcher.drain_reason})
         if stats['done'] != stats['total'] and not (validate_only and (dispatcher.draining or bounded_complete)):
             raise QueueError('Incomplete round; retain result receipts for next direct success scan')
-    if not validate_only:
-        merge(root, old)
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['prepare', 'run'])
-    parser.add_argument('--root', type=Path, help='Prepared run directory; prepare defaults to <repo>/FFCWS/outputs/ffc_median_mode_gpa-<unique ID>')
-    parser.add_argument('--base', type=Path)
-    parser.add_argument('--repo', type=Path)
-    parser.add_argument('--old', type=Path)
-    parser.add_argument('--workers', type=int, default=21)
-    parser.add_argument('--validate-only', action='store_true')
-    args = parser.parse_args(argv)
-    if args.command == 'prepare':
-        if args.base is None:
-            parser.error('prepare requires --base pointing to a stopped GPA run')
-        if args.root is None:
-            repo = (args.repo or Path(__file__).resolve().parents[3]).expanduser().resolve()
-            args.root = repo / 'FFCWS' / 'outputs' / ('ffc_median_mode_gpa-' + uuid.uuid4().hex[:12])
-        args.root = args.root.expanduser().resolve()
-        args.base = args.base.expanduser().resolve()
-        owner_root = args.base if (args.base/'manifest.json').exists() else args.base/'queue'
-        with file_lock(args.base / 'control/round.lock'), file_lock(owner_root / 'dispatcher.lock'):
-            prepare(args.base, args.root)
-        print(json.dumps({'root': str(args.root),
-                          'final_csv': str(args.root / 'final' / 'ffc_median_mode_gpa.csv')}), flush=True)
-    else:
-        if args.root is None or args.repo is None or args.old is None:
-            parser.error('run requires --root from prepare, --repo and --old')
-        run(args.root.expanduser().resolve(), args.repo.expanduser().resolve(),
-            args.old.expanduser().resolve(), args.workers, args.validate_only)
-
-
-if __name__ == '__main__':
-    main()

@@ -9,7 +9,7 @@
     "mode": "fixed_a_priori"
   },
   "group_column": null,
-  "id_column": null,
+  "id_column": "smr_row_id",
   "imputation": {
     "continuous": "median",
     "model_overrides": {

@@ -42,6 +42,7 @@ def refresh_cost_profile(plan, root, previous):
     Unpriced work still runs, one task per claim.
     """
     from aleatoric_nk_grid import prediction_profile
+    from aleatoric_nk_grid.scheduler_cost import CostEstimator
     from aleatoric_nk_grid.shared_queue import atomic_json
     root = Path(root)
     profile_path = root / 'cost-profile.json'
@@ -83,6 +84,7 @@ def refresh_cost_profile(plan, root, previous):
         if not candidate: continue
         try:
             profile = prediction_profile.build(plan, candidate)
+            CostEstimator(profile=profile)  # Empty/invalid observations cannot replace usable timing.
         except Exception:
             continue
         atomic_json(profile_path, profile)
@@ -92,7 +94,7 @@ def refresh_cost_profile(plan, root, previous):
 
 def operational_inputs(root, directory, item=None):
     """A submitted round reads its immutable snapshot, never a mutable profile."""
-    from aleatoric_nk_grid.scheduler_cost import CostEstimator
+    from aleatoric_nk_grid.scheduler_cost import CostEstimator, EmptyDurationProfile
     from aleatoric_nk_grid.scheduler_policy import validate_policy
     from aleatoric_nk_grid.shared_queue import digest
     path = Path(directory) / 'operational.json'
@@ -112,10 +114,96 @@ def operational_inputs(root, directory, item=None):
     policy = operational_policy(root)
     profile_path = Path(root) / 'cost-profile.json'
     profile = read(profile_path) if profile_path.exists() else None
-    if profile is not None: CostEstimator(profile=profile)
+    if profile is not None:
+        try:
+            CostEstimator(profile=profile)
+        except EmptyDurationProfile:
+            profile = None  # Recover older controllers' empty journals without changing the file.
     return {'format': 'scheduler-operational-v1', 'policy': policy,
             'policy_sha256': digest(policy), 'cost_profile': profile,
             'cost_profile_sha256': digest(profile) if profile is not None else None}
+
+
+def dispatcher_settled(plan, state, phase):
+    """True when the phase's last stopped round says it accepted every remaining task.
+
+    A routing hint only: it lets the controller skip reparsing tens of gigabytes
+    of stopped journals on one CPU. The parallel check that must follow rederives
+    provenance, uniqueness and coverage from those journals and publishes nothing
+    otherwise, so a wrong hint costs a refused check, never an unproven barrier.
+    """
+    from aleatoric_nk_grid.prediction_workflow import PredictionDesign
+    items = [r for r in state['rounds'] if r['label'] in state['jobs'] and r.get('phase') == phase]
+    if not items: return False
+    last = items[-1]; root = Path(last['root'])
+    try:
+        receipt = read(root / 'control' / 'round-result.json'); stats = receipt['stats']
+        queue_id = read(root / 'queue-id.json')['queue_id']
+        merged = receipt.get('journal_merge')
+        merged_ok = merged is None or (merged['lines'] == stats['done']
+                                       and all(s['dropped_tail_bytes'] == 0 for s in merged['shards']))
+        return (receipt['complete'] is True and merged_ok
+                and str(receipt['job_id']) == str(state['jobs'][last['label']].get('job_id'))
+                and receipt['queue_id'] == queue_id and stats.get('queue_id', queue_id) == queue_id
+                and stats['failed'] == 0 and stats['leased'] == 0 and stats['done'] == stats['total']
+                and last['done_before'] + stats['done'] == PredictionDesign(plan['prediction_workflow'], phase).count)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def calibration_evidence(item):
+    """Measured startup and steady commit rate of one stopped SL calibration round.
+
+    The commit span comes from the shards' own protocol metrics; without them the
+    whole allocation time counts as active, which only makes that arm look slower.
+    """
+    root = Path(item['root']) / 'control'
+    receipt = read(root / 'round-result.json')
+    done = receipt['stats']['done']; elapsed = float(receipt['elapsed_seconds'])
+    first = last = None; source = 'elapsed'
+    try:
+        shards = read(root / str(receipt['generation']) / 'progress.json')['shards']
+        spans = [s['stats']['protocol_metrics']['event_times']['committed_records'] for s in shards]
+        first = min(float(s['first_elapsed']) for s in spans); last = max(float(s['last_elapsed']) for s in spans)
+        source = 'commit_span'
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if first is None or not last > first:
+        first, last, source = 0., elapsed, 'elapsed'
+    return {'label': item['label'], 'job_id': str(receipt.get('job_id')), 'worker_cap': item['calibration']['worker_cap'],
+            'nodes': item['allocation']['nodes'], 'workers': item['allocation']['workers'],
+            'allocated_cpu': receipt.get('allocation_cpu') or item['allocation']['allocated_cpu_bound'],
+            'done': done, 'elapsed_seconds': elapsed, 'startup_seconds': first, 'active_seconds': last - first,
+            'throughput_per_second': done / (last - first) if done else 0., 'source': source}
+
+
+def choose_sl_worker_cap(arms, remaining):
+    """The measured cap whose projected CPU-seconds to finish ``remaining`` cells is least."""
+    projected = {a['worker_cap']: a['allocated_cpu'] * (a['startup_seconds'] + remaining / a['throughput_per_second'])
+                 for a in arms if a['throughput_per_second'] > 0}
+    if not projected: return None, {}
+    return min(projected, key=lambda cap: (projected[cap], cap)), projected
+
+
+def calibrate_sl_round(state, calibration, policy, remaining):
+    """Policy and round note for the next SL round: a bounded arm, then the chosen cap."""
+    sl = [r for r in state['rounds'] if r['label'] in state['jobs'] and r.get('phase') == 'sl']
+    arms = [r for r in sl if 'arm' in r.get('calibration', {})]
+    caps = calibration['worker_caps']
+    record = state.setdefault('sl_calibration', {'worker_caps': caps, 'tasks_per_arm': calibration['tasks_per_arm']})
+    if len(arms) < len(caps):
+        cap = caps[len(arms)]; tasks = min(calibration['tasks_per_arm'], remaining)
+        return {**policy, 'sl_worker_cap': cap, 'max_claimed_tasks': tasks}, {'arm': len(arms), 'worker_cap': cap, 'tasks': tasks}
+    evidence, errors = [], []
+    for arm in arms:
+        try: evidence.append(calibration_evidence(arm))
+        except (OSError, ValueError, KeyError, TypeError) as exc: errors.append({'label': arm['label'], 'error': str(exc)})
+    chosen, projected = choose_sl_worker_cap(evidence, remaining)
+    if chosen is None: chosen = policy.get('sl_worker_cap')   # nothing measured: keep the configured cap
+    record.update(arms=evidence, evidence_errors=errors, remaining_at_choice=remaining, chosen_worker_cap=chosen,
+                  projected_cpu_seconds={str(k): v for k, v in projected.items()},
+                  base_audit_overlap=[r['label'] for r in state.get('verification_rounds', []) if r['mode'] == 'final-base'])
+    return {**policy, 'sl_worker_cap': chosen}, {'chosen_worker_cap': chosen}
 
 
 def worker_cpu_hours(state):
@@ -264,22 +352,39 @@ def scheduler(spec):
     return Slurm(spec['cluster']['account'], spec['cluster'].get('qos'))
 
 
-def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, policy, resource_resolver):
-    """Submit a separately admitted verification allocation, never a local pool."""
+def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, policy, resource_resolver,
+                                 *, wait=True, node_cap=None, dependency=None):
+    """Submit a separately admitted verification allocation, never a local pool.
+
+    ``wait=False`` submits no successor: an overlapped base audit is joined by the
+    controller that the concurrent SL allocation already wakes. ``node_cap`` bounds
+    it to the nodes that allocation leaves under the run's total cap.
+    """
     from copy import deepcopy
     from aleatoric_nk_grid import parallel_verification as verification
     from aleatoric_nk_grid import prediction_workflow as phases
     from aleatoric_nk_grid.shared_queue import digest
     state = journal.state; root = Path(plan['launch']['output'])
-    receipt = root / {'base': 'base-verified.json', 'index': 'base-input-ready.json', 'final': 'verified.json'}[mode]
+    receipt = root / {'base': 'base-verified.json', 'index': 'base-input-ready.json', 'final': 'verified.json',
+                      'final-base': 'parallel-verification/final-base/complete.json'}[mode]
     if receipt.exists():
         if mode == 'base': phases.verify_base_receipt(plan)
         elif mode == 'index': phases.verify_base_input_receipt(plan)
-        else: phases.finalize(plan, base_rounds, sl_rounds)
+        elif mode == 'final': phases.finalize(plan, base_rounds, sl_rounds)
         return True
     directory = root / 'parallel-verification' / mode
+    options = {}
+    if mode == 'final':
+        options['sl_block_bytes'] = policy['sl_verification_block_bytes']
+        existing = directory / 'manifest.json'
+        joined = root / 'parallel-verification' / 'final-base'
+        if existing.exists():   # a prepared final keeps whatever it joined
+            options['sl_block_bytes'] = read(existing)['identity'].get('sl_block_bytes')
+            options['base_part'] = read(existing)['identity'].get('base_part', {}).get('directory')
+        elif (joined / 'complete.json').exists() and not any(joined.glob('failure-*.json')):
+            options['base_part'] = joined
     manifest = verification.prepare(plan, mode, base_rounds, sl_rounds, directory,
-                                    block_bytes=policy['verification_block_bytes'])
+                                    block_bytes=policy['verification_block_bytes'], **options)
     failures = list(directory.glob('failure-*.json'))
     if failures:
         raise ValueError('Parallel verification failed: ' + str(read(failures[0])))
@@ -296,7 +401,8 @@ def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, po
         options = phase_allocation_options(policy, 'base')
         options.update(worker_cap=min(max(1, pending), options['worker_cap'] or max(1, pending)),
                        sizing_mode='capacity', target_round_seconds=None,
-                       max_nodes=state['max_nodes'] - 2, validation_processes=0, dispatcher_shards=1,
+                       max_nodes=min(state['max_nodes'] - 2, node_cap if node_cap is not None else state['max_nodes']),
+                       validation_processes=0, dispatcher_shards=1,
                        cpu_hours_remaining=cpu_budget(state, policy),
                        control_jobs_reserved=sum(k.startswith(('C', 'G')) for k in state['jobs']) + 2)
         parameters = inspect.signature(resource_resolver).parameters
@@ -322,10 +428,11 @@ def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, po
             'manifest_sha256': digest(manifest), 'policy': policy}
         history.append(prepared); journal.save()
     job = journal.submit(prepared['label'], batch_args(plan['launch'], 'check', root / 'plan.json',
-                           allocation=prepared['allocation'], policy=prepared['policy']))
+                           dependency=dependency, allocation=prepared['allocation'], policy=prepared['policy']))
     prepared['job_id'] = job; journal.save()
-    journal.submit('Gwait-' + job, batch_args(plan['launch'], 'control', root / 'plan.json',
-                                            dependency=job, policy=policy))
+    if wait:
+        journal.submit('Gwait-' + job, batch_args(plan['launch'], 'control', root / 'plan.json',
+                                                dependency=job, policy=policy))
     return False
 
 
@@ -408,11 +515,14 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         for label in list(state['jobs']):
             if label.startswith(('W', 'V')):
                 ended, job = terminal(journal, label)
-                if not ended: active.append(job)
+                if not ended: active.append((label, job))
         if active:
-            if len(active) != 1: raise ValueError('Overlapping worker allocations')
-            label = 'Gwait-' + active[0]
-            journal.submit(label, batch_args(spec, 'control', plan_path, dependency=active[0], policy=policy))
+            # Only an overlapped base audit may run beside another allocation.
+            overlapped = {r['label'] for r in state.get('verification_rounds', []) if r['mode'] == 'final-base'}
+            if len([l for l, _ in active if l not in overlapped]) > 1 or len([l for l, _ in active if l in overlapped]) > 1:
+                raise ValueError('Overlapping worker allocations')
+            for _, job in active:
+                journal.submit('Gwait-' + job, batch_args(spec, 'control', plan_path, dependency=job, policy=policy))
             return state
         for item in state['rounds']:
             if item['label'] not in state['jobs']: continue
@@ -501,16 +611,31 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         # A restart inside the base barrier has only stopped base journals, which
         # the profile already priced when the barrier was entered: rebuilding it
         # would reparse every journal to reproduce the same file.
-        if workflow and prepared_item is None and state.get('workflow_state') not in ('BASE_VERIFYING', 'BASE_INDEXING'):
-            refresh_cost_profile(plan, root, previous)
-        operational = operational_inputs(root, queue_root, prepared_item)
-        policy, profile = operational['policy'], operational['cost_profile']
+        barrier = state.get('workflow_state') in ('BASE_VERIFYING', 'BASE_INDEXING')
         try:
-            if (workflow and phase == 'base' and state.get('workflow_state') in ('BASE_VERIFYING', 'BASE_INDEXING')):
+            settled = bool(workflow and prepared_item is None and not barrier
+                           and dispatcher_settled(plan, state, phase))
+            # A profile can only price another round of this same phase; a
+            # settled phase has none, so rebuilding it would only reparse journals.
+            if workflow and prepared_item is None and not barrier and not settled:
+                refresh_cost_profile(plan, root, previous)
+            operational = operational_inputs(root, queue_root, prepared_item)
+        except (ValueError, OSError) as exc:
+            state.update(status='repair_required', blocked_reason=str(exc))
+            journal.save(); return state
+        policy, profile = operational['policy'], operational['cost_profile']
+        # Only a parallel check proves coverage before it publishes; the local
+        # seal and finalize paths keep the controller's own scan.
+        settled = settled and (policy['parallel_verification'] or phases.deferred_base_audit(workflow))
+        try:
+            if (workflow and phase == 'base' and barrier):
                 expected = phases.PredictionDesign(plan['prediction_workflow'], 'base').count
                 if state.get('phase_completed', {}).get('base') != expected:
                     raise ValueError('Persisted base verification checkpoint has incomplete coverage')
                 report = {'done': expected, 'remaining': 0, 'phase': 'base'}
+            elif settled:
+                report = {'done': phases.PredictionDesign(plan['prediction_workflow'], phase).count,
+                          'remaining': 0, 'phase': phase}
             else:
                 report = (phases.prepare_round(plan, phase, previous, queue_root, cost_profile=profile) if workflow
                           else backend.prepare_round(plan, previous, queue_root, cost_profile=profile))
@@ -566,6 +691,15 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         # Operational: how many allocations a phase may use, never what it computes.
         if workflow and policy.get(phase + '_round_limit') is not None:
             round_limit = policy[phase + '_round_limit']
+        calibration = policy.get('sl_calibration') if workflow and phase == 'sl' else None
+        if calibration:
+            round_limit = max(round_limit, len(calibration['worker_caps']) + 1)
+        round_note = prepared_item.get('calibration') if prepared_item else None
+        if calibration and prepared_item is None:
+            # The round's own snapshot carries its cap and claim bound, never the file.
+            from aleatoric_nk_grid.shared_queue import digest
+            policy, round_note = calibrate_sl_round(state, calibration, policy, report['remaining'])
+            operational.update(policy=policy, policy_sha256=digest(policy))
         if phase_index >= round_limit:
             state['status'] = 'round_budget_exhausted'; journal.save(); return state
         stalled = 0
@@ -643,6 +777,7 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
                 'continuation_allowed': phase_index + 1 < round_limit}
         if workflow:
             item.update(phase=phase, phase_index=phase_index)
+            if round_note is not None: item['calibration'] = round_note
             allocation.update(phase=phase)
             state['workflow_state'] = 'BASE_RUNNING' if phase == 'base' else 'SL_RUNNING'
         if len(rounds) == index: rounds.append(item)
@@ -662,7 +797,32 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         job = journal.submit(item['label'], batch_args(spec, 'work', plan_path,
             dependency=current, allocation=allocation, policy=policy))
         item['job_id'] = job; journal.save()
+        if workflow and phase == 'sl' and phase_index == 0:
+            overlap_base_audit(plan, state, journal, policy, resource_resolver, base_rounds, allocation, current)
         return state
+
+
+def overlap_base_audit(plan, state, journal, policy, resource_resolver, base_rounds, allocation, dependency):
+    """Start the stopped base rounds' content audit beside the first SL allocation.
+
+    Best effort: without room under the node cap, or on any admission refusal,
+    the final audit checks base itself exactly as before.
+    """
+    from aleatoric_nk_grid import prediction_workflow as phases
+    if (not policy['overlap_base_audit'] or not phases.deferred_base_audit(plan['prediction_workflow'])
+            or any(r['mode'] == 'final-base' for r in state.get('verification_rounds', []))):
+        return
+    spare = state['max_nodes'] - 2 - allocation['nodes']
+    if spare < 1:
+        state['overlap_base_audit'] = {'started': False, 'reason': 'SL allocation uses the whole node cap'}
+    else:
+        try:
+            ensure_parallel_verification(plan, 'final-base', base_rounds, [], journal, policy, resource_resolver,
+                                         wait=False, node_cap=spare, dependency=dependency)
+            state['overlap_base_audit'] = {'started': True, 'node_cap': spare}
+        except (ValueError, OSError) as exc:
+            state['overlap_base_audit'] = {'started': False, 'reason': str(exc)}
+    journal.save()
 
 
 def work(plan_path):

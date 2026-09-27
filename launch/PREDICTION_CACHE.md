@@ -106,7 +106,7 @@ frozen contract and cannot be changed by resuming an existing experiment.
 `FFCWS/panels.yaml` opts future runs of all 18 panels into `final_only`; the
 completed MH run retains its original plan and receipts. There is no separate
 MH-only manifest. Base and SL can share their compute
-policy using `unified_compute`; [launch options](README.md#dispatcher-shards-and-initial-policy)
+policy using `unified_compute`; [launch options](OPERATIONS.md#dispatcher-shards-and-initial-policy)
 include the explicit dispatcher count and initial policy file.
 
 Classification predictions are positive-class probabilities with class mappings.

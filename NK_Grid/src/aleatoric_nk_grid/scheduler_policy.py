@@ -21,6 +21,9 @@ DEFAULTS = {
     # out of the frozen plan lets a run be resized between rounds instead of
     # discarding every cell it already finished.
     'protocol_metrics': False, 'rpc_keepalive': False,
+    'online_costs': False, 'online_cost_refresh_seconds': 15.,
+    'online_cost_min_observations': 100, 'online_cost_safety_factor': 1.25,
+    'online_cost_max_batch': 16,
     'heartbeat_aggregate_seconds': 0., 'validation_processes': 0,
     # Node relay (opt-in): each node forwards its workers' requests over a few
     # persistent connections. It needs a connection budget above the per-worker
@@ -51,6 +54,16 @@ DEFAULTS = {
     'unified_compute': False, 'sizing_mode': 'work',
     'parallel_verification': False, 'verification_block_bytes': 64 * 1024**2,
     'verification_round_limit': 3,
+    # final_only runs: content-check the stopped base rounds while SL computes,
+    # inside the node cap left by the SL allocation, so the final audit only
+    # checks SL. Optional smaller SL ranges balance that last audit.
+    'overlap_base_audit': False, 'sl_verification_block_bytes': None,
+    # Worker ceiling for SL allocations only, also under unified_compute.
+    'sl_worker_cap': None,
+    # In-run SL sizing: bounded SL rounds at each worker cap measure real
+    # throughput; the rest of SL runs at the cap projected cheapest in CPU time.
+    # {'worker_caps': [ascending ints], 'tasks_per_arm': int}
+    'sl_calibration': None,
 }
 
 
@@ -81,13 +94,23 @@ def validate_policy(value=None):
             if item['sizing_mode'] == 'capacity' and item.get('target_round_seconds') is not None:
                 raise QueueError('capacity sizing cannot also specify target_round_seconds')
             policy[key] = dict(item)
+        elif key == 'sl_calibration':
+            if item is None:
+                continue
+            caps = item.get('worker_caps') if isinstance(item, dict) else None
+            if (not isinstance(item, dict) or set(item) != {'worker_caps', 'tasks_per_arm'}
+                    or not isinstance(caps, list) or not 1 <= len(caps) <= 8
+                    or any(type(c) is not int or c < 1 for c in caps) or caps != sorted(set(caps))
+                    or type(item['tasks_per_arm']) is not int or item['tasks_per_arm'] < 1):
+                raise QueueError('sl_calibration needs ascending positive worker_caps (1..8) and a positive integer tasks_per_arm')
+            policy[key] = {'worker_caps': list(caps), 'tasks_per_arm': item['tasks_per_arm']}
         elif key == 'exclude_nodes':
             if not isinstance(item, list) or any(not isinstance(n, str) or not n
                     or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in n)
                     for n in item):
                 raise QueueError('exclude_nodes must be explicit node names')
             policy[key] = sorted(set(item))
-        elif key in ('drain_enabled', 'protocol_metrics', 'rpc_keepalive', 'node_relay', 'validation_fast_reads', 'dispatcher_fast_path', 'dispatcher_smt', 'unified_compute', 'parallel_verification'):
+        elif key in ('drain_enabled', 'protocol_metrics', 'rpc_keepalive', 'node_relay', 'validation_fast_reads', 'dispatcher_fast_path', 'dispatcher_smt', 'unified_compute', 'parallel_verification', 'online_costs', 'overlap_base_audit'):
             if type(item) is not bool: raise QueueError(key + ' must be boolean')
         elif key in ('heartbeat_aggregate_seconds', 'validation_processes'):
             if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or item < 0:
@@ -115,6 +138,14 @@ def validate_policy(value=None):
         if type(policy[key]) is not int: raise QueueError(key + ' must be an integer')
     if not 1 <= policy['max_connections'] <= 4096:
         raise QueueError('max_connections must be within 1..4096')
+    if type(policy['online_cost_min_observations']) is not int or policy['online_cost_min_observations'] < 100:
+        raise QueueError('Online costs require at least 100 complete cold observations')
+    if type(policy['online_cost_max_batch']) is not int or not 1 <= policy['online_cost_max_batch'] <= 64:
+        raise QueueError('Online batch cap must be within 1..64')
+    if policy['online_cost_safety_factor'] < 1:
+        raise QueueError('Online cost safety factor cannot discount observed runtimes')
+    if policy['online_cost_refresh_seconds'] < 5:
+        raise QueueError('Online cost summaries must not refresh more often than every five seconds')
     if not 1 <= policy['max_submissions'] <= 1024:
         raise QueueError('max_submissions must be within 1..1024')
     if not .1 <= policy['keepalive_idle_seconds'] <= 30.:
@@ -143,8 +174,13 @@ def validate_policy(value=None):
         raise QueueError('Claim limit must be an integer')
     if policy['worker_cap'] is not None and type(policy['worker_cap']) is not int:
         raise QueueError('worker_cap must be an integer')
+    if policy['sl_worker_cap'] is not None and type(policy['sl_worker_cap']) is not int:
+        raise QueueError('sl_worker_cap must be an integer')
     if not 1024 <= policy['verification_block_bytes'] <= 1024**3:
         raise QueueError('verification_block_bytes must be within 1 KiB..1 GiB')
+    if policy['sl_verification_block_bytes'] is not None and (type(policy['sl_verification_block_bytes']) is not int
+            or not 1024 <= policy['sl_verification_block_bytes'] <= 1024**3):
+        raise QueueError('sl_verification_block_bytes must be an integer within 1 KiB..1 GiB')
     if policy['unified_compute']:
         if policy['sl_allocation'] is not None:
             raise QueueError('Unified compute cannot also have an SL-specific allocation')

@@ -1,39 +1,25 @@
 # How the core code runs an experiment
 
-`NKGridExecutionSession` executes the core computation. Local and cluster runs share the same sampling, preprocessing, and model-training steps.
+This package carries out one panel: it reads the prepared data, lays out every training combination, fits the models, and checks the results. The same numerical code runs locally and on a cluster.
 
-## From inputs to training combinations
+## Reading the data and the design
 
-[ingest.py](ingest.py) reads the analysis table and feature definitions from the schema. [validate_input.py](validate_input.py) checks numeric values, category states, IDs, and missingness rates, then returns eligible data for the selected outcome. These checks precede sampling so input inconsistencies are identified before model fitting.
+[ingest.py](ingest.py) loads the schema and the analysis table. [validate_input.py](validate_input.py) checks values, category states, IDs and outcome missingness before any sampling, so a problem in the data stops the run before any model is fit. [run_panels.py](run_panels.py) reads the panel catalog, [config.py](config.py) holds the chosen outcome, models and grid, and [grid_contract.py](grid_contract.py) checks the design. [nk_grid.py](nk_grid.py) builds the N and K grids, makes each seed's train/test split, orders the rows and variables for each draw, and takes the first N rows and K variables.
 
-[run_panels.py](run_panels.py) selects the outcome, models, and repetition counts; [config.py](config.py) stores these choices. [nk_grid.py](nk_grid.py) determines the available N/K range, splits by seed, permutes by draw, and selects the first N rows and K sources.
+## One training combination
 
-Sources and columns are distinct. [preprocessing.py](preprocessing.py) groups columns that share preprocessing, then binds groups belonging to the same sampling source. An original variable's one-hot columns and missingness indicators can use different imputation methods but enter or leave the training input together.
+[preprocessing.py](preprocessing.py) groups the columns that belong to one variable, so dummy columns and missingness indicators are selected together while each group keeps its own imputation rule. Its `FoldPreprocessor` learns imputation and scaling from the rows it is fitted on and applies them to validation or test rows. Cross-validation inside a model starts again from the raw values in each fold, and a variable that is unobserved in the training rows is set to a fixed prior value or NaN on both sides.
 
-## Missing-value handling in model pipelines
+[model_registry.py](model_registry.py) builds each model. [fold_local.py](fold_local.py) runs the cross-validated tuning and final refit of Ridge, Lasso and the neural network, and [mlp_estimator.py](mlp_estimator.py) sets up the network's balanced mini-batches. [robust_linear.py](robust_linear.py) and [svd_fallback.py](svd_fallback.py) recover linear fits when the standard solver fails on finite input. [native_process.py](native_process.py) runs models that use native libraries in separate processes, so a crash or timeout can be retried. [evaluation.py](evaluation.py) computes the metrics and keeps the training-mean and test-mean baselines of the two R² measures apart.
 
-`FoldPreprocessor` implements type-specific imputation as a refittable step. It learns from the supplied training rows and applies the result to validation or test rows. Groups unobserved during training are set to a fixed prior value or NaN on both sides.
+## Saved predictions and the Super Learner
 
-The outer preprocessed matrix is used for diagnostics. Internal cross-validation starts with the original NaN values and refits imputation and standardization within each training fold.
+Each base-model task saves its test predictions and out-of-fold training predictions before it reports back ([prediction_training.py](prediction_training.py), [prediction_worker.py](prediction_worker.py), [prediction_cache.py](prediction_cache.py)). [prediction_workflow.py](prediction_workflow.py) moves a run through its phases: base models, an index of their saved predictions, the Super Learner and the final check. [offline_sl.py](offline_sl.py) fits the Super Learner from the saved predictions alone. [parallel_verification.py](parallel_verification.py) and [base_seal.py](base_seal.py) spread the checks over the allocation's worker processes before the final CSV is published.
 
-[model_registry.py](model_registry.py) selects an implementation by model and task type. [fold_local.py](fold_local.py) handles fold-specific preprocessing, parameter selection, and full refitting for Ridge, Lasso, and MLP. Models without internal parameter selection fit their pipeline once on the current N rows.
+## Running on a cluster
 
-## MLP and ensemble models
+[cluster_queue.py](cluster_queue.py) prepares a run and publishes its results. [shared_queue.py](shared_queue.py) holds the queue of model tasks and the record of accepted results. [single_model_worker.py](single_model_worker.py) takes a task, runs it and returns the result, and [slurm_queue_round.py](slurm_queue_round.py) starts the queue service and the workers inside one Slurm allocation. [scheduler_cost.py](scheduler_cost.py) and [cost_profile.py](cost_profile.py) estimate task durations from timings measured in the run, so the longest tasks can start first. [execution_contract.py](execution_contract.py) records the inputs, methods and design of a run, so results are only merged with results produced under the same settings.
 
-[mlp_estimator.py](mlp_estimator.py) creates balanced batches from the actual row count in each fit, retaining native Adam, L2 regularization, and stopping behavior. Batch sizes are based on the rows in each fit rather than the outer N, because cross-validation training folds contain fewer rows.
+The earlier grouped-task protocol uses [flat_task_table.py](flat_task_table.py), [worker_event_wal.py](worker_event_wal.py) and [generation_control.py](generation_control.py); that code stays so runs started under it can be resumed.
 
-[mlp_batch_cv.py](mlp_batch_cv.py) also retains explicit batch-size search and ensemble diagnostics. Current production regression settings use the fixed balanced-batch rule rather than searching batch sizes by default.
-
-Super Learner fits combination weights using out-of-fold predictions from its base models, then refits those models on all training rows. Optional diagnostics save the out-of-fold predictions and weights from that fit.
-
-Some models backed by native libraries run in isolated processes through [native_process.py](native_process.py), with bounded retries after crashes or timeouts. This execution mechanism preserves the declared training combinations.
-
-## From predictions to results
-
-After prediction, `nk_grid.py` computes metrics. [evaluation.py](evaluation.py) defines regression errors and their denominators. Training-mean and test-mean baselines are stored separately to distinguish the two R² measures.
-
-[experiment.py](experiment.py) manages local checkpoints. The cluster path uses [flat_task_table.py](flat_task_table.py) to drive the same computation and [worker_event_wal.py](worker_event_wal.py) to save committed results. Only fully written, validated records count toward progress; training without saved results may be repeated after interruption.
-
-[execution_contract.py](execution_contract.py) records input, method, and design identities so results from different runs are not combined solely because their columns match. [generation_control.py](generation_control.py) coordinates the start and sealing of each task generation. Final merging checks coverage of expected combinations and conflicting duplicates before publication. [checkpoint_retention.py](checkpoint_retention.py) then applies the selected checkpoint policy.
-
-See the [experiment description](../../README.md) for methods and the [root tutorial](../../../README.md) for execution steps.
+See the [experiment methods](../../README.md) and the [root README](../../../README.md).
