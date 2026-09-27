@@ -45,7 +45,7 @@ panels:
       sl_resources:
         worker_cap: 24
         io_concurrency: 8
-        memory: 4G
+        memory: 2G
         time_limit: '04:00:00'
     out: outputs/nk_grid_smr_hourlywage.csv
 

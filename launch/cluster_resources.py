@@ -190,7 +190,7 @@ def _resolve_round(spec, remaining, *, work_seconds=None, target_round_seconds=N
         cluster = {**cluster, 'time_limit': worker_time_limit}
     qos = cluster.get('qos') or default_qos(cluster['account'], run=run)
     live = base.snapshot(cluster['account'], qos, cluster['partition'], run=run)
-    memory = worker_memory or cluster.get('memory_override') or '16G'
+    memory = worker_memory or cluster.get('memory_override') or '2G'
     cap = worker_cap if worker_cap is not None else spec.get('continuation', {}).get('worker_cap')
     # This is one Slurm job, not an array of independently submitted workers.
     # Keep job slots and every scoped CPU/memory/node headroom dimension separate.

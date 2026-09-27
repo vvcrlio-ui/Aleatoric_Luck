@@ -47,13 +47,15 @@ Worker count comes from live capacity and remaining work; `--workers` is an opti
 
 | Setting | Default |
 |---|---|
-| Worker memory | 16G |
+| Worker memory | 2G |
 | Worker rounds | 2 |
 | Worker time, `timing_full` / `production` | Profile maximum; explicit `--time` required without a profile |
 | Worker time, other presets | 1 hour |
 | Bootstrap and controller | 1 CPU, 48G, 2 hours |
 
-`--memory`, `--rounds`, `--time`, `--plan-memory` and `--plan-time` override these requests. Live Slurm limits can reduce each worker allocation.
+`--memory` sets base-worker memory; the FFCWS and SMR catalogs request 2G for SL workers. Use `--memory 4G` for full-grid SMR runs. A scheduler policy with an explicit `worker_memory` supplies that request; the example policies specify 3G. Bootstrap and controller memory is set separately with `--plan-memory`.
+
+`--rounds`, `--time` and `--plan-time` override the corresponding requests. Live Slurm limits can reduce each worker allocation.
 
 ## Preparing data
 

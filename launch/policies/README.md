@@ -14,7 +14,7 @@ The file is one JSON object. Only the field names below and the others listed in
 | `sizing_mode` | `"work"` | `work` sizes each round from the estimated remaining work; `capacity` asks for as many workers as the live cluster limits allow, up to `worker_cap` and `max_nodes`. `capacity` requires `unified_compute`. |
 | `max_nodes` | `60` | Most nodes one round may use, including the two kept for control jobs. At least 3. |
 | `worker_cap` | `null` | Most numerical workers in one round. `null` uses `--workers` or the profile's default. |
-| `worker_memory` | `null` | Memory per worker as a Slurm size, such as `"3G"`. `null` uses `--memory`, or 16G. |
+| `worker_memory` | `null` | Memory per worker as a Slurm size, such as `"3G"`. `null` uses `--memory`, or 2G for base workers. |
 | `worker_time_limit` | `null` | Wall time of each worker allocation, `[days-]HH:MM:SS`. `null` uses `--time` or the profile's default. |
 | `dispatcher_shards` | `1` | Number of queue service processes, 1–8. More than one requires `validation_processes`. |
 | `validation_processes` | `0` | Result-checking processes per queue service, 0–32. |

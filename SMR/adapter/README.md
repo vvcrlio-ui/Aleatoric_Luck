@@ -4,7 +4,7 @@ SMR uses the provider's existing analysis matrix, `asample2_withlag.csv`. The ad
 
 ## Preparing a run
 
-Use the shared launcher with `--manifest SMR/panels.yaml --panel smr_totalincome --prepare --data-dir DIR`, where DIR contains `asample2_withlag.csv`. Preparation runs in the compute bootstrap and publishes under that run's `prepared/` directory.
+Use the shared launcher with `--manifest SMR/panels.yaml --panel smr_totalincome --prepare --data-dir DIR`, where DIR contains `asample2_withlag.csv`. Preparation runs in the compute bootstrap and publishes under that run's `prepared/` directory. For `timing_full` or `production`, include `--memory 4G` for the base workers; when using a scheduler policy, set its explicit `worker_memory` accordingly.
 
 The adapter also accepts `--output-root DIR` for direct preparation. This directs both schema and ARD output to DIR; `--article-root` still locates the input defaults and feature contract.
 

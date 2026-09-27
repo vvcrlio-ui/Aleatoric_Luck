@@ -91,7 +91,7 @@ def parser():
     p.add_argument("--time", dest="time_limit")
     p.add_argument("--workers", type=positive, help="Optional worker cap; live capacity determines the default")
     p.add_argument("--rounds", type=positive, help="Maximum continuation rounds; all clusters submit only the current worker allocation")
-    p.add_argument("--memory", help="Optional worker memory request, e.g. 16G")
+    p.add_argument("--memory", help="Base-worker memory request; default 2G")
     p.add_argument('--dispatcher-shards', type=int, choices=range(1, 9), metavar='1..8',
                    help='New shared Slurm run: requested dispatcher shards for both base and SL; >1 defaults to two validators per shard')
     p.add_argument('--scheduler-policy', help='New shared Slurm run: operational policy JSON; explicit shard option overrides this file')
@@ -160,7 +160,7 @@ def launch_spec(args):
                    constraint=args.constraint or defaults.get("NKGRID_CONSTRAINT") or "none",
                    partition=partition, time_limit=time_limit,
                    workers=args.workers or 1, rounds=args.rounds or 2,
-                   memory_override=args.memory or "16G")
+                   memory_override=args.memory or "2G")
     for value in [*cluster.values(), args.plan_time, args.plan_memory]:
         if isinstance(value, str) and ("\n" in value or "\r" in value or "\x00" in value):
             raise ValueError("scheduler fields must be single-line strings")
