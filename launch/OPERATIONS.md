@@ -99,13 +99,5 @@ After a trial, check the process or scheduler logs for out-of-memory errors and 
 
 ## Resuming
 
-Resume with the original profile and account and `--resume /absolute/run/plan.json`. The resumed run reuses the original inputs and parameters, reads the saved results and schedules only the remaining tasks; training whose results were not saved before the interruption is repeated. Single-panel plans have the format `single-model-slurm-v1`. Plans from the older grouped protocol go to their original snapshot, submission journal and continuation protocol, and their frozen code and input checks still apply, so resume such runs from their original checkout. The launcher does not change the settings of an existing run in place.
+Resume with the original profile and account and `--resume /absolute/run/plan.json`. The resumed run reuses the original inputs and parameters, reads the saved results and schedules only the remaining tasks; training whose results were not saved before the interruption is repeated. Single-panel plans have the format `single-model-slurm-v1`. A plan in the grouped task-table format is passed to the scripts in [NK_Grid/slurm](../NK_Grid/slurm/README.md). The launcher does not change the settings of an existing run in place.
 
-## Older entry points
-
-Runs started with the entry points below resume from their own frozen checkouts; the current code no longer contains them, except the grouped-task scripts.
-
-- BMRC multi-panel suite (`--suite ffc_non_gpa`, `run.sh status`) and the 2026-09-08 Discoverer continuation protocol (`continuation.json`, `discoverer_control.sbatch`).
-- `fresh_single_model.py`, used for the SMR independent-SL runs of 2026-09-14/15.
-- Grouped-task protocol: the scripts in [NK_Grid/slurm](../NK_Grid/slurm/README.md). `submit_flat_task_table.sh [--submit] PLAN.json` routes saved single-model plans to the shared scheduler and grouped plans to their original journaled protocol. `submit_nk_grid.sh` only prints a pointer to `run.sh`.
-- GPA recovery: the stopped `ffc_median_mode_gpa` run of 2026-09-09 was resumed with a direct-key tool (`direct_key_resume.py` and the `prepare`/`run` commands of `direct_success_queue`). The tool is no longer in the current code; it remains in that run's frozen checkout and in the Git history.
