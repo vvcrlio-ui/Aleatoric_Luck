@@ -16,7 +16,6 @@ bash run.sh slurm --profile discoverer \
   --preset timing_full \
   --checkpoints delete \
   --prepare-ffc --ffc-data-dir FFCWS/data \
-  --output runs/discoverer-gpa-timing-001 \
   --dry-run
 ```
 
@@ -60,8 +59,7 @@ bootstrap 和 controller 在模块/Python 初始化前显式进入运行目录�
 bash run.sh slurm --profile discoverer \
   --account ehpc-dev-2026d08-299 \
   --panel ffc_median_mode_gpa --preset timing_full \
-  --schema runs/discoverer-gpa-timing-001/prepared/schema/ffc_median_mode_gpa.json \
-  --output runs/discoverer-gpa-timing-002
+  --schema FFCWS/outputs/ffc_median_mode_gpa-<ID>/prepared/schema/ffc_median_mode_gpa.json
 ```
 
 SMR 使用 `--manifest SMR/panels.yaml --panel ... --schema ...` 指向已经准备好的输入；FFC 专用准备开关不用于 SMR。
@@ -109,7 +107,7 @@ bootstrap 失败时不会进入后续计划/训练步骤。先核对日志、原
 ```bash
 bash run.sh slurm --profile discoverer \
   --account ehpc-dev-2026d08-299 \
-  --resume runs/discoverer-gpa-timing-001/plan.json
+  --resume FFCWS/outputs/ffc_median_mode_gpa-<ID>/plan.json
 ```
 
 如果初次使用自定义 QoS，恢复时必须传同一个 `--qos`。恢复重用冻结环境，由共享调度器只安排剩余任务，不重新准备输入或任务表。terminal 状态不得盲目重试；先定位问题并核实作业身份。运行期间保持源码及输入不变。

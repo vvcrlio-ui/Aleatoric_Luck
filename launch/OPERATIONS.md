@@ -18,7 +18,7 @@ Every panel in both catalogs saves the eight base models' test and out-of-fold p
 
 `--preset` also accepts `medium`, `pilot` and `dev-dynamic`. All presets use the panel's model list.
 
-Start with `--dry-run`, which prints the launch configuration without installing anything, reading data or submitting jobs. Give each stage its own output directory, and submit Slurm runs from a clean, committed checkout. On Discoverer:
+Start with `--dry-run`, which prints the launch configuration without installing anything, reading data or submitting jobs. Each run gets its own new directory under the catalog's `outputs/` (see below). Submit Slurm runs from a clean, committed checkout. On Discoverer:
 
 ```bash
 bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
@@ -29,17 +29,17 @@ bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
 bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
   --panel ffc_median_mode_gpa --preset dev \
   --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep --output FFCWS/outputs/ffc-gpa-dev
+  --checkpoints keep
 
 bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
   --panel ffc_median_mode_gpa --preset timing_full \
   --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep --output FFCWS/outputs/ffc-gpa-timing
+  --checkpoints keep
 
 bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
   --panel ffc_median_mode_gpa --preset production --allow-large-run \
   --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep --output FFCWS/outputs/ffc-gpa-production
+  --checkpoints keep
 ```
 
 A custom policy can live outside the checkout and be passed with `--scheduler-policy /absolute/path/my-policy.json`.
@@ -93,7 +93,7 @@ bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT \
 
 ## Results and output locations
 
-Without `--output`, a run is created at `<manifest directory>/outputs/<panel>-<unique ID>/`, with the validated result in `final.csv`. For the FFCWS GPA panel this is `FFCWS/outputs/ffc_median_mode_gpa-<unique ID>/`; SMR panels use `SMR/outputs/<panel>-<unique ID>/`. These paths are inside the repository. An explicit `--output`, or the path of a resumed run, takes precedence.
+Every run is created at `<manifest directory>/outputs/<panel>-<unique ID>/`, with the validated result in `final.csv`. For the FFCWS GPA panel this is `FFCWS/outputs/ffc_median_mode_gpa-<unique ID>/`; SMR panels use `SMR/outputs/<panel>-<unique ID>/`. These paths are inside the repository. `outputs/` is ignored by Git, so the checkout stays clean. A resumed run keeps its original directory; `--output` exists only for the rare case that needs another location.
 
 After a trial, check the process or scheduler logs for out-of-memory errors and timeouts, and look at the `status` and `error` columns. `cluster-state.json` records a cluster run's controller receipts, rounds and status; `complete` means validation, publication and the selected checkpoint handling have finished. `verified.json` ties the final CSV to the exact task count and the source receipts. With `--checkpoints delete`, only the run's `rounds/` checkpoint directory is removed, after publication; the plan, final CSV and verification receipts stay.
 

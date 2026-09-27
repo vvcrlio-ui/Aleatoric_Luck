@@ -162,7 +162,7 @@ def launch(args, spec):
     if output.is_relative_to(common.ROOT):
         result = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=common.ROOT)
         if result.returncode:
-            raise ValueError("Discoverer output inside the checkout must be Git-ignored (use runs/)")
+            raise ValueError("Output inside the checkout must be Git-ignored; the default <catalog>/outputs/ is")
     spec.update(source=source, manifest_sha256=common.sha256(spec["manifest"]))
     if spec["schema"]:
         spec["schema_sha256"] = common.sha256(spec["schema"])

@@ -8,7 +8,7 @@ Each combination of seed, draw, N, K and model is one task. A production panel h
 
 ## Stages before production
 
-A run starts with a dry-run, which only prints the launch settings. A `dev` run then checks the whole path from data to results on a small grid, and a `timing_full` run fits every point of the full grid once, so memory use and run time across the whole N and K range are known before `production` repeats the grid for 100 seeds and 50 draws. Each stage writes to its own directory.
+A run starts with a dry-run, which only prints the launch settings. A `dev` run then checks the whole path from data to results on a small grid, and a `timing_full` run fits every point of the full grid once, so memory use and run time across the whole N and K range are known before `production` repeats the grid for 100 seeds and 50 draws. Each stage writes to its own new directory, `<dataset>/outputs/<panel>-<ID>/`.
 
 ## Phases within a run
 

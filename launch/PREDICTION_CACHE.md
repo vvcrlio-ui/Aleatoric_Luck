@@ -138,16 +138,16 @@ synthetic panels, including N=399/400/401. It is an engineering acceptance run,
 not evidence of FFC scientific speedup. `prepare-ffc --schema ... --timing-full`
 prepares a new unchanged-parameter FFC grid; it also does not submit by itself.
 Start an authorized prepared plan with `python launch/cluster_scheduler.py start
-runs/NEW/plan.json` after reviewing its bounds and live admission.
+RUN_DIR/plan.json` after reviewing its bounds and live admission.
 
 Refit a different subset without any base fitting:
 
 ```sh
 python -m aleatoric_nk_grid.offline_sl \
-  --plan runs/NEW/plan.json --panel PANEL --seed SEED --draw DRAW --n N --k K \
+  --plan RUN_DIR/plan.json --panel PANEL --seed SEED --draw DRAW --n N --k K \
   --pipelines standalone8-v1/ridge standalone8-v1/extra_trees \
               standalone8-v1/lightgbm standalone8-v1/shallow_neural_network \
-  --variant-id sensitivity-sl4 --output runs/NEW/sensitivity-sl4
+  --variant-id sensitivity-sl4 --output RUN_DIR/sensitivity-sl4
 ```
 
 Classification requires `--combiner-config` with an explicit logistic rule.

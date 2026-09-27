@@ -456,7 +456,7 @@ def main(argv=None):
         if args.target == "slurm" and output.is_relative_to(ROOT):
             ignored = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=ROOT)
             if ignored.returncode != 0:
-                raise ValueError("Slurm output inside the checkout must be Git-ignored (use runs/ or aleatoric-production/) so launching does not dirty the frozen checkout")
+                raise ValueError("Slurm output inside the checkout must be Git-ignored (the default <catalog>/outputs/ is) so launching does not dirty the frozen checkout")
     if args.target == "slurm" and not (args.venv or os.environ.get("VENV")):
         # Every cluster: one environment per set of locked dependencies, shared by runs.
         if args.refresh_env:
