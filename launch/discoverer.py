@@ -132,9 +132,13 @@ def launch(args, spec):
         from cluster_scheduler import resume
         return resume(args)
     output = Path(spec["output"])
-    # A per-run venv avoids mutating an environment used by another experiment.
+    if args.refresh_env and not args.venv:
+        raise ValueError("--refresh-env applies to an explicit --venv; shared environments are never modified")
+    # Without --venv, the bootstrap reuses the shared environment for these exact
+    # locked dependencies, or creates it once; project code comes from this checkout.
     spec["bootstrap"] = {
-        "venv": str(common.path_from_repo(args.venv)) if args.venv else str(output / "venv"),
+        "venv": str(common.path_from_repo(args.venv)) if args.venv else None,
+        "shared_env_root": str(common.shared_env_root()),
         "refresh_env": args.refresh_env,
         "python_module": os.environ.get("PYTHON_MODULE", DEFAULT_MODULE),
         "prepare_ffc": args.prepare_ffc,
@@ -142,7 +146,7 @@ def launch(args, spec):
     }
     if args.dry_run:
         print(json.dumps({"launch": spec, "actions": ["submit compute-node bootstrap",
-              "install/validate environment", "prepare FFC if requested", "freeze single-model design", "start shared single-model scheduler"],
+              "reuse or create the shared dependency environment", "prepare FFC if requested", "freeze single-model design", "start shared single-model scheduler"],
               "live_resources": {"workers": "unresolved until each round", "qos_account_partition_limits": "unresolved",
                                  "existing_jobs": "unresolved", "effective_wall_time": "unresolved"},
               "note": "No data reads, installation or submission. The planning placeholder worker count is not a resource decision. Each round resolves live limits and CPU-minute headroom, then submits one worker allocation; --workers is an optional cap and --rounds a hard bound."}, indent=2))
@@ -225,11 +229,16 @@ def bootstrap(request):
         os.environ[key] = str(temporary)
     import tempfile
     tempfile.tempdir = None
-    os.environ["PIP_CACHE_DIR"] = str(Path(spec["output"]) / "pip-cache")
     print(f"Bootstrap temporary directory: {temporary}", flush=True)
-    python, venv = common.ensure_environment(argparse.Namespace(venv=options["venv"], refresh_env=options["refresh_env"]))
+    if options.get("venv"):
+        os.environ["PIP_CACHE_DIR"] = str(Path(spec["output"]) / "pip-cache")
+        python, venv = common.ensure_environment(argparse.Namespace(venv=options["venv"], refresh_env=options["refresh_env"]))
+    else:
+        os.environ["PIP_CACHE_DIR"] = str(Path(options["shared_env_root"]) / "pip-cache")
+        python, venv = common.ensure_shared_environment(options["shared_env_root"])
     environment = batch_environment()
-    environment.update(VENV=str(venv), PYTHON=str(python), ENGINE_DIR=str(common.ROOT / "NK_Grid"))
+    environment.update(VENV=str(venv), PYTHON=str(python), ENGINE_DIR=str(common.ROOT / "NK_Grid"),
+                       PYTHONPATH=str(common.ENGINE_SRC))
     if spec.get("resume_plan"):
         if common.sha256(spec["resume_plan"]) != spec["resume_plan_sha256"]:
             raise ValueError("resume plan changed while queued")

@@ -18,6 +18,10 @@ from contextlib import contextmanager
 
 ROOT = Path(__file__).resolve().parents[1]
 THREADS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "BLIS_NUM_THREADS")
+ENGINE_SRC = ROOT / "NK_Grid/src"
+# Launcher processes import the engine of this checkout, never one installed elsewhere.
+if str(ENGINE_SRC) not in sys.path:
+    sys.path.insert(0, str(ENGINE_SRC))
 
 
 def command(args, *, capture=False, cwd=ROOT, env=None):
@@ -254,6 +258,50 @@ def environment_lock(environment):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+
+def shared_env_root():
+    """Where cluster runs keep shared dependency environments, beside the checkouts by default."""
+    return Path(os.environ.get("NKGRID_ENV_ROOT") or ROOT.parent / "nkgrid-envs")
+
+
+def shared_environment_path(root):
+    """Content-keyed location: same locked dependencies and Python module, same environment."""
+    key = {"requirements": (ROOT / "NK_Grid/requirements.txt").read_text(encoding="utf-8"),
+           "python_module": os.environ.get("PYTHON_MODULE", ""),
+           "cpu_type": os.environ.get("MODULE_CPU_TYPE", "")}
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return Path(root).expanduser().resolve() / ("deps-" + digest)
+
+
+def ensure_shared_environment(root):
+    """Third-party dependencies only, installed once and never changed afterwards.
+
+    Several experiments and checkouts use one environment, so it holds no project
+    code: every process imports aleatoric_nk_grid from its own checkout through
+    PYTHONPATH. A missing stamp means an interrupted build, rebuilt under the lock.
+    """
+    environment = shared_environment_path(root)
+    python = environment / "bin/python"
+    stamp = environment / ".nkgrid-shared-environment.json"
+    expected = {"requirements": sha256(ROOT / "NK_Grid/requirements.txt"),
+                "python_module": os.environ.get("PYTHON_MODULE", ""),
+                "cpu_type": os.environ.get("MODULE_CPU_TYPE", "")}
+    with environment_lock(environment):
+        if not stamp.exists():
+            pip = {**os.environ, "PIP_CACHE_DIR": os.environ.get("PIP_CACHE_DIR") or str(Path(root) / "pip-cache")}
+            command([sys.executable, "-m", "venv", "--clear", environment])
+            command([python, "-m", "pip", "install", "-r", ROOT / "NK_Grid/requirements.txt"], env=pip)
+            command([python, "-m", "pip", "check"])
+            atomic_json(stamp, expected)
+        elif json.loads(stamp.read_text()) != expected:
+            raise ValueError(f"Shared environment {environment} does not match its key; do not edit it in place")
+        probe_code = ("import pathlib,sys,aleatoric_nk_grid as n,lightgbm,xgboost; "
+                      "assert pathlib.Path(n.__file__).resolve()==pathlib.Path(sys.argv[1]).resolve(), 'engine imported from another checkout'; print('NKGRID shared environment ready')")
+        command([python, "-c", probe_code, ENGINE_SRC / "aleatoric_nk_grid/__init__.py"],
+                env={**os.environ, "PYTHONPATH": str(ENGINE_SRC)})
+    return python, environment
+
+
 def frozen_source():
     return {"commit": command(["git", "rev-parse", "HEAD"], capture=True).stdout.strip(),
             "dirty": bool(command(["git", "status", "--porcelain"], capture=True).stdout.strip())}
@@ -409,10 +457,16 @@ def main(argv=None):
             ignored = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=ROOT)
             if ignored.returncode != 0:
                 raise ValueError("Slurm output inside the checkout must be Git-ignored (use runs/ or aleatoric-production/) so launching does not dirty the frozen checkout")
-    python, venv = ensure_environment(args)
+    if args.target == "slurm" and not (args.venv or os.environ.get("VENV")):
+        # Every cluster: one environment per set of locked dependencies, shared by runs.
+        if args.refresh_env:
+            raise ValueError("--refresh-env applies to an explicit --venv; shared environments are never modified")
+        python, venv = ensure_shared_environment(shared_env_root())
+    else:
+        python, venv = ensure_environment(args)
     environment = {**{k: v for k, v in os.environ.items() if not k.startswith('SBATCH_')},
                    "VENV": str(venv), "PYTHON": str(python), "ENGINE_DIR": str(ROOT / "NK_Grid"),
-                   **{key: "1" for key in THREADS}}
+                   "PYTHONPATH": str(ENGINE_SRC), **{key: "1" for key in THREADS}}
     output = Path(spec["output"])
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()

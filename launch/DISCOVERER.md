@@ -40,15 +40,15 @@ bash run.sh slurm --profile discoverer \
 | worker | 单计算线程、16G；timing_full/production 自动容量，其他预设上限 16；默认最多 2 rounds |
 | worker wall time | timing_full/production 为 48h；其他预设为 1h |
 | bootstrap / controller | 1 CPU、48G、2h，可用 `--plan-memory` / `--plan-time` 调整 |
-| venv | 默认 `<运行目录>/venv`，避免复用不完整的安装环境 |
+| 依赖环境 | 默认使用共享环境：同一锁定依赖、Python module 和 CPU 类型共用一个，位于 checkout 旁的 `nkgrid-envs/`（或 `NKGRID_ENV_ROOT`） |
 
 每个作业显式携带 account、QoS、nodes、ntasks-per-node、ntasks-per-core 和内存。计算线程环境均为 1；按 CR_CORE 与硬件线程配置分配时可能计入两个逻辑 CPU，容量收据单独记录。每轮 worker 资源形成独立不可变合约。准备期间有效限制收紧时明确停止，不修改已经准备好的 assignment。当前 profile 接受的作业时长请求最多 48 小时，worker 还会按实时有效 MaxWall 缩短；700/1000 是已查快照，不是硬编码的 QoS 名额。
 
-若管理员提供其他模块，可设置 `DISCOVERER_PYTHON_MODULE`；不要复用 BMRC 的 Python venv。安装临时文件位于 `<运行目录>/tmp/bootstrap-JOBID/`，pip 缓存位于 `<运行目录>/pip-cache/`，均使用项目存储，避免计算节点 `/tmp` 容量不足。依赖严格按仓库锁定版本安装，包不可下载或版本不可用会终止 bootstrap，不会自动放宽版本继续跑。
+若管理员提供其他模块，可设置 `DISCOVERER_PYTHON_MODULE`；不要复用 BMRC 的 Python venv。安装临时文件位于 `<运行目录>/tmp/bootstrap-JOBID/`，共享环境的 pip 缓存位于 `nkgrid-envs/pip-cache/`，均使用项目存储，避免计算节点 `/tmp` 容量不足。共享环境只在第一次遇到新的依赖组合时安装，之后的运行直接复用、不做修改，各运行的项目代码都从自己的 checkout 导入。依赖严格按仓库锁定版本安装，包不可下载或版本不可用会终止 bootstrap，不会自动放宽版本继续跑。
 
 bootstrap 和 controller 在模块/Python 初始化前显式进入运行目录，以处理本站计算节点偶发的 Slurm 初始工作目录回退；worker 的 `--chdir`、Python、引擎和 snapshot 均绑定该次运行的绝对路径。
 
-如有已经验证且没有作业正在修改的环境，可显式 `--venv /绝对路径` 复用。环境不匹配时会拒绝运行；`--refresh-env` 会重新安装，仅在确认没有其他作业使用该环境后使用。恢复模式不接受环境刷新。
+需要单独的环境时，可显式 `--venv /绝对路径`。环境不匹配时会拒绝运行；`--refresh-env` 只能用于这种显式环境，会重新安装，仅在确认没有其他作业使用该环境后使用。共享环境从不原地修改。恢复模式不接受环境刷新。
 
 ## 数据准备与复用
 
@@ -102,7 +102,7 @@ squeue -u "$USER"
 sacct -j BOOTSTRAP_JOB_ID --format=JobID,State,ExitCode,Elapsed,MaxRSS
 ```
 
-bootstrap 失败时不会进入后续计划/训练步骤。先核对日志、原提交收据和 Slurm 终态；只有确认原 bootstrap 已结束且没有后续控制链、尚无 plan 时，才在排除原因后使用新的输出目录重试。已安装完的环境可显式复用；取消安装留下的不完整 venv 不会被默认复用。响应是否被接受仍不确定时，先按下述原身份恢复流程核对，不能通过新目录重复发起实验。不要在原目录手工改哈希或覆盖生成输入。
+bootstrap 失败时不会进入后续计划/训练步骤。先核对日志、原提交收据和 Slurm 终态；只有确认原 bootstrap 已结束且没有后续控制链、尚无 plan 时，才在排除原因后使用新的输出目录重试。共享环境安装中断时，下一次 bootstrap 会在锁内重新安装。响应是否被接受仍不确定时，先按下述原身份恢复流程核对，不能通过新目录重复发起实验。不要在原目录手工改哈希或覆盖生成输入。
 
 已经生成 plan 的恢复方式：
 
