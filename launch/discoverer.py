@@ -12,8 +12,10 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import uuid
 
 import experiment as common
+from slurm_submission import Journal, Slurm, _lock, batch_environment, now, read
 
 DEFAULT_MODULE = "python/3/3.12/3.12.4"
 
@@ -75,15 +77,6 @@ def configure(args):
     args.plan_memory = args.plan_memory or "48G"
 
 
-def batch_environment():
-    # Slurm CLI flags override only named options; inherited SBATCH_* can inject
-    # dependencies, arrays, export modes or a GPU constraint into another site.
-    env = {key: value for key, value in os.environ.items() if not key.startswith("SBATCH_")}
-    env.update({key: "1" for key in common.THREADS})
-    env['SLURM_EXPORT_ENV'] = 'ALL'
-    return env
-
-
 def bootstrap_command(spec, request):
     output = Path(spec["output"])
     return ["sbatch", "--parsable", "--job-name=nkgrid-discoverer-bootstrap",
@@ -94,6 +87,26 @@ def bootstrap_command(spec, request):
             "--error=" + str(output / "logs/bootstrap-%j.err"), "--export=ALL",
             str(common.ROOT / "launch/discoverer_bootstrap.sbatch"), str(request),
             spec["bootstrap"]["python_module"], str(common.ROOT / "launch/experiment.py")]
+
+
+def submit_bootstrap(request, *, slurm=None):
+    """Initial accepted-but-response-lost recovery, without creating another run."""
+    request = Path(request).resolve()
+    spec = read(request)
+    common.validate_source(spec)
+    path = request.parent / "bootstrap-journal.json"
+    with _lock(request.parent / ".bootstrap.lock"):
+        digest = common.sha256(request)
+        if path.exists():
+            state = read(path)
+            if state["request_sha256"] != digest:
+                raise ValueError("Bootstrap request identity changed")
+        else:
+            state = {"run_id": uuid.uuid4().hex, "jobs": {}, "request_sha256": digest,
+                     "request": str(request), "created_at_utc": now()}
+        journal = Journal(path, state, slurm or Slurm(spec["cluster"]["account"], spec["cluster"]["qos"]))
+        arguments = [a for a in bootstrap_command(spec, request)[2:] if not a.startswith("--job-name=")]
+        return journal.submit("B0", arguments)
 
 
 def resumed_spec(args, plan_path):
@@ -153,7 +166,6 @@ def launch(args, spec):
     (output / "logs").mkdir()
     request = output / "launch.json"
     common.atomic_json(request, spec)
-    from discoverer_continuation import submit_bootstrap
     job = submit_bootstrap(request)
     receipt = request.with_name(request.stem + ".submission.json")
     common.atomic_json(receipt, {"bootstrap_job": job, "request": str(request)})
@@ -229,6 +241,10 @@ def bootstrap(request):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "recover-bootstrap":
+        # Login node: bind a bootstrap whose sbatch response was lost to its original identity.
+        print("Bootstrap job: " + submit_bootstrap(sys.argv[2]))
+        raise SystemExit(0)
     if len(sys.argv) != 3 or sys.argv[1] != "prepare-execute" or not os.environ.get("SLURM_JOB_ID"):
         raise SystemExit("Internal compute-node entry point")
     spec = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))

@@ -83,7 +83,6 @@ The Discoverer preset `launch/policies/discoverer-cache.json` requests four disp
 |---|---|---|
 | Discoverer, shared single-model entry | Supported | Implemented; each release needs isolated Linux validation |
 | BMRC or another Slurm cluster, prepared data | Supported, same policy code | Shared core workflow; quota and CPU binding need site validation |
-| BMRC `--suite` or `--ffc-data-dir` | Rejected | Separate scheduler, not migrated |
 
 A BMRC prepared-data preview, with its constraint selected explicitly:
 
@@ -96,17 +95,17 @@ bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT \
 
 Without `--output`, a run is created at `<manifest directory>/outputs/<panel>-<unique ID>/`, with the validated result in `final.csv`. For the FFCWS GPA panel this is `FFCWS/outputs/ffc_median_mode_gpa-<unique ID>/`; SMR panels use `SMR/outputs/<panel>-<unique ID>/`. These paths are inside the repository. An explicit `--output`, or the path of a resumed run, takes precedence.
 
-After a trial, check the process or scheduler logs for out-of-memory errors and timeouts, and look at the `status` and `error` columns. `cluster-state.json` records a cluster run's controller receipts, rounds and status; `complete` means validation, publication and the selected checkpoint handling have finished. `verified.json` ties the final CSV to the exact task count and the source receipts. With `--checkpoints delete`, only the run's `rounds/` checkpoint directory is removed, after publication; the plan, final CSV and verification receipts stay. Historical Discoverer runs keep their original `continuation.json` protocol.
+After a trial, check the process or scheduler logs for out-of-memory errors and timeouts, and look at the `status` and `error` columns. `cluster-state.json` records a cluster run's controller receipts, rounds and status; `complete` means validation, publication and the selected checkpoint handling have finished. `verified.json` ties the final CSV to the exact task count and the source receipts. With `--checkpoints delete`, only the run's `rounds/` checkpoint directory is removed, after publication; the plan, final CSV and verification receipts stay.
 
 ## Resuming
 
-Resume with the original profile and account and `--resume /absolute/run/plan.json`. The resumed run reuses the original inputs and parameters, reads the saved results and schedules only the remaining tasks; training whose results were not saved before the interruption is repeated. Single-panel plans have the format `single-model-slurm-v1`. Plans from the older grouped protocol go to their original snapshot, submission journal and continuation protocol, and their frozen code and input checks still apply, so resume such runs from their original checkout. The launcher does not change the settings of an existing run in place. Suite plans use the directory form described in [BMRC.md](BMRC.md).
+Resume with the original profile and account and `--resume /absolute/run/plan.json`. The resumed run reuses the original inputs and parameters, reads the saved results and schedules only the remaining tasks; training whose results were not saved before the interruption is repeated. Single-panel plans have the format `single-model-slurm-v1`. Plans from the older grouped protocol go to their original snapshot, submission journal and continuation protocol, and their frozen code and input checks still apply, so resume such runs from their original checkout. The launcher does not change the settings of an existing run in place.
 
 ## Older entry points
 
-These remain for runs that were started with them.
+Runs started with the entry points below resume from their own frozen checkouts; the current code no longer contains them, except the grouped-task scripts.
 
-- BMRC suite: `--suite ffc_non_gpa` runs fifteen panels on one dispatcher and one fixed worker allocation, with its own protocol and without the cache workflow. See [BMRC.md](BMRC.md); recover suite runs from their original checkout.
-- SMR independent-SL runs of 2026-09-14/15: prepared with [fresh_single_model.py](fresh_single_model.py), which runs each model as an independent task through the direct-success dispatcher passed with `--runtime`. Its workers refuse a required cache, so new SMR runs use the shared scheduler.
+- BMRC multi-panel suite (`--suite ffc_non_gpa`, `run.sh status`) and the 2026-09-08 Discoverer continuation protocol (`continuation.json`, `discoverer_control.sbatch`).
+- `fresh_single_model.py`, used for the SMR independent-SL runs of 2026-09-14/15.
 - Grouped-task protocol: the scripts in [NK_Grid/slurm](../NK_Grid/slurm/README.md). `submit_flat_task_table.sh [--submit] PLAN.json` routes saved single-model plans to the shared scheduler and grouped plans to their original journaled protocol. `submit_nk_grid.sh` only prints a pointer to `run.sh`.
 - GPA recovery: the stopped `ffc_median_mode_gpa` run of 2026-09-09 was resumed with a direct-key tool (`direct_key_resume.py` and the `prepare`/`run` commands of `direct_success_queue`). The tool is no longer in the current code; it remains in that run's frozen checkout and in the Git history.

@@ -20,8 +20,6 @@ case "$PROFILE" in
   *) echo "Unknown profile: $PROFILE (choose local, bmrc or discoverer)" >&2; exit 2 ;;
 esac
 cd "$ROOT"
-# Status never loads a cluster module or installs dependencies.
-if [ "${ARGS[0]:-}" = status ]; then PREVIEW=1; fi
 if [ "$UPDATE" = 1 ] && [ "$PREVIEW" = 0 ]; then
   # Fast-forward the checked-out branch from origin; forks and upstream clones
   # use different branch names, so none is hard-coded here.
