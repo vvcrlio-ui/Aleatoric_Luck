@@ -68,16 +68,3 @@ def normalize_prediction_options(cache=None, execution=None):
     elif workflow.get("workflow") not in {None, "capture"}:
         raise ValueError("Unknown prediction workflow")
     return result, workflow
-
-
-def prediction_cache_enabled(config):
-    # A configuration predating these fields cannot have enabled persistence,
-    # so absence reads as disabled rather than crashing this legacy guard.
-    return bool(normalize_prediction_options(getattr(config, "prediction_cache", None),
-                                             getattr(config, "execution", None))[0])
-
-
-def reject_unsupported_prediction_backend(config, backend):
-    if prediction_cache_enabled(config):
-        raise ValueError(f"{backend} does not implement the required prediction cache contract; "
-                         "use the protocol v2 base_then_sl controller")

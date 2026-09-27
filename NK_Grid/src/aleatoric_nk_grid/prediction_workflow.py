@@ -30,8 +30,6 @@ BASE_READY_FORMAT = 'base-input-ready-v1'
 # batch_seconds price it, so the next round can lease more than one task at a
 # time. Kept equal to the pricing threshold so the two cannot drift apart.
 from .cost_profile import DEFAULT_MIN_BATCH_OBSERVATIONS as PRICING_PRIME_REPEATS
-STATES = ('PLANNED', 'BASE_RUNNING', 'BASE_INDEXING', 'BASE_VERIFYING', 'SL_READY', 'SL_RUNNING',
-          'FINAL_VERIFYING', 'COMPLETE', 'REPAIR_REQUIRED')
 
 
 def read(path):
@@ -57,7 +55,7 @@ def reject_unphased_cache(spec):
 
 
 def contract_from_config(config, plan):
-    """Single-panel launcher adapter; joint plans concatenate explicit panels."""
+    """Single-panel launcher adapter."""
     from .prediction_contract import normalize_prediction_options
     cache, execution = normalize_prediction_options(getattr(config, 'prediction_cache', None),
                                                      getattr(config, 'execution', None))
@@ -128,24 +126,6 @@ def contract_from_config(config, plan):
     if 'verification_schedule' in execution:
         contract['verification_schedule'] = execution['verification_schedule']
     return validate_contract(contract)
-
-
-def joint_contract(contracts, *, output_root, phase_round_limits, sl_resources):
-    """One scheduler/receipt for a joint submission, never independent barriers."""
-    contracts = [validate_contract(c) for c in contracts]
-    if not contracts: raise QueueError('Joint submission needs explicit panel contracts')
-    first = contracts[0]
-    for c in contracts[1:]:
-        if any(c[k] != first[k] for k in ('base_library_id', 'cache_mode', 'required', 'protocol_version')):
-            raise QueueError('Joint submission library/cache/protocol contracts differ')
-        if c.get('base_round_time_limits') != first.get('base_round_time_limits'):
-            raise QueueError('Joint panels require the same frozen base round time limits')
-        if c.get('verification_schedule', 'before_sl') != first.get('verification_schedule', 'before_sl'):
-            raise QueueError('Joint panels require the same verification schedule')
-    root = Path(output_root).resolve()
-    return validate_contract({**first, 'output_root': str(root), 'cache_root': str(root / 'prediction-cache'),
-        'panels': [p for c in contracts for p in c['panels']],
-        'phase_round_limits': phase_round_limits, 'sl_resources': sl_resources})
 
 
 def validate_contract(contract):

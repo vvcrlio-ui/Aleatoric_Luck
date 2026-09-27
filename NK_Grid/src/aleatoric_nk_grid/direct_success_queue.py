@@ -28,7 +28,7 @@ import time
 import uuid
 
 from aleatoric_nk_grid.shared_queue import (
-    Dispatcher, LeaseLostError, MAX_BATCH_TASKS, MAX_SUBMISSIONS, ModelTask, QueueError,
+    Dispatcher, LeaseLostError, MAX_BATCH_TASKS, ModelTask, QueueError,
     atomic_json, canonical, digest, file_digest, file_lock)
 from aleatoric_nk_grid.scheduler_cost import CostEstimator
 from aleatoric_nk_grid.scheduler_policy import TailMonitor, validate_policy

@@ -105,49 +105,6 @@ def prepare(config, launch, repo):
     return path
 
 
-def prepare_joint(plans, launch, *, phase_round_limits, sl_resources):
-    """Freeze one multi-panel submission and one barrier, without submitting.
-
-    Inputs are already-frozen single-panel plans, not running queues. The new
-    output identity is independent and never mutates their code, caches or jobs.
-    """
-    from .prediction_workflow import joint_contract, validate_round_time_limits
-    from .prediction_cache import initialize_cache
-    plans = [read(p) if isinstance(p, (str, Path)) else p for p in plans]
-    if not plans or any(p.get('format') != 'single-model-slurm-v1' or not p.get('prediction_workflow') for p in plans):
-        raise QueueError('Joint prediction submission needs frozen two-phase panel plans')
-    first = plans[0]
-    if any(p['runtime_sha256'] != first['runtime_sha256'] or
-           p['cell_spec'].get('git_commit') != first['cell_spec'].get('git_commit') for p in plans):
-        raise QueueError('Joint panels must use the same frozen runtime/code')
-    root = Path(launch['output']).resolve()
-    initialize_launch_policy(launch, root)
-    contract = joint_contract([p['prediction_workflow'] for p in plans], output_root=root,
-                             phase_round_limits=phase_round_limits, sl_resources=sl_resources)
-    validate_round_time_limits(contract, global_time_limit=launch['cluster']['time_limit'])
-    dimensions = [p.get('prediction_dimensions', {}) for p in plans]
-    if any(not d for d in dimensions): raise QueueError('Every joint panel requires storage dimensions')
-    merged = {}
-    for original in plans:
-        dims = original['prediction_dimensions']
-        for panel in original['prediction_workflow']['panels']:
-            merged[panel['panel_id']] = dims.get(panel['panel_id'], dims)
-    plan = {'format': 'single-model-slurm-v1', 'cell_spec': first['cell_spec'],
-        'runtime_sha256': first['runtime_sha256'], 'launch': launch, 'submission': launch['cluster'],
-        'task_kind': first['task_kind'], 'checkpoint_retention': 'keep',
-        'public_columns': list(dict.fromkeys(column for p in plans for column in p['public_columns'])),
-        'prediction_workflow': contract, 'prediction_dimensions': merged,
-        'source_panel_plan_sha256': [digest(p) for p in plans]}
-    root.mkdir(parents=True, exist_ok=True); path = root / 'plan.json'
-    if path.exists() and read(path) != plan: raise QueueError('Joint frozen plan changed')
-    initialize_cache(contract['cache_root'], {'workflow_sha256': digest(contract),
-        'plan_sha256': digest(plan), 'contract': contract})
-    from .prediction_maps import prepare_maps
-    prepare_maps(plan, repo_root=launch.get('source', {}).get('root', Path.cwd()))
-    if not path.exists(): atomic_json(path, plan)
-    return path
-
-
 def scan(plan, rounds, accept=lambda row: None):
     """Validate durable receipts with bounded key memory, including partial tails.
 

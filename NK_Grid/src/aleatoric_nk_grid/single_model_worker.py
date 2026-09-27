@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .shared_queue import (Dispatcher, MAX_BATCH_TASKS, MAX_LEASE_TASKS, ModelTask, QueueError, digest,
                            heartbeat_interval)
-from .scheduler_cost import CostEstimator, DEFAULT_COST_WEIGHTS
+from .scheduler_cost import CostEstimator
 
 def iter_model_tasks(spec, weights=None, *, profile=None):
     """Stream full design, one model per row, no Python list of 18M tasks."""

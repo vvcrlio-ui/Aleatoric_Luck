@@ -20,7 +20,7 @@ import uuid
 
 from .shared_queue import Dispatcher, QueueError, atomic_json, file_lock
 from .queue_readiness import wait_ready
-from .queue_service import Client, worker_slot
+from .queue_service import Client
 
 
 def read(path):

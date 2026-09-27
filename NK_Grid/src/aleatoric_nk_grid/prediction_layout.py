@@ -7,7 +7,6 @@ No accepted historical cache is migrated: this requires a shared-v1 manifest.
 """
 from contextlib import closing
 from functools import lru_cache
-import hashlib
 import json
 import os
 from pathlib import Path
