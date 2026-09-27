@@ -409,6 +409,7 @@ def main(argv: list[str] | None = None) -> None:
         type=Path,
         default=Path(__file__).resolve().parents[1],
     )
+    parser.add_argument("--output-root", type=Path, help="Write prepared schema and data under this directory")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--contract", type=Path)
     parser.add_argument("--validation-model", nargs="+", default=["ols"])
@@ -434,7 +435,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     result = build_adapter(
         source,
-        article_root=article_root,
+        article_root=args.output_root or article_root,
         contract_path=contract,
         validation_models=args.validation_model,
         min_n=args.min_n,

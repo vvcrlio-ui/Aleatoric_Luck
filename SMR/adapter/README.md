@@ -2,6 +2,12 @@
 
 SMR uses the provider's existing analysis matrix, `asample2_withlag.csv`. The adapter selects predictors and outcomes using fixed definitions, describes category groups, and passes them to the shared engine. It does not reconstruct wages, income, lagged variables, or existing missingness indicators.
 
+## Preparing a run
+
+Use the shared launcher with `--manifest SMR/panels.yaml --panel smr_totalincome --prepare --data-dir DIR`, where DIR contains `asample2_withlag.csv`. Preparation runs in the compute bootstrap and publishes under that run's `prepared/` directory.
+
+The adapter also accepts `--output-root DIR` for direct preparation. This directs both schema and ARD output to DIR; `--article-root` still locates the input defaults and feature contract.
+
 ## Fixed variable definitions
 
 The [feature definition file](config/asample2_withlag.json) lists predictor columns and their order, the two outcomes, and one-hot groups. The current definition contains 4,252 predictor columns and 29 one-hot groups, representing 497 sampling sources. Predictors outside one-hot groups are treated as individual continuous columns.

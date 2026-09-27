@@ -1,102 +1,131 @@
 # Operations reference
 
-This page collects the commands and options for running experiments. [README.md](README.md) explains what the stages and phases do.
+Start in a clean, committed checkout. Each launch selects one panel from a dataset's `panels.yaml`. The login node checks arguments, the checkout, output location and, with `--prepare`, raw file paths. It writes `launch.json` and submits one bootstrap job.
 
-## Selecting a panel
+On a compute node, `bootstrap.sbatch` loads the profile's Python module when supplied, creates or reuses the shared dependency environment, prepares data when requested, freezes the plan and starts the shared Slurm scheduler.
 
-`FFCWS/panels.yaml` holds the 18 FFCWS panels (six outcomes under three encodings). It is the default catalog, so `--manifest FFCWS/panels.yaml` can be left out. Choose one panel with `--panel`, for example `ffc_median_mode_gpa` or `ffc_tree_ordinal_materialHardship`; without `--panel` the launcher uses `ffc_median_mode_gpa`. For SMR, use `--manifest SMR/panels.yaml --panel smr_hourlywage` or `--panel smr_totalincome`. A launch runs only the selected panel.
+## One command per cluster
 
-Every panel in both catalogs saves the eight base models' test and out-of-fold predictions, fits SL7 from the seven saved columns other than OLS, and verifies all results once, at the end. [PREDICTION_CACHE.md](PREDICTION_CACHE.md) describes this workflow.
-
-## Stages and presets
-
-| Preset | Seeds × draws | Grid | Use |
-|---|---|---|---|
-| dev | 3 × 3 | 3 × 3, N and K at most 100 | Check the path from data to results on a small scale |
-| timing_full | 1 × 1 | 20 × 20 over the full training sample and all sources | Check memory, run time and failures across the full range |
-| production | 100 × 50 | 20 × 20 | The full experiment; requires `--allow-large-run` |
-
-`--preset` also accepts `medium` and `pilot`. All presets use the panel's model list.
-
-Start with `--dry-run`, which prints the launch configuration without installing anything, reading data or submitting jobs. Each run gets its own new directory under the catalog's `outputs/` (see below). Submit Slurm runs from a clean, committed checkout. On Discoverer:
+Substitute the account, manifest, panel and raw directory:
 
 ```bash
-bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
-  --panel ffc_median_mode_gpa --preset timing_full \
-  --scheduler-policy launch/policies/discoverer-cache.json \
-  --dispatcher-shards 4 --dry-run
+bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT \
+  --manifest DATASET/panels.yaml --panel PANEL --preset dev \
+  --prepare --data-dir /absolute/raw/directory
 
-bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
-  --panel ffc_median_mode_gpa --preset dev \
-  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep
+bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT \
+  --manifest DATASET/panels.yaml --panel PANEL --preset dev \
+  --prepare --data-dir /absolute/raw/directory
 
-bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
-  --panel ffc_median_mode_gpa --preset timing_full \
-  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep
-
-bash run.sh slurm --profile discoverer --account YOUR_PROJECT_ACCOUNT \
-  --panel ffc_median_mode_gpa --preset production --allow-large-run \
-  --scheduler-policy launch/policies/discoverer-cache.json --dispatcher-shards 4 \
-  --checkpoints keep
+bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION \
+  --qos YOUR_QOS --time 01:00:00 \
+  --manifest DATASET/panels.yaml --panel PANEL --preset dev \
+  --prepare --data-dir /absolute/raw/directory
 ```
 
-A custom policy can live outside the checkout and be passed with `--scheduler-policy /absolute/path/my-policy.json`.
+Append `--dry-run` to preview. A preview creates no directories, reads no data, installs nothing and submits nothing. Actual submission requires Linux. The login Python must be 3.11–3.14; preparation checks also require PyYAML. Select an already available interpreter with `NKGRID_BOOTSTRAP_PYTHON` when needed. Dependencies are installed only inside the bootstrap allocation.
 
-## Where runs can execute
+For prepared inputs, use `--schema /absolute/schema.json` instead of preparation arguments. The schema and referenced files must remain available to compute nodes.
 
-Every run goes through the shared Slurm scheduler.
+Compute nodes need shared access to the checkout and run directory, TLS connectivity from workers to the dispatcher, `srun` and `openssl`. The account must be able to read its Slurm association, QoS limits and usage through `sacctmgr` and `scontrol show assoc_mgr`. BMRC and the example profile require site validation. [DISCOVERER.md](DISCOVERER.md) gives Discoverer site notes.
 
-| Environment | Command prefix |
+## Profiles and defaults
+
+`--profile NAME` sources `launch/profiles/NAME.sh`. Copy [profiles/example.sh](profiles/example.sh) to add a site. A profile exports only these values:
+
+| Variable | Meaning |
 |---|---|
-| Discoverer | `bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT` |
-| BMRC, prepared data | `bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT` |
-| Other Slurm clusters | `bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION --constraint none --qos YOUR_QOS` |
+| `PYTHON_MODULE` | Optional compute-node Python module |
+| `NKGRID_PARTITION` | Default partition |
+| `NKGRID_CONSTRAINT` | Optional node constraint |
+| `NKGRID_MAX_TIME` | Maximum requested job duration |
+| `NKGRID_QOS` | Optional default QoS; `account` means the explicit `--account` |
 
-Other clusters also take `--time`, and need a compatible Python environment loaded first. On every Slurm cluster the launcher keeps one Python environment per set of locked dependencies (`NK_Grid/requirements.txt`), Python module and CPU type, in `nkgrid-envs/` beside the checkout or in `NKGRID_ENV_ROOT`. The first run with a new combination creates it, with the pip cache in the same place; later runs, from any checkout, reuse it unchanged, and every run imports the engine from its own checkout. The launcher needs Python 3.11–3.14 on a Linux login node; `--dry-run` also works elsewhere. Site profiles in `profiles/` set Python modules, constraints, partitions and accounts; `--qos` works with any profile.
+CLI options override profile defaults, within the profile's maximum time. With no profile, supply partition and any constraint or QoS on the command line. `--constraint none` omits that Slurm argument. With no QoS, Slurm's account default applies. Accounts are always explicit.
 
-The compute nodes must share the run directory, allow TLS connections from workers to the dispatcher, and provide `srun` and `openssl`. The submitting account needs read access to its Slurm association and QoS limits and usage (`sacctmgr`, `scontrol show assoc_mgr`); submission stops if a limit cannot be read. The cache admission code expects Lustre project paths and `lfs` project-quota commands. On BMRC and other clusters the cache workflow still needs site validation of quota handling and CPU binding.
+Worker count comes from live capacity and remaining work; `--workers` is an optional upper limit for every preset and site. Without a cap, the initial plan uses a worker count of 1 as a placeholder. Each round records its actual allocation.
+
+| Setting | Default |
+|---|---|
+| Worker memory | 16G |
+| Worker rounds | 2 |
+| Worker time, `timing_full` / `production` | Profile maximum; explicit `--time` required without a profile |
+| Worker time, other presets | 1 hour |
+| Bootstrap and controller | 1 CPU, 48G, 2 hours |
+
+`--memory`, `--rounds`, `--time`, `--plan-memory` and `--plan-time` override these requests. Live Slurm limits can reduce each worker allocation.
 
 ## Preparing data
 
-The panel's schema points to analysis data prepared by the adapter. Prepared data can be reused, and `--schema` selects a different prepared input without rewriting the tracked schema. To change preprocessing, regenerate the data and schema with the adapter before starting a run.
+Use `--prepare --data-dir DIR` together. They cannot be combined with `--schema` or a resume. The login node checks file existence; raw data is read only in the bootstrap allocation. The launcher does not download inputs or search for data directories.
 
-On Discoverer, `--prepare-ffc --ffc-data-dir YOUR_DATA_DIRECTORY` prepares the selected FFCWS panel on a compute node. The directory holds `background.dta`, `train.csv`, `test.csv` and the labels for the selected outcome.
+Each manifest's top-level `preparation` mapping names its adapter, required files relative to `--data-dir` and generated schema. FFC also declares its YAML config, a panel-name pattern extracting strategy and outcome, and strategy arguments. SMR declares its fixed feature contract. Validation models, minimum N, split fraction and seed follow the selected panel and preset.
 
-## Scheduling options
+- FFCWS requires `background.dta`, `train.csv` and `test.csv`. Preparation selects the panel's outcome and encoding.
+- SMR requires `asample2_withlag.csv`. Its adapter's `--output-root` directs schema and ARD publication into the run directory.
 
-Each round checks the live account, QoS, partition, existing-job and CPU-minute limits, then submits one worker allocation and the controllers it needs. `--workers` caps the number of numerical workers, `--rounds` limits the number of worker allocations, and `--memory` sets the memory per worker; the per-node request adds a reserve for the queue services. Admission is conservative, and Slurm decides when an allocation starts. A worker allocation reserves slots for the queue services; a model task is not a separate Slurm job.
+All generated configuration, work files, ARD and schemas stay under `<run>/prepared/`. The execution request records the generated schema path and SHA-256. Tracked schemas and original data are unchanged.
 
-Every round uses a 600-second heartbeat and a 3,600-second task lease, both fixed in the queue manifest by `shared_queue.transport_manifest`. A failed heartbeat is retried within 30 seconds, and the tasks of a lost worker are handed out again after at most one lease interval. The queue service accepts a limited number of result submissions at once: 32 by default, never more than half its connection limit, and 256 under the Discoverer policy. A submission over the limit receives a retryable HTTP 503, and the worker keeps its result until it is accepted. Progress records show submission back-pressure, heartbeat age and expired leases.
+## Presets and environments
 
-## Dispatcher shards and initial policy
-
-A dispatcher shard is one queue service process; it is not a compute node, a prediction file or a verification chunk. Request the number for a new run with `--dispatcher-shards` (1–8). Base and SL phases use the same setting. With more than one dispatcher, each gets two validation processes unless the policy file sets another number.
-
-`--scheduler-policy PATH.json` supplies the initial operational policy. `--dispatcher-shards` overrides the value in that file, and fields the file leaves out keep their defaults. The launch saves both `scheduler-policy.initial.json` and the current `scheduler-policy.json`; restarting preparation keeps later operational edits. A resumed run keeps its existing policy and rejects these new-run options.
-
-The Discoverer preset `launch/policies/discoverer-cache.json` requests four dispatchers, common resource limits for base and SL, and distributed final verification. It sizes rounds by capacity, with up to 300 compute nodes plus two controller nodes, 3 GiB per worker and ten-hour worker allocations. It is a Discoverer setting, not a resource recommendation for BMRC. The actual allocation still depends on live limits, memory, service-core reservations and the work left. If an allocation cannot fit the requested dispatchers, admission falls back to one and reports `requested_dispatcher_shards`, the actual count and `shard_admission_note`.
-
-| Entry | `--dispatcher-shards` | Cache and SL workflow |
+| Preset | Seeds × draws | Grid |
 |---|---|---|
-| Discoverer, shared single-model entry | Supported | Implemented; each release needs isolated Linux validation |
-| BMRC or another Slurm cluster, prepared data | Supported, same policy code | Shared core workflow; quota and CPU binding need site validation |
+| dev | 3 × 3 | 3 × 3, N and K at most 100 |
+| timing_full | 1 × 1 | 20 × 20 over the full input |
+| production | 100 × 50 | 20 × 20; requires `--allow-large-run` |
 
-A BMRC prepared-data preview, with its constraint selected explicitly:
+`medium` and `pilot` are also available. Models come from the panel; `--models` selects a unique subset.
+
+The shared environment key includes locked dependencies in `NK_Grid/requirements.txt`, the Python module and CPU type. Environments live in `nkgrid-envs/` beside the checkout, or `NKGRID_ENV_ROOT`. Bootstrap creates a missing environment under a lock; later runs reuse it unchanged. Engine code always comes from the run's checkout. Pip cache is shared there, while install temporary files stay in `<run>/tmp/bootstrap-JOBID/`.
+
+## Storage admission
+
+Before cache work, the controller reserves estimated unwritten bytes, temporary worker space and file count.
+
+With an available `lfs` executable, admission uses the Lustre project ID and soft byte/file quotas under `projects/PROJECT`, plus filesystem free bytes. Pending reservations share a project ledger.
+
+Without `lfs`, admission uses `os.statvfs` on the cache directory: `f_bavail × f_frsize` bytes and `f_favail` inodes. These values feed the same admission checks. Its ledger lives in the run's cache directory and accounts for that run's pending allocation; filesystem availability includes all data already written. It does not coordinate unwritten reservations across separate runs.
+
+The admission receipt records the ledger location. Verified completion releases the pending reservation using that receipt. Both modes preserve data and apply the workflow's storage reserves.
+
+## Scheduling and policy
+
+Each round checks account, QoS, partition, existing jobs and CPU-minute headroom, then submits the worker allocation and required controllers. Workers use one numerical thread; service cores and memory are included in the allocation. Slurm decides when jobs start. A task is not a separate Slurm job.
+
+`--dispatcher-shards 1..8` requests queue processes for a new run. More than one defaults to two validation processes per shard. `--scheduler-policy PATH.json` supplies initial operational policy; an explicit shard count overrides it. Launch saves `scheduler-policy.initial.json` and the active `scheduler-policy.json`. Resume preserves that run's policy.
+
+The Discoverer policy `launch/policies/discoverer-cache.json` requests four dispatchers, common base/SL resource limits and distributed final verification. Its resource sizes require a suitable account and should be selected deliberately. Profiles contain site defaults; operational policy controls experiment scheduling resources.
+
+Every round uses a 600-second heartbeat and 3,600-second task lease. Result submission has bounded concurrency; a busy service returns retryable HTTP 503 and workers retain unaccepted results. [PREDICTION_CACHE.md](PREDICTION_CACHE.md) describes base, index, SL and final verification.
+
+## Results and recovery
+
+A run lives at `<manifest directory>/outputs/<panel>-<ID>/`, ignored by Git.
+
+| File | Evidence |
+|---|---|
+| `launch.json` | Frozen request, source commit and manifest identity |
+| `launch.submission.json` | Bootstrap job ID |
+| `bootstrap-journal.json` | Submission intent and recovered job identity |
+| `logs/bootstrap-JOBID.out/.err` | Environment, preparation and planning logs |
+| `prepared-launch.json` | Request with prepared schema and hash |
+| `plan.json` | Frozen experimental plan |
+| `cluster-state.json` | Controller receipts, rounds and status |
+| `verified.json` | Final coverage, integrity and CSV identity |
+| `final.csv` | Verified result table |
+
+Recover a lost bootstrap submission response using the same request and journal:
 
 ```bash
-bash run.sh slurm --profile bmrc --account YOUR_PROJECT_ACCOUNT \
-  --constraint skl-compat --preset timing_full --dispatcher-shards 4 --dry-run
+python launch/experiment.py recover-bootstrap --request /absolute/run/launch.json
 ```
 
-## Results and output locations
+The journal matches the original unique name against both `squeue` and `sacct`; it does not resubmit an uncertain intent. For a failed bootstrap, inspect its logs and job state before launching a new run.
 
-Every run is created at `<manifest directory>/outputs/<panel>-<unique ID>/`, with the validated result in `final.csv`. For the FFCWS GPA panel this is `FFCWS/outputs/ffc_median_mode_gpa-<unique ID>/`; SMR panels use `SMR/outputs/<panel>-<unique ID>/`. These paths are inside the repository. `outputs/` is ignored by Git, so the checkout stays clean. A resumed run keeps its original directory.
+Resume a stopped plan from its original clean checkout, with the original profile and account:
 
-After a trial, check the process or scheduler logs for out-of-memory errors and timeouts, and look at the `status` and `error` columns. `cluster-state.json` records a cluster run's controller receipts, rounds and status; `complete` means validation, publication and the selected checkpoint handling have finished. `verified.json` ties the final CSV to the exact task count and the source receipts. With `--checkpoints delete`, only the run's `rounds/` checkpoint directory is removed, after publication; the plan, final CSV and verification receipts stay.
+```bash
+bash run.sh slurm --profile YOUR_SITE --account YOUR_ACCOUNT --resume /absolute/run/plan.json
+```
 
-## Resuming
-
-Resume with the original profile and account and `--resume /absolute/run/plan.json`. The resumed run reuses the original inputs and parameters, reads the saved results and schedules only the remaining tasks; training whose results were not saved before the interruption is repeated. The launcher does not change the settings of an existing run in place, and a run is resumed only from the checkout that started it.
-
+Resume keeps frozen inputs, resources, environment and checkpoint policy. Only missing tasks are scheduled. `--checkpoints keep` is the default; `delete` removes round checkpoints only after verified publication. Plans, receipts and the final CSV remain.

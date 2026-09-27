@@ -1,7 +1,6 @@
 """Single-command bootstrap and shared single-model cluster orchestration.
 
-The bootstrap and dry run use only the standard library. Numerical work runs in
-the shared dependency environment and imports the engine from this checkout.
+Numerical work runs in the shared dependency environment and imports the engine from this checkout.
 """
 from __future__ import annotations
 
@@ -71,8 +70,8 @@ def path_from_repo(value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("target", choices=("slurm", "execute", "bootstrap"))
-    p.add_argument("--profile", choices=("bmrc", "discoverer"))
+    p.add_argument("target", choices=("slurm", "execute", "bootstrap", "recover-bootstrap"))
+    p.add_argument("--profile", help="Site defaults loaded by run.sh from launch/profiles/NAME.sh")
     p.add_argument("--manifest", default="FFCWS/panels.yaml")
     p.add_argument("--panel", default="ffc_median_mode_gpa")
     p.add_argument("--preset", choices=("dev", "medium", "timing_full", "production", "pilot"), default="dev")
@@ -84,53 +83,84 @@ def parser():
     p.add_argument("--dry-run", action="store_true", help="Read-only launch preview; no installation, data reads or submission")
     p.add_argument("--resume", help="Resume a run from its plan.json")
     p.add_argument("--account", help="Required for Slurm, including resume; explicitly enter your authorized project account")
-    p.add_argument("--qos", help="Slurm QoS; Discoverer defaults to the explicit account")
-    p.add_argument("--prepare-ffc", action="store_true", help="Discoverer: prepare selected FFC panel on a compute node")
-    p.add_argument("--ffc-data-dir", help="Directory containing background.dta, train.csv and test.csv")
-    p.add_argument("--constraint", default=os.environ.get("NKGRID_CONSTRAINT"))
+    p.add_argument("--qos", help="Slurm QoS; overrides the profile default")
+    p.add_argument("--prepare", action="store_true", help="Prepare the selected panel on the bootstrap node")
+    p.add_argument("--data-dir", help="Directory containing the raw files declared in the panel manifest")
+    p.add_argument("--constraint")
     p.add_argument("--partition")
     p.add_argument("--time", dest="time_limit")
-    p.add_argument("--workers", type=positive, help="Worker cap; Discoverer timing_full/production resolves live capacity by default")
+    p.add_argument("--workers", type=positive, help="Optional worker cap; live capacity determines the default")
     p.add_argument("--rounds", type=positive, help="Maximum continuation rounds; all clusters submit only the current worker allocation")
     p.add_argument("--memory", help="Optional worker memory request, e.g. 16G")
     p.add_argument('--dispatcher-shards', type=int, choices=range(1, 9), metavar='1..8',
                    help='New shared Slurm run: requested dispatcher shards for both base and SL; >1 defaults to two validators per shard')
     p.add_argument('--scheduler-policy', help='New shared Slurm run: operational policy JSON; explicit shard option overrides this file')
     p.add_argument("--plan-memory")
-    p.add_argument("--plan-time", help="Planning job time; production 8h, other presets 1h")
+    p.add_argument("--plan-time", help="Bootstrap and controller time; default 2h")
     p.add_argument("--request", help=argparse.SUPPRESS)
     return p
 
 
+def wall_seconds(value):
+    """Parse a positive finite Slurm duration in minutes or day/hour clock form."""
+    if not re.fullmatch(r"(?:\d+-)?\d+(?::\d{1,2}){0,2}", value):
+        raise ValueError("Time must be a finite Slurm duration")
+    day, clock = value.split("-", 1) if "-" in value else (None, value)
+    fields = [int(part) for part in clock.split(":")]
+    if any(part >= 60 for part in fields[1:]):
+        raise ValueError("invalid Slurm clock fields")
+    if day is not None:
+        fields += [0] * (3 - len(fields))
+        seconds = int(day) * 86400 + fields[0] * 3600 + fields[1] * 60 + fields[2]
+    elif len(fields) == 1:
+        seconds = fields[0] * 60
+    elif len(fields) == 2:
+        seconds = fields[0] * 60 + fields[1]
+    else:
+        seconds = fields[0] * 3600 + fields[1] * 60 + fields[2]
+    if seconds <= 0:
+        raise ValueError("Job time must be positive")
+    return seconds
+
+
 def launch_spec(args):
-    if args.profile == "discoverer":
-        from discoverer import configure
-        configure(args)
-    elif args.prepare_ffc or args.ffc_data_dir:
-        raise ValueError("--prepare-ffc and --ffc-data-dir require --profile discoverer")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.panel):
         raise ValueError("panel name may contain only letters, digits, _, . and -")
     if args.resume and (args.schema or args.models or args.preset != "dev"
                         or args.manifest != "FFCWS/panels.yaml" or args.panel != "ffc_median_mode_gpa"
                         or any((args.workers, args.rounds, args.partition, args.time_limit, args.memory,
-                                args.dispatcher_shards, args.scheduler_policy))):
+                                args.dispatcher_shards, args.scheduler_policy, args.prepare, args.data_dir,
+                                args.plan_time, args.plan_memory, args.constraint))):
         raise ValueError("resume reuses frozen design/resources; do not combine it with design/resource overrides")
     if not args.account or not args.account.strip():
         raise ValueError("Slurm requires explicit --account YOUR_PROJECT_ACCOUNT (including resume); no default account is used")
-    if not args.resume and not args.constraint:
-        raise ValueError("Slurm requires --profile bmrc or explicit --constraint")
+    if args.prepare and args.schema:
+        raise ValueError("--prepare and --schema are mutually exclusive")
+    if bool(args.prepare) != bool(args.data_dir):
+        raise ValueError("--prepare requires --data-dir, and --data-dir requires --prepare")
     if args.preset == "production" and not args.allow_large_run and not args.dry_run:
         raise ValueError("production requires explicit --allow-large-run")
-    production = args.preset == "production"
-    cluster = dict(account=args.account, constraint=args.constraint,
-                   partition=args.partition or ("long" if production else "short"),
-                   time_limit=args.time_limit or ("10-00:00:00" if production else "01:00:00"),
-                   workers=args.workers or (600 if production else 32), rounds=args.rounds or (4 if production else 2),
-                   memory_override=args.memory)
-    if args.profile == "discoverer":
-        cluster.update(qos=args.qos, workers=args.workers or 1)
-    elif args.qos:
-        cluster['qos'] = args.qos
+    defaults = os.environ if args.profile else {}
+    partition = args.partition or defaults.get("NKGRID_PARTITION")
+    if not args.resume and not partition:
+        raise ValueError("Slurm requires --partition or a profile partition")
+    maximum = defaults.get("NKGRID_MAX_TIME")
+    time_limit = args.time_limit or (maximum if args.preset in ("timing_full", "production") else "01:00:00")
+    if not args.resume and not time_limit:
+        raise ValueError("timing_full/production requires --time or a profile maximum time")
+    plan_time = args.plan_time or "02:00:00"
+    for value in (time_limit, plan_time):
+        if value is not None:
+            seconds = wall_seconds(value)
+            if maximum and seconds > wall_seconds(maximum):
+                raise ValueError("Requested time exceeds the profile maximum")
+    default_qos = defaults.get("NKGRID_QOS")
+    qos = args.qos or (args.account if default_qos == "account" else default_qos)
+    cluster = dict(account=args.account, qos=qos,
+                   constraint=args.constraint or defaults.get("NKGRID_CONSTRAINT") or "none",
+                   partition=partition, time_limit=time_limit,
+                   workers=args.workers or 1, rounds=args.rounds or 2,
+                   memory_override=args.memory or "16G")
     for value in [*cluster.values(), args.plan_time, args.plan_memory]:
         if isinstance(value, str) and ("\n" in value or "\r" in value or "\x00" in value):
             raise ValueError("scheduler fields must be single-line strings")
@@ -141,13 +171,16 @@ def launch_spec(args):
     result = dict(format_version=1, profile=args.profile, panel=args.panel, preset=args.preset,
                 manifest=str(manifest), schema=str(path_from_repo(args.schema)) if args.schema else None,
                 models=args.models, output=str(output), allow_large_run=args.allow_large_run,
-                cluster=cluster, plan_memory=args.plan_memory or "16G",
+                cluster=cluster, plan_memory=args.plan_memory or "48G",
                 checkpoint_retention=args.checkpoints or "keep",
-                plan_time=args.plan_time or ("08:00:00" if production else "01:00:00"))
-    if args.profile == "discoverer":
-        result["continuation"] = {"worker_cap": args.workers, "max_rounds": args.rounds or 2,
-                                  "max_no_progress_rounds": 2, "max_control_failures": 3,
-                                  "max_control_jobs": 4 * (args.rounds or 2) + 8}
+                plan_time=plan_time)
+    result["continuation"] = {"worker_cap": args.workers, "max_rounds": args.rounds or 2,
+                              "max_no_progress_rounds": 2, "max_control_failures": 3,
+                              "max_control_jobs": 4 * (args.rounds or 2) + 8}
+    result["bootstrap"] = {"shared_env_root": str(shared_env_root()),
+                           "python_module": defaults.get("PYTHON_MODULE", ""),
+                           "prepare": args.prepare,
+                           "data_dir": str(path_from_repo(args.data_dir)) if args.data_dir else None}
     if args.dispatcher_shards is not None or args.scheduler_policy is not None:
         if args.resume:
             raise ValueError('Dispatcher options apply to a new shared Slurm run; existing rounds retain their snapshot')
@@ -241,7 +274,8 @@ def resolve_experiment(spec):
     from aleatoric_nk_grid.ingest import load_input
     from aleatoric_nk_grid.validate_input import validate_input
     from aleatoric_nk_grid.nk_grid import resolve_input_grids, LARGE_RUN_THRESHOLD
-    panels = resolved_panels(Path(spec["manifest"]), only={spec["panel"]}, preset=spec["preset"])
+    panels = resolved_panels(Path(spec["manifest"]), only={spec["panel"]}, preset=spec["preset"],
+                             schema=Path(spec["schema"]) if spec["schema"] else None)
     if len(panels) != 1:
         raise ValueError(f"expected one panel named {spec['panel']}, found {len(panels)}")
     _, config = panels[0]
@@ -256,7 +290,7 @@ def resolve_experiment(spec):
         loaded = load_input(config.schema, config.outcome)
     except FileNotFoundError as exc:
         raise ValueError("Prepared input missing. Use --schema to point to existing ARD/schema, "
-                         "or prepare the private dataset with its adapter once. No input is fabricated or overwritten.") from exc
+                         "or launch with --prepare --data-dir DIR.") from exc
     loaded, groups = validate_input(loaded, config.outcome, models=config.models,
                                   min_n=config.min_n, test_size=config.test_size, seed=config.seed)
     n_grid, k_grid = resolve_input_grids(config, loaded, groups)
@@ -282,29 +316,21 @@ def execute(spec):
     start(plan_path)
 
 
-def slurm_command(spec, request):
-    cluster = spec["cluster"]
-    args = ["sbatch", "--parsable", "--job-name=nkgrid-plan-submit", "--cpus-per-task=1",
-            "--chdir=" + spec["output"], "--output=" + str(Path(spec["output"]) / "logs/plan-%j.out"),
-            "--error=" + str(Path(spec["output"]) / "logs/plan-%j.err"),
-            "--account=" + cluster["account"], "--partition=" + cluster["partition"],
-            "--mem=" + spec["plan_memory"], "--time=" + spec["plan_time"]]
-    if cluster["constraint"] != "none":
-        args += ["--constraint=" + cluster["constraint"]]
-    if cluster.get('qos'):
-        args += ['--qos=' + cluster['qos']]
-    return args + [str(ROOT / "launch/prepare_and_submit.sbatch"), str(request)]
-
-
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser().parse_args(argv)
     if args.target != 'slurm' and (args.dispatcher_shards is not None or args.scheduler_policy is not None):
         raise ValueError('Dispatcher options apply to new shared Slurm launches')
+    if args.target == "recover-bootstrap":
+        if not args.request:
+            raise ValueError("recover-bootstrap requires --request")
+        from bootstrap import submit_bootstrap
+        print("Bootstrap job: " + submit_bootstrap(args.request))
+        return
     if args.target == "bootstrap":
         if args.checkpoints is not None:
             raise ValueError("bootstrap reuses the frozen launch request; set --checkpoints on slurm instead")
-        from discoverer import bootstrap
+        from bootstrap import bootstrap
         bootstrap(args.request)
         return
     if args.target == "execute":
@@ -314,7 +340,15 @@ def main(argv=None):
             raise ValueError("execute reuses the frozen launch request; set --checkpoints on slurm instead")
         if sys.platform == "win32":
             raise ValueError("Full engine execution requires Linux/WSL")
-        execute(json.loads(Path(args.request).read_text(encoding="utf-8")))
+        if not os.environ.get("SLURM_JOB_ID"):
+            raise ValueError("execute requires a Slurm compute allocation")
+        spec = json.loads(Path(args.request).read_text(encoding="utf-8"))
+        validate_source(spec)
+        if spec["bootstrap"]["prepare"]:
+            from preparation import prepare_data
+            prepare_data(spec)
+        atomic_json(Path(spec["output"]) / "prepared-launch.json", spec)
+        execute(spec)
         return
     if not args.resume and not any(a == "--preset" or a.startswith("--preset=") for a in argv):
         raise ValueError("New runs require an explicit --preset")
@@ -323,64 +357,13 @@ def main(argv=None):
         from cluster_scheduler import resume
         resume(args)
         return
-    if args.profile == "discoverer":
-        from discoverer import launch
-        launch(args, spec)
-        return
-    if args.dry_run:
-        print(json.dumps({"launch": spec,
-                          "actions": ["reuse or create the shared dependency environment",
-                                      "submit planning job, then shared single-model scheduler"],
-                          "note": "Read-only preview; input availability and resolved cell count checked at execution."}, indent=2))
-        return
-    if sys.platform == "win32":
-        raise ValueError("Run this command in a Linux cluster login shell; --dry-run works anywhere")
-    if not (3, 11) <= sys.version_info[:2] < (3, 15):
-        raise ValueError("Python 3.11–3.14 required; select the cluster module or NKGRID_BOOTSTRAP_PYTHON")
-    source = frozen_source()
-    if source["dirty"]:
-        raise ValueError("Slurm requires a clean committed checkout; commit changes before submission")
-    output = Path(spec["output"])
-    if output.exists():
-        raise FileExistsError(f"run directory already exists: {output}")
-    ignored = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=ROOT)
-    if ignored.returncode != 0:
-        raise ValueError("Run directory must be Git-ignored (the default <catalog>/outputs/ is) so launching does not dirty the frozen checkout")
-    # Every cluster: one environment per set of locked dependencies, shared by runs.
-    python, venv = ensure_shared_environment(shared_env_root())
-    environment = {**{k: v for k, v in os.environ.items() if not k.startswith('SBATCH_')},
-                   "VENV": str(venv), "PYTHON": str(python), "ENGINE_DIR": str(ROOT / "NK_Grid"),
-                   "PYTHONPATH": str(ENGINE_SRC), **{key: "1" for key in THREADS}}
-    output = Path(spec["output"])
-    output.mkdir(parents=True, exist_ok=False)
-    (output / "logs").mkdir()
-    spec.update(source=source, manifest_sha256=sha256(spec["manifest"]))
-    if spec["schema"]:
-        spec["schema_sha256"] = sha256(spec["schema"])
-    request = output / "launch.json"
-    atomic_json(request, spec)
-    print(f"Run directory: {output}", flush=True)
-    from slurm_submission import Journal, Slurm, _lock
-    with _lock(output / '.planning.lock'):
-        state = {'run_id': uuid.uuid4().hex, 'jobs': {}}
-        journal = Journal(output / 'planning-journal.json', state,
-                          Slurm(spec['cluster']['account'], spec['cluster'].get('qos')))
-        # Journal submission uses a sanitized environment; preserve the
-        # freshly validated venv for the compute-node planning entry.
-        prior = dict(os.environ)
-        try:
-            os.environ.update(environment)
-            job_id = journal.submit('P0', [a for a in slurm_command(spec, request)[2:]
-                                           if not a.startswith('--job-name=')])
-        finally:
-            os.environ.clear(); os.environ.update(prior)
-    atomic_json(output / "submission.json", {"planning_job": job_id, "request": str(request)})
-    print(f"Planning job: {job_id}; after planning, the shared single-model scheduler starts automatically.")
+    from bootstrap import launch
+    launch(args, spec)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, FileExistsError, subprocess.CalledProcessError) as exc:
+    except (ValueError, FileNotFoundError, FileExistsError, subprocess.CalledProcessError) as exc:
         print(f"NKGRID: {exc}", file=sys.stderr)
         raise SystemExit(2)

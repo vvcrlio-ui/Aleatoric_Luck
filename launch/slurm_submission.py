@@ -17,7 +17,7 @@ import time
 import uuid
 
 import experiment as common
-import discoverer_resources as resources
+import slurm_resources as resources
 
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
 

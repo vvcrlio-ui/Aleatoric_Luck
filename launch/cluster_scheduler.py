@@ -208,7 +208,7 @@ def calibrate_sl_round(state, calibration, policy, remaining):
 
 def worker_cpu_hours(state):
     """Charge stopped rounds once; missing receipt means the full reservation."""
-    from discoverer_resources import duration
+    from slurm_resources import duration
     total = 0.
     for item in state['rounds'] + state.get('verification_rounds', []):
         if item['label'] not in state['jobs']: continue
@@ -445,7 +445,7 @@ def check(plan_path):
     from aleatoric_nk_grid import parallel_verification as verification
     from aleatoric_nk_grid.direct_success_queue import allocation_start_time
     from aleatoric_nk_grid.shared_queue import digest
-    from discoverer_resources import duration
+    from slurm_resources import duration
     import time
     plan = load(plan_path); root = Path(plan_path).parent
     with _lock(root / '.cluster-state.lock'):
@@ -554,7 +554,7 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         prior_control_bounds = [value for value in prior_control_bounds if value is not None]
         guard_allowed = True
         if remaining_budget is not None and prior_control_bounds:
-            from discoverer_resources import duration
+            from slurm_resources import duration
             guard_allowed = ((controls + 1) * max(prior_control_bounds)
                              * duration(spec['plan_time']) / 3600 <= remaining_budget)
         # This guard covers failures during scanning, preparation and sbatch.
@@ -749,7 +749,7 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         allocation['prior_no_progress_rounds'] = stalled
         allocation['max_no_progress_rounds'] = max_no_progress
         if remaining_budget is not None:
-            from discoverer_resources import duration
+            from slurm_resources import duration
             cpu = allocation.get('allocated_cpu_bound')
             control_cpu = allocation.get('control_cpu_bound')
             if cpu is None or control_cpu is None:
@@ -858,7 +858,7 @@ def work(plan_path):
             journal.submit('Gwait-' + os.environ['SLURM_JOB_ID'],
                 batch_args(plan['launch'], 'control', plan_path, dependency=os.environ['SLURM_JOB_ID'],
                            policy=operational['policy']))
-    from discoverer_resources import duration
+    from slurm_resources import duration
     runtime.run(Path(item['root']), common.ROOT, common.ROOT, item['allocation']['workers'],
                 validate_only=True, max_seconds=duration(item['allocation']['time_limit']),
                 policy=operational['policy'], cost_profile=operational['cost_profile'],

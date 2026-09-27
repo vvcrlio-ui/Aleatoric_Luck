@@ -200,6 +200,7 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
 
 def resolved_panels(
     manifest_path: Path, only: set[str] | None = None, *, preset: str | None = None,
+    schema: Path | None = None,
 ) -> list[tuple[str, NKGridConfig]]:
     """Resolve selected panels, optionally through one declared preset."""
 
@@ -208,7 +209,7 @@ def resolved_panels(
     manifest = load_manifest(manifest_path)
     allowed_root = {
         "panels", "model_params", "preset", "experiment_id", "data_version",
-        "model_spec_version", "repeat_plan", "n_grid", "k_grid", "panel_family",
+        "model_spec_version", "repeat_plan", "n_grid", "k_grid", "panel_family", "preparation",
     }
     root_unknown = sorted(set(manifest) - allowed_root)
     if root_unknown:
@@ -228,5 +229,7 @@ def resolved_panels(
         values = {**shared, **panel}
         if preset is not None:
             values["preset"] = preset
+        if schema is not None:
+            values["schema"] = schema
         panels.append(resolve_panel(values, Path(manifest_path).parent))
     return panels
