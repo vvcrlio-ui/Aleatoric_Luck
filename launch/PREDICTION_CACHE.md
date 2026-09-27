@@ -118,8 +118,8 @@ Holdout labels are loaded by the scoring step after fitting the combiner.
 
 Use the ordinary `launch/experiment.py slurm` command with a new FFC manifest
 containing the above options. `cluster_queue.prepare_joint` accepts explicitly
-prepared panel plans and creates one multi-panel barrier. The legacy suite,
-flat-task-table and local full-run paths reject required cache configurations.
+prepared panel plans and creates one multi-panel barrier. The flat-task-table
+and local full-run paths reject required cache configurations.
 They do not silently fall back to mixed full SL training.
 
 An isolated native acceptance run can be prepared without submitting jobs:

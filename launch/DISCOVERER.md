@@ -2,7 +2,7 @@
 
 新运行与 BMRC 的 prepared-data 入口相同，由共享 single-model 调度器（[cluster_scheduler.py](cluster_scheduler.py)）执行；调度、恢复和状态文件见[启动指南](README.md)。`--profile discoverer` 额外把安装依赖、可选 FFC 数据准备和计划生成放进一个 Slurm bootstrap 作业。登录节点只检查提交条件、写启动请求并提交这个 bootstrap 作业。
 
-> 本文关于 worker array、控制作业链、`continuation.json`、`rounds/N/` 的段落，以及“验证范围”一节，描述的是 2026-09-08 引入的旧续跑协议。该协议现在只用于恢复带有 `continuation.json` 的历史运行；新运行的状态记录在 `cluster-state.json` 和 `verified.json` 中。
+> 2026-09-08 引入的旧续跑协议（`continuation.json`、控制作业链）已从现行代码删除；带 `continuation.json` 的历史运行在其原冻结 checkout 中恢复。
 
 ## 首次运行 FFC GPA timing_full
 
@@ -25,9 +25,9 @@ bash run.sh slurm --profile discoverer \
 
 `timing_full` 沿用引擎定义：20×20 N/K 网格、1 seed、1 draw，模型取面板的完整模型列表；最终网格可能因去重而减少。Discoverer timing_full/production 默认自动解析 worker 数；`--rounds 2` 是最多两轮的保护上限，`--time 48:00:00` 是请求上限，仍受实时 MaxWall 限制。rounds 不改变 seed、draw 或模型数量，也不把未保存的单次训练变成连续 96 小时训练。
 
-Discoverer 现在只提交当前轮的一个 worker array 及必要控制/恢复作业。控制作业封存并验证上一轮，完成则验证后发布；有剩余可执行任务才准备下一轮。每轮查询 QoS、用户和账户祖先关联、分区、Slurm 配置及已有作业，并在准备后提交 worker 前再次检查。worker 数取有效运行/提交数、CPU/内存/节点资源、剩余任务组的保守交集，计入实际辅助作业，不为未来轮次预留 array。700/1000 快照且没有其他限制或作业时通常约 698 workers；实际决策写入收据，不保证立即调度。显式 `--workers` 设置自动容量上限。
+每轮只提交当前这一个 worker 分配：提交前查询账户、QoS、分区、已有作业和 CPU 分钟余量，worker 数由这些实时限制和剩余任务共同决定，不为后续轮次预留作业。显式 `--workers` 设置上限。细节见 [OPERATIONS.md](OPERATIONS.md#scheduling-options)。
 
-资源调整只改变 execution plan ID，保持 analysis ID、任务表、模型参数及设计不变。dry-run 将实时 worker、QoS/关联/分区和有效 wall time 显示为 unresolved；未传 `--workers` 的 timing_full/production 初始计划使用 `cluster.workers=1` 占位，实际 array 使用本轮冻结快照中的 worker 数。BMRC 的 prepared-data 入口使用同一共享调度器；只有 BMRC `--suite` 或 `--ffc-data-dir` 启动走独立的历史 suite 调度器（见 [BMRC.md](BMRC.md)）。
+资源调整只改变 execution plan ID，保持 analysis ID、任务表、模型参数及设计不变。dry-run 将实时 worker、QoS/关联/分区和有效 wall time 显示为 unresolved；未传 `--workers` 的 timing_full/production 初始计划使用 `cluster.workers=1` 占位，实际分配使用本轮冻结快照中的 worker 数。BMRC 的 prepared-data 入口使用同一共享调度器。
 
 ## 默认资源与环境
 
@@ -119,10 +119,10 @@ runs/balanced-adoption-20260909/baseline-758f0b4，旧结果保持原身份。
 - `bootstrap-journal.json`：bootstrap 原提交意图、唯一名称及接受/恢复状态。
 - `logs/bootstrap-JOBID.out/.err`：环境安装、数据准备和计划生成日志。
 - `prepared-launch.json`：生成 schema 后的执行请求。
-- `plan.json`、`snapshot.json`、`tasks.parquet`：原动态队列计划。
-- `continuation.json`：唯一运行 ID、预先冻结的预算、原 sbatch 意图、实时资源、每轮精确 generation、进度与失败。
-- `rounds/N/snapshot.json`：本轮资源冻结快照；`logs/control-JOBID.*` 为自动控制日志。
-- 其余作业收据、worker 日志和结果沿用原队列布局，位于运行目录及 `out/`。
+- `plan.json`：冻结的单 panel 计划。
+- `cluster-state.json`：控制器收据、各轮次和运行状态；`complete` 表示验证、发布和所选检查点处理均已完成。
+- `verified.json`：把最终 CSV 与精确任务数和来源收据绑定。
+- `rounds/`：各轮检查点；`--checkpoints delete` 只在发布后删除这个目录。
 
 ```bash
 squeue -u "$USER"
@@ -139,35 +139,12 @@ bash run.sh slurm --profile discoverer \
   --resume runs/discoverer-gpa-timing-001/plan.json
 ```
 
-如果初次使用自定义 QoS，恢复时必须传同一个 `--qos`。恢复重用冻结环境和 continuation 收据；已有控制/恢复作业时返回原 ID，不提交重复 bootstrap 或另一条链。不重新准备输入或任务表，旧版一次提交全部轮次的运行不能直接迁入新协议。terminal 状态不得盲目重试；先定位问题并核实作业身份。运行期间保持源码及输入不变。
+如果初次使用自定义 QoS，恢复时必须传同一个 `--qos`。恢复重用冻结环境，由共享调度器只安排剩余任务，不重新准备输入或任务表。terminal 状态不得盲目重试；先定位问题并核实作业身份。运行期间保持源码及输入不变。
 
-每次 sbatch 前持久化原意图与唯一作业名；响应丢失时以 `squeue` 和 `sacct` 的名称/账户/用户/QoS 恢复 ID。array 使用 `JobID` 的根身份，不能用每元素不同的 `JobIDRaw`。未查到不代表未提交，绝不重发不确定意图。bootstrap 响应丢失时，在原干净 checkout 执行 `python launch/discoverer_continuation.py recover-bootstrap runs/运行目录/launch.json` 恢复原身份。
+每次 sbatch 前持久化原意图与唯一作业名；响应丢失时以 `squeue` 和 `sacct` 的名称/账户/用户/QoS 恢复 ID。array 使用 `JobID` 的根身份，不能用每元素不同的 `JobIDRaw`。未查到不代表未提交，绝不重发不确定意图。bootstrap 响应丢失时，在原干净 checkout 执行 `python launch/discoverer.py recover-bootstrap runs/运行目录/launch.json` 恢复原身份。
 
-控制作业在准备/提交 worker 前先安排依赖自身 afterany 的延迟恢复 guard；正常 successor 依赖整个 worker array 的 afterany。正常时 guard 发现已建立后继即退出；部分提交失败时 guard 使用原身份补齐链。控制锁有界等待以处理同时触发；worker 还须通过原引擎精确 ready/generation 检查。续跑完全在集群端运行，不依赖本地电脑、SSH 或本 goal 在线。
-
-默认最多两轮、连续两轮无进展停止、连续三次控制错误停止，最多 16 个控制/恢复作业提交意图（包含正常控制器及 guard，不包含 bootstrap 和 worker array）；控制推进次数也有同值上限。显式设置 `--rounds R` 时，控制上限为 `4R+8`。这些预算在启动前冻结。恢复提交序号单调递增，不随成功后清零的连续失败计数复用。OOM、BOOT_FAIL、FAILED、持久 TASK_ABORTED 或失败模型结果明确停止；TIMEOUT/NODE_FAIL 等仅在预算内重分配。未知接受状态做有界延迟查询，仍不确定则停止并保留意图供检查。
-
-`continuation.json.status` 的含义：
-
-| 状态 | 含义 |
-|---|---|
-| `ready` / `preparing` | 设计已冻结，正在安排或准备当前轮 |
-| `workers_active` | 当前轮 worker 身份已记录，等待其终态及验证 |
-| `recovery_required` | 已记录控制错误并安排有界恢复；不是完成 |
-| `finalizing` | 全部结果已验证，正在发布最终输出 |
-| `complete` | 验证、最终发布及所选检查点保留流程成功 |
-| `round_budget_exhausted` / `no_progress` / `no_executable_tasks` | 按轮次/进度/可执行任务条件停止，实验可能未完整 |
-| `control_budget_exhausted` / `quota_insufficient` / `unrecoverable` | 按控制预算、资源或失败证据停止，需要检查收据和日志 |
-
-除 `complete` 外，停止状态都不能作为完整实验成功的凭据；恢复入口也不允许直接重启这些 terminal 状态。
 
 生产规模仍要求显式 `--allow-large-run`。检查点沿用共享引擎的保留/恢复协议。可在首次启动时传 `--checkpoints delete`，只在验证成功后清理检查点并保留最终 CSV；`--checkpoints keep` 显式保留。恢复时不能更改已冻结的策略。
-
-## 验证范围（旧续跑协议，2026-09-08）
-
-本地 35 项调度测试覆盖模拟上限、剩余任务缩容、依赖、部分提交恢复、响应丢失、重复触发、guard 锁竞争、OOM 与无进展/预算停止。Linux 集成测试使用真实任务表、资源合约、OLS 训练、WAL、封存验证与发布，仅模拟 Slurm。2026-09-08 的有界计算节点验证通过 217 项模型/调度/引擎测试，随后当前源码快照通过另外 50 项测试，其中只读 WAL 观察测试使用真实结果增长、冻结身份校验，并确认不获取文件锁、不改写运行文件。第二份快照包含 controller 的目录重入修正；它不是对真实 Slurm 控制链的端到端验证。
-
-这些结果没有验证一次真实 Slurm 自动多轮训练链；尚未提交新版正式 FFC GPA timing_full，也没有正式运行结果验收。批量/尾批科学决策已按用户要求暂停，本次整理只推进到 GitHub 推送前；不据此宣称已选择新的 MLP 协议或已完成正式实验。
 
 站点参考：[作业资源](https://docs.discoverer.bg/writing_slurm_batch.html)、[登录节点限制](https://docs.discoverer.bg/cpu-login-node-resource-limits.html)。
 Slurm 参考：[资源限制](https://slurm.schedmd.com/resource_limits.html)、[sacctmgr](https://slurm.schedmd.com/sacctmgr.html)、[array 身份](https://slurm.schedmd.com/job_array.html)。

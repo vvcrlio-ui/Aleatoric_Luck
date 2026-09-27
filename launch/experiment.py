@@ -67,13 +67,10 @@ def path_from_repo(value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("target", choices=("local", "slurm", "execute", "bootstrap", "status"))
+    p.add_argument("target", choices=("local", "slurm", "execute", "bootstrap"))
     p.add_argument("--profile", choices=("local", "bmrc", "discoverer"), default="local")
     p.add_argument("--manifest", default="FFCWS/panels.yaml")
     p.add_argument("--panel", default="ffc_median_mode_gpa")
-    p.add_argument("--suite", choices=("ffc_non_gpa",))
-    p.add_argument("--resources", help="Create or reuse an exact BMRC allocation JSON (suite only)")
-    p.add_argument("--run", help="Run directory for status")
     p.add_argument("--preset", choices=("dev", "medium", "timing_full", "production", "pilot", "dev-dynamic"), default="dev")
     p.add_argument("--output", help="New run directory; defaults to <manifest directory>/outputs/<panel>-<unique ID>")
     p.add_argument("--schema", help="Use existing prepared data via its schema; never rewrite tracked schema")
@@ -85,7 +82,7 @@ def parser():
     p.add_argument("--checkpoints", choices=("keep", "delete"),
                    help="Keep (default) or delete checkpoint data only after verified success")
     p.add_argument("--dry-run", action="store_true", help="Read-only launch preview; no installation, data reads or submission")
-    p.add_argument("--resume", help="Slurm: resume a suite run directory or a historical/single-panel plan JSON")
+    p.add_argument("--resume", help="Slurm: resume a single-panel plan JSON; grouped-protocol plans go to their original scripts")
     p.add_argument("--account", help="Required for Slurm, including resume; explicitly enter your authorized project account")
     p.add_argument("--qos", help="Slurm QoS; Discoverer defaults to the explicit account")
     p.add_argument("--prepare-ffc", action="store_true", help="Discoverer: prepare selected FFC panel on a compute node")
@@ -354,18 +351,7 @@ def resume_legacy(args, path, plan):
         print(json.dumps({"plan": str(path), "scheduler": "historical", "actions": ["recover original frozen protocol"]}, indent=2))
         return
     if args.profile == "discoverer":
-        from discoverer import resumed_spec
-        from discoverer_continuation import start
-        spec = resumed_spec(args, path); validate_source(spec)
-        prepared = json.loads((path.parent / "prepared-launch.json").read_bytes())
-        if not (path.parent / "continuation.json").is_file():
-            raise ValueError("Historical continuation journal is required")
-        python = Path(prepared["bootstrap"]["venv"]) / "bin/python"
-        if not python.is_file():
-            raise ValueError("Frozen continuation Python is unavailable")
-        os.environ.update(PYTHON=str(python), VENV=prepared["bootstrap"]["venv"],
-                          ENGINE_DIR=str(ROOT / "NK_Grid"), PYTHON_MODULE=prepared["bootstrap"]["python_module"])
-        return start(prepared, path)
+        raise ValueError("Discoverer continuation.json runs resume from their original frozen checkout")
     python, venv = ensure_environment(args)
     environment = {**os.environ, "PYTHON": str(python), "VENV": str(venv), "ENGINE_DIR": str(ROOT / "NK_Grid")}
     command(["bash", ROOT / "NK_Grid/slurm/legacy_submit_flat_task_table.sh", "--submit", path], cwd=path.parent, env=environment)
@@ -376,12 +362,6 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if args.target != 'slurm' and (args.dispatcher_shards is not None or args.scheduler_policy is not None):
         raise ValueError('Dispatcher options apply to new shared Slurm launches')
-    if args.target == "status" or args.suite or (args.profile == "bmrc" and args.ffc_data_dir) or (args.resume and path_from_repo(args.resume).is_dir()):
-        from suite import entry
-        entry(args, argv)
-        return
-    if args.resources or args.run:
-        raise ValueError("--resources requires --suite; --run requires status")
     if args.target == "bootstrap":
         if args.checkpoints is not None:
             raise ValueError("bootstrap reuses the frozen launch request; set --checkpoints on slurm instead")
@@ -445,7 +425,7 @@ def main(argv=None):
     if args.target == "local":
         command([python, Path(__file__).resolve(), "execute", "--request", request], env=environment)
     else:
-        from discoverer_continuation import Journal, Slurm, _lock
+        from slurm_submission import Journal, Slurm, _lock
         with _lock(output / '.planning.lock'):
             state = {'run_id': uuid.uuid4().hex, 'jobs': {}}
             journal = Journal(output / 'planning-journal.json', state,

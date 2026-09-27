@@ -30,4 +30,4 @@ A task counts as done only once its result has been saved and accepted. If an al
 - [OPERATIONS.md](OPERATIONS.md): commands, clusters, scheduling policy, resuming and output locations.
 - [PREDICTION_CACHE.md](PREDICTION_CACHE.md): how predictions are saved and checked, and how SL7 uses them.
 - [SCHEDULER_EFFICIENCY.md](SCHEDULER_EFFICIENCY.md): how task costs are estimated.
-- [DISCOVERER.md](DISCOVERER.md) and [BMRC.md](BMRC.md): site notes, including the older BMRC multi-panel suite.
+- [DISCOVERER.md](DISCOVERER.md): Discoverer site notes, method-version history and bootstrap recovery.
