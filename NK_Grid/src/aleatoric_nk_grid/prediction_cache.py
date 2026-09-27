@@ -70,9 +70,6 @@ def cache_identity(identity: Mapping[str, object]) -> str:
     return hashlib.sha256(canonical_bytes(dict(identity))).hexdigest()
 
 
-build_cache_identity = cache_identity
-
-
 def encode_index_json(value):
     return b'ZJ01' + zlib.compress(canonical_bytes(value), 6)
 
@@ -750,13 +747,6 @@ class ShardScan:
     tail_error: str | None
 
 
-def scan_shard(root: Path | str, relative: str) -> ShardScan:
-    """Read-only targeted scan; corruption is explicit and never silently skipped."""
-    path = safe_cache_path(root, relative)
-    with path.open("rb") as handle:
-        return _scan_handle(handle, relative)
-
-
 def _scan_handle(handle, relative: str) -> ShardScan:
     handle.seek(0)
     size = os.fstat(handle.fileno()).st_size
@@ -822,136 +812,6 @@ def rebuild_index(root: Path | str, relative: str, *, writer_revoked: bool = Fal
             _unlock(handle)
 
 
-def verify_coverage(root: Path | str, expected_identities: Iterable[Mapping[str, object] | str],
-                    references: Iterable[Mapping[str, object]], *, require_oof: bool = True,
-                    require_sealed: bool = True, output_name: str | None = "verified.json",
-                    allowed_skip_reasons: Iterable[str] | None = None) -> dict[str, object]:
-    """Verify authoritative references, exact coverage, skips and conflicts.
-
-    Pass references from accepted queue results, not arbitrary orphan shards.
-    This deliberately does not infer score completeness or lease quiescence; the
-    scheduler must check those before its plan-wide barrier may publish success.
-    """
-    root = Path(root)
-    expected = {cache_identity(x) if isinstance(x, Mapping) else x for x in expected_identities}
-    seen, conflicts, failures, shard_hashes, sample_maps = {}, [], [], {}, {}
-    skips, oof_skips = 0, 0
-    legal_reasons = set(allowed_skip_reasons) if allowed_skip_reasons is not None else None
-    for reference in references:
-        record = read_record(root, reference, require_sealed=require_sealed)
-        key = record.reference["identity"]
-        content = record.reference["content_sha256"]
-        if key in seen and seen[key] != content:
-            conflicts.append(key)
-            continue
-        duplicate = key in seen
-        seen[key] = content
-        if record.status == "failed":
-            failures.append(key)
-        elif record.status == "skipped":
-            reason = record.metadata.get("reason")
-            if legal_reasons is not None and reason not in legal_reasons:
-                failures.append(key)
-            if not duplicate:
-                skips += 1
-        else:
-            if "holdout_prediction" not in record.arrays:
-                failures.append(key)
-            oof_skip = record.metadata.get("oof_status") == "skipped" and bool(record.metadata.get("oof_reason"))
-            if oof_skip and legal_reasons is not None and record.metadata["oof_reason"] not in legal_reasons:
-                failures.append(key)
-            if require_oof and "oof_prediction" not in record.arrays:
-                if oof_skip and not duplicate:
-                    oof_skips += 1
-                elif not oof_skip:
-                    failures.append(key)
-            n_samples = record.identity.get("N", record.identity.get("n_samples"))
-            if require_oof and "oof_prediction" in record.arrays and n_samples is not None and (
-                    record.arrays["oof_prediction"].ndim < 1 or record.arrays["oof_prediction"].shape[0] != int(n_samples)):
-                failures.append(key)
-        map_refs = record.metadata.get("sample_map_refs", [])
-        if isinstance(map_refs, Mapping):
-            map_refs = list(map_refs.values())
-        for map_ref in map_refs:
-            map_key = str(map_ref.get("sha256"))
-            if map_key not in sample_maps:
-                mapping = read_record(root, map_ref, require_sealed=require_sealed)
-                if mapping.kind != "sample_map":
-                    raise CacheIntegrityError("sample map reference points to predictions")
-                sample_maps[map_key] = mapping.reference["identity"]
-        if require_sealed:
-            for ref in [reference, *map_refs]:
-                from .prediction_layout import resolve_reference
-                relative = str(resolve_reference(root, ref)["path"])
-                if relative not in shard_hashes:
-                    index, _ = _load_index(_index_path(root, relative))
-                    path = safe_cache_path(root, relative)
-                    if path.stat().st_size != index["bytes"]:
-                        raise CacheIntegrityError("sealed prediction shard size mismatch")
-                    shard_hashes[relative] = {"bytes": index["bytes"], "integrity": "record-sha256-v1"}
-    missing, unexpected = sorted(expected - seen.keys()), sorted(seen.keys() - expected)
-    complete = not (missing or unexpected or conflicts or failures)
-    report = {"format": FORMAT, "prediction_cache_complete": complete,
-              "oof_complete": complete if require_oof else None,
-              "expected_count": len(expected), "verified_count": len(seen), "skipped_count": skips,
-              "oof_skipped_count": oof_skips,
-              "missing": missing, "unexpected": unexpected, "conflicts": sorted(set(conflicts)),
-              "failed": sorted(set(failures)), "shards": shard_hashes,
-              "sample_maps": sample_maps, "index_generation": cache_identity({"records": seen, "shards": shard_hashes}),
-              "cache_bytes": sum(safe_cache_path(root, p).stat().st_size for p in shard_hashes)}
-    if not complete:
-        if output_name:
-            _atomic_json(safe_cache_path(root, output_name + ".incomplete"), report)
-        raise CacheIntegrityError(f"cache coverage incomplete: missing={len(missing)} unexpected={len(unexpected)} conflicts={len(set(conflicts))} failed={len(set(failures))}")
-    if output_name:
-        _atomic_json(safe_cache_path(root, output_name), report)
-    return report
-
-
-def estimate_prediction_bytes(*, n_grid: Sequence[int], k_count: int, holdout_samples: int,
-                               repeats: int, base_models: int = 8, sl_variants: int = 1) -> dict[str, int]:
-    values = [*n_grid, k_count, holdout_samples, repeats, base_models, sl_variants]
-    if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in values):
-        raise ValueError("capacity parameters must be nonnegative integers")
-    base_holdout = repeats * len(n_grid) * k_count * base_models * holdout_samples * 8
-    base_oof = repeats * k_count * base_models * sum(n_grid) * 8
-    sl_holdout = repeats * len(n_grid) * k_count * sl_variants * holdout_samples * 8
-    return {"base_holdout_bytes": base_holdout, "base_oof_bytes": base_oof,
-            "sl_holdout_bytes": sl_holdout, "raw_prediction_bytes": base_holdout + base_oof + sl_holdout}
-
-
-def check_storage_admission(*, used_bytes: int, soft_quota_bytes: int, pending_reserved_bytes: int,
-                            temporary_bytes: int, reserve_bytes: int, used_files: int,
-                            soft_quota_files: int, pending_files: int, temporary_files: int,
-                            reserve_files: int = 1_000_000, filesystem_free_bytes: int | None = None,
-                            quota_observed_at: float, max_quota_age_seconds: float = 300,
-                            now: float | None = None) -> dict[str, object]:
-    """Conservative live soft-quota admission; pending includes all approved runs.
-
-    Callers must refresh site quota and atomically reserve their allocation in a
-    shared reservation ledger. This pure calculation is not itself a reservation.
-    Compression savings and the hard quota are intentionally excluded.
-    """
-    now = time.time() if now is None else now
-    age = now - quota_observed_at
-    if age < -5 or age > max_quota_age_seconds:
-        raise CacheStorageError("live quota evidence is missing/stale")
-    numbers = [used_bytes, soft_quota_bytes, pending_reserved_bytes, temporary_bytes, reserve_bytes,
-               used_files, soft_quota_files, pending_files, temporary_files, reserve_files]
-    if any(v < 0 for v in numbers):
-        raise ValueError("quota/reservation inputs cannot be negative")
-    projected_bytes = used_bytes + pending_reserved_bytes + temporary_bytes + reserve_bytes
-    projected_files = used_files + pending_files + temporary_files + reserve_files
-    filesystem_ok = filesystem_free_bytes is not None and filesystem_free_bytes >= pending_reserved_bytes + temporary_bytes + reserve_bytes
-    admitted = projected_bytes <= soft_quota_bytes and projected_files <= soft_quota_files and filesystem_ok
-    report = {"admitted": admitted, "projected_bytes": projected_bytes,
-              "projected_files": projected_files, "quota_age_seconds": age,
-              "filesystem_free_verified": filesystem_ok}
-    if not admitted:
-        raise CacheStorageError(f"prediction storage admission rejected: {report}")
-    return report
-
-
 def verify_reference(root: Path | str, reference: Mapping[str, object], *,
                      expected_identity: Mapping[str, object] | str | None = None,
                      require_sealed: bool = False, context: ReadContext | None = None) -> dict[str, object]:
@@ -994,65 +854,6 @@ def seal_stopped_writers(root: Path | str, *, writer_revoked: bool = False,
             rebuild_index(root, relative, writer_revoked=True, repair_incomplete_tail=True)
             recovered.append(relative)
     return recovered
-
-
-def verified_index_evidence(root: Path | str, references: Iterable[Mapping[str, object]]) -> list[dict[str, object]]:
-    """Return immutable evidence for exactly these refs, unaffected by later SL."""
-    root = Path(root)
-    paths = set()
-    from .prediction_layout import resolve_reference
-    for reference in references:
-        record = read_record(root, reference, require_sealed=True)
-        paths.add(str(resolve_reference(root, reference)["path"]))
-        maps = record.metadata.get("sample_map_refs", [])
-        if isinstance(maps, Mapping):
-            maps = maps.values()
-        for mapping in maps:
-            read_record(root, mapping, require_sealed=True)
-            paths.add(str(resolve_reference(root, mapping)["path"]))
-    evidence = []
-    for relative in sorted(paths):
-        path = safe_cache_path(root, relative)
-        index_path = _index_path(root, relative)
-        index, _ = _load_index(index_path)
-        if path.stat().st_size != index.get("bytes"):
-            raise CacheIntegrityError("sealed shard differs from its batch index")
-        evidence.extend([{"path": relative, "bytes": index["bytes"], "integrity": "record-sha256-v1"},
-                         {"path": index_path.relative_to(root).as_posix(),
-                          "bytes": index_path.stat().st_size, "integrity": "record-sha256-v1"}])
-    return evidence
-
-
-def find_record(root: Path | str, identity: Mapping[str, object] | str, *,
-                writer_id: str | None = None,
-                authoritative_references: Iterable[Mapping[str, object]] | None = None) -> CacheRecord | None:
-    """Find an exact cached training identity using indexes, never model names.
-
-    Use accepted references when recovering a queue. Without those references the
-    caller must explicitly trust this run/source cache; conflicting predictions
-    cause refusal rather than arbitrary last-writer-wins selection.
-    """
-    root = Path(root)
-    key = cache_identity(identity) if isinstance(identity, Mapping) else identity
-    if not isinstance(key, str) or not _HEX.fullmatch(key):
-        raise CacheIntegrityError("lookup requires a full identity SHA256")
-    if authoritative_references is None:
-        prefix = hashlib.sha256(writer_id.encode()).hexdigest()[:16] + "." if writer_id is not None else ""
-        references = []
-        for directory in ("shards", "meta-results"):
-            for index_path in sorted((root / "indexes").glob(directory + "-" + prefix + "*.pcshard.json")):
-                index, _ = _load_index(index_path)
-                if index.get("sealed"):
-                    references.extend(ref for ref in index.get("records", []) if ref.get("identity") == key)
-    else:
-        references = [ref for ref in authoritative_references if ref.get("identity") == key]
-    found = None
-    for reference in references:
-        record = read_record(root, reference, expected_identity=key, require_sealed=True)
-        if found is not None and found.reference["content_sha256"] != record.reference["content_sha256"]:
-            raise CacheIntegrityError("identical cache identity has conflicting predictions")
-        found = record
-    return found
 
 
 class WriterRecoveryIndex:
@@ -1162,71 +963,3 @@ def retire_private_fold_shards(checkpoint_root: Path | str, relatives: Sequence[
     return retired
 
 
-def compact_shards(root: Path | str, relatives: Sequence[str], *, temporary_byte_limit: int,
-                    writer_revoked: bool = False, target_bytes: int = DEFAULT_SHARD_BYTES) -> dict[str, object]:
-    """Bounded copy/verify/publish; old files stay valid until readers drain.
-
-    Publication returns an immutable remapping generation. The controller must
-    rebase authoritative refs to it before it may call ``retire_compaction``.
-    An interrupted copy leaves harmless unreferenced new shards; no old data or
-    index is modified, and a generation is published only after all copies verify.
-    """
-    if not writer_revoked:
-        raise CacheBusyError("compaction requires stopped source writers")
-    root = Path(root)
-    unique = sorted(set(relatives))
-    source_refs, source_bytes = [], 0
-    for relative in unique:
-        index_path = _index_path(root, relative)
-        if not index_path.is_file():
-            raise CacheIntegrityError("compaction source is unsealed")
-        index = json.loads(index_path.read_text(encoding="utf-8"))
-        source_bytes += safe_cache_path(root, relative).stat().st_size
-        if source_bytes * 2 > temporary_byte_limit:
-            # Includes bounded metadata and transient encoder buffers conservatively.
-            raise CacheStorageError("bounded compaction temporary budget exceeded")
-        source_refs.extend(index["records"])
-    verified_index_evidence(root, source_refs)
-    generation = uuid.uuid4().hex
-    remapping = []
-    with PredictionCacheWriter(root, writer_id="compaction", incarnation=generation,
-                               shard_target_bytes=target_bytes) as writer:
-        for old_ref in source_refs:
-            record = read_record(root, old_ref, require_sealed=True)
-            new_ref = writer.append(record.identity, record.arrays, record.metadata, kind=record.kind)
-            remapping.append({"old": old_ref, "new": new_ref})
-    for replacement in remapping:
-        old = read_record(root, replacement["old"], require_sealed=True)
-        new = read_record(root, replacement["new"], require_sealed=True)
-        if old.reference["content_sha256"] != new.reference["content_sha256"]:
-            raise CacheIntegrityError("compaction changed numerical content")
-    report = {"format": FORMAT, "generation": generation, "sources": unique,
-              "source_bytes": source_bytes, "temporary_byte_limit": temporary_byte_limit,
-              "replacements": remapping, "source_retirement_pending": True}
-    _atomic_json(root / "indexes" / f"compaction-{generation}.json", report)
-    return report
-
-
-def retire_compaction(root: Path | str, generation: str, *, readers_drained: bool = False,
-                       authoritative_refs_rebased: bool = False) -> list[str]:
-    """Delete only superseded source shards after two explicit controller proofs."""
-    if not readers_drained or not authoritative_refs_rebased:
-        raise CacheBusyError("old readers must exit and authoritative refs must be rebased before retirement")
-    if not re.fullmatch(r"[0-9a-f]{32}", generation):
-        raise CacheIntegrityError("invalid compaction generation")
-    root = Path(root)
-    report_path = root / "indexes" / f"compaction-{generation}.json"
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    if any(PurePosixPath(relative).parts[0] == "sample-maps" for relative in report["sources"]):
-        raise CacheIntegrityError("sample-map retirement requires rewriting dependent immutable record references")
-    verified_index_evidence(root, [item["new"] for item in report["replacements"]])
-    retired = []
-    for relative in report["sources"]:
-        path = safe_cache_path(root, relative)
-        if path.parent.name not in {"shards", "sample-maps", "meta-results"} or path.suffix != ".pcshard":
-            raise CacheIntegrityError("compaction retirement path is not a cache shard")
-        path.unlink(missing_ok=True)
-        _index_path(root, relative).unlink(missing_ok=True)
-        retired.append(relative)
-    _atomic_json(report_path, {**report, "source_retirement_pending": False})
-    return retired

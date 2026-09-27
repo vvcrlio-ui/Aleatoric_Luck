@@ -11,9 +11,6 @@ from .cost_profile import (PROFILE_FORMAT, TIMING_SOURCES,
                            DEFAULT_MIN_BATCH_OBSERVATIONS, positive_integer, positive_number)
 from .shared_queue import QueueError
 
-CATEGORY = {'super_learner': 'sl', 'shallow_neural_network': 'nn',
-            'xgboost': 'boost', 'lightgbm': 'boost',
-            **{model: 'five' for model in ('ols', 'ridge', 'lasso', 'random_forest', 'extra_trees')}}
 DEFAULT_COST_WEIGHTS = {'ols': 1, 'ridge': 5, 'lasso': 5, 'random_forest': 1,
     'shallow_neural_network': 15, 'extra_trees': 1, 'super_learner': 40, 'xgboost': 5, 'lightgbm': 5}
 

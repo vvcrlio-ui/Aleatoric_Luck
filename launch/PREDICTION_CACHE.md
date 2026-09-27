@@ -115,27 +115,8 @@ Holdout labels are loaded by the scoring step after fitting the combiner.
 
 ## Execution and offline analysis
 
-Use the ordinary `launch/experiment.py slurm` command with a new FFC manifest
-containing the above options. `cluster_queue.prepare_joint` accepts explicitly
-prepared panel plans and creates one multi-panel barrier.
-
-An isolated native acceptance run can be prepared without submitting jobs:
-
-```sh
-python NK_Grid/validation/prediction_acceptance.py prepare-fixture \
-  --output runs/cache-native-p5 --workers 1 --memory 4G \
-  --time-limit 00:15:00 --max-cpu-hours 1
-python NK_Grid/validation/prediction_acceptance.py execute-local \
-  --plan runs/cache-native-p5/plan.json --max-seconds 780 \
-  --inject-confirmation-loss
-```
-
-This fixture uses reduced, separately identified model parameters and two
-synthetic panels, including N=399/400/401. It is an engineering acceptance run,
-not evidence of FFC scientific speedup. `prepare-ffc --schema ... --timing-full`
-prepares a new unchanged-parameter FFC grid; it also does not submit by itself.
-Start an authorized prepared plan with `python launch/cluster_scheduler.py start
-RUN_DIR/plan.json` after reviewing its bounds and live admission.
+A panel with these options runs through the ordinary launch command in
+[OPERATIONS.md](OPERATIONS.md); one run covers one panel.
 
 Refit a different subset without any base fitting:
 

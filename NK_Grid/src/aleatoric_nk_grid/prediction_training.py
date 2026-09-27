@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import time
 import warnings
-from collections.abc import Mapping
 
 import numpy as np
 from sklearn.ensemble import StackingClassifier, StackingRegressor
@@ -19,7 +18,6 @@ from sklearn.model_selection import KFold, StratifiedKFold, check_cv
 BASE_MODELS = ("ols", "ridge", "lasso", "random_forest", "xgboost", "lightgbm",
                "shallow_neural_network", "extra_trees")
 BASE_LIBRARY = "standalone8-v1"
-FORMAL_REGRESSION_MODELS = ("ridge", "extra_trees", "lightgbm", "shallow_nn")
 
 
 def rows(X, indexes):

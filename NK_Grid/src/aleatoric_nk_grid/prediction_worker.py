@@ -21,7 +21,7 @@ import numpy as np
 
 from .prediction_cache import (PredictionCacheWriter, WriterRecoveryIndex, CacheStorageError,
                                cache_identity, read_record, seal_stopped_writers,
-                               retire_private_fold_shards, safe_cache_path, fold_record_identity,
+                               retire_private_fold_shards, fold_record_identity,
                                FORMAT as CACHE_FORMAT)
 from .shared_queue import QueueError, digest
 
