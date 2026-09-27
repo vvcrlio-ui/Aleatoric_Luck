@@ -1070,7 +1070,6 @@ class NKGridExecutionSession:
             n_sizes_k=len(value["resolved_k_grid"]),
             max_n=max(int(item) for item in value["resolved_n_grid"]),
             max_k=max(int(item) for item in value["resolved_k_grid"]),
-            batch_size=1,
             n_jobs=int(value["model_n_jobs"]),
             min_n=int(value["min_n"]),
             model_params=model_params,
