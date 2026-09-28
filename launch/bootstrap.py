@@ -1,7 +1,8 @@
 """Compute-node bootstrap for the shared single-model cluster scheduler.
 
-The login node reads configuration and checks input paths. Numerical imports,
-pip, data preparation and task-design generation run inside the bootstrap allocation.
+The login node uses only the standard library to check arguments, the checkout
+and the run directory. Numerical imports, pip, data preparation and task-design
+generation run inside the bootstrap allocation.
 """
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ def submit_bootstrap(request, *, slurm=None):
         else:
             state = {"run_id": uuid.uuid4().hex, "jobs": {}, "request_sha256": digest,
                      "request": str(request), "created_at_utc": now()}
-        journal = Journal(path, state, slurm or Slurm(spec["cluster"]["account"], spec["cluster"]["qos"]))
+        journal = Journal(path, state, slurm or Slurm(spec))
         arguments = [a for a in bootstrap_command(spec, request)[2:] if not a.startswith("--job-name=")]
         return journal.submit("B0", arguments)
 
@@ -76,9 +77,6 @@ def launch(args, spec):
     spec.update(source=source, manifest_sha256=common.sha256(spec["manifest"]))
     if spec["schema"]:
         spec["schema_sha256"] = common.sha256(spec["schema"])
-    if spec["bootstrap"]["prepare"]:
-        from preparation import check_raw_inputs
-        check_raw_inputs(spec)
     output.mkdir(parents=True, exist_ok=False)
     (output / "logs").mkdir()
     request = output / "launch.json"

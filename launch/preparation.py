@@ -1,16 +1,14 @@
-"""Manifest-declared raw input checks and compute-node adapter execution."""
+"""Manifest-declared data preparation, run inside the bootstrap allocation."""
 from pathlib import Path
 import re
 import sys
+
+import yaml
 
 import experiment as common
 
 
 def preparation_spec(spec):
-    try:
-        import yaml
-    except ImportError as exc:
-        raise ValueError("--prepare requires PyYAML in the login Python; select an existing interpreter with NKGRID_BOOTSTRAP_PYTHON") from exc
     manifest = yaml.safe_load(Path(spec["manifest"]).read_text(encoding="utf-8"))
     declaration = manifest.get("preparation")
     if not isinstance(declaration, dict):
@@ -34,19 +32,13 @@ def preparation_spec(spec):
     return declaration, panel, fields, inputs
 
 
-def check_raw_inputs(spec):
+def prepare_data(spec):
+    from aleatoric_nk_grid.run_panels import DEFAULTS, PRESETS
+
     declaration, panel, fields, inputs = preparation_spec(spec)
     for path in inputs.values():
         if not path.is_file():
             raise FileNotFoundError(f"Missing raw input: {path}")
-    return declaration, panel, fields, inputs
-
-
-def prepare_data(spec):
-    import yaml
-    from aleatoric_nk_grid.run_panels import DEFAULTS, PRESETS
-
-    declaration, panel, fields, inputs = check_raw_inputs(spec)
     settings = {**DEFAULTS, **PRESETS[spec["preset"]], **panel}
     models = spec["models"] or panel["models"]
     if len(set(models)) != len(models) or not set(models).issubset(panel["models"]):

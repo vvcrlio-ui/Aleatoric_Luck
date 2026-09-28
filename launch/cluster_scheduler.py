@@ -14,7 +14,7 @@ import uuid
 
 import experiment as common
 import inspect
-from slurm_submission import Journal, Slurm, TERMINAL, controller_lock as _lock, read
+from slurm_submission import Journal, Slurm, controller_lock as _lock, read
 
 FORMAT = 'single-model-slurm-v1'
 DONE = {'complete', 'round_budget_exhausted', 'no_progress', 'control_budget_exhausted',
@@ -352,10 +352,6 @@ def state_for(plan_path, plan):
     return path, state
 
 
-def scheduler(spec):
-    return Slurm(spec['cluster']['account'], spec['cluster'].get('qos'))
-
-
 def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, policy, resource_resolver,
                                  *, wait=True, node_cap=None, dependency=None):
     """Submit a separately admitted verification allocation, never a local pool.
@@ -408,7 +404,8 @@ def ensure_parallel_verification(plan, mode, base_rounds, sl_rounds, journal, po
                        max_nodes=min(state['max_nodes'] - 2, node_cap if node_cap is not None else state['max_nodes']),
                        validation_processes=0, dispatcher_shards=1,
                        cpu_hours_remaining=cpu_budget(state, policy),
-                       control_jobs_reserved=sum(k.startswith(('C', 'G')) for k in state['jobs']) + 2)
+                       control_jobs_reserved=sum(k.startswith(('C', 'G')) for k in state['jobs']) + 2,
+                       run=journal.slurm.query)
         parameters = inspect.signature(resource_resolver).parameters
         allocation = dict(resource_resolver(request, max(1, pending),
                          **{k: v for k, v in options.items() if k in parameters}))
@@ -473,24 +470,18 @@ def check(plan_path):
             'elapsed_evidence': elapsed_evidence, 'allocation_cpu': item['allocation']['allocated_cpu_bound']})
 
 
-def terminal(journal, label):
-    job = journal.submit(label, [])  # Recover an accepted-but-unacknowledged intent.
-    return all(s in TERMINAL for s in journal.slurm.states(job)), job
-
-
 def start(plan_path, *, slurm=None):
     plan = load(plan_path); root = Path(plan_path).parent
     policy = operational_policy(root)
     with _lock(root / '.cluster-state.lock'):
         path, state = state_for(plan_path, plan)
         if state['status'] in DONE: raise ValueError('Continuation is terminal: ' + state['status'])
-        journal = Journal(path, state, slurm or scheduler(plan['launch']))
+        journal = Journal(path, state, slurm or Slurm(plan['launch']))
         journal.save()
-        for label in list(state['jobs']):
-            ended, job = terminal(journal, label)
-            if not ended:
-                print('Continuation already active: ' + job)
-                return job
+        active = journal.active(list(state['jobs']))
+        if active:
+            print('Continuation already active: ' + active[0][1])
+            return active[0][1]
         label = 'C' + str(sum(k.startswith('C') for k in state['jobs']))
         job = journal.submit(label, batch_args(plan['launch'], 'control', plan_path,
                                                dependency=os.environ.get('SLURM_JOB_ID'), policy=policy))
@@ -509,17 +500,13 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
     with _lock(root / '.cluster-state.lock'):
         path, state = state_for(plan_path, plan)
         if state['status'] in DONE: return state
-        journal = Journal(path, state, slurm or scheduler(spec)); journal.save()
+        journal = Journal(path, state, slurm or Slurm(spec)); journal.save()
         policy = operational_policy(root)
         controls = [journal.submit(label, []) for label in list(state['jobs']) if label.startswith(('C', 'G'))]
         if current not in controls:
             raise ValueError('Controller allocation is not in the submission journal')
         # Resolve ALL intents before interpreting any missing job receipt.
-        active = []
-        for label in list(state['jobs']):
-            if label.startswith(('W', 'V')):
-                ended, job = terminal(journal, label)
-                if not ended: active.append((label, job))
+        active = journal.active([label for label in state['jobs'] if label.startswith(('W', 'V'))])
         if active:
             # Only an overlapped base audit may run beside another allocation.
             overlapped = {r['label'] for r in state.get('verification_rounds', []) if r['mode'] == 'final-base'}
@@ -727,7 +714,8 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
                       'validation_processes': policy.get('validation_processes', 0),
                       'dispatcher_shards': policy.get('dispatcher_shards', 1),
                       'worker_cap': policy.get('worker_cap'),
-                      'worker_time_limit': policy.get('worker_time_limit') if phase != 'sl' else None}
+                      'worker_time_limit': policy.get('worker_time_limit') if phase != 'sl' else None,
+                      'run': journal.slurm.query}
         from cluster_resources import phase_allocation_options
         candidates.update(phase_allocation_options(policy, phase))
         parameters = inspect.signature(resource_resolver).parameters
@@ -847,7 +835,7 @@ def work(plan_path):
             raise ValueError('Frozen dispatcher changed without a matching operational revision')
     with _lock(root / '.cluster-state.lock'):
         path, state = state_for(plan_path, plan)
-        journal = Journal(path, state, scheduler(plan['launch']))
+        journal = Journal(path, state, Slurm(plan['launch']))
         matches = [r for r in state['rounds'] if journal.submit(r['label'], []) == os.environ.get('SLURM_JOB_ID')]
         if len(matches) != 1: raise ValueError('Allocation does not match one recorded round')
         item = matches[0]

@@ -1,6 +1,6 @@
 # Operations reference
 
-Start in a clean, committed checkout. Each launch selects one panel from a dataset's `panels.yaml`. The login node checks arguments, the checkout, output location and, with `--prepare`, raw file paths. It writes `launch.json` and submits one bootstrap job.
+Start in a clean, committed checkout. Each launch selects one panel from a dataset's `panels.yaml`. The login node checks arguments, the checkout and output location with the Python standard library. It writes `launch.json` and submits one bootstrap job.
 
 On a compute node, `bootstrap.sbatch` loads the profile's Python module when supplied, creates or reuses the shared dependency environment, prepares data when requested, freezes the plan and starts the shared Slurm scheduler.
 
@@ -23,7 +23,7 @@ bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION \
   --prepare --data-dir /absolute/raw/directory
 ```
 
-Append `--dry-run` to preview. A preview creates no directories, reads no data, installs nothing and submits nothing. Actual submission requires Linux. The login Python must be 3.11–3.14; preparation checks also require PyYAML. Select an already available interpreter with `NKGRID_BOOTSTRAP_PYTHON` when needed. Dependencies are installed only inside the bootstrap allocation.
+Append `--dry-run` to preview. A preview creates no directories, reads no data, installs nothing and submits nothing. Actual submission requires Linux. The login Python must be 3.11–3.14. Dependencies are installed only inside the bootstrap allocation.
 
 For prepared inputs, use `--schema /absolute/schema.json` instead of preparation arguments. The schema and referenced files must remain available to compute nodes.
 
@@ -40,6 +40,7 @@ Compute nodes need shared access to the checkout and run directory, TLS connecti
 | `NKGRID_CONSTRAINT` | Optional node constraint |
 | `NKGRID_MAX_TIME` | Maximum requested job duration |
 | `NKGRID_QOS` | Optional default QoS; `account` means the explicit `--account` |
+| `NKGRID_SLURM_QUERY_INTERVAL` | Optional minimum seconds between `squeue`/`sacct` calls |
 
 CLI options override profile defaults, within the profile's maximum time. With no profile, supply partition and any constraint or QoS on the command line. `--constraint none` omits that Slurm argument. With no QoS, Slurm's account default applies. Accounts are always explicit.
 
@@ -59,7 +60,7 @@ Worker count comes from live capacity and remaining work; `--workers` is an opti
 
 ## Preparing data
 
-Use `--prepare --data-dir DIR` together. They cannot be combined with `--schema` or a resume. The login node checks file existence; raw data is read only in the bootstrap allocation. The launcher does not download inputs or search for data directories.
+Use `--prepare --data-dir DIR` together. They cannot be combined with `--schema` or a resume. The bootstrap allocation checks that the declared files exist before running the adapter. The launcher does not download inputs or search for data directories.
 
 Each manifest's top-level `preparation` mapping names its adapter, required files relative to `--data-dir` and generated schema. FFC also declares its YAML config, a panel-name pattern extracting strategy and outcome, and strategy arguments. SMR declares its fixed feature contract. Validation models, minimum N, split fraction and seed follow the selected panel and preset.
 
@@ -92,7 +93,7 @@ The admission receipt records the ledger location. Verified completion releases 
 
 ## Scheduling and policy
 
-Each round checks account, QoS, partition, existing jobs and CPU-minute headroom, then submits the worker allocation and required controllers. Workers use one numerical thread; service cores and memory are included in the allocation. Slurm decides when jobs start. A task is not a separate Slurm job.
+Each round checks account, QoS, partition, existing jobs and CPU-minute headroom, then submits the worker allocation and required controllers. A controller reads the state of all the run's unfinished jobs with one `squeue` and, for jobs that have left the queue, one `sacct`. Terminal states are recorded in `cluster-state.json` and not queried again. With `NKGRID_SLURM_QUERY_INTERVAL`, every `squeue`/`sacct` call of the run, across its controller jobs, waits until that many seconds have passed since the previous one; `slurm-query.json` in the run directory holds the time of the last call. The interval is frozen in `launch.json`. Workers use one numerical thread; service cores and memory are included in the allocation. Slurm decides when jobs start. A task is not a separate Slurm job.
 
 `--dispatcher-shards 1..8` requests queue processes for a new run. More than one defaults to two validation processes per shard. `--scheduler-policy PATH.json` supplies initial operational policy; an explicit shard count overrides it. Launch saves `scheduler-policy.initial.json` and the active `scheduler-policy.json`. Resume preserves that run's policy.
 

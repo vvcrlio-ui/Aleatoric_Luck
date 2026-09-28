@@ -6,5 +6,7 @@ export NKGRID_MAX_TIME=24:00:00
 # export PYTHON_MODULE=Python/3.12
 # export NKGRID_CONSTRAINT=cpu_feature
 # export NKGRID_QOS=normal
+# export NKGRID_SLURM_QUERY_INTERVAL=100
 # NKGRID_QOS=account means the account supplied with --account.
 # With no QoS here or on the CLI, Slurm's account default applies.
+# NKGRID_SLURM_QUERY_INTERVAL is the site's minimum seconds between squeue/sacct calls.

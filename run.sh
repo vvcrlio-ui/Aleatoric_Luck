@@ -13,7 +13,7 @@ while [ "$#" -gt 0 ]; do
     *) ARGS+=("$1"); shift ;;
   esac
 done
-unset PYTHON_MODULE NKGRID_PARTITION NKGRID_CONSTRAINT NKGRID_MAX_TIME NKGRID_QOS
+unset PYTHON_MODULE NKGRID_PARTITION NKGRID_CONSTRAINT NKGRID_MAX_TIME NKGRID_QOS NKGRID_SLURM_QUERY_INTERVAL
 if [ -n "$PROFILE" ]; then
   [[ "$PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid profile name: $PROFILE" >&2; exit 2; }
   PROFILE_FILE="$ROOT/launch/profiles/$PROFILE.sh"

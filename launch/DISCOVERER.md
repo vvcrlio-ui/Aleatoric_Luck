@@ -12,8 +12,6 @@ Use `--profile discoverer` and an explicit authorized `--account`. Commands, pre
 
 The profile is [profiles/discoverer.sh](profiles/discoverer.sh). Worker count follows live account, QoS, partition, CPU-minute and memory limits. The optional [cache policy](policies/discoverer-cache.json) requests resources for large cache/SL experiments through `--scheduler-policy`.
 
-The site module's Python needs an available PyYAML installation for login-node `--prepare` checks. Use `NKGRID_BOOTSTRAP_PYTHON=/path/to/existing/python` to select an interpreter that already provides it. The compute bootstrap loads the module and builds or reuses the locked shared environment independently.
-
 Run directories and raw inputs must be on compute-visible storage. Under `/valhalla/projects/PROJECT`, storage admission uses `lfs` project quotas. Bootstrap temporary downloads stay in the run directory and pip cache stays beside the shared environments.
 
 Check current jobs and QoS headroom before submitting:

@@ -160,7 +160,8 @@ def launch_spec(args):
                    constraint=args.constraint or defaults.get("NKGRID_CONSTRAINT") or "none",
                    partition=partition, time_limit=time_limit,
                    workers=args.workers or 1, rounds=args.rounds or 2,
-                   memory_override=args.memory or "2G")
+                   memory_override=args.memory or "2G",
+                   query_interval=int(defaults.get("NKGRID_SLURM_QUERY_INTERVAL", 0)))
     for value in [*cluster.values(), args.plan_time, args.plan_memory]:
         if isinstance(value, str) and ("\n" in value or "\r" in value or "\x00" in value):
             raise ValueError("scheduler fields must be single-line strings")
