@@ -4,6 +4,10 @@ FFCWS inputs comprise a background-variable table and official train/test outcom
 
 The steps are: identify missing values, screen variables in the training pool, determine variable types and category vocabularies, build the three representations, join the selected outcome, and validate the inputs before they go to the training engine.
 
+## Preparing a run
+
+Use the shared launcher with `--manifest FFCWS/panels.yaml --panel PANEL --prepare --data-dir DIR`, where DIR contains `background.dta`, `train.csv` and `test.csv`. The panel name selects the strategy and outcome, for example `ffc_median_mode_gpa`. Preparation runs in the compute bootstrap, builds only that strategy and outcome, and publishes under that run's `prepared/` directory.
+
 ## 1. Row and column handling
 
 Families are not removed based on the number of missing predictors. Missing predictors are handled during training. Data are aligned by unique `challengeID`.
