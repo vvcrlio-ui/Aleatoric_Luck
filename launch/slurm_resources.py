@@ -1,4 +1,4 @@
-"""Live Slurm capacity for Discoverer. No site quota numbers are defaults.
+"""Live Slurm capacity. No site quota numbers are defaults.
 
 Finite limits are conservatively intersected (including association ancestors
 and partition QoS). This may undershoot a QoS override, never bypass it.

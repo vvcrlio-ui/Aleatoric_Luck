@@ -8,7 +8,7 @@ import math
 import re
 from copy import deepcopy
 
-import discoverer_resources as base
+import slurm_resources as base
 
 
 class CpuBudgetExhausted(ValueError):
@@ -47,7 +47,6 @@ def phase_spec(spec, workflow, phase, *, round_index=0, policy=None):
     cap = min(resources['worker_cap'], resources['io_concurrency'])
     old_cap = result.get('continuation', {}).get('worker_cap')
     if old_cap is not None: cap = min(cap, old_cap)
-    if result['profile'] != 'discoverer': cap = min(cap, result['cluster']['workers'])
     result.setdefault('continuation', {})['worker_cap'] = cap
     result['prediction_phase'] = 'sl'
     result['prediction_io_concurrency'] = resources['io_concurrency']
@@ -191,9 +190,8 @@ def _resolve_round(spec, remaining, *, work_seconds=None, target_round_seconds=N
         cluster = {**cluster, 'time_limit': worker_time_limit}
     qos = cluster.get('qos') or default_qos(cluster['account'], run=run)
     live = base.snapshot(cluster['account'], qos, cluster['partition'], run=run)
-    memory = worker_memory or cluster.get('memory_override') or '16G'
+    memory = worker_memory or cluster.get('memory_override') or '2G'
     cap = worker_cap if worker_cap is not None else spec.get('continuation', {}).get('worker_cap')
-    if cap is None and spec['profile'] != 'discoverer': cap = cluster['workers']
     # This is one Slurm job, not an array of independently submitted workers.
     # Keep job slots and every scoped CPU/memory/node headroom dimension separate.
     bound = base.capacity(live, remaining=2**63 - 1, memory=memory,
@@ -202,7 +200,7 @@ def _resolve_round(spec, remaining, *, work_seconds=None, target_round_seconds=N
     threads = max(int(n['threads']) for n in live['nodes'])
     cpu_per_task = max(threads, bound['allocated_cpu_per_worker_bound'])
     if validation_processes:
-        # Discoverer Slurm 20 steps count logical CPUs even with a one-thread
+        # Slurm 20 steps count logical CPUs even with a one-thread
         # allocation hint. Keep the allocation CPU group large enough for the
         # service step, then verify physical affinity before any fit.
         task_width = service_slots * cpu_per_task

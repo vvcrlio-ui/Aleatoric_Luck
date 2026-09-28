@@ -13,12 +13,13 @@ while [ "$#" -gt 0 ]; do
     *) ARGS+=("$1"); shift ;;
   esac
 done
-case "$PROFILE" in
-  "") ;;
-  bmrc) source "$ROOT/launch/profiles/bmrc.sh" ;;
-  discoverer) source "$ROOT/launch/profiles/discoverer.sh" ;;
-  *) echo "Unknown profile: $PROFILE (choose bmrc or discoverer)" >&2; exit 2 ;;
-esac
+unset PYTHON_MODULE NKGRID_PARTITION NKGRID_CONSTRAINT NKGRID_MAX_TIME NKGRID_QOS NKGRID_SLURM_QUERY_INTERVAL
+if [ -n "$PROFILE" ]; then
+  [[ "$PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid profile name: $PROFILE" >&2; exit 2; }
+  PROFILE_FILE="$ROOT/launch/profiles/$PROFILE.sh"
+  [ -f "$PROFILE_FILE" ] || { echo "Profile does not exist: $PROFILE_FILE" >&2; exit 2; }
+  source "$PROFILE_FILE"
+fi
 cd "$ROOT"
 if [ "$UPDATE" = 1 ] && [ "$PREVIEW" = 0 ]; then
   # Fast-forward the checked-out branch from origin; forks and upstream clones
@@ -28,11 +29,6 @@ if [ "$UPDATE" = 1 ] && [ "$PREVIEW" = 0 ]; then
   [ -z "$(git status --porcelain)" ] || { echo 'Update refused: worktree has changes.' >&2; exit 2; }
   git pull --ff-only origin "$BRANCH"
   exec bash "$ROOT/run.sh" "${ARGS[@]}"
-fi
-if [ "$PREVIEW" = 0 ] && [ -n "${PYTHON_MODULE:-}" ]; then
-  command -v module >/dev/null 2>&1 || { echo "module command unavailable; use a cluster login shell for $PYTHON_MODULE" >&2; exit 2; }
-  module purge
-  module load "$PYTHON_MODULE"
 fi
 export ENGINE_DIR="$ROOT/NK_Grid"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1
@@ -44,7 +40,7 @@ bootstrap_compatible() {
 # A preview skips installation/submission, but still needs a supported parser.
 # Login nodes may default to an older system Python even with a site profile.
 if ! bootstrap_compatible; then
-  if [ "$PREVIEW" = 1 ] && [ -n "${PYTHON_MODULE:-}" ] && [ -z "${NKGRID_BOOTSTRAP_PYTHON:-}" ] && command -v module >/dev/null 2>&1; then
+  if [ -n "${PYTHON_MODULE:-}" ] && [ -z "${NKGRID_BOOTSTRAP_PYTHON:-}" ] && command -v module >/dev/null 2>&1; then
     module purge
     module load "$PYTHON_MODULE"
     hash -r
