@@ -91,7 +91,10 @@ YourArticle/
 ```
 
 The schema and feature-universe definition must be under version control; data
-must not be.
+must not be. This layout applies when the adapter is run by hand. When a cluster
+launch prepares the data (Section 10), the adapter writes every artifact under
+that run's `prepared/` directory instead, and the tracked `schema/` and `data/`
+directories stay unchanged.
 
 ### Path Resolution
 
@@ -545,9 +548,57 @@ print([(g.name, g.unit_type, len(g.features)) for g in groups])
 - [ ] If provenance is provided, it contains no raw IDs or absolute paths.
 - [ ] `validate_input` raises no errors.
 
+## 10. Registering Panels and Preparing Runs
+
 After the adapter artifacts pass validation, register the schema as a panel: add
 an entry whose `schema` field points to it in a panel manifest, as
 `FFCWS/panels.yaml` and `SMR/panels.yaml` do. Launch it with `--manifest` and
 `--panel` as described in the [root quick start](../README.md#quick-start) and the
-[launch flow](../launch/README.md). [`../NK_Grid/README.md`](../NK_Grid/README.md)
-explains how the engine samples N and K and fits models.
+[launch flow](../launch/README.md). A launch either uses existing artifacts
+through `--schema`, or builds them for that run with `--prepare --data-dir DIR`.
+[`../NK_Grid/README.md`](../NK_Grid/README.md) explains how the engine samples N
+and K and fits models.
+
+### The `preparation` Declaration
+
+`--prepare` requires a top-level `preparation` mapping in the manifest. Paths are
+relative to the manifest's directory unless stated otherwise.
+
+| Key | Meaning |
+|---|---|
+| `adapter` | Adapter script, run with the compute environment's Python. |
+| `inputs` | Name → raw file, relative to `--data-dir`. Absolute paths and `..` are rejected. |
+| `schema` | Generated schema, relative to the run's `prepared/` directory. |
+| `config` | YAML adapter configuration that the launcher rewrites for the run (FFCWS). |
+| `contract` | Fixed feature contract passed to the adapter; used when there is no `config` (SMR). |
+| `panel_pattern` | Optional regular expression over the panel name; its named groups become fields. A group named `outcome` must equal the panel's outcome. |
+| `arguments` | Optional extra adapter arguments. |
+
+`inputs`, `schema` and `arguments` may contain `{panel}`, `{outcome}` and the
+named groups of `panel_pattern`, filled from the selected panel. FFCWS uses
+`panel_pattern` to take the strategy from the panel name and passes it as
+`--strategy {strategy}`.
+
+### How the Launcher Calls the Adapter
+
+Preparation runs in the bootstrap allocation, after the shared environment is
+ready. The launcher first checks that every declared input exists, then creates
+`<run>/prepared/` and runs the adapter once:
+
+- With `config`, it copies that YAML to `prepared/adapter.yaml`, sets its `paths`
+  entries for each input name, `output_root` (`prepared/work`), `ard_root`
+  (`prepared/ard`) and `schema_root` (`prepared/schema`), restricts `outcomes` to
+  the panel's outcome and `strategies` to the `strategy` field, and passes
+  `--config prepared/adapter.yaml`.
+- Without `config`, it passes `--article-root` (the manifest's directory),
+  `--contract`, `--source` (the input named `source`) and
+  `--output-root prepared/`.
+- It then appends the declared `arguments`, followed by
+  `--validation-model MODEL...`, `--min-n`, `--test-size` and `--seed` from the
+  selected panel, preset and `--models`. The adapter runs `validate_input` with
+  these values before it publishes anything.
+
+The adapter must write all of its outputs under the directories it is given. The
+generated schema must lie inside `prepared/`; the launcher uses it in place of the
+panel's `schema` entry and records its path and SHA-256 in `prepared-launch.json`.
+Raw inputs and tracked files are only read.
