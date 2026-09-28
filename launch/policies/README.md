@@ -11,8 +11,8 @@ The file is one JSON object. Only the field names below and the others listed in
 | Field | Default | Meaning |
 |---|---|---|
 | `unified_compute` | `false` | Base models and the Super Learner share one set of resource limits. Requires `worker_cap`, `worker_memory` and `worker_time_limit`. |
-| `sizing_mode` | `"work"` | `work` sizes each round from the estimated remaining work; `capacity` asks for as many workers as the live cluster limits allow, up to `worker_cap` and `max_nodes`. `capacity` requires `unified_compute`. |
-| `max_nodes` | `60` | Most nodes one round may use, including the two kept for control jobs. At least 3. |
+| `sizing_mode` | `"work"` | `work` sizes each round from the estimated remaining work; `capacity` fills the run's node count up to `worker_cap`. `capacity` requires `unified_compute`. |
+| `max_nodes` | `null` | Lower cap on the run's `--nodes`, which counts the two nodes kept for control jobs. At least 3. A later edit can lower it but not raise it. |
 | `worker_cap` | `null` | Most numerical workers in one round. `null` uses `--workers` or the profile's default. |
 | `worker_memory` | `null` | Memory per worker as a Slurm size, such as `"3G"`. `null` uses `--memory`, or 2G for base workers. |
 | `worker_time_limit` | `null` | Wall time of each worker allocation, `[days-]HH:MM:SS`. `null` uses `--time` or the profile's default. |
@@ -26,4 +26,4 @@ The file is one JSON object. Only the field names below and the others listed in
 | `max_cpu_hours` | `null` | CPU-hour budget for the run's workers. A later edit can lower it but not raise it. |
 | `exclude_nodes` | `[]` | Node names never to request. |
 
-Choose `max_nodes`, `worker_cap`, `worker_memory` and `worker_time_limit` from the cluster's own limits: nodes per job, memory per core and maximum wall time. The launcher still checks every round against the live account, QoS and partition limits and asks for less when the cluster allows less.
+Choose `--nodes`, `worker_cap`, `worker_memory` and `worker_time_limit` from the cluster's own limits: nodes per job, memory per core and maximum wall time. The launcher does not query account or QoS limits; a request beyond them stays pending in Slurm with its reason shown by `squeue`.

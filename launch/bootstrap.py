@@ -58,9 +58,7 @@ def launch(args, spec):
     if args.dry_run:
         print(json.dumps({"launch": spec, "actions": ["submit compute-node bootstrap",
               "reuse or create the shared dependency environment", "prepare data if requested", "freeze single-model design", "start shared single-model scheduler"],
-              "live_resources": {"workers": "unresolved until each round", "qos_account_partition_limits": "unresolved",
-                                 "existing_jobs": "unresolved", "effective_wall_time": "unresolved"},
-              "note": "No data reads, installation or submission. The planning placeholder worker count is not a resource decision. Each round resolves live limits and CPU-minute headroom, then submits one worker allocation; --workers is an optional cap and --rounds a hard bound."}, indent=2))
+              "note": "No data reads, installation or submission. Each round fits workers onto at most --nodes minus two nodes, using the partition's node geometry; --rounds is a hard bound."}, indent=2))
         return
     if sys.platform == "win32":
         raise ValueError("Run this command in a Linux cluster login shell; --dry-run works locally")

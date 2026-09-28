@@ -51,12 +51,12 @@ Each experiment is one panel: one outcome with one prepared input, listed in a d
 Run a small experiment on a Slurm cluster:
 
 ```bash
-bash run.sh slurm --profile YOUR_SITE --account YOUR_PROJECT_ACCOUNT \
+bash run.sh slurm --profile YOUR_SITE --account YOUR_PROJECT_ACCOUNT --nodes 4 \
   --manifest DATASET/panels.yaml --panel PANEL_NAME --preset dev \
   --prepare --data-dir /absolute/raw/directory
 ```
 
-Append `--dry-run` to preview without submitting. The login node checks the request and submits a bootstrap job. Environment setup, data preparation and planning run on a compute node. Profiles in `launch/profiles/` hold site defaults; without a profile, pass the partition and resource choices explicitly.
+Append `--dry-run` to preview without submitting. The login node checks the request and submits a bootstrap job. Environment setup, data preparation and planning run on a compute node. `--nodes` is the total number of nodes the run may occupy. Profiles in `launch/profiles/` hold site defaults; without a profile, pass the partition and time explicitly.
 
 [How runs are carried out](launch/README.md) explains the stages and what happens on the cluster. [launch/OPERATIONS.md](launch/OPERATIONS.md) lists all commands and options, including other clusters, data preparation, resuming and output locations.
 

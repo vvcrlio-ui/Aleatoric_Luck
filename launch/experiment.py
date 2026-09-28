@@ -89,7 +89,9 @@ def parser():
     p.add_argument("--constraint")
     p.add_argument("--partition")
     p.add_argument("--time", dest="time_limit")
-    p.add_argument("--workers", type=positive, help="Optional worker cap; live capacity determines the default")
+    p.add_argument("--nodes", type=positive,
+                   help="Total nodes the run may occupy, including two reserved for controllers")
+    p.add_argument("--workers", type=positive, help="Optional cap on numerical workers per round")
     p.add_argument("--rounds", type=positive, help="Maximum continuation rounds; all clusters submit only the current worker allocation")
     p.add_argument("--memory", help="Base-worker memory request; default 2G")
     p.add_argument('--dispatcher-shards', type=int, choices=range(1, 9), metavar='1..8',
@@ -128,7 +130,7 @@ def launch_spec(args):
         raise ValueError("panel name may contain only letters, digits, _, . and -")
     if args.resume and (args.schema or args.models or args.preset != "dev"
                         or args.manifest != "FFCWS/panels.yaml" or args.panel != "ffc_median_mode_gpa"
-                        or any((args.workers, args.rounds, args.partition, args.time_limit, args.memory,
+                        or any((args.nodes, args.workers, args.rounds, args.partition, args.time_limit, args.memory,
                                 args.dispatcher_shards, args.scheduler_policy, args.prepare, args.data_dir,
                                 args.plan_time, args.plan_memory, args.constraint))):
         raise ValueError("resume reuses frozen design/resources; do not combine it with design/resource overrides")
@@ -140,6 +142,9 @@ def launch_spec(args):
         raise ValueError("--prepare requires --data-dir, and --data-dir requires --prepare")
     if args.preset == "production" and not args.allow_large_run and not args.dry_run:
         raise ValueError("production requires explicit --allow-large-run")
+    from aleatoric_nk_grid.scheduler_policy import CONTROL_NODE_RESERVE, validate_policy
+    if not args.resume and (args.nodes is None or args.nodes < CONTROL_NODE_RESERVE + 1):
+        raise ValueError(f"New runs require --nodes, the total nodes including {CONTROL_NODE_RESERVE} reserved for controllers")
     defaults = os.environ if args.profile else {}
     partition = args.partition or defaults.get("NKGRID_PARTITION")
     if not args.resume and not partition:
@@ -158,8 +163,7 @@ def launch_spec(args):
     qos = args.qos or (args.account if default_qos == "account" else default_qos)
     cluster = dict(account=args.account, qos=qos,
                    constraint=args.constraint or defaults.get("NKGRID_CONSTRAINT") or "none",
-                   partition=partition, time_limit=time_limit,
-                   workers=args.workers or 1, rounds=args.rounds or 2,
+                   partition=partition, nodes=args.nodes, time_limit=time_limit, rounds=args.rounds or 2,
                    memory_override=args.memory or "2G",
                    query_interval=int(defaults.get("NKGRID_SLURM_QUERY_INTERVAL", 0)))
     for value in [*cluster.values(), args.plan_time, args.plan_memory]:
@@ -183,16 +187,12 @@ def launch_spec(args):
                            "prepare": args.prepare,
                            "data_dir": str(path_from_repo(args.data_dir)) if args.data_dir else None}
     if args.dispatcher_shards is not None or args.scheduler_policy is not None:
-        if args.resume:
-            raise ValueError('Dispatcher options apply to a new shared Slurm run; existing rounds retain their snapshot')
         policy = json.loads(path_from_repo(args.scheduler_policy).read_text(encoding='utf-8')) if args.scheduler_policy else {}
         if not isinstance(policy, dict): raise ValueError('Scheduler policy must be a JSON object')
         if args.dispatcher_shards is not None:
             policy['dispatcher_shards'] = args.dispatcher_shards
             if args.dispatcher_shards > 1 and 'validation_processes' not in policy:
                 policy['validation_processes'] = 2
-        # The policy module and its shared-queue types have only stdlib imports.
-        from aleatoric_nk_grid.scheduler_policy import validate_policy
         result['scheduler_policy'] = validate_policy(policy)
     return result
 

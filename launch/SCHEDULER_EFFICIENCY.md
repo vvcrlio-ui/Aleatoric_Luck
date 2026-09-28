@@ -70,19 +70,16 @@ does not expand any frozen round budget.
 New prediction workflows may freeze `execution.base_round_time_limits`, with
 one `HH:MM:SS` entry per base round. For example, a separately approved plan can
 freeze global wall time `08:00:00` and `['01:00:00', '08:00:00']`: its first
-allocation drains at one hour, then the ordinary missing-task and live-capacity
-checks size a smaller continuation. Each entry must fit the frozen global time
-limit; current QoS/partition limits still apply. Submitted round count determines
+allocation drains at one hour, then the ordinary missing-task and node-count
+sizing sizes a smaller continuation. Each entry must fit the frozen global time
+limit. Submitted round count determines
 the entry after a controller restart, and CPU-hour usage remains cumulative.
 Omitting the field preserves the existing behavior.
 
-The shared dispatcher requests one multi-node Slurm allocation. Job-count
-limits reserve one allocation plus its controller jobs; they do not count its
-worker processes as separate jobs, and `MaxArraySize` does not apply. Admission
-checks every scoped CPU, memory and node headroom independently against the
-whole allocation, including conservative billing for a partially filled last
-node. Per-job limits, live wall-time limits, QoS CPU-minute headroom and the
-cumulative run budget still apply.
+The shared dispatcher requests one multi-node Slurm allocation of at most the
+run's `max_nodes` minus two nodes; its worker processes are not separate jobs.
+The cumulative run budget charges every allocated node in full for its wall
+time. Slurm applies the account's limits when it schedules the allocation.
 
 Automatic economic tail drain is disabled until measured migration costs are
 available. To enable it, supply positive `restart_overhead_seconds`,

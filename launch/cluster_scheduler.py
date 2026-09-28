@@ -310,8 +310,6 @@ def batch_args(spec, mode, plan_path, *, dependency=None, allocation=None, polic
     excluded = (policy or {}).get('exclude_nodes', [])
     if excluded: args.append('--exclude=' + ','.join(excluded))
     if allocation:
-        if allocation['nodes'] + allocation.get('control_node_reserve', 0) > (policy or {}).get('max_nodes', 60):
-            raise ValueError('Allocation exceeds the explicit total node hard limit')
         args += ['--nodes=' + str(allocation['nodes']),
                  '--ntasks=' + str(allocation.get('allocation_tasks', allocation['workers'] + allocation.get('controller_task_slots', 1))),
                  '--ntasks-per-node=' + str(allocation.get('allocation_tasks_per_node', allocation['tasks_per_node'])),
@@ -533,8 +531,10 @@ def advance(plan_path, *, slurm=None, backend=None, resource_resolver=None):
         if controls >= state['limits']['max_control_jobs']:
             state['status'] = 'control_budget_exhausted'; journal.save(); return state
         remaining_budget = cpu_budget(state, policy)
-        # A restart or policy-file removal cannot raise an established node cap.
-        state['max_nodes'] = min(state.get('max_nodes', policy['max_nodes']), policy['max_nodes'])
+        # The launch fixes the node count; a policy edit may only lower it, and a
+        # restart or policy-file removal cannot raise an established cap.
+        state['max_nodes'] = min(v for v in (state.get('max_nodes'), spec['cluster']['nodes'], policy['max_nodes'])
+                                 if v is not None)
         prior_control_bounds = [r['allocation'].get('control_cpu_bound',
                                r['allocation'].get('allocated_cpu_bound')) for r in state['rounds']
                                if r['label'] in state['jobs']]

@@ -19,7 +19,7 @@ A run starts with a dry-run, which only prints the launch settings. A `dev` run 
 
 ## Scheduling on the cluster
 
-Workers take tasks from a shared queue and send back each result as soon as it is done. Tasks expected to take longest start first, and the estimates are updated from timings measured in the same run. Cluster time is requested in rounds: each round is one Slurm allocation with a time limit, and before each round the controller checks how much of the account's allowance is left.
+Workers take tasks from a shared queue and send back each result as soon as it is done. Tasks expected to take longest start first, and the estimates are updated from timings measured in the same run. Cluster time is requested in rounds: each round is one Slurm allocation of at most the chosen number of nodes, with a time limit.
 
 ## Interruptions and resuming
 

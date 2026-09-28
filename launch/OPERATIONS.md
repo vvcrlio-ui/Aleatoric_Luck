@@ -6,18 +6,18 @@ On a compute node, `bootstrap.sbatch` loads the profile's Python module when sup
 
 ## One command per cluster
 
-Substitute the account, manifest, panel and raw directory:
+Substitute the account, node count, manifest, panel and raw directory:
 
 ```bash
-bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT \
+bash run.sh slurm --profile discoverer --account YOUR_ACCOUNT --nodes 4 \
   --manifest DATASET/panels.yaml --panel PANEL --preset dev \
   --prepare --data-dir /absolute/raw/directory
 
-bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT \
+bash run.sh slurm --profile bmrc --account YOUR_ACCOUNT --nodes 4 \
   --manifest DATASET/panels.yaml --panel PANEL --preset dev \
   --prepare --data-dir /absolute/raw/directory
 
-bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION \
+bash run.sh slurm --account YOUR_ACCOUNT --partition YOUR_PARTITION --nodes 4 \
   --qos YOUR_QOS --time 01:00:00 \
   --manifest DATASET/panels.yaml --panel PANEL --preset dev \
   --prepare --data-dir /absolute/raw/directory
@@ -27,7 +27,7 @@ Append `--dry-run` to preview. A preview creates no directories, reads no data, 
 
 For prepared inputs, use `--schema /absolute/schema.json` instead of preparation arguments. The schema and referenced files must remain available to compute nodes.
 
-Compute nodes need shared access to the checkout and run directory, TLS connectivity from workers to the dispatcher, `srun` and `openssl`. The account must be able to read its Slurm association, QoS limits and usage through `sacctmgr` and `scontrol show assoc_mgr`. BMRC and the example profile require site validation. [DISCOVERER.md](DISCOVERER.md) gives Discoverer site notes.
+Compute nodes need shared access to the checkout and run directory, TLS connectivity from workers to the dispatcher, `srun` and `openssl`. BMRC and the example profile require site validation. [DISCOVERER.md](DISCOVERER.md) gives Discoverer site notes.
 
 ## Profiles and defaults
 
@@ -44,10 +44,15 @@ Compute nodes need shared access to the checkout and run directory, TLS connecti
 
 CLI options override profile defaults, within the profile's maximum time. With no profile, supply partition and any constraint or QoS on the command line. `--constraint none` omits that Slurm argument. With no QoS, Slurm's account default applies. Accounts are always explicit.
 
-Worker count comes from live capacity and remaining work; `--workers` is an optional upper limit for every preset and site. Without a cap, the initial plan uses a worker count of 1 as a placeholder. Each round records its actual allocation.
+## Nodes, memory and time
+
+A new run states its resources, which are frozen in `launch.json`: `--nodes` is the total number of nodes the run may occupy, including two reserved for its controllers, so each worker allocation has at most `--nodes` minus two nodes. `--memory` is the memory of each numerical worker and `--time` the worker wall time. Each round reads the partition's node sizes with `sinfo` and places as many workers on a node as its cores and memory allow, after the queue services' cores and memory. `--workers` optionally caps the number of workers.
+
+A round uses fewer nodes when the remaining work, priced by the run's own timings, would leave some idle, or when a `max_cpu_hours` budget in the scheduler policy would otherwise be exceeded. Account and QoS limits are not queried: Slurm admits the allocation or keeps it pending, and `squeue -j JOB` shows the reason. Each round records its actual allocation.
 
 | Setting | Default |
 |---|---|
+| Nodes | Required |
 | Worker memory | 2G |
 | Worker rounds | 2 |
 | Worker time, `timing_full` / `production` | Profile maximum; explicit `--time` required without a profile |
@@ -56,7 +61,7 @@ Worker count comes from live capacity and remaining work; `--workers` is an opti
 
 `--memory` sets base-worker memory; the FFCWS and SMR catalogs request 2G for SL workers. Use `--memory 4G` for full-grid SMR runs. A scheduler policy with an explicit `worker_memory` supplies that request; the example policies specify 3G. Bootstrap and controller memory is set separately with `--plan-memory`.
 
-`--rounds`, `--time` and `--plan-time` override the corresponding requests. Live Slurm limits can reduce each worker allocation.
+`--rounds`, `--time` and `--plan-time` override the corresponding requests.
 
 ## Preparing data
 
@@ -93,9 +98,9 @@ The admission receipt records the ledger location. Verified completion releases 
 
 ## Scheduling and policy
 
-Each round checks account, QoS, partition, existing jobs and CPU-minute headroom, then submits the worker allocation and required controllers. A controller reads the state of all the run's unfinished jobs with one `squeue` and, for jobs that have left the queue, one `sacct`. Terminal states are recorded in `cluster-state.json` and not queried again. With `NKGRID_SLURM_QUERY_INTERVAL`, every `squeue`/`sacct` call of the run, across its controller jobs, waits until that many seconds have passed since the previous one; `slurm-query.json` in the run directory holds the time of the last call. The interval is frozen in `launch.json`. Workers use one numerical thread; service cores and memory are included in the allocation. Slurm decides when jobs start. A task is not a separate Slurm job.
+Each round sizes its allocation as described above, then submits it with the required controllers. A controller reads the state of all the run's unfinished jobs with one `squeue` and, for jobs that have left the queue, one `sacct`. Terminal states are recorded in `cluster-state.json` and not queried again. With `NKGRID_SLURM_QUERY_INTERVAL`, every `squeue`/`sacct` call of the run, across its controller jobs, waits until that many seconds have passed since the previous one; `slurm-query.json` in the run directory holds the time of the last call. The interval is frozen in `launch.json`. Workers use one numerical thread; service cores and memory are included in the allocation. Slurm decides when jobs start. A task is not a separate Slurm job.
 
-`--dispatcher-shards 1..8` requests queue processes for a new run. More than one defaults to two validation processes per shard. `--scheduler-policy PATH.json` supplies initial operational policy; an explicit shard count overrides it. Launch saves `scheduler-policy.initial.json` and the active `scheduler-policy.json`. Resume preserves that run's policy.
+`--dispatcher-shards 1..8` requests queue processes for a new run. More than one defaults to two validation processes per shard. `--scheduler-policy PATH.json` supplies initial operational policy; an explicit shard count overrides it. Between rounds, `max_nodes` in `scheduler-policy.json` may be lowered, and `worker_memory`, `worker_cap` and `worker_time_limit` changed; none of them changes what a round computes. Launch saves `scheduler-policy.initial.json` and the active `scheduler-policy.json`. Resume preserves that run's policy.
 
 The Discoverer policy `launch/policies/discoverer-cache.json` requests four dispatchers, common base/SL resource limits and distributed final verification. Its resource sizes require a suitable account and should be selected deliberately. Profiles contain site defaults; operational policy controls experiment scheduling resources.
 

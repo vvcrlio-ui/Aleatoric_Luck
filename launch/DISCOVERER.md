@@ -10,7 +10,7 @@ Use `--profile discoverer` and an explicit authorized `--account`. Commands, pre
 | Maximum requested time | 48 hours |
 | Default QoS | The supplied account |
 
-The profile is [profiles/discoverer.sh](profiles/discoverer.sh). Worker count follows live account, QoS, partition, CPU-minute and memory limits. The optional [cache policy](policies/discoverer-cache.json) requests resources for large cache/SL experiments through `--scheduler-policy`.
+The profile is [profiles/discoverer.sh](profiles/discoverer.sh). Each run states its node count with `--nodes`. The optional [cache policy](policies/discoverer-cache.json) requests resources for large cache/SL experiments through `--scheduler-policy`.
 
 Run directories and raw inputs must be on compute-visible storage. Under `/valhalla/projects/PROJECT`, storage admission uses `lfs` project quotas. Bootstrap temporary downloads stay in the run directory and pip cache stays beside the shared environments.
 
