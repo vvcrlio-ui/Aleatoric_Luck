@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v12-classification-cv-3
+algorithm_version: nk-grid-v12-classification-cv-4
 
 regression:
   ols:
@@ -99,7 +99,7 @@ classification:
     alpha_log10_min: -1
     alpha_log10_max: 0
     n_alphas: 11
-    max_cv_folds: 5
+    max_cv_folds: 3
     max_iter: 20000
   random_forest:
     n_estimators: 500
