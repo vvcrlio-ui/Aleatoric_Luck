@@ -13,7 +13,7 @@ while [ "$#" -gt 0 ]; do
     *) ARGS+=("$1"); shift ;;
   esac
 done
-unset PYTHON_MODULE NKGRID_PARTITION NKGRID_CONSTRAINT NKGRID_MAX_TIME NKGRID_QOS NKGRID_SLURM_QUERY_INTERVAL
+unset PYTHON_MODULE NKGRID_PARTITION NKGRID_CONSTRAINT NKGRID_MAX_TIME NKGRID_QOS NKGRID_SLURM_QUERY_INTERVAL NKGRID_OFFLINE_COMPUTE
 if [ -n "$PROFILE" ]; then
   [[ "$PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid profile name: $PROFILE" >&2; exit 2; }
   PROFILE_FILE="$ROOT/launch/profiles/$PROFILE.sh"
@@ -34,6 +34,13 @@ export ENGINE_DIR="$ROOT/NK_Grid"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1
 BOOTSTRAP="${NKGRID_BOOTSTRAP_PYTHON:-python3}"
 command -v "$BOOTSTRAP" >/dev/null 2>&1 || BOOTSTRAP=python
+if [ -n "${NKGRID_OFFLINE_COMPUTE:-}" ] && [ "$PREVIEW" = 0 ]; then
+  # Wheels downloaded here must match the Python the compute nodes load.
+  module purge
+  module load "$PYTHON_MODULE"
+  hash -r
+  BOOTSTRAP=python3
+fi
 bootstrap_compatible() {
   "$BOOTSTRAP" -c 'import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] < (3, 15) else 1)' >/dev/null 2>&1
 }

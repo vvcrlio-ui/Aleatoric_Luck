@@ -184,6 +184,7 @@ def launch_spec(args):
                               "max_control_jobs": 4 * (args.rounds or 2) + 8}
     result["bootstrap"] = {"shared_env_root": str(shared_env_root()),
                            "python_module": defaults.get("PYTHON_MODULE", ""),
+                           "wheelhouse": str(wheelhouse(shared_env_root())) if defaults.get("NKGRID_OFFLINE_COMPUTE") else None,
                            "prepare": args.prepare,
                            "data_dir": str(path_from_repo(args.data_dir)) if args.data_dir else None}
     if args.dispatcher_shards is not None or args.scheduler_policy is not None:
@@ -225,7 +226,18 @@ def shared_environment_path(root):
     return Path(root).expanduser().resolve() / ("deps-" + digest)
 
 
-def ensure_shared_environment(root):
+def wheelhouse(root):
+    """Wheels fetched on the login node for sites whose compute nodes cannot reach PyPI."""
+    return Path(root).expanduser().resolve() / ("wheels-" + sha256(ROOT / "NK_Grid/requirements.txt")[:16])
+
+
+def download_wheels(directory):
+    """Run on the login node with the interpreter the compute nodes load."""
+    command([sys.executable, "-m", "pip", "download", "--only-binary=:all:", "--no-cache-dir",
+             "--dest", directory, "-r", ROOT / "NK_Grid/requirements.txt"])
+
+
+def ensure_shared_environment(root, wheels):
     """Third-party dependencies only, installed once and never changed afterwards.
 
     Several experiments and checkouts use one environment, so it holds no project
@@ -242,7 +254,8 @@ def ensure_shared_environment(root):
         if not stamp.exists():
             pip = {**os.environ, "PIP_CACHE_DIR": os.environ.get("PIP_CACHE_DIR") or str(Path(root) / "pip-cache")}
             command([sys.executable, "-m", "venv", "--clear", environment])
-            command([python, "-m", "pip", "install", "-r", ROOT / "NK_Grid/requirements.txt"], env=pip)
+            source = ["--no-index", "--find-links", wheels] if wheels else []
+            command([python, "-m", "pip", "install", *source, "-r", ROOT / "NK_Grid/requirements.txt"], env=pip)
             command([python, "-m", "pip", "check"])
             atomic_json(stamp, expected)
         elif json.loads(stamp.read_text()) != expected:

@@ -7,6 +7,9 @@ export NKGRID_MAX_TIME=24:00:00
 # export NKGRID_CONSTRAINT=cpu_feature
 # export NKGRID_QOS=normal
 # export NKGRID_SLURM_QUERY_INTERVAL=100
+# export NKGRID_OFFLINE_COMPUTE=1
 # NKGRID_QOS=account means the account supplied with --account.
 # With no QoS here or on the CLI, Slurm's account default applies.
 # NKGRID_SLURM_QUERY_INTERVAL is the site's minimum seconds between squeue/sacct calls.
+# NKGRID_OFFLINE_COMPUTE=1 downloads wheels on the login node for compute nodes without
+# PyPI access; it needs PYTHON_MODULE, which run.sh then also loads on the login node.

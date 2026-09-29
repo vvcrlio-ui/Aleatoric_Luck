@@ -72,6 +72,8 @@ def launch(args, spec):
         result = subprocess.run(["git", "check-ignore", "-q", str(output / "launch.json")], cwd=common.ROOT)
         if result.returncode:
             raise ValueError("Output inside the checkout must be Git-ignored; the default <catalog>/outputs/ is")
+    if spec["bootstrap"]["wheelhouse"]:
+        common.download_wheels(spec["bootstrap"]["wheelhouse"])
     spec.update(source=source, manifest_sha256=common.sha256(spec["manifest"]))
     if spec["schema"]:
         spec["schema_sha256"] = common.sha256(spec["schema"])
@@ -105,7 +107,7 @@ def bootstrap(request):
     tempfile.tempdir = None
     print(f"Bootstrap temporary directory: {temporary}", flush=True)
     os.environ["PIP_CACHE_DIR"] = str(Path(options["shared_env_root"]) / "pip-cache")
-    python, venv = common.ensure_shared_environment(options["shared_env_root"])
+    python, venv = common.ensure_shared_environment(options["shared_env_root"], options["wheelhouse"])
     environment = batch_environment()
     environment.update(VENV=str(venv), PYTHON=str(python), ENGINE_DIR=str(common.ROOT / "NK_Grid"),
                        PYTHONPATH=str(common.ENGINE_SRC))

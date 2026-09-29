@@ -189,6 +189,7 @@ Relative paths to manifests, schemas, policies and raw data are read from the re
 | `NKGRID_MAX_TIME` | Longest time a job may request |
 | `NKGRID_QOS` | Optional default QoS; `account` means the value of `--account` |
 | `NKGRID_SLURM_QUERY_INTERVAL` | Optional shortest gap in seconds between `squeue` or `sacct` calls, for sites that limit them |
+| `NKGRID_OFFLINE_COMPUTE` | Set to `1` where compute nodes cannot reach PyPI; the launcher then downloads the dependency wheels on the login node |
 
 Command-line options override the profile, within its maximum time. The account is never taken from a profile.
 
@@ -210,7 +211,7 @@ The adapter's output, including the analysis table and schema, stays in `<run>/p
 
 ## Software environment
 
-The bootstrap job installs the locked dependencies in `NK_Grid/requirements.txt` into a shared environment in `nkgrid-envs/` beside the checkout, or in `NKGRID_ENV_ROOT` if set. An environment is identified by those dependencies, the Python module and the CPU type; a later run with the same three reuses it unchanged. The experiment code itself always comes from the run's own checkout.
+The bootstrap job installs the locked dependencies in `NK_Grid/requirements.txt` into a shared environment in `nkgrid-envs/` beside the checkout, or in `NKGRID_ENV_ROOT` if set. An environment is identified by those dependencies, the Python module and the CPU type; a later run with the same three reuses it unchanged. The experiment code itself always comes from the run's own checkout. At sites whose compute nodes cannot reach PyPI, such as BMRC, the launcher first downloads the wheels on the login node, with the profile's Python module loaded, into a `wheels-` directory beside the environments, and the bootstrap job installs from that directory only.
 
 ## Scheduler policies
 
