@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
+from sklearn.dummy import DummyClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Lasso, LogisticRegression, lasso_path
 from sklearn.metrics import log_loss
@@ -244,6 +245,11 @@ def _fold_log_loss(y, probability):
     return float(log_loss(y, probability, labels=[0, 1]))
 
 
+def _alpha_max(X, y):
+    """Smallest mean-loss L1 penalty at which every coefficient is zero."""
+    return float(np.max(np.abs((X - X.mean(axis=0)).T @ (y - y.mean())), initial=0.) / len(y))
+
+
 class _Classifier(ClassifierMixin, BaseEstimator):
     def predict(self, X):
         return self.model_.predict(X)
@@ -302,6 +308,12 @@ class FoldLocalLogisticLasso(_Classifier):
     alpha*||w||_1. The same objective on the Bernoulli likelihood is sklearn's
     C = 1/(n*alpha), with n the rows of that fit. As in LassoCV, alphas run from
     the strongest penalty down with warm starts, and ties keep the stronger one.
+
+    From alpha_max = max|X'(y - ybar)|/n upward every coefficient is zero and the
+    unpenalized intercept predicts the training rate. saga is not run there: it
+    stops once the coefficients stop changing, without checking the intercept,
+    which it leaves partway to logit(ybar). Each fold's path starts from that
+    exact solution, and a selected alpha at or above alpha_max refits to it.
     """
     def __init__(self, preprocessor, seed, alpha_log10_min, alpha_log10_max, n_alphas,
                  max_cv_folds, max_iter, tol=1e-4):
@@ -328,17 +340,27 @@ class FoldLocalLogisticLasso(_Classifier):
         for train, valid in folds:
             scaled = make_pipeline(clone(process), StandardScaler()).fit(_rows(X, train))
             train_X, valid_X = scaled.transform(_rows(X, train)), scaled.transform(_rows(X, valid))
+            top, rate = _alpha_max(train_X, y[train]), y[train].mean()
             model = self._logistic(len(train), self.alphas_[0], warm_start=True)
+            model.coef_, model.intercept_ = np.zeros((1, train_X.shape[1])), np.array([np.log(rate / (1 - rate))])
             fold = []
             for alpha in self.alphas_:
-                model.set_params(C=1. / (len(train) * alpha)).fit(train_X, y[train])
-                fold.append(_fold_log_loss(y[valid], model.predict_proba(valid_X)[:, 1]))
+                if alpha >= top:
+                    probability = np.full(len(valid), rate)
+                else:
+                    model.set_params(C=1. / (len(train) * alpha)).fit(train_X, y[train])
+                    probability = model.predict_proba(valid_X)[:, 1]
+                fold.append(_fold_log_loss(y[valid], probability))
             losses.append(fold)
         self.fold_log_loss_ = np.asarray(losses)
         self.cv_log_loss_ = self.fold_log_loss_.mean(axis=0)
         self.alpha_ = float(self.alphas_[np.argmin(self.cv_log_loss_)])
-        self.model_ = make_pipeline(clone(process), StandardScaler(),
-                                    self._logistic(len(y), self.alpha_)).fit(X, y)
+        scaled = make_pipeline(clone(process), StandardScaler()).fit(X)
+        full_X = scaled.transform(X)
+        self.alpha_max_ = _alpha_max(full_X, y)
+        estimator = (DummyClassifier(strategy="prior") if self.alpha_ >= self.alpha_max_
+                     else self._logistic(len(y), self.alpha_))
+        self.model_ = make_pipeline(scaled, estimator.fit(full_X, y))
         self.classes_ = self.model_.classes_
         return self
 
