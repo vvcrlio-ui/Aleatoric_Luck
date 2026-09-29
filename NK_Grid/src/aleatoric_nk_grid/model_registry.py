@@ -106,7 +106,7 @@ MODEL_PARAM_KEYS = {
         "ridge": {"alpha_log10_min", "alpha_log10_max", "n_alphas", "max_iter"},
         "lasso": {
             "alpha_log10_min", "alpha_log10_max", "n_alphas",
-            "max_cv_folds", "max_iter", "tol",
+            "max_cv_folds", "max_iter", "alpha_scale", "tol",
         },
         "random_forest": {"n_estimators", "max_features", "min_samples_leaf"},
         "extra_trees": {"n_estimators", "max_features", "min_samples_leaf"},

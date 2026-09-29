@@ -302,7 +302,7 @@ class FoldLocalLogisticRidge(_Classifier):
 
 
 class FoldLocalLogisticLasso(_Classifier):
-    """L1 logistic twin of FoldLocalLasso's absolute alpha scale.
+    """L1 logistic twin of FoldLocalLasso, on its absolute or relative alpha scale.
 
     Lasso regression minimizes the mean Gaussian negative log-likelihood plus
     alpha*||w||_1. The same objective on the Bernoulli likelihood is sklearn's
@@ -314,9 +314,13 @@ class FoldLocalLogisticLasso(_Classifier):
     stops once the coefficients stop changing, without checking the intercept,
     which it leaves partway to logit(ybar). Each fold's path starts from that
     exact solution, and a selected alpha at or above alpha_max refits to it.
+
+    On the relative scale the grid holds ratios to each training fold's
+    alpha_max, as glmnet's path does, and the selected ratio is refit at the
+    whole sample's alpha_max.
     """
     def __init__(self, preprocessor, seed, alpha_log10_min, alpha_log10_max, n_alphas,
-                 max_cv_folds, max_iter, tol=1e-4):
+                 max_cv_folds, max_iter, tol=1e-4, alpha_scale="absolute"):
         self.preprocessor = preprocessor
         self.seed = seed
         self.alpha_log10_min = alpha_log10_min
@@ -325,26 +329,34 @@ class FoldLocalLogisticLasso(_Classifier):
         self.max_cv_folds = max_cv_folds
         self.max_iter = max_iter
         self.tol = tol
+        self.alpha_scale = alpha_scale
 
     def _logistic(self, n, alpha, warm_start=False):
         return LogisticRegression(C=1. / (n * alpha), l1_ratio=1., solver="saga", max_iter=self.max_iter,
                                   tol=self.tol, random_state=self.seed, warm_start=warm_start)
 
     def fit(self, X, y):
+        if self.alpha_scale not in ("absolute", "relative"):
+            raise ValueError("alpha_scale must be absolute or relative")
         y = np.asarray(y, dtype=int)
         process = classification_preprocessor(self.preprocessor)
         folds = stratified_cv_folds(y, self.max_cv_folds, "lasso")
         self.n_splits_ = len(folds)
-        self.alphas_ = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)[::-1]
+        grid = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)[::-1]
+        if self.alpha_scale == "absolute":
+            self.alphas_ = grid
+        else:
+            self.ratios_ = grid
         losses = []
         for train, valid in folds:
             scaled = make_pipeline(clone(process), StandardScaler()).fit(_rows(X, train))
             train_X, valid_X = scaled.transform(_rows(X, train)), scaled.transform(_rows(X, valid))
             top, rate = _alpha_max(train_X, y[train]), y[train].mean()
-            model = self._logistic(len(train), self.alphas_[0], warm_start=True)
+            alphas = grid if self.alpha_scale == "absolute" else grid * top
+            model = self._logistic(len(train), alphas[0], warm_start=True)
             model.coef_, model.intercept_ = np.zeros((1, train_X.shape[1])), np.array([np.log(rate / (1 - rate))])
             fold = []
-            for alpha in self.alphas_:
+            for alpha in alphas:
                 if alpha >= top:
                     probability = np.full(len(valid), rate)
                 else:
@@ -354,10 +366,11 @@ class FoldLocalLogisticLasso(_Classifier):
             losses.append(fold)
         self.fold_log_loss_ = np.asarray(losses)
         self.cv_log_loss_ = self.fold_log_loss_.mean(axis=0)
-        self.alpha_ = float(self.alphas_[np.argmin(self.cv_log_loss_)])
+        selected = float(grid[np.argmin(self.cv_log_loss_)])
         scaled = make_pipeline(clone(process), StandardScaler()).fit(X)
         full_X = scaled.transform(X)
         self.alpha_max_ = _alpha_max(full_X, y)
+        self.alpha_ = selected if self.alpha_scale == "absolute" else selected * self.alpha_max_
         estimator = (DummyClassifier(strategy="prior") if self.alpha_ >= self.alpha_max_
                      else self._logistic(len(y), self.alpha_))
         self.model_ = make_pipeline(scaled, estimator.fit(full_X, y))
