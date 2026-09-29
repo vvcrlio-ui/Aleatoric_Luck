@@ -1,48 +1,33 @@
-# Cost-bounded queue protocol
+# How tasks are priced and scheduled
 
-New shared-controller allocations use protocol 2: the dispatcher prices leases,
-workers save and submit completed chunks independently of subsequent computation,
-and heartbeats address the lease token rather than its first cell. Legacy
-Dispatcher entry points explicitly retain protocol 1.
+Within a round, worker processes take tasks from a queue service and send results back. This page describes the protocol between them, how the queue service estimates what each task costs, how the CPU-hour budget is charged, and when a round is ended early. None of this changes what a task computes: task identity, model settings, thread limits and success checks are the same however tasks are scheduled.
 
-The scientific task identity, model settings, thread limits and success checks
-are unchanged. Every round still runs its frozen checkout and plan. Existing
-running panels must retain their original checkout.
+## Queue protocol
 
-## Build an operational profile
+Runs use protocol 2. The queue service hands out leases on batches of tasks, sized by their estimated cost. A worker saves and submits each finished chunk of results while it goes on computing. Its heartbeats name the lease token, not a particular task.
 
-From a stopped result journal, with the new checkout on `PYTHONPATH`:
+Heartbeats are sent about every 600 seconds, with some jitter, and a lease lasts 3,600 seconds, so one delayed heartbeat does not cost a worker its lease. The queue service accepts only a limited number of result submissions at once (`max_submissions` in the [scheduler policy](policies/README.md)); when it is busy it replies with HTTP 503, and the worker keeps the result and tries again.
+
+A chunk normally holds at most 512 KiB, including the whole request. A single larger row may use up to the server's 1 MiB limit. A row that cannot be sent at all is kept intact as evidence and never truncated or resent endlessly: the round drains, and the controller records `protocol_blocked` instead of starting another allocation with the same input.
+
+## Estimating task costs
+
+The controller prices each round from the timings of the run's own finished rounds, and from any profile placed in `cost-profile.json` in the run directory. A profile can be built from another run's result journal:
 
 ```sh
 PYTHONPATH=NK_Grid/src python -m aleatoric_nk_grid.cost_profile \
-  /path/to/stopped/round/results.jsonl -o /path/to/new-panel/cost-profile.json
+  /path/to/stopped/round/results.jsonl -o /path/to/run/cost-profile.json
 ```
 
-Use full input (`--stride 1`, the default) for batch pricing. The builder uses
-bounded float32 reservoirs, retains exact means, records quantile sampling error,
-and separates successful, failed and skipped timing observations. Complete outer
-worker timing is preferred; historical model-only timing remains explicitly
-labelled. Validate the dataset, grid, model parameters and environment before
-reusing another panel's profile.
+Use the full journal (`--stride 1`, the default). The builder keeps exact means, estimates quantiles from bounded samples and records their sampling error, and keeps successful, failed and skipped fits apart. Check that the dataset, grid, model settings and environment match before reusing another panel's profile. If any source in the profile belongs to a different plan, the whole import is ignored and the run relies on its own rounds.
 
-Only an exact group with sufficient successful observations supplies a p99 batch
-price. Unknown groups are leased one cell at a time. Old mean-only profiles still
-support mean work estimates but do not authorize large batches. Thus deploying
-without a suitable profile is safe but can materially reduce cheap-cell throughput.
-The round's `operational.json` records profile coverage, source hashes and policy.
+Only a group of tasks with enough successful timings gets a batch price, taken from its 99th percentile. Tasks from a group without one are leased one at a time. A run without a suitable profile therefore gives the same results, but can move slowly through many cheap tasks.
 
-Prediction workflows additionally match phase, pipeline/variant, fold count,
-cache mode and frozen training identity. Only complete cold work supplies their
-mean/p99 prices. Cache hits, resumed fits, missing OOF and unclassified workflow
-observations retain separate diagnostic timing groups; they cannot make a cold
-task appear cheaper. Workflow profiles built before this distinction are
-unpriced until rebuilt from rows that prove complete cold work. Ordinary legacy
-profiles keep their previous interpretation.
+For the prediction workflow, timings are grouped by phase, pipeline or variant, fold count, cache mode and training identity. Only tasks that did all their training from scratch set prices. Fits that reused cached predictions, resumed fits and incomplete out-of-fold work are kept in separate groups for diagnosis, so they cannot make a task look cheaper than it is. Each round's `operational.json` records the profile it used, its coverage and the policy.
 
-## Optional policy beside the new plan
+## Budgets and policy changes
 
-Place `scheduler-policy.json` beside `plan.json`. For example, a **local-policy
-example, not a production resource recommendation**, is:
+A scheduler policy passed with `--scheduler-policy` is saved as `scheduler-policy.json` beside `plan.json`. Fields and defaults are listed in [policies/README.md](policies/README.md). A small test policy might look like this:
 
 ```json
 {
@@ -55,77 +40,18 @@ example, not a production resource recommendation**, is:
 }
 ```
 
-Choose a CPU-hour budget for the actual panel before launch. A 100-hour example
-does not fit an 18-million-cell production panel. The existing account/QoS and
-whole-allocation resource checks also apply. A budget can be tightened during
-continuation; it cannot silently be raised or reset by removing the policy.
-Missing trusted allocation-time evidence is charged at the full reserved duration.
-Controls are conservatively charged by their reserved duration.
+Choose `max_cpu_hours` for the actual panel; a production panel needs far more than this. The budget charges every allocated node in full for its wall time, and controller jobs for the time they reserved. When the actual allocation time is unknown, the full reserved time is charged. The budget can be lowered between rounds, but not raised, and removing the policy does not reset it.
 
-Policy/profile edits affect only rounds without a saved operational snapshot.
-Never edit a submitted round's snapshot, frozen plan, queue manifest or checkout.
-The existing `--rounds` option determines the total permitted rounds; this change
-does not expand any frozen round budget.
+A policy change applies only to rounds that have not started. Do not edit a submitted round's saved settings, the plan, the queue manifest or the checkout. `--rounds` or the manifest's phase limits set how many rounds the run may use. Per-round time limits for base rounds are described in [PREDICTION_CACHE.md](PREDICTION_CACHE.md#manifest-settings).
 
-New prediction workflows may freeze `execution.base_round_time_limits`, with
-one `HH:MM:SS` entry per base round. For example, a separately approved plan can
-freeze global wall time `08:00:00` and `['01:00:00', '08:00:00']`: its first
-allocation drains at one hour, then the ordinary missing-task and node-count
-sizing sizes a smaller continuation. Each entry must fit the frozen global time
-limit. Submitted round count determines
-the entry after a controller restart, and CPU-hour usage remains cumulative.
-Omitting the field preserves the existing behavior.
+## Ending a round early
 
-The shared dispatcher requests one multi-node Slurm allocation of at most the
-run's `max_nodes` minus two nodes; its worker processes are not separate jobs.
-The cumulative run budget charges every allocated node in full for its wall
-time. Slurm applies the account's limits when it schedules the allocation.
+Every round drains before its allocation's time limit. When a round drains, workers keep their finished chunks, stop taking new tasks, get a grace period, and their job step is then ended so the controller can take stock and start a smaller allocation for the remaining work. An unresponsive filesystem can delay this; Slurm's time limit is the final bound.
 
-Automatic economic tail drain is disabled until measured migration costs are
-available. To enable it, supply positive `restart_overhead_seconds`,
-`restart_cpu_hours` and `max_cpu_hours`, then set `drain_enabled: true`. These
-values must come from the site's scan, initialization and control measurements.
-The decision requires sustained low utilization, priced remaining work, no unknown
-worker status, sufficient remaining CPU budget and an available successor round.
-It also checks the no-progress limit. A normal final batch with everyone computing
-does not authorize drain. Missing/stale telemetry blocks automatic economic drain.
+A round can also be drained when its last tasks leave most workers idle. This is off by default. To turn it on, set `restart_overhead_seconds`, `restart_cpu_hours` and `max_cpu_hours` from the site's own measurements of start-up and scanning costs, and set `drain_enabled: true`. The round is then drained only when utilization stays low, the remaining work is priced, every worker's status is known, enough CPU budget remains, another round is allowed, and the no-progress limit has not been reached. A final batch in which every worker is still computing does not trigger it, and missing or stale worker reports block it.
 
-Runtime keeps completed chunks durable, stops new claims, allows a drain grace,
-and terminates the old step before the controller scans and starts a smaller
-allocation. Allocation-deadline drain is always active. An unresponsive filesystem
-can delay software shutdown; Slurm's allocation time limit is the final bound.
+## Progress and fault records
 
-## Faults and evidence
+`control/<generation>/progress.json` counts computing, submitting, idle, unknown and slow workers, and records the estimated remaining work and any drain decision. A worker whose reported task has already been committed counts as unknown, not idle, until its next report. Reports from long tasks are jittered, and workers that find the queue empty poll less and less often.
 
-`control/<generation>/progress.json` includes computing, submitting, idle, unknown
-and straggler counts, profile work estimates and costed drain decisions. A worker
-whose reported cell has already committed is conservatively unknown until its
-next status; it is not counted as idle to justify a drain. Long-cell status reports
-are jittered; empty-queue claim polling backs off.
-
-Chunks normally use at most 512 KiB including the entire encoded RPC envelope.
-A single larger row may use up to the server's 1 MiB limit. An unrepresentable row
-is retained intact as blocked evidence; it is never truncated or endlessly replayed.
-Terminal protocol faults notify the dispatcher and write a shared fault marker.
-The round drains, and the controller records `protocol_blocked` without submitting
-another worker allocation with the same poison input.
-
-`control/round-result.json` records job/generation/queue identity, elapsed-time
-source, outcome and drain reason. Completed journal rows remain the authority for
-resumption and final publication. Same-token replays wait for the original durable
-commit and cannot append duplicates while fsync is in flight.
-
-## Validation and remaining gates
-
-Run the tracked regressions in [validation/README.md](../NK_Grid/validation/README.md).
-The synthetic multi-process/multi-node probe is
-`NK_Grid/validation/efficiency_probe.py`; it never performs scientific fits or
-submits jobs itself. It validates TLS, journal durability, partial submission,
-heterogeneous leases and exact missing-task continuation. Its timings are not
-evidence of production savings.
-
-Native scientific fixed-task A/B and one complete production pilot remain gates
-before claiming reduced scientific CPU-hour cost. In-round compute-process
-supervision, automatic node quarantine and SMT packing remain separate changes;
-the present recovery mechanism releases the whole allocation and resumes its
-missing work. No model-thread or SMT binding defaults were changed.
+A fault in the protocol itself notifies the queue service and leaves a shared fault marker. `control/round-result.json` records the job, generation and queue, where the elapsed time came from, the outcome and the reason for draining. The completed rows of the result journal decide what a resumed run still has to do and what goes into the final table. A result sent twice with the same lease token waits for the first copy to reach disk and is never stored twice.

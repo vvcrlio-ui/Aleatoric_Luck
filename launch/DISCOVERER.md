@@ -1,6 +1,6 @@
 # Discoverer site notes
 
-Use `--profile discoverer` and an explicit authorized `--account`. Commands, preparation and recovery are described in [OPERATIONS.md](OPERATIONS.md).
+Use `--profile discoverer` and an explicit authorized `--account`. Commands, preparation and recovery are described in [the launch guide](README.md).
 
 | Profile value | Setting |
 |---|---|
@@ -10,9 +10,9 @@ Use `--profile discoverer` and an explicit authorized `--account`. Commands, pre
 | Maximum requested time | 48 hours |
 | Default QoS | The supplied account |
 
-The profile is [profiles/discoverer.sh](profiles/discoverer.sh). Each run states its node count with `--nodes`. The optional [cache policy](policies/discoverer-cache.json) requests resources for large cache/SL experiments through `--scheduler-policy`.
+The profile is [profiles/discoverer.sh](profiles/discoverer.sh). Each run states its node count with `--nodes`. For large runs, pass the [Discoverer policy](policies/discoverer-cache.json) with `--scheduler-policy`.
 
-Run directories and raw inputs must be on compute-visible storage. Under `/valhalla/projects/PROJECT`, storage admission uses `lfs` project quotas. Bootstrap temporary downloads stay in the run directory and pip cache stays beside the shared environments.
+Run directories and raw inputs must be on compute-visible storage. Under `/valhalla/projects/PROJECT`, the [storage check](PREDICTION_CACHE.md#storage-checks) uses `lfs` project quotas. Bootstrap temporary downloads stay in the run directory and pip cache stays beside the shared environments.
 
 Check current jobs and QoS headroom before submitting:
 

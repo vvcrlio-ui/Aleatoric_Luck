@@ -6,7 +6,7 @@ This repository runs a repeated-sampling prediction experiment. For an outcome i
 
 An adapter turns a dataset into an analysis table, a description of its variables, and a schema that ties them together ([adapter principles](Adapter/README.md)). The test set is either the one defined by the data provider or, when there is none, a random 30% of the observations with an observed outcome, drawn anew for each seed. Variables are screened and categories coded without using the test set.
 
-K counts variables, not columns. The dummy columns of a categorical variable, together with any missingness indicators attached to it, enter and leave the model as one unit and count once.
+K counts variables, not columns. The dummy columns of a categorical variable, together with any missingness indicators attached to it, enter and leave the model as one unit and count once. The adapter files call this unit a source.
 
 Missing values stay missing in the prepared data. Imputation, scaling and model tuning are learned from the sampled training rows only, and inside cross-validation from each training fold only, so a small training sample does not borrow information from the rest of the data or from the test set ([why](Adapter/README.md#why-imputation-happens-during-training)).
 
@@ -26,11 +26,9 @@ The production design repeats the grid for 100 seeds with 50 draws each. When th
 
 ## Models
 
-Eight models are fit separately on every training sample: OLS, Ridge, Lasso, random forest, extra trees, XGBoost, LightGBM and a neural network with one hidden layer. For binary outcomes, OLS, Ridge and Lasso are logistic regressions with different penalties.
+Eight models are fit separately on every training sample: OLS, Ridge, Lasso, random forest, extra trees, XGBoost, LightGBM and a neural network with one hidden layer. For binary outcomes, OLS, Ridge and Lasso are logistic regressions with different penalties. For continuous outcomes, Ridge, Lasso and the neural network choose their penalty, and the two boosting models their number of rounds, by cross-validation within the training sample; for binary outcomes these models use fixed settings.
 
-For continuous outcomes, Ridge, Lasso and the neural network choose their penalty, and the two boosting models their number of rounds, by cross-validation within the training sample, and are then refit on all N rows. For binary outcomes these models use fixed settings. Each dataset's settings are in its `model_params.yaml`.
-
-The ninth model, the Super Learner (SL7), combines the seven models other than OLS. Besides its fit on all N rows, each of the seven is fit five more times, each time on about four fifths of the training sample, to predict the remaining rows. This gives an out-of-fold prediction for every training row. SL7 finds the nonnegative weights, plus an intercept, that best predict the training outcome from these out-of-fold predictions, and applies the same weights to the seven models' test predictions. For binary outcomes it combines predicted probabilities with a logistic regression. SL7 does not see test outcomes and does not retrain any model.
+The ninth model, the Super Learner (SL7), is a weighted combination of the seven models other than OLS. Its weights are estimated from predictions each model makes for training rows it was not fit on, so it never sees test outcomes. The [experiment methods](NK_Grid/README.md#model-fitting) describe the tuning and the Super Learner in full.
 
 ## Reading the results
 
@@ -38,27 +36,9 @@ Every run writes to a new directory in its dataset folder, `<dataset>/outputs/<p
 
 For continuous outcomes, `mse` is the mean squared error on the test set. `r2_test` compares it with predicting the training-sample mean for everyone; `r2_test_mean` compares it with the test-sample mean, which is the usual test R². For binary outcomes the table has `roc_auc`, `brier`, `log_loss` and `accuracy`. A metric that cannot be computed for a particular sample is stored as NaN, which is different from a failed fit.
 
-## Quick start
+## Running experiments
 
-Each experiment is one panel: one outcome with one prepared input, listed in a dataset's `panels.yaml`. A run goes through a dry-run that only prints the launch settings, a small `dev` run or a `timing_full` run that covers the full grid once, and then `production`.
-
-| Preset | Seeds × draws | Grid |
-|---|---|---|
-| dev | 3 × 3 | 3 × 3, N and K at most 100 |
-| timing_full | 1 × 1 | full 20 × 20 |
-| production | 100 × 50 | full 20 × 20 |
-
-Run a small experiment on a Slurm cluster:
-
-```bash
-bash run.sh slurm --profile YOUR_SITE --account YOUR_PROJECT_ACCOUNT --nodes 4 \
-  --manifest DATASET/panels.yaml --panel PANEL_NAME --preset dev \
-  --prepare --data-dir /absolute/raw/directory
-```
-
-Append `--dry-run` to preview without submitting. The login node checks the request and submits a bootstrap job. Environment setup, data preparation and planning run on a compute node. `--nodes` is the total number of nodes the run may occupy. Profiles in `launch/profiles/` hold site defaults; without a profile, pass the partition and time explicitly.
-
-[How runs are carried out](launch/README.md) explains the stages and what happens on the cluster. [launch/OPERATIONS.md](launch/OPERATIONS.md) lists all commands and options, including other clusters, data preparation, resuming and output locations.
+The [launch guide](launch/README.md) starts with a command that only previews a run, then a small real run, and then the steps up to a full production run. It also explains how to follow a run on the cluster and how to resume one that stopped.
 
 ## Where to read more
 
@@ -69,5 +49,4 @@ Append `--dry-run` to preview without submitting. The login node checks the requ
 | How a particular dataset is prepared | `adapter/README.md` in that dataset's folder |
 | Sampling, preprocessing, models and metrics in detail | [Experiment methods](NK_Grid/README.md) |
 | How the code carries out one experiment | [Core code](NK_Grid/src/aleatoric_nk_grid/README.md) |
-| How runs are carried out | [Running experiments](launch/README.md) |
-| Commands, clusters and recovery | [Operations](launch/OPERATIONS.md) |
+| Launching, following and resuming a run | [Running experiments](launch/README.md) |

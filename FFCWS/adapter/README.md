@@ -2,6 +2,8 @@
 
 FFCWS inputs comprise a background-variable table and official train/test outcome tables. The code joins them by `challengeID`, preserving the official split and the row order of each outcome table. Only the official training pool determines variable retention and encoding; the same rules are then applied to test data.
 
+FFC has six outcomes. GPA, grit and material hardship are continuous; eviction, layoff and job training are binary. Each outcome is prepared in each of the three encodings described in section 2, which gives the 18 panels in [panels.yaml](../panels.yaml), named `ffc_<encoding>_<outcome>`.
+
 The steps are: identify missing values, screen variables in the training pool, determine variable types and category vocabularies, build the three representations, join the selected outcome, and validate the inputs before they go to the training engine.
 
 ## Preparing a run
@@ -19,9 +21,9 @@ Column screening uses only the official training pool, with rules from the [conf
 | Check | Current rule |
 |---|---|
 | Missing-value recognition | Blanks, NA-like markers, and codes −9 through −1 are treated as missing; values that cannot be parsed as numbers also become NaN |
-| Valid-value rate | After excluding recognized blanks and negative missing codes, discard the source if fewer than 50% of its original values are valid; exactly 50% passes |
-| Variation | If conversion leaves no observed numeric values or only one distinct value, discard the entire source and its missingness indicators |
-| Categorical-source retention | At least one observed level must satisfy `min(p,1-p) >= 0.01`, where p is its proportion of all training-pool rows |
+| Valid-value rate | After excluding recognized blanks and negative missing codes, discard the variable if fewer than 50% of its original values are valid; exactly 50% passes |
+| Variation | If conversion leaves no observed numeric values or only one distinct value, discard the entire variable and its missingness indicators |
+| Categorical-variable retention | At least one observed level must satisfy `min(p,1-p) >= 0.01`, where p is its proportion of all training-pool rows |
 
 Here, structural missingness includes blanks, NA markers, and codes -9 through -1. Numeric parsing failures become NaN, but parsing success rates do not determine column retention. The 50% threshold is based on structural missingness. The negative-code rule for predictors is not automatically applied to outcomes.
 
@@ -33,7 +35,7 @@ Numbers can represent quantities or category identifiers. For example, 1, 2, and
 
 A type declared in the configuration, `numeric` or `categorical` under `schema.variable_types`, takes precedence. Without a declaration, a variable is treated as categorical if it has at most 15 observed levels and either Stata value labels or only integer values, and as numeric otherwise. No types are declared at present, so this rule decides every variable; any declaration added later should be checked against the variable documentation. Category vocabularies are built only from the official training pool.
 
-The same retained sources are represented in three ways:
+The same retained variables are represented in three ways:
 
 | Representation | Numeric variables | Categorical variables | Additional missingness information |
 |---|---|---|---|
@@ -41,7 +43,7 @@ The same retained sources are represented in three ways:
 | `median_missing_indicator` | Values and NaN | Same as above | Retained 0/1 indicators for declared missing codes or blanks |
 | `tree_ordinal` | Values and NaN | Categories sorted by original numeric code and mapped to 0, 1, 2, … | None |
 
-Once a categorical source is retained, its one-hot representation keeps all known observed levels, including rare levels. Missingness indicators remain subject to the 1% binary-prevalence threshold.
+Once a categorical variable is retained, its one-hot representation keeps all known observed levels, including rare levels. Missingness indicators remain subject to the 1% binary-prevalence threshold.
 
 In the missing-indicator representation, codes −9 through −1 become NaN in the value column. Separate 0/1 indicators are generated for specific codes observed in the training pool, preserving their different meanings as defined by the variable's labels. The value column is imputed during training; linear models and neural networks can also use these indicators.
 
@@ -55,22 +57,11 @@ For example, suppose a variable labels −1 as refusal and −2 as “don't know
 
 These columns let models learn from reasons for missingness without treating −1 and −2 as quantities. Only `median_missing_indicator` adds these columns.
 
-All three representations retain the same original sampling sources, although expanded column counts can differ. Value columns and missingness indicators are sampled together, and K counts the original variable once. See the [three encoding methods](src/ffcws_data_processor/strategies/README.md) for examples.
+All three representations retain the same variables, although their column counts can differ. Value columns and missingness indicators are sampled together, and K counts the original variable once. See the [three encoding methods](src/ffcws_data_processor/strategies/README.md) for examples.
 
 ## 3. When and how imputation occurs
 
-The adapter identifies missing values and keeps them as NaN; imputation takes place during training. The engine learns imputation rules after drawing the training sample. Each cross-validation training fold learns its own rules, which are then applied to its validation or test data.
-
-| Type | Training-time treatment |
-|---|---|
-| Continuous variable | Impute the median of the current training rows |
-| One-hot category group | Impute the most frequent complete category state in the training rows, rather than imputing columns independently |
-| Integer category encoding (`ordinal`) | Find the training median, then select the nearest legal level observed in that training data; ties select the lower value |
-| Standalone LightGBM/XGBoost | Preserve NaN as specified by the schema and let the model handle it |
-
-For example, categories represented by `[1,0,0]`, `[0,1,0]`, and `[0,0,1]` have a missing state of `[NaN,NaN,NaN]`. Imputation selects a complete category state rather than filling the columns with `[0,0,0]`.
-
-A column observed in the full training pool may be entirely missing in a small training sample. The code retains the column and its contribution to K, setting the corresponding preprocessing group to the same prior value on both training and validation/test sides. Models preserving NaN receive NaN on both sides. This prevents test observations from restoring information absent during training. A combination is skipped if the primary value representations of all selected sources are unobserved.
+The adapter identifies missing values and keeps them as NaN; imputation takes place during training, learned from each training sample and each cross-validation training fold. The rules for each column type are in the [experiment methods](../../NK_Grid/README.md#learn-preprocessing-from-the-current-training-data). A variable observed in the full training pool can be entirely missing in a small training sample; it still counts toward K, and a combination is skipped if none of the selected variables is observed.
 
 ## 4. New categories in test data
 

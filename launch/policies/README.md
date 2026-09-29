@@ -1,8 +1,8 @@
 # Scheduler policies
 
-A scheduler policy sets how a run uses a Slurm cluster: how many nodes and workers each round may take, how much memory and time each worker gets, and how the queue service is laid out. It never changes what is computed, so it is not part of a run's scientific identity. Pass one with `--scheduler-policy PATH.json`; without it, every field keeps its default, which suits small runs. Options given on the command line, such as `--dispatcher-shards`, override the same field in the file. A run saves the file it started with as `scheduler-policy.initial.json`.
+A scheduler policy sets how a run uses a Slurm cluster: how many nodes and workers each round may take, how much memory and time each worker gets, and how the queue service is laid out. It does not change what is computed, so two runs that differ only in their policy give the same results. Pass one with `--scheduler-policy PATH.json`; without it, every field keeps its default, which suits small runs. Options given on the command line, such as `--dispatcher-shards`, override the same field in the file. A run saves the file it started with as `scheduler-policy.initial.json`.
 
-`discoverer-cache.json` holds the values used for large cache/SL7 runs on Discoverer. To prepare a policy for another cluster or run size, copy [template.json](template.json) and replace its values; fields you leave out keep their defaults.
+[discoverer-cache.json](discoverer-cache.json) holds the values used for large runs on Discoverer: four queue service processes, one set of resource limits for the base models and the Super Learner, and a final check spread over the workers. To prepare a policy for another cluster or run size, copy [template.json](template.json) and replace its values; fields you leave out keep their defaults.
 
 ## Format
 
