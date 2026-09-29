@@ -41,8 +41,11 @@ def duration(value):
 
 
 def node_geometry(partition, *, run=query):
-    """CPUs, memory in MB and hardware threads per core of each node in the partition."""
-    nodes = records(run(["sinfo", "-h", "-p", partition, "-o", "%c|%m|%Z"]), "cpu,mem,threads")
+    """CPUs, memory in MB and hardware threads per core of each node in the partition.
+
+    One line per node: grouped output of a mixed partition reports "24+".
+    """
+    nodes = records(run(["sinfo", "-h", "-N", "-p", partition, "-o", "%c|%m|%Z"]), "cpu,mem,threads")
     if not nodes:
         raise ValueError(f"sinfo reports no nodes in partition {partition}")
     return nodes
