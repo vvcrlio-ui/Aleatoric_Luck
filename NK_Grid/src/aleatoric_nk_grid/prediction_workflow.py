@@ -73,11 +73,9 @@ def contract_from_config(config, plan):
                   'oof_folds': cache.get('oof_folds', 5), 'base_library_id': 'standalone8-v1',
                   'model_params': plan['cell_spec']['resolved_model_params'][model]} for model in base_models]
     variants = cache.get('variants')
+    combiner = ({'rule': 'nnls-intercept-v1'} if plan['task_kind'] == 'regression' else
+                {'rule': 'nonnegative-logistic-intercept-v1'})
     if variants is None:
-        sl_params = plan['cell_spec']['resolved_model_params']['super_learner']
-        default_combiner = ({'rule': 'nnls-intercept-v1'} if plan['task_kind'] == 'regression' else
-            {'rule': 'logistic-v1', 'C': sl_params.get('C', 1.), 'max_iter': sl_params.get('max_iter', 500),
-             'random_state_rule': 'cell-model-seed'})
         # OLS is excluded from the combination, not from the library: it keeps its
         # own independent column and OOF. Underdetermined OLS predicts far outside
         # the label range (GPA labels 1.0-4.0 against OLS predictions -779.8..760.9),
@@ -86,7 +84,7 @@ def contract_from_config(config, plan):
         variants = [{'variant_id': 'standalone8-sl7-v1', 'pipeline_ids': ['standalone8-v1/' + model
                      for model in ('ridge', 'lasso', 'random_forest', 'extra_trees',
                                    'xgboost', 'lightgbm', 'shallow_neural_network')],
-                     'missing_policy': 'skip', 'combiner': default_combiner}]
+                     'missing_policy': 'skip', 'combiner': combiner}]
     # Off by default: the original four-model SL is reproduced only when a run
     # explicitly asks for that control. It is four extra pipelines of full+OOF
     # training, not a disk write, and it cannot be added to a sealed cache later.
@@ -95,16 +93,11 @@ def contract_from_config(config, plan):
         params = plan['cell_spec']['resolved_model_params']['super_learner']
         if params.get('passthrough') or (task_kind == 'regression' and not params.get('positive', True)):
             raise QueueError('Formal cache-only SL supports frozen passthrough=false and positive regression')
-        entries = ([('ridge', 'ridge'), ('extra_trees', 'extra_trees'), ('lightgbm', 'lightgbm'),
-                    ('shallow_nn', 'shallow_neural_network')] if task_kind == 'regression' else
-                   [('logistic', 'ols'), ('lightgbm', 'lightgbm'), ('extra_trees', 'extra_trees'),
-                    ('shallow_nn', 'shallow_neural_network')])
+        entries = [('ridge', 'ridge'), ('extra_trees', 'extra_trees'), ('lightgbm', 'lightgbm'),
+                   ('shallow_nn', 'shallow_neural_network')]
         pipelines += [{'pipeline_id': formal_id + '/' + internal, 'model': model,
                        'oof_folds': params.get('cv', 5), 'base_library_id': formal_id,
                        'formal_params': params} for internal, model in entries]
-        combiner = ({'rule': 'nnls-intercept-v1'} if task_kind == 'regression' else
-                    {'rule': 'logistic-v1', 'C': params.get('C', 1.), 'max_iter': params.get('max_iter', 500),
-                     'random_state_rule': 'cell-model-seed'})
         variants = [*variants, {'variant_id': formal_id, 'pipeline_ids': [formal_id + '/' + internal for internal, _ in entries],
                                 'missing_policy': 'skip', 'combiner': combiner, 'reported_sl': True}]
     root = Path(plan['launch']['output']).resolve()

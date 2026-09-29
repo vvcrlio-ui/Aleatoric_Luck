@@ -46,9 +46,9 @@ The verification schedule and the other settings above are fixed when a run star
 
 Unless the manifest sets `variants`, the Super Learner combines the seven base models other than OLS (variant `standalone8-sl7-v1`). OLS keeps its own saved predictions and its own score, but it is left out of the combination: with more columns than rows it can predict far outside the range of the outcome. To combine a different subset, set `variants` in the manifest; each subset needs its own variant ID, and results from different variants are never pooled.
 
-For continuous outcomes, the combiner is a nonnegative least-squares fit with an intercept on centered predictions; the weights are not rescaled to sum to one. For binary outcomes, it is a logistic regression on the positive-class probabilities, with fixed parameters and seed. Test outcomes are loaded only by the scoring step, after the combiner has been fitted.
+For continuous outcomes, the combiner is a nonnegative least-squares fit with an intercept on centered predictions; the weights are not rescaled to sum to one. For binary outcomes, it is an unpenalized logistic regression on the positive-class probabilities, with nonnegative weights and an intercept. Test outcomes are loaded only by the scoring step, after the combiner has been fitted.
 
-`store_reported_sl_holdout: true` adds a four-model Super Learner as a control, identified as `reported-sl4-*`. For continuous outcomes it combines Ridge, extra trees, LightGBM and the neural network. Its four models are built by the Super Learner's own constructors rather than taken from the eight base models, because a model with the same name is not necessarily the same training pipeline. The control therefore adds four more models with full and out-of-fold training, and it has to be chosen before the base phase: it cannot be added to a finished cache.
+`store_reported_sl_holdout: true` adds a four-model Super Learner as a control, identified as `reported-sl4-*`. It combines Ridge, extra trees, LightGBM and the neural network. Its four models are built by the Super Learner's own constructors rather than taken from the eight base models, because a model with the same name is not necessarily the same training pipeline. The control therefore adds four more models with full and out-of-fold training, and it has to be chosen before the base phase: it cannot be added to a finished cache.
 
 ## Order of phases
 
@@ -91,4 +91,4 @@ python -m aleatoric_nk_grid.offline_sl \
   --variant-id sensitivity-sl4 --output RUN_DIR/sensitivity-sl4
 ```
 
-For binary outcomes, `--combiner-config` must give an explicit logistic rule. `--store-prediction` also saves the new variant's test predictions. Custom pipeline recipes and training imported from another run are rejected.
+`--store-prediction` also saves the new variant's test predictions. Custom pipeline recipes and training imported from another run are rejected.

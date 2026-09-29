@@ -25,12 +25,12 @@ from sklearn.linear_model import (
     LogisticRegression,
 )
 from sklearn.model_selection import KFold
-from sklearn.neural_network import MLPClassifier, MLPRegressor
+from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 # Keep the existing import path available for callers and older pickles.
-from .mlp_estimator import FitBatchMLPRegressor, build_mlp_regressor
+from .mlp_estimator import FitBatchMLPRegressor, build_mlp_classifier, build_mlp_regressor
 from .config import DEFAULT_MODEL_PARAMS_PATH
 from .robust_linear import LinearRegression, RidgeCV
 
@@ -103,29 +103,38 @@ MODEL_PARAM_KEYS = {
     },
     "classification": {
         "ols": {"C", "l1_ratio", "solver", "max_iter"},
-        "ridge": {"C", "l1_ratio", "solver", "max_iter"},
-        "lasso": {"penalty", "C", "l1_ratio", "solver", "max_iter"},
+        "ridge": {"alpha_log10_min", "alpha_log10_max", "n_alphas", "max_iter"},
+        "lasso": {
+            "alpha_log10_min", "alpha_log10_max", "n_alphas",
+            "max_cv_folds", "max_iter", "tol",
+        },
         "random_forest": {"n_estimators", "max_features", "min_samples_leaf"},
         "extra_trees": {"n_estimators", "max_features", "min_samples_leaf"},
         "shallow_neural_network": {
-            "hidden_layer_sizes", "activation", "solver", "alpha",
+            "hidden_layer_sizes", "activation", "solver",
+            "alpha_log10_min", "alpha_log10_max", "n_alphas", "max_cv_folds",
             "learning_rate_init", "max_iter", "early_stopping",
             "validation_fraction", "n_iter_no_change",
+            "mlp_batch_size", "mlp_l2_normalization", "tol",
         },
         "super_learner": {
             "cv", "passthrough", "n_estimators", "max_features",
             "min_samples_leaf", "hidden_layer_sizes", "alpha",
-            "learning_rate_init", "max_iter", "C",
+            "ridge_alpha_log10_min", "ridge_alpha_log10_max",
+            "ridge_n_alphas", "ridge_max_iter",
+            "learning_rate_init", "max_iter",
             "lgbm_n_estimators", "lgbm_learning_rate", "lgbm_num_leaves",
             "lgbm_min_data_in_leaf",
+            "mlp_batch_size", "mlp_l2_normalization", "tol",
         },
         "xgboost": {
-            "objective", "eval_metric", "max_depth", "learning_rate",
-            "n_estimators",
+            "objective", "eval_metric", "max_depth", "eta", "max_rounds",
+            "cv_folds",
         },
         "lightgbm": {
-            "objective", "learning_rate", "num_leaves", "min_data_in_leaf",
-            "n_estimators", "verbosity",
+            "objective", "metric", "learning_rate", "num_leaves",
+            "min_data_in_leaf", "verbosity", "max_rounds", "cv_folds",
+            "early_stopping_rounds",
         },
     },
 }
@@ -157,6 +166,14 @@ def _validated_params(
         params = {"diagnostics": False, **params}
         if type(params["diagnostics"]) is not bool:
             raise ValueError("diagnostics must be boolean")
+    if task == "classification" and model_name in {"super_learner", "shallow_neural_network"}:
+        params = {"mlp_batch_size": "auto", "mlp_l2_normalization": "batch", "tol": 1e-4, **params}
+        if params["mlp_l2_normalization"] not in {"batch", "fit_samples", "effective_batch"}:
+            raise ValueError("mlp_l2_normalization must be batch, fit_samples or effective_batch")
+        policy = params["mlp_batch_size"]
+        if not (policy in {"auto", "full", "balanced"} if isinstance(policy, str)
+                else type(policy) is int and policy > 0):
+            raise ValueError("classification mlp_batch_size must be auto, full, balanced, or a positive integer")
     if allowed is None:
         reject_removed_model(model_name)
         raise ValueError(
@@ -169,20 +186,20 @@ def _validated_params(
             f"Invalid parameters for {task} model '{model_name}': "
             f"{', '.join(unknown)}"
         )
-    if task == "regression" and model_name in {
-        "xgboost", "lightgbm", "super_learner",
-    }:
+    if model_name in {"xgboost", "lightgbm", "super_learner"}:
         missing = sorted(allowed - set(params))
         if missing:
             raise ValueError(
                 f"Missing required parameters for {task} model '{model_name}': "
                 f"{', '.join(missing)}"
             )
-    if task == "regression" and model_name in {"xgboost", "lightgbm"}:
+    if model_name in {"xgboost", "lightgbm"}:
         metric_field = "eval_metric" if model_name == "xgboost" else "metric"
-        if params[metric_field] != "rmse":
+        metric = ("rmse" if task == "regression" else
+                  "logloss" if model_name == "xgboost" else "binary_logloss")
+        if params[metric_field] != metric:
             raise ValueError(
-                f"{task} model '{model_name}' requires {metric_field}='rmse'; "
+                f"{task} model '{model_name}' requires {metric_field}={metric!r}; "
                 f"got {params[metric_field]!r}"
             )
     return dict(params)
@@ -502,6 +519,127 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
         if self.preprocessor is not None:
             X = self.preprocessor_.transform(X)
         return np.asarray(self.model_.predict(X), dtype=float)
+
+
+class _BoostingCVClassifier(BaseEstimator, ClassifierMixin):
+    """Binary twins of the CV regressors: rounds selected on stratified fold log loss.
+
+    As in the regressors, the folds are shuffled with the model seed. Every fold
+    refits the preprocessing on its own training rows. The fitted booster
+    predicts the positive-class probability.
+    """
+
+    def _fold_curve(self, train_X, train_y, valid_X, valid_y):
+        raise NotImplementedError
+
+    def _refit(self, X, y, rounds):
+        raise NotImplementedError
+
+    def fit(self, X, y):
+        from .fold_local import _rows, classification_preprocessor, stratified_cv_folds
+
+        y = np.asarray(y, dtype=int)
+        process = classification_preprocessor(self.preprocessor)
+        curves = []
+        for train, valid in stratified_cv_folds(y, self.cv_folds, self._model_name, shuffle_seed=self.seed):
+            fitted = clone(process).fit(_rows(X, train))
+            curves.append(self._fold_curve(fitted.transform(_rows(X, train)), y[train],
+                                           fitted.transform(_rows(X, valid)), y[valid]))
+        self.cv_curve_ = np.mean(np.asarray(curves, dtype=float), axis=0)
+        self.best_rounds_ = _select_cv_round(self.cv_curve_, getattr(self, "early_stopping_rounds", None))
+        self.preprocessor_ = clone(process).fit(X)
+        self.model_ = self._refit(self.preprocessor_.transform(X), y, self.best_rounds_)
+        self.classes_ = np.asarray([0, 1])
+        return self
+
+    def predict_proba(self, X):
+        probability = np.asarray(self._positive(self.preprocessor_.transform(X)), dtype=float)
+        return np.column_stack((1. - probability, probability))
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= .5).astype(int)
+
+
+class XGBoostCVClassifier(_BoostingCVClassifier):
+    _model_name = "xgboost"
+
+    def __init__(self, seed: int, n_jobs: int, *, objective: str, eval_metric: str,
+                 max_depth: int, eta: float, max_rounds: int, cv_folds: int, preprocessor=None):
+        self.seed = seed
+        self.n_jobs = n_jobs
+        self.objective = objective
+        self.eval_metric = eval_metric
+        self.max_depth = max_depth
+        self.eta = eta
+        self.max_rounds = max_rounds
+        self.cv_folds = cv_folds
+        self.preprocessor = preprocessor
+
+    def _params(self):
+        return {"objective": self.objective, "eval_metric": self.eval_metric, "max_depth": self.max_depth,
+                "eta": self.eta, "nthread": self.n_jobs, "seed": self.seed}
+
+    def _fold_curve(self, train_X, train_y, valid_X, valid_y):
+        import xgboost as xgb
+
+        history = {}
+        xgb.train(self._params(), xgb.DMatrix(train_X, label=train_y), num_boost_round=self.max_rounds,
+                  evals=[(xgb.DMatrix(valid_X, label=valid_y), "valid")], evals_result=history,
+                  verbose_eval=False)
+        return history["valid"][self.eval_metric]
+
+    def _refit(self, X, y, rounds):
+        import xgboost as xgb
+
+        return xgb.train(self._params(), xgb.DMatrix(X, label=y), num_boost_round=rounds)
+
+    def _positive(self, X):
+        import xgboost as xgb
+
+        return self.model_.predict(xgb.DMatrix(X))
+
+
+class LightGBMCVClassifier(_BoostingCVClassifier):
+    _model_name = "lightgbm"
+
+    def __init__(self, seed: int, n_jobs: int, *, objective: str, metric: str,
+                 learning_rate: float, num_leaves: int, min_data_in_leaf: int, verbosity: int,
+                 max_rounds: int, cv_folds: int, early_stopping_rounds: int, preprocessor=None):
+        self.seed = seed
+        self.n_jobs = n_jobs
+        self.objective = objective
+        self.metric = metric
+        self.learning_rate = learning_rate
+        self.num_leaves = num_leaves
+        self.min_data_in_leaf = min_data_in_leaf
+        self.verbosity = verbosity
+        self.max_rounds = max_rounds
+        self.cv_folds = cv_folds
+        self.early_stopping_rounds = early_stopping_rounds
+        self.preprocessor = preprocessor
+
+    def _params(self):
+        return {"objective": self.objective, "metric": self.metric, "learning_rate": self.learning_rate,
+                "num_leaves": self.num_leaves, "min_data_in_leaf": self.min_data_in_leaf,
+                "num_threads": self.n_jobs, "seed": self.seed, "verbosity": self.verbosity}
+
+    def _fold_curve(self, train_X, train_y, valid_X, valid_y):
+        import lightgbm as lgb
+
+        history = {}
+        train = lgb.Dataset(train_X, label=train_y)
+        lgb.train(self._params(), train, num_boost_round=self.max_rounds,
+                  valid_sets=[lgb.Dataset(valid_X, label=valid_y, reference=train)],
+                  valid_names=["valid"], callbacks=[lgb.record_evaluation(history)])
+        return history["valid"][self.metric]
+
+    def _refit(self, X, y, rounds):
+        import lightgbm as lgb
+
+        return lgb.train(self._params(), lgb.Dataset(X, label=y), num_boost_round=rounds)
+
+    def _positive(self, X):
+        return self.model_.predict(X)
 
 
 class AdaptiveRidgeCV(BaseEstimator, RegressorMixin):
@@ -865,7 +1003,12 @@ class AdaptiveStackingRegressor(BaseEstimator, RegressorMixin):
 
 
 class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
-    """Classification counterpart of the out-of-fold Super Learner."""
+    """Classification twin of AdaptiveStackingRegressor's reported four-model SL.
+
+    The same four learners with the regression recipe's settings: CV-tuned L2
+    logistic, extra trees, fixed-round LightGBM and the balanced-batch MLP. The
+    stratified OOF probabilities are combined by nonnegative logistic regression.
+    """
 
     def __init__(
         self,
@@ -879,13 +1022,19 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         min_samples_leaf: int,
         hidden_layer_sizes: Sequence[int],
         alpha: float,
+        ridge_alpha_log10_min: float,
+        ridge_alpha_log10_max: float,
+        ridge_n_alphas: int,
+        ridge_max_iter: int,
         learning_rate_init: float,
         max_iter: int,
-        C: float,
         lgbm_n_estimators: int,
         lgbm_learning_rate: float,
         lgbm_num_leaves: int,
         lgbm_min_data_in_leaf: int,
+        mlp_batch_size: str | int = "auto",
+        mlp_l2_normalization: str = "batch",
+        tol: float = 1e-4,
         preprocessor=None,
     ):
         self.seed = seed
@@ -897,79 +1046,70 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
         self.min_samples_leaf = min_samples_leaf
         self.hidden_layer_sizes = hidden_layer_sizes
         self.alpha = alpha
+        self.ridge_alpha_log10_min = ridge_alpha_log10_min
+        self.ridge_alpha_log10_max = ridge_alpha_log10_max
+        self.ridge_n_alphas = ridge_n_alphas
+        self.ridge_max_iter = ridge_max_iter
         self.learning_rate_init = learning_rate_init
         self.max_iter = max_iter
-        self.C = C
         self.lgbm_n_estimators = lgbm_n_estimators
         self.lgbm_learning_rate = lgbm_learning_rate
         self.lgbm_num_leaves = lgbm_num_leaves
         self.lgbm_min_data_in_leaf = lgbm_min_data_in_leaf
+        self.mlp_batch_size = mlp_batch_size
+        self.mlp_l2_normalization = mlp_l2_normalization
+        self.tol = tol
         self.preprocessor = preprocessor
 
     def base_estimators(self):
         """Unfitted exact reported-SL recipes, for separately scheduled base work."""
         import lightgbm as lgb
+        from .fold_local import FoldLocalLogisticRidge
 
+        mlp_params = dict(hidden_layer_sizes=self.hidden_layer_sizes, activation="relu",
+            solver="adam", learning_rate_init=self.learning_rate_init, max_iter=self.max_iter,
+            early_stopping=False, n_iter_no_change=10, tol=self.tol,
+            mlp_batch_size=self.mlp_batch_size, mlp_l2_normalization=self.mlp_l2_normalization)
         estimators = [
-            (
-                "logistic",
-                make_pipeline(
-                    SimpleImputer(strategy="median"),
-                    StandardScaler(),
-                    LogisticRegression(max_iter=self.max_iter, random_state=self.seed),
+            ("ridge", FoldLocalLogisticRidge(
+                self.preprocessor, self.ridge_alpha_log10_min, self.ridge_alpha_log10_max,
+                self.ridge_n_alphas, self.ridge_max_iter)),
+            ("extra_trees", make_pipeline(
+                SimpleImputer(strategy="median"),
+                ExtraTreesClassifier(
+                    n_estimators=self.n_estimators,
+                    max_features=self.max_features,
+                    min_samples_leaf=self.min_samples_leaf,
+                    n_jobs=1,
+                    random_state=self.seed,
                 ),
-            ),
-            (
-                "lightgbm",
-                make_pipeline(
-                    SimpleImputer(strategy="median").set_output(
-                        transform="pandas"
-                    ),
-                    lgb.LGBMClassifier(
-                        n_estimators=self.lgbm_n_estimators,
-                        learning_rate=self.lgbm_learning_rate,
-                        num_leaves=self.lgbm_num_leaves,
-                        min_data_in_leaf=self.lgbm_min_data_in_leaf,
-                        n_jobs=1,
-                        random_state=self.seed,
-                        verbosity=-1,
-                    ),
+            )),
+            ("lightgbm", make_pipeline(
+                SimpleImputer(strategy="median").set_output(transform="pandas"),
+                lgb.LGBMClassifier(
+                    n_estimators=self.lgbm_n_estimators,
+                    learning_rate=self.lgbm_learning_rate,
+                    num_leaves=self.lgbm_num_leaves,
+                    min_data_in_leaf=self.lgbm_min_data_in_leaf,
+                    n_jobs=1,
+                    random_state=self.seed,
+                    verbosity=-1,
                 ),
-            ),
-            (
-                "extra_trees",
-                make_pipeline(
-                    SimpleImputer(strategy="median"),
-                    ExtraTreesClassifier(
-                        n_estimators=self.n_estimators,
-                        max_features=self.max_features,
-                        min_samples_leaf=self.min_samples_leaf,
-                        n_jobs=1,
-                        random_state=self.seed,
-                    ),
-                ),
-            ),
-            (
-                "shallow_nn",
-                make_pipeline(
-                    SimpleImputer(strategy="median"),
-                    StandardScaler(),
-                    MLPClassifier(
-                        hidden_layer_sizes=tuple(self.hidden_layer_sizes),
-                        alpha=self.alpha,
-                        learning_rate_init=self.learning_rate_init,
-                        max_iter=self.max_iter,
-                        random_state=self.seed,
-                    ),
-                ),
-            ),
+            )),
+            ("shallow_nn", make_pipeline(
+                SimpleImputer(strategy="median"),
+                StandardScaler(),
+                build_mlp_classifier(seed=self.seed, alpha=self.alpha, params=mlp_params),
+            )),
         ]
-        if getattr(self, "preprocessor", None) is not None:
-            for _, estimator in estimators:
-                estimator.steps.insert(0, ("typed_preprocessing", clone(self.preprocessor)))
+        if self.preprocessor is not None:
+            for _, estimator in estimators[1:]:
+                estimator.steps[0] = ("typed_preprocessing", clone(self.preprocessor))
         return estimators
 
     def fit(self, X, y):
+        from .offline_sl import NonNegativeLogisticRegression
+
         if self.passthrough and np.asarray(pd.isna(X)).any():
             raise ValueError(
                 "Super Learner passthrough=True does not support NaN values in X; "
@@ -981,16 +1121,13 @@ class AdaptiveStackingClassifier(BaseEstimator, ClassifierMixin):
             raise ValueError(
                 "Super Learner classification requires at least two rows per class."
             )
-        estimators = self.base_estimators()
         stack_class = StackingClassifier
         if getattr(self, "capture_predictions", False):
             from .prediction_training import CapturingStackingClassifier
             stack_class = CapturingStackingClassifier
         self.model_ = stack_class(
-            estimators=estimators,
-            final_estimator=LogisticRegression(
-                C=self.C, max_iter=self.max_iter, random_state=self.seed
-            ),
+            estimators=self.base_estimators(),
+            final_estimator=NonNegativeLogisticRegression(),
             cv=cv,
             stack_method="predict_proba",
             passthrough=self.passthrough,
@@ -1011,85 +1148,45 @@ def _make_classification_model(
     seed: int,
     n_jobs: int,
     params: Mapping[str, Any],
+    preprocessor,
 ):
+    """Every classifier refits the typed preprocessing inside each CV fold.
+
+    Without a typed preprocessor, median imputation takes its place.
+    """
+    from .fold_local import (FoldLocalLogisticLasso, FoldLocalLogisticRidge,
+                             FoldLocalMLPClassifier, classification_preprocessor)
+
     name = model_name.lower()
+    process = classification_preprocessor(preprocessor)
     if name == "xgboost":
-        import xgboost as xgb
-
-        return xgb.XGBClassifier(
-            **params,
-            n_jobs=n_jobs,
-            random_state=seed,
-        )
+        return XGBoostCVClassifier(seed=seed, n_jobs=n_jobs, preprocessor=process, **params)
     if name == "lightgbm":
-        import lightgbm as lgb
-
-        return lgb.LGBMClassifier(
-            **params,
-            n_jobs=n_jobs,
-            random_state=seed,
-        )
+        return LightGBMCVClassifier(seed=seed, n_jobs=n_jobs, preprocessor=process, **params)
     if name == "ols":
         return make_pipeline(
-            SimpleImputer(strategy="median"),
+            clone(process),
             StandardScaler(),
-            LogisticRegression(
-                **params,
-                random_state=seed,
-            ),
+            LogisticRegression(**params, random_state=seed),
         )
     if name == "ridge":
-        return make_pipeline(
-            SimpleImputer(strategy="median"),
-            StandardScaler(),
-            LogisticRegression(
-                **params,
-                random_state=seed,
-            ),
-        )
+        return FoldLocalLogisticRidge(preprocessor=process, **params)
     if name == "lasso":
-        return make_pipeline(
-            SimpleImputer(strategy="median"),
-            StandardScaler(),
-            LogisticRegression(
-                **params,
-                random_state=seed,
-            ),
-        )
+        return FoldLocalLogisticLasso(preprocessor=process, seed=seed, **params)
     if name == "random_forest":
         return make_pipeline(
-            SimpleImputer(strategy="median"),
-            RandomForestClassifier(
-                **params,
-                n_jobs=n_jobs,
-                random_state=seed,
-            ),
+            clone(process),
+            RandomForestClassifier(**params, n_jobs=n_jobs, random_state=seed),
         )
     if name == "extra_trees":
         return make_pipeline(
-            SimpleImputer(strategy="median"),
-            ExtraTreesClassifier(
-                **params,
-                n_jobs=n_jobs,
-                random_state=seed,
-            ),
+            clone(process),
+            ExtraTreesClassifier(**params, n_jobs=n_jobs, random_state=seed),
         )
     if name == "shallow_neural_network":
-        neural_params = dict(params)
-        neural_params["hidden_layer_sizes"] = tuple(
-            neural_params["hidden_layer_sizes"]
-        )
-        return make_pipeline(
-            SimpleImputer(strategy="median"),
-            StandardScaler(),
-            MLPClassifier(**neural_params, random_state=seed),
-        )
+        return FoldLocalMLPClassifier(process, seed, params)
     if name == "super_learner":
-        return AdaptiveStackingClassifier(
-            seed=seed,
-            n_jobs=n_jobs,
-            **params,
-        )
+        return AdaptiveStackingClassifier(seed=seed, n_jobs=n_jobs, preprocessor=preprocessor, **params)
     reject_removed_model(name)
     raise ValueError(
         f"Unknown model '{model_name}'. Choose from: "
@@ -1121,10 +1218,12 @@ def make_model(
     resolved_params = _validated_params(task, name, params)
     resolved_params = _apply_environment_overrides(name, resolved_params)
 
-    if task == "regression" and name == "shallow_neural_network" and resolved_params["mlp_batch_size"] == "cv":
+    if task == "classification":
+        return _make_classification_model(name, seed, n_jobs, resolved_params, preprocessor)
+    if name == "shallow_neural_network" and resolved_params["mlp_batch_size"] == "cv":
         from .fold_local import FoldLocalMLP
         return FoldLocalMLP(preprocessor, seed, resolved_params)
-    if preprocessor is not None and task == "regression":
+    if preprocessor is not None:
         from .fold_local import FoldLocalRidge, FoldLocalLasso, FoldLocalMLP
         if name == "ridge":
             return FoldLocalRidge(preprocessor=preprocessor, **resolved_params)
@@ -1139,17 +1238,7 @@ def make_model(
     if preprocessor is not None:
         # Models without nested parameter selection fit this chain once.
         estimator = make_model(name, seed, n_jobs, task, params)
-        if task == "classification" and name == "super_learner":
-            estimator.preprocessor = preprocessor
-            return estimator
         return make_pipeline(clone(preprocessor), estimator)
-    if task == "classification":
-        return _make_classification_model(
-            name,
-            seed=seed,
-            n_jobs=n_jobs,
-            params=resolved_params,
-        )
 
     if name == "xgboost":
         return XGBoostCVRegressor(

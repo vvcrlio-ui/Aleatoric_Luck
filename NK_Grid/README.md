@@ -30,13 +30,18 @@ If a variable is entirely missing in a small training fold, both sides are set t
 
 Eight models are fit separately: OLS, Ridge, Lasso, Random Forest, Extra Trees, XGBoost, LightGBM and a shallow neural network. A ninth, the Super Learner, combines seven of them.
 
-For continuous outcomes, Ridge, Lasso and the neural network choose their penalty by cross-validation on the training rows, and XGBoost and LightGBM choose their number of boosting rounds the same way. Each model is then refit on all N rows. The candidate values and fold counts are in each dataset's `model_params.yaml`.
+Ridge, Lasso and the neural network choose their penalty by cross-validation on the training rows, and XGBoost and LightGBM choose their number of boosting rounds the same way. Each model is then refit on all N rows. The candidate values and fold counts are in each dataset's `model_params.yaml`.
 
-The regression neural network has one hidden layer of 32 units. Each fit splits its training rows into mini-batches of at most 200 rows and of nearly equal size, so the last batch is never much smaller than the others. Training runs for at most 2,000 epochs and stops earlier once the training loss stops improving.
+The neural network has one hidden layer of 32 units. Each fit splits its training rows into mini-batches of at most 200 rows and of nearly equal size, so the last batch is never much smaller than the others. Training runs for at most 2,000 epochs and stops earlier once the training loss stops improving.
 
-The Super Learner (SL7) combines the seven models other than OLS. Each of the seven is fit five more times, on about four fifths of the training rows each time, to predict the remaining rows; this gives an out-of-fold prediction for every training row. SL7 finds the nonnegative weights, plus an intercept, that best predict the training outcome from these predictions, and applies them to the seven models' test predictions. For binary outcomes it combines predicted probabilities with a logistic regression. It uses no test outcomes and retrains nothing.
+The Super Learner (SL7) combines the seven models other than OLS. Each of the seven is fit five more times, on about four fifths of the training rows each time, to predict the remaining rows; this gives an out-of-fold prediction for every training row. SL7 finds the nonnegative weights, plus an intercept, that best predict the training outcome from these predictions, and applies them to the seven models' test predictions. It uses no test outcomes and retrains nothing.
 
-For binary outcomes, the OLS, Ridge and Lasso names refer to logistic regressions with different penalties, and the base models use fixed settings instead of cross-validated tuning.
+Binary outcomes use the same models, search grids, fold counts and network settings. The differences follow from the outcome:
+
+- OLS, Ridge and Lasso are logistic regressions: unpenalized, L2-penalized and L1-penalized.
+- A penalty is chosen with the same alpha grid as for continuous outcomes. Ridge and Lasso regression put alpha on the Gaussian negative log-likelihood, as its sum for Ridge and its mean for Lasso, and the logistic versions put the same alpha on the Bernoulli negative log-likelihood.
+- Cross-validation selects by log loss instead of squared error, and its folds are stratified so every fold holds both classes. As for continuous outcomes, XGBoost and LightGBM shuffle the rows with the model's seed before splitting; the other models split the rows in their sampled order. With fewer rows of the rarer class than the declared number of folds, the number of folds drops to that count; below two, the model is skipped.
+- SL7 combines predicted probabilities with a logistic regression that has nonnegative weights and an intercept and no penalty.
 
 ## Interpreting prediction quality
 

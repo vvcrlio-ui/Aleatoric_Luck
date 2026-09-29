@@ -26,7 +26,7 @@ The production design repeats the grid for 100 seeds with 50 draws each. When th
 
 ## Models
 
-Eight models are fit separately on every training sample: OLS, Ridge, Lasso, random forest, extra trees, XGBoost, LightGBM and a neural network with one hidden layer. For binary outcomes, OLS, Ridge and Lasso are logistic regressions with different penalties. For continuous outcomes, Ridge, Lasso and the neural network choose their penalty, and the two boosting models their number of rounds, by cross-validation within the training sample; for binary outcomes these models use fixed settings.
+Eight models are fit separately on every training sample: OLS, Ridge, Lasso, random forest, extra trees, XGBoost, LightGBM and a neural network with one hidden layer. For binary outcomes, OLS, Ridge and Lasso are logistic regressions with different penalties. Ridge, Lasso and the neural network choose their penalty, and the two boosting models their number of rounds, by cross-validation within the training sample, for binary outcomes as for continuous ones.
 
 The ninth model, the Super Learner (SL7), is a weighted combination of the seven models other than OLS. Its weights are estimated from predictions each model makes for training rows it was not fit on, so it never sees test outcomes. The [experiment methods](NK_Grid/README.md#model-fitting) describe the tuning and the Super Learner in full.
 

@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 import numpy as np
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.neural_network import MLPRegressor
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.utils import gen_batches
 
 
@@ -47,7 +47,7 @@ def _balanced_stochastic_loop():
                         native.__name__, native.__defaults__, native.__closure__)
 
 
-class FitBatchMLPRegressor(MLPRegressor):
+class _FitBatchMLP:
     """Resolve policies at each actual fit; retain constructor values for clone.
 
     ``effective_batch`` fixes the regularizer denominator to the actual fit's
@@ -57,26 +57,8 @@ class FitBatchMLPRegressor(MLPRegressor):
     scaled temporarily so both penalty terms use the selected denominator.
     ``batch_partition=balanced`` changes only the native loop's batch iterator.
     Initialization, Adam, shuffling, L2 and stopping retain their native rules.
+    Regression and classification share sklearn's training loop and backprop.
     """
-
-    def __init__(self, loss="squared_error", hidden_layer_sizes=(100,), activation="relu", *,
-                 solver="adam", alpha=0.0001, batch_size="auto", learning_rate="constant",
-                 learning_rate_init=0.001, power_t=0.5, max_iter=200, shuffle=True,
-                 random_state=None, tol=0.0001, verbose=False, warm_start=False,
-                 momentum=0.9, nesterovs_momentum=True, early_stopping=False,
-                 validation_fraction=0.1, beta_1=0.9, beta_2=0.999, epsilon=1e-8,
-                 n_iter_no_change=10, max_fun=15000, l2_normalization="batch",
-                 batch_partition="native"):
-        self.l2_normalization = l2_normalization
-        self.batch_partition = batch_partition
-        super().__init__(loss=loss, hidden_layer_sizes=hidden_layer_sizes, activation=activation,
-            solver=solver, alpha=alpha, batch_size=batch_size, learning_rate=learning_rate,
-            learning_rate_init=learning_rate_init, power_t=power_t, max_iter=max_iter,
-            shuffle=shuffle, random_state=random_state, tol=tol, verbose=verbose,
-            warm_start=warm_start, momentum=momentum, nesterovs_momentum=nesterovs_momentum,
-            early_stopping=early_stopping, validation_fraction=validation_fraction,
-            beta_1=beta_1, beta_2=beta_2, epsilon=epsilon,
-            n_iter_no_change=n_iter_no_change, max_fun=max_fun)
 
     def _fit(self, X, y, sample_weight=None, incremental=False):
         if self.batch_partition not in {"native", "balanced"}:
@@ -148,14 +130,51 @@ class FitBatchMLPRegressor(MLPRegressor):
             self.batch_size = policy
 
 
-def build_mlp_regressor(
-    *, seed: int, alpha: float, params: Mapping[str, Any],
-) -> FitBatchMLPRegressor:
-    """Build the same base learner for legacy and complete-pipeline CV."""
+class FitBatchMLPRegressor(_FitBatchMLP, MLPRegressor):
+    def __init__(self, loss="squared_error", hidden_layer_sizes=(100,), activation="relu", *,
+                 solver="adam", alpha=0.0001, batch_size="auto", learning_rate="constant",
+                 learning_rate_init=0.001, power_t=0.5, max_iter=200, shuffle=True,
+                 random_state=None, tol=0.0001, verbose=False, warm_start=False,
+                 momentum=0.9, nesterovs_momentum=True, early_stopping=False,
+                 validation_fraction=0.1, beta_1=0.9, beta_2=0.999, epsilon=1e-8,
+                 n_iter_no_change=10, max_fun=15000, l2_normalization="batch",
+                 batch_partition="native"):
+        self.l2_normalization = l2_normalization
+        self.batch_partition = batch_partition
+        super().__init__(loss=loss, hidden_layer_sizes=hidden_layer_sizes, activation=activation,
+            solver=solver, alpha=alpha, batch_size=batch_size, learning_rate=learning_rate,
+            learning_rate_init=learning_rate_init, power_t=power_t, max_iter=max_iter,
+            shuffle=shuffle, random_state=random_state, tol=tol, verbose=verbose,
+            warm_start=warm_start, momentum=momentum, nesterovs_momentum=nesterovs_momentum,
+            early_stopping=early_stopping, validation_fraction=validation_fraction,
+            beta_1=beta_1, beta_2=beta_2, epsilon=epsilon,
+            n_iter_no_change=n_iter_no_change, max_fun=max_fun)
 
+
+class FitBatchMLPClassifier(_FitBatchMLP, MLPClassifier):
+    def __init__(self, hidden_layer_sizes=(100,), activation="relu", *,
+                 solver="adam", alpha=0.0001, batch_size="auto", learning_rate="constant",
+                 learning_rate_init=0.001, power_t=0.5, max_iter=200, shuffle=True,
+                 random_state=None, tol=0.0001, verbose=False, warm_start=False,
+                 momentum=0.9, nesterovs_momentum=True, early_stopping=False,
+                 validation_fraction=0.1, beta_1=0.9, beta_2=0.999, epsilon=1e-8,
+                 n_iter_no_change=10, max_fun=15000, l2_normalization="batch",
+                 batch_partition="native"):
+        self.l2_normalization = l2_normalization
+        self.batch_partition = batch_partition
+        super().__init__(hidden_layer_sizes=hidden_layer_sizes, activation=activation,
+            solver=solver, alpha=alpha, batch_size=batch_size, learning_rate=learning_rate,
+            learning_rate_init=learning_rate_init, power_t=power_t, max_iter=max_iter,
+            shuffle=shuffle, random_state=random_state, tol=tol, verbose=verbose,
+            warm_start=warm_start, momentum=momentum, nesterovs_momentum=nesterovs_momentum,
+            early_stopping=early_stopping, validation_fraction=validation_fraction,
+            beta_1=beta_1, beta_2=beta_2, epsilon=epsilon,
+            n_iter_no_change=n_iter_no_change, max_fun=max_fun)
+
+
+def _mlp_arguments(seed: int, alpha: float, params: Mapping[str, Any]) -> dict[str, Any]:
     policy = params.get("mlp_batch_size", "auto")
-    return FitBatchMLPRegressor(
-        loss="squared_error",
+    return dict(
         batch_size="auto" if policy == "balanced" else policy,
         batch_partition="balanced" if policy == "balanced" else "native",
         l2_normalization=params.get("mlp_l2_normalization", "batch"),
@@ -176,3 +195,19 @@ def build_mlp_regressor(
         epsilon=1e-8,
         random_state=seed,
     )
+
+
+def build_mlp_regressor(
+    *, seed: int, alpha: float, params: Mapping[str, Any],
+) -> FitBatchMLPRegressor:
+    """Build the same base learner for legacy and complete-pipeline CV."""
+
+    return FitBatchMLPRegressor(loss="squared_error", **_mlp_arguments(seed, alpha, params))
+
+
+def build_mlp_classifier(
+    *, seed: int, alpha: float, params: Mapping[str, Any],
+) -> FitBatchMLPClassifier:
+    """The regression learner's architecture, batching and stopping for log loss."""
+
+    return FitBatchMLPClassifier(**_mlp_arguments(seed, alpha, params))

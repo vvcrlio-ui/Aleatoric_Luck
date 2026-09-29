@@ -438,19 +438,10 @@ class PredictionTaskExecutor:
         row.update(_base_fit_count=0, _fit_seconds=0., _full_fit_seconds=0., _oof_fit_seconds=0.,
                    _resumed_fit_count=0, _expected_base_fit_count=0, _combiner_fit_count=0,
                    _prediction_cache_hit=False)
-        combiner_config = dict(variant.get("combiner") or {})
-        random_state_rule = combiner_config.pop("random_state_rule", None)
-        if random_state_rule is not None:
-            if random_state_rule != "cell-model-seed":
-                raise QueueError("Unknown frozen SL combiner random-state rule")
-            seeds = {r.metadata.get("model_seed") for r in records}
-            if len(seeds) != 1 or None in seeds:
-                raise QueueError("Formal SL source model seeds differ or are absent")
-            combiner_config["random_state"] = seeds.pop()
         try:
             answer = recombine_cache_records(records, y_train=y_train, selected_models=names,
                         variant_id=task.variant_id, task=panel["task_kind"],
-                        combiner_config=combiner_config)
+                        combiner_config=variant.get("combiner"))
         except IncompletePredictionCache as exc:
             if variant["missing_policy"] != "skip":
                 raise

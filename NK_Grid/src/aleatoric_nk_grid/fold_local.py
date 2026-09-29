@@ -1,16 +1,18 @@
-"""Versioned complete-pipeline regression CV; legacy models remain M2 oracles."""
+"""Versioned complete-pipeline CV; legacy regression models remain M2 oracles."""
 from __future__ import annotations
 
 import numpy as np
-from sklearn.base import BaseEstimator, RegressorMixin, clone
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
-from sklearn.linear_model import Lasso, lasso_path
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Lasso, LogisticRegression, lasso_path
+from sklearn.metrics import log_loss
 from .robust_linear import Ridge
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .mlp_estimator import build_mlp_regressor
+from .mlp_estimator import build_mlp_classifier, build_mlp_regressor
 from .svd_fallback import ridge_svd
 
 
@@ -210,3 +212,156 @@ class FoldLocalMLP(RegressorMixin, BaseEstimator):
 
     def predict(self, X):
         return self.model_.predict(X)
+
+
+# Classification twins of the regression CV above. Folds are ordered and
+# stratified, as in the OOF split, so every fold holds both classes; the number
+# of folds shrinks to the minority count. Selection minimizes mean fold log
+# loss, the Bernoulli counterpart of mean fold MSE.
+
+def classification_preprocessor(preprocessor):
+    return preprocessor if preprocessor is not None else SimpleImputer(strategy="median", keep_empty_features=True)
+
+
+def stratified_cv_folds(y, folds, model_name, shuffle_seed=None):
+    """Ordered folds, or seeded shuffled ones where the regression twin shuffles."""
+    y = np.asarray(y)
+    classes, counts = np.unique(y, return_counts=True)
+    if not np.array_equal(classes, [0, 1]):
+        raise ValueError("single-class training sample for classification")
+    count = min(folds, int(counts.min()))
+    if count < 2:
+        raise ValueError(f"below minimum per-class count for {model_name}'s internal CV")
+    splitter = StratifiedKFold(count, shuffle=shuffle_seed is not None, random_state=shuffle_seed)
+    return tuple(splitter.split(np.empty((len(y), 0)), y))
+
+
+def _rows(X, indexes):
+    return X.iloc[indexes] if hasattr(X, "iloc") else np.asarray(X)[indexes]
+
+
+def _fold_log_loss(y, probability):
+    return float(log_loss(y, probability, labels=[0, 1]))
+
+
+class _Classifier(ClassifierMixin, BaseEstimator):
+    def predict(self, X):
+        return self.model_.predict(X)
+
+    def predict_proba(self, X):
+        return self.model_.predict_proba(X)
+
+
+class FoldLocalLogisticRidge(_Classifier):
+    """L2 logistic twin of FoldLocalRidge: five stratified folds, same alpha grid.
+
+    Ridge regression minimizes the squared-error sum, twice the Gaussian negative
+    log-likelihood, plus alpha*||w||^2. The same alpha on the Bernoulli negative
+    log-likelihood is sklearn's C = 1/alpha. Each fold walks the grid from the
+    strongest penalty down, warm-starting every fit from the previous solution.
+    """
+    def __init__(self, preprocessor, alpha_log10_min, alpha_log10_max, n_alphas, max_iter):
+        self.preprocessor = preprocessor
+        self.alpha_log10_min = alpha_log10_min
+        self.alpha_log10_max = alpha_log10_max
+        self.n_alphas = n_alphas
+        self.max_iter = max_iter
+
+    def _logistic(self, alpha, warm_start=False):
+        return LogisticRegression(C=1. / alpha, l1_ratio=0., solver="lbfgs",
+                                  max_iter=self.max_iter, warm_start=warm_start)
+
+    def fit(self, X, y):
+        y = np.asarray(y, dtype=int)
+        process = classification_preprocessor(self.preprocessor)
+        folds = stratified_cv_folds(y, 5, "ridge")
+        self.n_splits_ = len(folds)
+        self.alphas_ = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)
+        losses = []
+        for train, valid in folds:
+            scaled = make_pipeline(clone(process), StandardScaler()).fit(_rows(X, train))
+            train_X, valid_X = scaled.transform(_rows(X, train)), scaled.transform(_rows(X, valid))
+            model = self._logistic(self.alphas_[-1], warm_start=True)
+            fold = np.empty(len(self.alphas_))
+            for index in range(len(self.alphas_) - 1, -1, -1):
+                model.set_params(C=1. / self.alphas_[index]).fit(train_X, y[train])
+                fold[index] = _fold_log_loss(y[valid], model.predict_proba(valid_X)[:, 1])
+            losses.append(fold)
+        self.fold_log_loss_ = np.asarray(losses)
+        self.cv_log_loss_ = self.fold_log_loss_.mean(axis=0)
+        self.alpha_ = float(self.alphas_[np.argmin(self.cv_log_loss_)])
+        self.model_ = make_pipeline(clone(process), StandardScaler(), self._logistic(self.alpha_)).fit(X, y)
+        self.classes_ = self.model_.classes_
+        return self
+
+
+class FoldLocalLogisticLasso(_Classifier):
+    """L1 logistic twin of FoldLocalLasso's absolute alpha scale.
+
+    Lasso regression minimizes the mean Gaussian negative log-likelihood plus
+    alpha*||w||_1. The same objective on the Bernoulli likelihood is sklearn's
+    C = 1/(n*alpha), with n the rows of that fit. As in LassoCV, alphas run from
+    the strongest penalty down with warm starts, and ties keep the stronger one.
+    """
+    def __init__(self, preprocessor, seed, alpha_log10_min, alpha_log10_max, n_alphas,
+                 max_cv_folds, max_iter, tol=1e-4):
+        self.preprocessor = preprocessor
+        self.seed = seed
+        self.alpha_log10_min = alpha_log10_min
+        self.alpha_log10_max = alpha_log10_max
+        self.n_alphas = n_alphas
+        self.max_cv_folds = max_cv_folds
+        self.max_iter = max_iter
+        self.tol = tol
+
+    def _logistic(self, n, alpha, warm_start=False):
+        return LogisticRegression(C=1. / (n * alpha), l1_ratio=1., solver="saga", max_iter=self.max_iter,
+                                  tol=self.tol, random_state=self.seed, warm_start=warm_start)
+
+    def fit(self, X, y):
+        y = np.asarray(y, dtype=int)
+        process = classification_preprocessor(self.preprocessor)
+        folds = stratified_cv_folds(y, self.max_cv_folds, "lasso")
+        self.n_splits_ = len(folds)
+        self.alphas_ = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)[::-1]
+        losses = []
+        for train, valid in folds:
+            scaled = make_pipeline(clone(process), StandardScaler()).fit(_rows(X, train))
+            train_X, valid_X = scaled.transform(_rows(X, train)), scaled.transform(_rows(X, valid))
+            model = self._logistic(len(train), self.alphas_[0], warm_start=True)
+            fold = []
+            for alpha in self.alphas_:
+                model.set_params(C=1. / (len(train) * alpha)).fit(train_X, y[train])
+                fold.append(_fold_log_loss(y[valid], model.predict_proba(valid_X)[:, 1]))
+            losses.append(fold)
+        self.fold_log_loss_ = np.asarray(losses)
+        self.cv_log_loss_ = self.fold_log_loss_.mean(axis=0)
+        self.alpha_ = float(self.alphas_[np.argmin(self.cv_log_loss_)])
+        self.model_ = make_pipeline(clone(process), StandardScaler(),
+                                    self._logistic(len(y), self.alpha_)).fit(X, y)
+        self.classes_ = self.model_.classes_
+        return self
+
+
+class FoldLocalMLPClassifier(_Classifier):
+    """FoldLocalMLP's alpha grid and folds, scored by log loss on 0/1 labels."""
+    def __init__(self, preprocessor, seed, params):
+        self.preprocessor = preprocessor
+        self.seed = seed
+        self.params = params
+
+    def _estimator(self, alpha):
+        return make_pipeline(clone(classification_preprocessor(self.preprocessor)), StandardScaler(),
+                             build_mlp_classifier(seed=self.seed, alpha=alpha, params=self.params))
+
+    def fit(self, X, y):
+        y = np.asarray(y, dtype=int)
+        folds = stratified_cv_folds(y, self.params["max_cv_folds"], "shallow_neural_network")
+        alphas = np.logspace(self.params["alpha_log10_min"], self.params["alpha_log10_max"], self.params["n_alphas"])
+        self.cv_log_loss_ = [np.mean([_fold_log_loss(y[v], self._estimator(alpha).fit(_rows(X, t), y[t])
+                                                     .predict_proba(_rows(X, v))[:, 1]) for t, v in folds])
+                             for alpha in alphas]
+        self.alpha_ = float(alphas[np.argmin(self.cv_log_loss_)])
+        self.model_ = self._estimator(self.alpha_).fit(X, y)
+        self.classes_ = self.model_.classes_
+        return self
