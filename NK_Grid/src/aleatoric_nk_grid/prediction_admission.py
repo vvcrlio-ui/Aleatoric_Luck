@@ -22,7 +22,8 @@ def _query(args):
 
 def read_live_quota(cache_root, *, query=_query):
     root = Path(cache_root).resolve()
-    if shutil.which('lfs') is None:
+    # Lustre project quotas apply only on Lustre; a site may ship lfs beside GPFS.
+    if query(['stat', '-f', '-c', '%T', str(root)]).strip() != 'lustre':
         space = os.statvfs(root)
         available = space.f_bavail * space.f_frsize
         return {'project_root': str(root), 'project_id': None,
