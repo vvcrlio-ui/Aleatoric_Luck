@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v12-classification-cv-4
+algorithm_version: nk-grid-v12-classification-cv-5
 
 regression:
   ols:
@@ -10,10 +10,12 @@ regression:
     n_alphas: 63
     scoring: neg_mean_squared_error
   lasso:
-    alpha_log10_min: -4
-    alpha_log10_max: 1
-    n_alphas: 50
-    max_cv_folds: 5
+    # Ratios 1..0.1 of each training fold's alpha_max, ten per decade.
+    alpha_scale: relative
+    alpha_log10_min: -1
+    alpha_log10_max: 0
+    n_alphas: 11
+    max_cv_folds: 3
     max_iter: 20000
   random_forest:
     n_estimators: 500
