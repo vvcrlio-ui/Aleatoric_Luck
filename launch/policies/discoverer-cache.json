@@ -1,7 +1,6 @@
 {
   "unified_compute": true,
   "sizing_mode": "capacity",
-  "max_nodes": 302,
   "worker_cap": 17994,
   "worker_memory": "3G",
   "worker_time_limit": "10:00:00",

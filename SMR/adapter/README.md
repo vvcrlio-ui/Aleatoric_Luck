@@ -2,9 +2,13 @@
 
 SMR uses the provider's existing analysis matrix, `asample2_withlag.csv`. The adapter selects predictors and outcomes using fixed definitions, describes category groups, and passes them to the shared engine. It does not reconstruct wages, income, lagged variables, or existing missingness indicators.
 
+## Preparing a run
+
+Use the shared launcher with `--manifest SMR/panels.yaml --panel smr_totalincome --prepare --data-dir DIR`, where DIR contains `asample2_withlag.csv`. Preparation runs in the compute bootstrap and publishes under that run's `prepared/` directory. For `timing_full` or `production`, include `--memory 4G` for the base workers; when using a scheduler policy, set its explicit `worker_memory` accordingly.
+
 ## Fixed variable definitions
 
-The [feature definition file](config/asample2_withlag.json) lists predictor columns and their order, the two outcomes, and one-hot groups. The current definition contains 4,252 predictor columns and 29 one-hot groups, representing 497 sampling sources. Predictors outside one-hot groups are treated as individual continuous columns.
+The [feature definition file](config/asample2_withlag.json) lists predictor columns and their order, the two outcomes, and one-hot groups. The current definition contains 4,252 predictor columns and 29 one-hot groups, which make up 497 variables. Predictors outside one-hot groups are treated as individual continuous columns.
 
 Loading checks column names, order, and category groups against this fixed list. Variable definitions remain fixed; the engine performs the train/test split.
 
@@ -18,9 +22,7 @@ No missing-value codes are declared, so negative values are kept as values. Miss
 
 The adapter keeps rows with missing predictors and does not impute outcomes. The outcomes are `Cm_lhourlywage` and `Cm_ltotalincome`. For each outcome, the engine first checks its missingness rate: a rate above 50% raises an error; otherwise, rows missing that outcome are removed before the seed-specific train/test split. The two outcomes can therefore have different eligible samples.
 
-A predictor column that is entirely missing is rejected by the input check. Partial missingness is handled within each training sample and cross-validation training fold: continuous columns use median imputation, and one-hot groups use the most frequent complete category state. Standalone LightGBM and XGBoost receive NaN and handle it themselves.
-
-If a group is entirely missing in a small training fold, both training and validation/test values are set to the same prior value or NaN, so the test data cannot bring back a variable the training rows never saw. The source still counts toward K.
+A predictor column that is entirely missing is rejected by the input check. Partial missingness is imputed within each training sample and cross-validation training fold, following the rules in the [experiment methods](../../NK_Grid/README.md#learn-preprocessing-from-the-current-training-data).
 
 ## Why categorical columns are grouped
 

@@ -159,7 +159,7 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
     after the caller has verified their complete cache identity.
     """
     from .model_registry import make_model
-    from .validate_input import REGRESSION_CV_MIN_N
+    from .validate_input import CLASSIFICATION_CV_MODELS, REGRESSION_CV_MIN_N
     if model_name not in BASE_MODELS:
         raise ValueError("base stage cannot fit super_learner or unknown models")
     if mode not in {"holdout", "holdout_oof"}:
@@ -197,19 +197,24 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
                 "base_fit_count": 0, "fit_count_kind": "outer complete-pipeline fits; excludes internal tuning",
                 "full_fit_seconds": 0., "oof_fit_seconds": 0., "resumed_fits": 0,
                 "folds": [], "converged": True}
+    minimum = (2 if internal_name == "ridge" else 1) if is_formal else REGRESSION_CV_MIN_N.get(model_name, 1)
+    classification_cv = internal_name == "ridge" if is_formal else model_name in CLASSIFICATION_CV_MODELS
+    def check_cv_rows(labels, stage):
+        if task == "regression" and len(labels) < minimum:
+            raise ValueError(f"below minimum N for {model_name}'s internal CV in {stage} training (requires N>={minimum})")
+        if task == "classification" and classification_cv and np.bincount(labels.astype(int), minlength=2).min() < 2:
+            raise ValueError(f"below minimum per-class count for {model_name}'s internal CV in {stage} training")
     try:
         if task == "classification" and not np.array_equal(np.unique(y), [0, 1]):
             raise ValueError("single-class training sample for classification")
-        minimum = ((2 if internal_name == "ridge" else 1) if is_formal else REGRESSION_CV_MIN_N.get(model_name, 1)) if task == "regression" else 1
-        if len(y) < minimum:
-            raise ValueError(f"below minimum N for {model_name}'s internal CV in full training (requires N>={minimum})")
+        check_cv_rows(y, "full")
     except ValueError as exc:
         metadata.update(status="skipped", reason=str(exc), holdout_status="skipped", oof_status="skipped", oof_reason=str(exc))
         return {"arrays": {}, "metadata": metadata, "model": None, "predictions": None}
     try:
         folds = make_oof_folds(y, task, oof_folds) if mode == "holdout_oof" else ()
-        if any(len(train) < minimum for train, _ in folds):
-            raise ValueError(f"below minimum N for {model_name}'s internal CV in OOF training (requires N>={minimum})")
+        for train, _ in folds:
+            check_cv_rows(y[train], "OOF")
     except ValueError as exc:
         # A legal OOF skip cannot erase a valid independent full prediction.
         folds = ()

@@ -74,7 +74,7 @@ from .preprocessing import (
     preprocess_cell,
     sampling_units,
 )
-from .validate_input import REGRESSION_CV_MIN_N, validate_input
+from .validate_input import CLASSIFICATION_CV_MODELS, REGRESSION_CV_MIN_N, validate_input
 
 
 LARGE_RUN_THRESHOLD = 250_000
@@ -1070,7 +1070,6 @@ class NKGridExecutionSession:
             n_sizes_k=len(value["resolved_k_grid"]),
             max_n=max(int(item) for item in value["resolved_n_grid"]),
             max_k=max(int(item) for item in value["resolved_k_grid"]),
-            batch_size=1,
             n_jobs=int(value["model_n_jobs"]),
             min_n=int(value["min_n"]),
             model_params=model_params,
@@ -1259,10 +1258,9 @@ class NKGridExecutionSession:
                 raise ValueError("formal SL pipeline requires configured super_learner parameters")
             oof_folds = int(self.selected_model_params["super_learner"]["cv"])
             internal = pipeline_id[len(formal_prefix):]
-            aliases = {"ridge": "ridge", "logistic": "ols", "lightgbm": "lightgbm",
+            aliases = {"ridge": "ridge", "lightgbm": "lightgbm",
                        "extra_trees": "extra_trees", "shallow_nn": "shallow_neural_network"}
-            valid = {"ridge", "extra_trees", "lightgbm", "shallow_nn"} if self.task == "regression" else {"logistic", "lightgbm", "extra_trees", "shallow_nn"}
-            if internal not in valid or aliases[internal] != model:
+            if aliases.get(internal) != model:
                 raise ValueError("formal base recipe does not match the declared public model alias")
         if (int(seed), int(draw)) not in self.repeat_pairs:
             raise ValueError("prediction identity seed/draw outside frozen plan")
@@ -1368,8 +1366,8 @@ class NKGridExecutionSession:
             diagnostics["underdetermined"] = bool(self.task == "regression" and model_name == "ols" and _ols_is_underdetermined(X_prepared))
             if self.task == "classification" and len(np.unique(y_sub)) < 2:
                 return result(empty_metrics, status="skipped", error="single-class training sample for classification")
-            if self.task == "classification" and model_name == "super_learner" and int(y_sub.value_counts().min()) < 2:
-                return result(empty_metrics, status="skipped", error="below minimum per-class count for super_learner CV")
+            if self.task == "classification" and model_name in CLASSIFICATION_CV_MODELS and int(y_sub.value_counts().min()) < 2:
+                return result(empty_metrics, status="skipped", error=f"below minimum per-class count for {model_name}'s internal CV")
             if model_name in {"lightgbm", "super_learner"}:
                 log_progress(f"cell starting model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features}")
             # The outer transformed matrices above are diagnostics only. CV

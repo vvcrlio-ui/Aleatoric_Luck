@@ -1,6 +1,6 @@
 # The three FFC encodings
 
-The three methods use the same training-pool screening result and change only the representation of retained variables. The same K represents the same number of original sources, but the expanded column count can differ. Shared row and column rules are described in the [adapter README](../../../README.md).
+The three methods use the same training-pool screening result and change only the representation of retained variables. The same K means the same number of variables, but the number of model columns can differ. Shared row and column rules are described in the [adapter README](../../../README.md).
 
 ## median_mode: preserve numeric values and expand categories
 
@@ -14,11 +14,11 @@ Implemented in [median_mode.py](median_mode.py).
 
 Value encoding is the same as median_mode, with additional 0/1 indicators for declared missing codes or blank values observed in the training pool. For example, an original value of -9 produces NaN in the value column and 1 in the corresponding -9 indicator. Indicators must pass the training-pool prevalence screen; a new missing code in the test data does not add a column.
 
-Value columns and indicators share the same original source. Three one-hot columns plus two missingness indicators produce five model columns, but K remains one, and all five are sampled together. Preprocessing treats them separately: the category group is imputed jointly, while indicators are treated as individual numeric columns.
+Value columns and indicators belong to the same variable. Three one-hot columns plus two missingness indicators produce five model columns, but K remains one, and all five are sampled together. Preprocessing treats them separately: the category group is imputed jointly, while indicators are treated as individual numeric columns.
 
 Missingness indicators provide information about why a value is absent; they do not replace imputation of the value column. See [median_missing_indicator.py](median_missing_indicator.py).
 
-## tree_ordinal: one column per categorical source
+## tree_ordinal: one column per categorical variable
 
 Categories in the training vocabulary are sorted by their original numeric codes and mapped to integers from 0 to L-1. Missing and unknown categories remain NaN. This reduces the expanded column count but introduces a numeric order that may not be intrinsic to an unordered category.
 
@@ -26,9 +26,9 @@ Current panels also run linear models and neural networks on this representation
 
 ## A simple comparison
 
-Suppose source A has three categories and source B is continuous, and both are selected:
+Suppose variable A has three categories and variable B is continuous, and both are selected:
 
-| Encoding | K | Expanded columns |
+| Encoding | K | Model columns |
 |---|---:|---:|
 | median_mode | 2 | 3+1=4 |
 | median_missing_indicator, with two retained missingness indicators | 2 | 3+1+2=6 |

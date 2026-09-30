@@ -1,4 +1,4 @@
-"""Live Lustre soft-quota admission and shared pending-space reservations.
+"""Live storage admission and pending-space reservations.
 
 This is a controller operation, never a per-cell/worker quota query. No data is
 deleted to make a reservation fit. Existing runs retain their ledger entries
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,6 +22,15 @@ def _query(args):
 
 def read_live_quota(cache_root, *, query=_query):
     root = Path(cache_root).resolve()
+    # Lustre project quotas apply only on Lustre; a site may ship lfs beside GPFS.
+    if query(['stat', '-f', '-c', '%T', str(root)]).strip() != 'lustre':
+        space = os.statvfs(root)
+        available = space.f_bavail * space.f_frsize
+        return {'project_root': str(root), 'project_id': None,
+                'used_bytes': 0, 'soft_quota_bytes': available,
+                'used_files': 0, 'soft_quota_files': space.f_favail,
+                'filesystem_free_bytes': available,
+                'queried_at': datetime.now(timezone.utc).isoformat(), 'raw': 'statvfs'}
     parts = root.parts
     try:
         at = parts.index('projects')
@@ -176,7 +186,7 @@ def release_plan_storage(plan):
     """Release this verified run's unwritten allowance without new admission.
 
     Used after final publication and safely replayable after controller loss.
-    Already-written data remains charged by Lustre. No quota query, reservation
+    Already-written data remains charged to storage. No quota query, reservation
     increase, file deletion, or other run's entry is involved.
     """
     workflow = plan['prediction_workflow']
@@ -189,12 +199,8 @@ def release_plan_storage(plan):
             or receipt.get('prediction_cache_complete') is not True
             or receipt.get('score_complete') is not True):
         raise QueueError('Storage release requires this exact fully verified prediction plan')
-    parts = Path(workflow['cache_root']).resolve().parts
-    try:
-        at = parts.index('projects')
-        project = Path(*parts[:at + 2])
-    except (ValueError, IndexError) as exc:
-        raise QueueError('Storage release requires the frozen Lustre project path') from exc
+    admission = json.loads((output / 'storage-admission.json').read_bytes())
+    project = Path(admission['project_root'])
     ledger_path = project / '.prediction-cache-reservations.json'
     key = digest({'output_root': workflow['output_root'], 'workflow': workflow})
     with file_lock(project / '.prediction-cache-reservations.lock'):

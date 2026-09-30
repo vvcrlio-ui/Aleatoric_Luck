@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v11-relative-lasso-3fold-all-linear-fallback-1
+algorithm_version: nk-grid-v12-classification-cv-6
 
 regression:
   ols:
@@ -10,12 +10,12 @@ regression:
     n_alphas: 63
     scoring: neg_mean_squared_error
   lasso:
-    # Ratios to alpha_max computed independently within each training fold.
+    # Ratios 1..0.1 of each training fold's alpha_max, ten per decade.
     alpha_scale: relative
-    alpha_log10_min: -3
+    alpha_log10_min: -1
     alpha_log10_max: 0
-    n_alphas: 25
-    max_cv_folds: 3
+    n_alphas: 11
+    max_cv_folds: 5
     max_iter: 20000
     tol: 0.0001
   random_forest:
@@ -84,65 +84,83 @@ regression:
     early_stopping_rounds: 10
 
 classification:
+  # Every model mirrors its regression entry: the same search grids, folds,
+  # architecture and stopping, scored by log loss on stratified folds.
   ols:
     C: 1.0e+12
     l1_ratio: 0.0
     solver: lbfgs
     max_iter: 20000
   ridge:
-    C: 1.0
-    l1_ratio: 0.0
-    solver: lbfgs
+    alpha_log10_min: -4
+    alpha_log10_max: 6
+    n_alphas: 63
     max_iter: 20000
   lasso:
-    penalty: l1
-    C: 1.0
-    l1_ratio: 1.0
-    solver: saga
+    # Ratios 1..0.1 of each training fold's alpha_max, ten per decade.
+    alpha_scale: relative
+    alpha_log10_min: -1
+    alpha_log10_max: 0
+    n_alphas: 11
+    max_cv_folds: 5
     max_iter: 20000
   random_forest:
     n_estimators: 500
     max_features: sqrt
-    min_samples_leaf: 1
+    min_samples_leaf: 5
   extra_trees:
     n_estimators: 500
     max_features: sqrt
-    min_samples_leaf: 1
+    min_samples_leaf: 5
   shallow_neural_network:
+    mlp_batch_size: balanced
+    mlp_l2_normalization: batch
     hidden_layer_sizes:
-      - 64
+      - 32
     activation: relu
     solver: adam
-    alpha: 0.0001
+    alpha_log10_min: -2
+    alpha_log10_max: 2
+    n_alphas: 5
+    max_cv_folds: 3
     learning_rate_init: 0.001
-    max_iter: 500
+    max_iter: 2000
     early_stopping: false
   super_learner:
+    mlp_batch_size: balanced
+    mlp_l2_normalization: batch
     cv: 5
     passthrough: false
-    n_estimators: 300
+    ridge_alpha_log10_min: -4
+    ridge_alpha_log10_max: 6
+    ridge_n_alphas: 63
+    ridge_max_iter: 20000
+    n_estimators: 500
     max_features: sqrt
-    min_samples_leaf: 1
+    min_samples_leaf: 5
     hidden_layer_sizes:
-      - 64
-    alpha: 0.0001
+      - 32
+    alpha: 0.01
     learning_rate_init: 0.001
-    max_iter: 500
-    C: 1.0
+    max_iter: 2000
     lgbm_n_estimators: 200
     lgbm_learning_rate: 0.05
     lgbm_num_leaves: 10
-    lgbm_min_data_in_leaf: 20
+    lgbm_min_data_in_leaf: 10
   xgboost:
     objective: binary:logistic
     eval_metric: logloss
     max_depth: 2
-    learning_rate: 0.3
-    n_estimators: 90
+    eta: 0.3
+    max_rounds: 90
+    cv_folds: 5
   lightgbm:
     objective: binary
+    metric: binary_logloss
     learning_rate: 0.05
     num_leaves: 10
-    min_data_in_leaf: 20
-    n_estimators: 200
+    min_data_in_leaf: 10
     verbosity: -1
+    max_rounds: 200
+    cv_folds: 5
+    early_stopping_rounds: 10

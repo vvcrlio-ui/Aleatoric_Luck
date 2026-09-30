@@ -5,17 +5,54 @@ import argparse
 import hashlib
 import json
 import time
-import warnings
 from pathlib import Path
 
 import numpy as np
-from scipy.optimize import nnls
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import LogisticRegression
+from scipy.optimize import minimize, nnls
+from scipy.special import expit, logit
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 
 class IncompletePredictionCache(ValueError):
     pass
+
+
+class NonNegativeLogisticRegression(ClassifierMixin, BaseEstimator):
+    """NNLS's classification twin: unpenalized logistic, nonnegative weights.
+
+    Minimizes mean log loss over a free intercept and nonnegative coefficients
+    with L-BFGS-B, starting from the intercept-only model.
+    """
+
+    def fit(self, X, y):
+        X, y = np.asarray(X, dtype=np.float64), np.asarray(y, dtype=np.float64)
+        if not np.array_equal(np.unique(y), [0, 1]):
+            raise ValueError("nonnegative logistic combiner requires both classes [0, 1]")
+
+        def objective(theta):
+            eta = theta[0] + X @ theta[1:]
+            residual = expit(eta) - y
+            loss = float(np.mean(np.logaddexp(0., eta) - y * eta))
+            return loss, np.concatenate(([residual.mean()], X.T @ residual / len(y)))
+
+        start = np.zeros(X.shape[1] + 1)
+        start[0] = logit(y.mean())
+        result = minimize(objective, start, jac=True, method="L-BFGS-B",
+                          bounds=[(None, None)] + [(0., None)] * X.shape[1])
+        self.intercept_ = result.x[:1]
+        self.coef_ = result.x[None, 1:]
+        self.objective_ = float(result.fun)
+        self.converged_ = bool(result.success)
+        self.message_ = str(result.message)
+        self.classes_ = np.asarray([0, 1])
+        return self
+
+    def predict_proba(self, X):
+        probability = expit(self.intercept_[0] + np.asarray(X, dtype=np.float64) @ self.coef_[0])
+        return np.column_stack((1. - probability, probability))
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= .5).astype(int)
 
 
 def recombine_predictions(*, oof_predictions, holdout_predictions, y_train,
@@ -23,9 +60,9 @@ def recombine_predictions(*, oof_predictions, holdout_predictions, y_train,
                           combiner_config=None, variant_id, statuses=None):
     """Learn from OOF and training labels only; holdout labels are not accepted.
 
-    Nonnegative regression coefficients include a fitted intercept and are not
-    normalized. Classification uses the declared logistic regression rule on
-    positive-class probabilities. Required missing columns are never dropped.
+    Nonnegative coefficients include a fitted intercept and are not normalized:
+    least squares for regression, log loss on positive-class probabilities for
+    classification. Required missing columns are never dropped.
     """
     names, selected = tuple(model_names), tuple(selected_models)
     if not variant_id or not selected or len(set(selected)) != len(selected) or len(set(names)) != len(names):
@@ -60,25 +97,20 @@ def recombine_predictions(*, oof_predictions, holdout_predictions, y_train,
         config = {"rule": "nnls-intercept-v1"}
         classes = []
     elif task == "classification":
-        unknown = set(config) - {"rule", "C", "max_iter", "random_state"}
-        if unknown or config.get("rule", "logistic-v1") != "logistic-v1":
-            raise ValueError("classification combiner must use frozen logistic-v1 rule")
+        if config not in ({}, {"rule": "nonnegative-logistic-intercept-v1"}):
+            raise ValueError("classification combiner must explicitly use nonnegative-logistic-intercept-v1")
         if not np.array_equal(np.unique(y), [0, 1]):
             raise IncompletePredictionCache("classification combiner requires both classes [0, 1]")
         if np.any((Z < 0) | (Z > 1)) or np.any((P < 0) | (P > 1)):
             raise ValueError("classification cache must contain probabilities")
-        config = {"rule": "logistic-v1", "C": float(config.get("C", 1.)),
-                  "max_iter": int(config.get("max_iter", 100)),
-                  "random_state": int(config.get("random_state", 0))}
-        estimator = LogisticRegression(**{key: value for key, value in config.items() if key != "rule"})
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", ConvergenceWarning)
-            estimator.fit(Z, y)
-        convergence = [str(w.message) for w in caught if issubclass(w.category, ConvergenceWarning)]
+        estimator = NonNegativeLogisticRegression().fit(Z, y)
+        if not estimator.converged_:
+            convergence = [estimator.message_]
         weights = estimator.coef_[0]
         intercept = float(estimator.intercept_[0])
         prediction = estimator.predict_proba(P)[:, 1]
         objective = None
+        config = {"rule": "nonnegative-logistic-intercept-v1"}
         classes = estimator.classes_.tolist()
     else:
         raise ValueError("task must be regression or classification")
@@ -191,8 +223,6 @@ def recombine_verified_cell(*, plan_path, panel_id, seed, draw, n, k, pipeline_i
             raise IncompletePredictionCache("source cache identity differs from frozen plan")
         records.append(record)
     training = read_record(contract["cache_root"], records[0].metadata["sample_map_refs"]["training"], require_sealed=True)
-    if panel["task_kind"] == "classification" and combiner_config is None:
-        raise ValueError("classification recombination requires explicit frozen combiner config")
     names = [r.metadata["model_name"] for r in records]
     answer = recombine_cache_records(records, y_train=training.arrays["y_train"], selected_models=names,
         variant_id=variant_id, task=panel["task_kind"], combiner_config=combiner_config)

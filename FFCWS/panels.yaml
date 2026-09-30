@@ -1,13 +1,21 @@
 # One catalog for all 18 FFC experiments. Select one with --panel.
-# All entries inherit the cache/SL7 workflow below. The eight independent base
-# recipes are unchanged; SL7 combines their cached predictions except OLS.
-# Fresh runs use the shared single-model Slurm entry. Existing frozen runs keep
-# their own configuration and code.
+# All panels use holdout/OOF caches for eight base models and cache-only SL7.
 model_params: model_params.yaml
 preset: dev
 experiment_id: ffcws-aleatoric-v1
 data_version: ffcws-ard-v1
 model_spec_version: nkgrid-models-v6-balanced-batch-1
+
+preparation:
+  adapter: adapter/adapter.py
+  config: adapter/config/ffc.yaml
+  inputs:
+    background: background.dta
+    train: train.csv
+    test: test.csv
+  panel_pattern: 'ffc_(?P<strategy>median_mode|median_missing_indicator|tree_ordinal)_(?P<outcome>.+)'
+  arguments: [--strategy, '{strategy}']
+  schema: 'schema/{panel}.json'
 
 panels:
   - &ffc_panel
@@ -41,7 +49,7 @@ panels:
       sl_resources:
         worker_cap: 24
         io_concurrency: 8
-        memory: 4G
+        memory: 2G
         time_limit: '04:00:00'
     out: outputs/nk_grid_ffc_median_mode_gpa.csv
 

@@ -15,7 +15,8 @@ DEFAULTS = {
     'drain_grace_seconds': 60., 'drain_enabled': False,
     'restart_overhead_seconds': None, 'restart_cpu_hours': None,
     'target_round_seconds': None, 'max_cpu_hours': None, 'exclude_nodes': [],
-    'max_nodes': 60,
+    # Optional lower cap on the run's --nodes (total nodes, control reserve included).
+    'max_nodes': None,
     # Geometry is operational: it decides how many workers a round asks for and
     # how much memory each reserves, never what the round computes. Keeping it
     # out of the frozen plan lets a run be resized between rounds instead of
@@ -133,7 +134,7 @@ def validate_policy(value=None):
                 raise QueueError('worker_time_limit must be a positive Slurm [days-]HH:MM:SS')
         elif isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) or item <= 0:
             raise QueueError('Scheduler policy ' + key + ' must be positive and finite')
-    for key in ('max_batch_tasks', 'claim_bytes', 'submit_bytes', 'idle_samples', 'max_nodes', 'max_connections',
+    for key in ('max_batch_tasks', 'claim_bytes', 'submit_bytes', 'idle_samples', 'max_connections',
                 'max_submissions', 'dispatcher_shards', 'verification_block_bytes', 'verification_round_limit'):
         if type(policy[key]) is not int: raise QueueError(key + ' must be an integer')
     if not 1 <= policy['max_connections'] <= 4096:
@@ -196,9 +197,10 @@ def validate_policy(value=None):
     # The scheduler hands the resolver max_nodes minus two reserved control
     # nodes, so a cap of two or less resolves to zero and fails deep inside
     # sizing, after the controller has already been submitted. Say so here.
-    if policy['max_nodes'] < CONTROL_NODE_RESERVE + 1:
+    if policy['max_nodes'] is not None and (type(policy['max_nodes']) is not int
+                                            or policy['max_nodes'] < CONTROL_NODE_RESERVE + 1):
         raise QueueError('max_nodes must leave room for %d control nodes plus at least one '
-                         'worker node; got %d' % (CONTROL_NODE_RESERVE, policy['max_nodes']))
+                         'worker node; got %r' % (CONTROL_NODE_RESERVE, policy['max_nodes']))
     if policy['max_batch_tasks'] > 4096 or policy['claim_bytes'] > 512 * 1024 or policy['submit_bytes'] > 512 * 1024:
         raise QueueError('Scheduler policy exceeds protocol safety limits')
     if not 0 < policy['idle_fraction'] < 1: raise QueueError('idle_fraction must be between zero and one')
