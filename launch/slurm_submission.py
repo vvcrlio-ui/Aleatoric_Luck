@@ -54,8 +54,10 @@ def _write(path, value):
 
 @contextmanager
 def _lock(path):
-    # Persistent inode; Windows uses its real byte-range lock for portable
-    # launcher tests, while the production POSIX path uses flock.
+    # Keep a persistent inode. POSIX record locks exclude other controller
+    # processes across nodes; flock was node-local in the BMRC GPFS probe.
+    # Own this file through one descriptor until release: closing another
+    # descriptor for the same inode would release this process's record lock.
     with Path(path).open("a+b") as handle:
         if os.name == "nt":
             import msvcrt
@@ -71,11 +73,11 @@ def _lock(path):
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.lockf(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                fcntl.lockf(handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager

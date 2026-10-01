@@ -92,6 +92,8 @@ When a run is complete, `final.csv` holds one row per model fit; the [root READM
 | `verified.json` | Result of the final check of every expected result |
 | `final.csv` | The result table |
 
+When upgrading from the older flock launcher, use a separate clean checkout for new runs. Keep every job of an existing run on the same launcher version, and finish or stop its jobs before updating that checkout. The [two-node controller lock acceptance](../runs/controller-lockf-repair-20261001/README.md) checks submission-journal concurrency using independent synthetic state.
+
 ## Resuming a run
 
 To continue a run that stopped before it finished, use the same clean checkout, profile and account:
