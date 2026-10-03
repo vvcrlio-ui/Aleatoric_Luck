@@ -43,7 +43,7 @@ panels:
       barrier_scope: submission_plan
       protocol_version: 2
       verification_schedule: final_only
-      phase_round_limits: {base: 2, sl: 1}
+      phase_round_limits: {base: 4, sl: 1}
       # Fallback bounds when no unified operational compute policy is selected.
       # The Discoverer policy supplies common base/SL resource limits instead.
       sl_resources:

@@ -201,7 +201,7 @@ A new run fixes its resources in `launch.json`. `--nodes` is the most nodes the 
 
 A round uses fewer nodes when the remaining work, estimated from the run's own timings, would leave some idle, or when a CPU-hour budget in the scheduler policy would otherwise be exceeded. The launcher does not look up account or QoS limits: Slurm either starts the allocation or keeps it pending, and `squeue -j JOB` shows why.
 
-`--memory` and `--time` set the base-worker defaults. A manifest can set its own time limit for each base round and separate resources for the Super Learner phase; the FFCWS and SMR manifests ask for `2G` per Super Learner worker and allow two base rounds and one Super Learner round. A scheduler policy can override worker memory, time and number of workers.
+`--memory` and `--time` set the base-worker defaults. A manifest can set its own time limit for each base round and separate resources for the Super Learner phase; the FFCWS and SMR manifests ask for `2G` per Super Learner worker and allow one Super Learner round; FFCWS allows four base rounds and SMR two. A scheduler policy can override worker memory, time and number of workers.
 
 The bootstrap and controller jobs each use one CPU, `48G` and two hours unless `--plan-memory` and `--plan-time` say otherwise.
 
