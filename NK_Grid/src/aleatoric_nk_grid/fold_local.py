@@ -107,7 +107,6 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
 
     def _fit_relative(self, X, y):
         """Select a ratio using training-fold alpha_max; refit at full-N scale."""
-        import json
         from sklearn.dummy import DummyRegressor
 
         y = np.asarray(y, dtype=float)
@@ -160,7 +159,6 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
         estimator.fit(full_X, y)
         self.model_ = make_pipeline(process, estimator)
         self.n_iter_ = np.append(self.fold_n_iter_.ravel(), getattr(estimator, 'n_iter_', 0))
-        # Small machine-readable diagnostics persist in each independent worker log.
         self.lasso_diagnostics_ = dict(protocol='relative-lasso-3fold-v1', folds=self.n_splits_,
             n_samples=len(y), expanded_columns=int(full_X.shape[1]),
             ratios=self.ratios_.tolist(), fold_alpha_max=self.fold_alpha_max_.tolist(),
@@ -168,7 +166,6 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
             cv_mse=self.cv_mse_.tolist(), selected_ratio=self.selected_ratio_, alpha=self.alpha_,
             boundary=self.boundary_, max_iter_hits=int(np.sum(self.n_iter_ >= self.max_iter)),
             refit_iterations=int(getattr(estimator, 'n_iter_', 0)), tol=self.tol)
-        print(json.dumps({'lasso_diagnostics': self.lasso_diagnostics_}, allow_nan=False), flush=True)
         return self
 
     def predict(self, X):
