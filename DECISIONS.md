@@ -50,7 +50,7 @@ Together with decision 1, 100 × 5 would bring a panel to roughly 3% of its prev
 
 ## 3. A simpler execution pipeline
 
-Status: in the code on branch `per-cell-pipeline`; not yet run as a dev experiment. The full pipeline used for the finished production runs is preserved at tag `multiround-pipeline-v1` (`3f4fa6c`), which already includes decision 1.
+Status: in the code on branch `per-cell-pipeline` (`29c2816`); checked against the previous pipeline in dev runs. The full pipeline used for the finished production runs is preserved at tag `multiround-pipeline-v1` (`3f4fa6c`), which already includes decision 1.
 
 The current pipeline was built for 16 million base fits and 2 million SL7 fits per panel, run by about 14,000 workers on 300 nodes over several allocations. At the smaller scale most of that machinery is no longer needed.
 
@@ -72,4 +72,8 @@ Why this is expected to be enough (estimates unless stated):
 - Keeping a cell's OOF predictions in memory costs under 1 MB for the largest SMR cell. Peak memory is set by the largest single model fit, as now, provided each fitted model is released after predicting. To be confirmed with timing_full.
 - The queue and controller code (about 6,500 lines across the engine and launcher) was the source of several recent failures, among them node-relay endpoints overwriting each other (2026-09-24), cross-node submission locking and `sinfo` parsing on BMRC.
 
-The engine went from 18,145 to 6,349 lines of Python and the launcher from 1,985 to 877. Checks so far: local tests of the engine, launcher and adapters, and new checks that one cell's rows, saved arrays and SL7 equal a fresh computation and that publication refuses missing, duplicate or failed cells. Still to do: a Linux test run and a dev run of the same panel with both pipelines, comparing `final.csv` and the saved predictions bit for bit.
+The engine went from 18,145 to 6,349 lines of Python and the launcher from 1,985 to 877. Checks:
+
+- Engine, launcher and adapter tests on Windows and Linux (Discoverer job 4457999), with no failure that the previous commit does not also have; new checks that one cell's rows, saved arrays and SL7 equal a fresh computation, that publication refuses missing, duplicate or failed cells, and an end-to-end run with an interruption and a resume (job 4458045).
+- Dev runs of three panels with both pipelines on Discoverer (FFC tree_ordinal GPA and layoff, SMR hourly wage; 81 cells and 729 result rows each): `final.csv` is identical in every row and column, including the SL7 rows, and every base model's test and OOF predictions, fold assignments and training-row IDs are identical bit for bit. A dev run took 2 Slurm jobs instead of 15.
+- Not yet measured: per-cell time and peak memory at full scale (timing_full).
