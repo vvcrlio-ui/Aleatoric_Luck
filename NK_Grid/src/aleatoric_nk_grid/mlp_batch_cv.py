@@ -40,15 +40,17 @@ class BatchSearchMLP(RegressorMixin, BaseEstimator):
 
     Only scalar diagnostics survive candidate fits. Candidate failures are
     explicit; final refit errors propagate. Constructor parameters are untouched
-    so sklearn clone and pickle preserve the selection contract.
+    so sklearn clone and pickle preserve the selection contract. A given
+    ``selected`` [alpha, batch size] skips the search and refits once.
     """
     def __init__(self, mlp, alphas, mlp_batch_candidates=DEFAULT_BATCH_CANDIDATES,
-                 max_cv_folds=3, preprocessor=None):
+                 max_cv_folds=3, preprocessor=None, selected=None):
         self.mlp = mlp
         self.alphas = alphas
         self.mlp_batch_candidates = mlp_batch_candidates
         self.max_cv_folds = max_cv_folds
         self.preprocessor = preprocessor
+        self.selected = selected
 
     def _estimator(self, alpha, batch):
         process = (clone(self.preprocessor) if self.preprocessor is not None
@@ -68,13 +70,17 @@ class BatchSearchMLP(RegressorMixin, BaseEstimator):
         started = time.perf_counter()
         self.fit_count_ = 0
         self.candidate_scores_ = []
-        folds = tuple(KFold(min(self.max_cv_folds, len(y))).split(X)) if len(y) >= 3 else ()
-        if folds and min(len(t) for t, _ in folds) < 2:
-            folds = ()
-        self.fallback_reason_ = (None if folds else
-            "inner CV would have fewer than 2 training rows; first declared alpha/batch")
+        if self.selected is None:
+            folds = tuple(KFold(min(self.max_cv_folds, len(y))).split(X)) if len(y) >= 3 else ()
+            if folds and min(len(t) for t, _ in folds) < 2:
+                folds = ()
+            self.fallback_reason_ = (None if folds else
+                "inner CV would have fewer than 2 training rows; first declared alpha/batch")
+            self.alpha_, self.batch_size_ = float(alphas[0]), self.mlp_batch_candidates[0]
+        else:
+            folds, self.fallback_reason_ = (), None
+            self.alpha_, self.batch_size_ = float(self.selected[0]), int(self.selected[1])
         best_score = float("inf")
-        self.alpha_, self.batch_size_ = float(alphas[0]), self.mlp_batch_candidates[0]
         for alpha in alphas if folds else ():
             for batch in self.mlp_batch_candidates:
                 record = {"alpha": float(alpha), "batch": batch, "folds": [], "mean_mse": None, "error": None}

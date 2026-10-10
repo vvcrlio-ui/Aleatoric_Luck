@@ -22,18 +22,26 @@ class FoldLocalRidge(RegressorMixin, BaseEstimator):
 
     Folds preserve row order. With fewer than five samples, use N folds;
     select by the unweighted mean of fold MSEs, as in GridSearchCV.
+    A given ``selected`` alpha skips the search and refits once; ``selection_``
+    holds the alpha used.
     """
-    def __init__(self, preprocessor, alpha_log10_min, alpha_log10_max, n_alphas, scoring):
+    def __init__(self, preprocessor, alpha_log10_min, alpha_log10_max, n_alphas, scoring, selected=None):
         self.preprocessor = preprocessor
         self.alpha_log10_min = alpha_log10_min
         self.alpha_log10_max = alpha_log10_max
         self.n_alphas = n_alphas
         self.scoring = scoring
+        self.selected = selected
 
     def fit(self, X, y):
+        y = np.asarray(y)
+        self.alpha_ = self.selection_ = self._search(X, y) if self.selected is None else float(self.selected)
+        self.model_ = make_pipeline(clone(self.preprocessor), StandardScaler(), Ridge(alpha=self.alpha_)).fit(X, y)
+        return self
+
+    def _search(self, X, y):
         if self.scoring != 'neg_mean_squared_error':
             raise ValueError('fold-local Ridge currently requires the declared neg_mean_squared_error scoring')
-        y = np.asarray(y)
         if len(y) < 2:
             raise ValueError('Ridge CV requires at least two training rows')
         self.n_splits_ = min(5, len(y))
@@ -59,16 +67,17 @@ class FoldLocalRidge(RegressorMixin, BaseEstimator):
             fold_losses.append(np.mean((self.cv_predictions_[valid] - y[valid, None]) ** 2, axis=0))
         self.fold_mse_ = np.asarray(fold_losses)
         self.cv_mse_ = self.fold_mse_.mean(axis=0)
-        self.alpha_ = float(self.alphas_[np.argmin(self.cv_mse_)])
-        self.model_ = make_pipeline(clone(self.preprocessor), StandardScaler(), Ridge(alpha=self.alpha_)).fit(X, y)
-        return self
+        return float(self.alphas_[np.argmin(self.cv_mse_)])
 
     def predict(self, X):
         return self.model_.predict(X)
 
 
 class FoldLocalLasso(RegressorMixin, BaseEstimator):
-    def __init__(self, preprocessor, seed, n_jobs, alpha_log10_min, alpha_log10_max, n_alphas, max_cv_folds, max_iter, alpha_scale='absolute', tol=1e-4):
+    """A given ``selected`` value skips the search and refits once: an alpha on
+    the absolute scale, or a ratio to this sample's alpha_max on the relative
+    scale. ``selection_`` holds the value used."""
+    def __init__(self, preprocessor, seed, n_jobs, alpha_log10_min, alpha_log10_max, n_alphas, max_cv_folds, max_iter, alpha_scale='absolute', tol=1e-4, selected=None):
         self.preprocessor = preprocessor
         self.seed = seed
         self.n_jobs = n_jobs
@@ -79,6 +88,7 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
         self.max_iter = max_iter
         self.alpha_scale = alpha_scale
         self.tol = tol
+        self.selected = selected
 
     def fit(self, X, y):
         if self.alpha_scale == 'relative':
@@ -86,6 +96,12 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
         if self.alpha_scale != 'absolute':
             raise ValueError('alpha_scale must be absolute or relative')
         y = np.asarray(y)
+        self.alpha_ = self.selection_ = self._search_absolute(X, y) if self.selected is None else float(self.selected)
+        self.model_ = make_pipeline(clone(self.preprocessor), StandardScaler(),
+            Lasso(alpha=self.alpha_, max_iter=self.max_iter, random_state=self.seed)).fit(X, y)
+        return self
+
+    def _search_absolute(self, X, y):
         # LassoCV sorts alphas descending, including its first-minimum tie rule.
         self.alphas_ = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)[::-1]
         losses = []
@@ -100,17 +116,18 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
             predictions = (valid_X - center) @ coefficients + target_mean
             losses.append(np.mean((predictions - y[valid, None]) ** 2, axis=0))
         self.cv_mse_ = np.mean(losses, axis=0)
-        self.alpha_ = float(self.alphas_[np.argmin(self.cv_mse_)])
-        self.model_ = make_pipeline(clone(self.preprocessor), StandardScaler(),
-            Lasso(alpha=self.alpha_, max_iter=self.max_iter, random_state=self.seed)).fit(X, y)
-        return self
+        return float(self.alphas_[np.argmin(self.cv_mse_)])
 
     def _fit_relative(self, X, y):
         """Select a ratio using training-fold alpha_max; refit at full-N scale."""
         import json
-        from sklearn.dummy import DummyRegressor
 
         y = np.asarray(y, dtype=float)
+        if self.selected is not None:
+            self.selected_ratio_ = self.selection_ = float(self.selected)
+            estimator, _ = self._refit_relative(X, y)
+            self.n_iter_ = np.asarray([getattr(estimator, 'n_iter_', 0)])
+            return self
         if len(y) < 2 or not np.isfinite(y).all():
             raise ValueError('Relative Lasso requires at least two finite targets')
         if (self.max_cv_folds < 2 or self.n_alphas < 2 or self.max_iter < 1
@@ -148,8 +165,25 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
         self.fold_dual_gaps_ = np.asarray(gaps)
         self.cv_mse_ = self.fold_mse_.mean(axis=0)
         selected = int(np.argmin(self.cv_mse_))  # ties prefer stronger regularization
-        self.selected_ratio_ = float(self.ratios_[selected])
+        self.selected_ratio_ = self.selection_ = float(self.ratios_[selected])
         self.boundary_ = 'weak' if selected == self.n_alphas - 1 else ('strong' if selected == 0 else 'interior')
+        estimator, columns = self._refit_relative(X, y)
+        self.n_iter_ = np.append(self.fold_n_iter_.ravel(), getattr(estimator, 'n_iter_', 0))
+        # Small machine-readable diagnostics persist in each independent worker log.
+        self.lasso_diagnostics_ = dict(protocol='relative-lasso-3fold-v1', folds=self.n_splits_,
+            n_samples=len(y), expanded_columns=columns,
+            ratios=self.ratios_.tolist(), fold_alpha_max=self.fold_alpha_max_.tolist(),
+            fold_iterations=self.fold_n_iter_.tolist(), fold_dual_gaps=self.fold_dual_gaps_.tolist(),
+            cv_mse=self.cv_mse_.tolist(), selected_ratio=self.selected_ratio_, alpha=self.alpha_,
+            boundary=self.boundary_, max_iter_hits=int(np.sum(self.n_iter_ >= self.max_iter)),
+            refit_iterations=int(getattr(estimator, 'n_iter_', 0)), tol=self.tol)
+        print(json.dumps({'lasso_diagnostics': self.lasso_diagnostics_}, allow_nan=False), flush=True)
+        return self
+
+    def _refit_relative(self, X, y):
+        """Refit selected_ratio_ times this sample's alpha_max on all its rows."""
+        from sklearn.dummy import DummyRegressor
+
         process = make_pipeline(clone(self.preprocessor), StandardScaler()).fit(X)
         full_X = process.transform(X)
         centered_y = y - y.mean()
@@ -159,27 +193,21 @@ class FoldLocalLasso(RegressorMixin, BaseEstimator):
             Lasso(alpha=self.alpha_, max_iter=self.max_iter, tol=self.tol, random_state=self.seed))
         estimator.fit(full_X, y)
         self.model_ = make_pipeline(process, estimator)
-        self.n_iter_ = np.append(self.fold_n_iter_.ravel(), getattr(estimator, 'n_iter_', 0))
-        # Small machine-readable diagnostics persist in each independent worker log.
-        self.lasso_diagnostics_ = dict(protocol='relative-lasso-3fold-v1', folds=self.n_splits_,
-            n_samples=len(y), expanded_columns=int(full_X.shape[1]),
-            ratios=self.ratios_.tolist(), fold_alpha_max=self.fold_alpha_max_.tolist(),
-            fold_iterations=self.fold_n_iter_.tolist(), fold_dual_gaps=self.fold_dual_gaps_.tolist(),
-            cv_mse=self.cv_mse_.tolist(), selected_ratio=self.selected_ratio_, alpha=self.alpha_,
-            boundary=self.boundary_, max_iter_hits=int(np.sum(self.n_iter_ >= self.max_iter)),
-            refit_iterations=int(getattr(estimator, 'n_iter_', 0)), tol=self.tol)
-        print(json.dumps({'lasso_diagnostics': self.lasso_diagnostics_}, allow_nan=False), flush=True)
-        return self
+        return estimator, int(full_X.shape[1])
 
     def predict(self, X):
         return self.model_.predict(X)
 
 
 class FoldLocalMLP(RegressorMixin, BaseEstimator):
-    def __init__(self, preprocessor, seed, params):
+    """A given ``selected`` value skips the search and fits once: the alpha, or
+    [alpha, batch size] under ``mlp_batch_size: cv``. ``selection_`` holds the
+    value used."""
+    def __init__(self, preprocessor, seed, params, selected=None):
         self.preprocessor = preprocessor
         self.seed = seed
         self.params = params
+        self.selected = selected
 
     def _estimator(self, alpha):
         mlp = build_mlp_regressor(seed=self.seed, alpha=alpha, params=self.params)
@@ -197,17 +225,22 @@ class FoldLocalMLP(RegressorMixin, BaseEstimator):
                 build_mlp_regressor(seed=self.seed, alpha=0.0, params=self.params),
                 np.logspace(self.params['alpha_log10_min'], self.params['alpha_log10_max'], self.params['n_alphas']),
                 self.params.get('mlp_batch_candidates', (32, 64, 128, 256)),
-                self.params['max_cv_folds'], self.preprocessor).fit(X, y)
+                self.params['max_cv_folds'], self.preprocessor, self.selected).fit(X, y)
             self.alpha_, self.batch_size_ = self.search_.alpha_, self.search_.batch_size_
+            self.selection_ = [self.alpha_, self.batch_size_]
             self.cv_mse_, self.diagnostics_ = self.search_.cv_mse_, self.search_.diagnostics_
             self.model_ = self.search_.model_
             return self
         y = np.asarray(y)
-        alphas = np.logspace(self.params['alpha_log10_min'], self.params['alpha_log10_max'], self.params['n_alphas'])
-        folds = tuple(KFold(min(self.params['max_cv_folds'], len(y))).split(X))
-        self.cv_mse_ = [np.mean([np.mean((self._estimator(alpha).fit(X.iloc[t], y[t]).predict(X.iloc[v]) - y[v]) ** 2)
-                                      for t, v in folds]) for alpha in alphas]
-        self.alpha_ = float(alphas[np.argmin(self.cv_mse_)])
+        if self.selected is None:
+            alphas = np.logspace(self.params['alpha_log10_min'], self.params['alpha_log10_max'], self.params['n_alphas'])
+            folds = tuple(KFold(min(self.params['max_cv_folds'], len(y))).split(X))
+            self.cv_mse_ = [np.mean([np.mean((self._estimator(alpha).fit(X.iloc[t], y[t]).predict(X.iloc[v]) - y[v]) ** 2)
+                                          for t, v in folds]) for alpha in alphas]
+            self.alpha_ = float(alphas[np.argmin(self.cv_mse_)])
+        else:
+            self.alpha_ = float(self.selected)
+        self.selection_ = self.alpha_
         self.model_ = self._estimator(self.alpha_).fit(X, y)
         return self
 
@@ -265,13 +298,16 @@ class FoldLocalLogisticRidge(_Classifier):
     log-likelihood, plus alpha*||w||^2. The same alpha on the Bernoulli negative
     log-likelihood is sklearn's C = 1/alpha. Each fold walks the grid from the
     strongest penalty down, warm-starting every fit from the previous solution.
+    A given ``selected`` alpha skips the search and refits once; ``selection_``
+    holds the alpha used.
     """
-    def __init__(self, preprocessor, alpha_log10_min, alpha_log10_max, n_alphas, max_iter):
+    def __init__(self, preprocessor, alpha_log10_min, alpha_log10_max, n_alphas, max_iter, selected=None):
         self.preprocessor = preprocessor
         self.alpha_log10_min = alpha_log10_min
         self.alpha_log10_max = alpha_log10_max
         self.n_alphas = n_alphas
         self.max_iter = max_iter
+        self.selected = selected
 
     def _logistic(self, alpha, warm_start=False):
         return LogisticRegression(C=1. / alpha, l1_ratio=0., solver="lbfgs",
@@ -280,6 +316,12 @@ class FoldLocalLogisticRidge(_Classifier):
     def fit(self, X, y):
         y = np.asarray(y, dtype=int)
         process = classification_preprocessor(self.preprocessor)
+        self.alpha_ = self.selection_ = self._search(X, y, process) if self.selected is None else float(self.selected)
+        self.model_ = make_pipeline(clone(process), StandardScaler(), self._logistic(self.alpha_)).fit(X, y)
+        self.classes_ = self.model_.classes_
+        return self
+
+    def _search(self, X, y, process):
         folds = stratified_cv_folds(y, 5, "ridge")
         self.n_splits_ = len(folds)
         self.alphas_ = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)
@@ -295,10 +337,7 @@ class FoldLocalLogisticRidge(_Classifier):
             losses.append(fold)
         self.fold_log_loss_ = np.asarray(losses)
         self.cv_log_loss_ = self.fold_log_loss_.mean(axis=0)
-        self.alpha_ = float(self.alphas_[np.argmin(self.cv_log_loss_)])
-        self.model_ = make_pipeline(clone(process), StandardScaler(), self._logistic(self.alpha_)).fit(X, y)
-        self.classes_ = self.model_.classes_
-        return self
+        return float(self.alphas_[np.argmin(self.cv_log_loss_)])
 
 
 class FoldLocalLogisticLasso(_Classifier):
@@ -317,10 +356,11 @@ class FoldLocalLogisticLasso(_Classifier):
 
     On the relative scale the grid holds ratios to each training fold's
     alpha_max, as glmnet's path does, and the selected ratio is refit at the
-    whole sample's alpha_max.
+    whole sample's alpha_max. A given ``selected`` alpha or ratio skips the
+    search and refits once; ``selection_`` holds the value used.
     """
     def __init__(self, preprocessor, seed, alpha_log10_min, alpha_log10_max, n_alphas,
-                 max_cv_folds, max_iter, tol=1e-4, alpha_scale="absolute"):
+                 max_cv_folds, max_iter, tol=1e-4, alpha_scale="absolute", selected=None):
         self.preprocessor = preprocessor
         self.seed = seed
         self.alpha_log10_min = alpha_log10_min
@@ -330,6 +370,7 @@ class FoldLocalLogisticLasso(_Classifier):
         self.max_iter = max_iter
         self.tol = tol
         self.alpha_scale = alpha_scale
+        self.selected = selected
 
     def _logistic(self, n, alpha, warm_start=False):
         return LogisticRegression(C=1. / (n * alpha), l1_ratio=1., solver="saga", max_iter=self.max_iter,
@@ -340,6 +381,18 @@ class FoldLocalLogisticLasso(_Classifier):
             raise ValueError("alpha_scale must be absolute or relative")
         y = np.asarray(y, dtype=int)
         process = classification_preprocessor(self.preprocessor)
+        selected = self.selection_ = self._search(X, y, process) if self.selected is None else float(self.selected)
+        scaled = make_pipeline(clone(process), StandardScaler()).fit(X)
+        full_X = scaled.transform(X)
+        self.alpha_max_ = _alpha_max(full_X, y)
+        self.alpha_ = selected if self.alpha_scale == "absolute" else selected * self.alpha_max_
+        estimator = (DummyClassifier(strategy="prior") if self.alpha_ >= self.alpha_max_
+                     else self._logistic(len(y), self.alpha_))
+        self.model_ = make_pipeline(scaled, estimator.fit(full_X, y))
+        self.classes_ = self.model_.classes_
+        return self
+
+    def _search(self, X, y, process):
         folds = stratified_cv_folds(y, self.max_cv_folds, "lasso")
         self.n_splits_ = len(folds)
         grid = np.logspace(self.alpha_log10_min, self.alpha_log10_max, self.n_alphas)[::-1]
@@ -366,24 +419,20 @@ class FoldLocalLogisticLasso(_Classifier):
             losses.append(fold)
         self.fold_log_loss_ = np.asarray(losses)
         self.cv_log_loss_ = self.fold_log_loss_.mean(axis=0)
-        selected = float(grid[np.argmin(self.cv_log_loss_)])
-        scaled = make_pipeline(clone(process), StandardScaler()).fit(X)
-        full_X = scaled.transform(X)
-        self.alpha_max_ = _alpha_max(full_X, y)
-        self.alpha_ = selected if self.alpha_scale == "absolute" else selected * self.alpha_max_
-        estimator = (DummyClassifier(strategy="prior") if self.alpha_ >= self.alpha_max_
-                     else self._logistic(len(y), self.alpha_))
-        self.model_ = make_pipeline(scaled, estimator.fit(full_X, y))
-        self.classes_ = self.model_.classes_
-        return self
+        return float(grid[np.argmin(self.cv_log_loss_)])
 
 
 class FoldLocalMLPClassifier(_Classifier):
-    """FoldLocalMLP's alpha grid and folds, scored by log loss on 0/1 labels."""
-    def __init__(self, preprocessor, seed, params):
+    """FoldLocalMLP's alpha grid and folds, scored by log loss on 0/1 labels.
+
+    A given ``selected`` alpha skips the search and fits once; ``selection_``
+    holds the alpha used.
+    """
+    def __init__(self, preprocessor, seed, params, selected=None):
         self.preprocessor = preprocessor
         self.seed = seed
         self.params = params
+        self.selected = selected
 
     def _estimator(self, alpha):
         return make_pipeline(clone(classification_preprocessor(self.preprocessor)), StandardScaler(),
@@ -391,12 +440,16 @@ class FoldLocalMLPClassifier(_Classifier):
 
     def fit(self, X, y):
         y = np.asarray(y, dtype=int)
-        folds = stratified_cv_folds(y, self.params["max_cv_folds"], "shallow_neural_network")
-        alphas = np.logspace(self.params["alpha_log10_min"], self.params["alpha_log10_max"], self.params["n_alphas"])
-        self.cv_log_loss_ = [np.mean([_fold_log_loss(y[v], self._estimator(alpha).fit(_rows(X, t), y[t])
-                                                     .predict_proba(_rows(X, v))[:, 1]) for t, v in folds])
-                             for alpha in alphas]
-        self.alpha_ = float(alphas[np.argmin(self.cv_log_loss_)])
+        if self.selected is None:
+            folds = stratified_cv_folds(y, self.params["max_cv_folds"], "shallow_neural_network")
+            alphas = np.logspace(self.params["alpha_log10_min"], self.params["alpha_log10_max"], self.params["n_alphas"])
+            self.cv_log_loss_ = [np.mean([_fold_log_loss(y[v], self._estimator(alpha).fit(_rows(X, t), y[t])
+                                                         .predict_proba(_rows(X, v))[:, 1]) for t, v in folds])
+                                 for alpha in alphas]
+            self.alpha_ = float(alphas[np.argmin(self.cv_log_loss_)])
+        else:
+            self.alpha_ = float(self.selected)
+        self.selection_ = self.alpha_
         self.model_ = self._estimator(self.alpha_).fit(X, y)
         self.classes_ = self.model_.classes_
         return self

@@ -34,7 +34,7 @@ Ridge, Lasso and the neural network choose their penalty by cross-validation on 
 
 The neural network has one hidden layer of 32 units. Each fit splits its training rows into mini-batches of at most 200 rows and of nearly equal size, so the last batch is never much smaller than the others. Training runs for at most 2,000 epochs and stops earlier once the training loss stops improving.
 
-The Super Learner (SL7) combines the seven models other than OLS. Each of the seven is fit five more times, on about four fifths of the training rows each time, to predict the remaining rows; this gives an out-of-fold prediction for every training row. SL7 finds the nonnegative weights, plus an intercept, that best predict the training outcome from these predictions, and applies them to the seven models' test predictions. It uses no test outcomes and retrains nothing.
+The Super Learner (SL7) combines the seven models other than OLS. Each of the seven is fit five more times, on about four fifths of the training rows each time, to predict the remaining rows; this gives an out-of-fold prediction for every training row. These fits reuse the penalty or number of boosting rounds chosen when the model was fit on all N rows and do not search again. Lasso's penalty is chosen as a fraction of the smallest penalty that removes every variable, and each of these fits applies that fraction to its own rows. SL7 finds the nonnegative weights, plus an intercept, that best predict the training outcome from these predictions, and applies them to the seven models' test predictions. It uses no test outcomes and retrains nothing.
 
 Binary outcomes use the same models, search grids, fold counts and network settings. The differences follow from the outcome:
 

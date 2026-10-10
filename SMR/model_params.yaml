@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v12-classification-cv-6
+algorithm_version: nk-grid-v13-fixed-oof-1
 
 regression:
   ols:

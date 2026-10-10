@@ -337,6 +337,8 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
     CV folds are generated from a private ``RandomState`` and passed explicitly
     to ``xgboost.cv``.  This avoids its module-global NumPy RNG, which is shared
     by concurrent cell workers even when both ``seed`` and ``nthread`` are fixed.
+    A given ``selected`` number of rounds skips the CV and refits once;
+    ``selection_`` holds the rounds used.
     """
 
     def __init__(
@@ -351,6 +353,7 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
         max_rounds: int,
         cv_folds: int,
         preprocessor=None,
+        selected=None,
     ):
         self.seed = seed
         self.n_jobs = n_jobs
@@ -361,6 +364,7 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
         self.max_rounds = max_rounds
         self.cv_folds = cv_folds
         self.preprocessor = preprocessor
+        self.selected = selected
 
     def fit(self, X, y):
         import xgboost as xgb
@@ -374,6 +378,18 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
             "nthread": self.n_jobs,
             "seed": self.seed,
         }
+        self.best_rounds_ = self.selection_ = self._search(X, y, dtrain) if self.selected is None else int(self.selected)
+        if self.preprocessor is not None:
+            self.preprocessor_ = clone(self.preprocessor).fit(X)
+            dtrain = xgb.DMatrix(self.preprocessor_.transform(X), label=np.asarray(y))
+        self.model_ = xgb.train(
+            self.params_, dtrain, num_boost_round=self.best_rounds_
+        )
+        return self
+
+    def _search(self, X, y, dtrain):
+        import xgboost as xgb
+
         # ``xgboost.cv`` otherwise calls ``np.random.seed(seed)`` then uses the
         # module-global generator to shuffle folds.  Concurrent callers race on
         # that shared generator, so give it the same legacy MT19937 permutation
@@ -411,14 +427,7 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
             finally:
                 del booster, fold_train, fold_valid
         self.cv_curve_ = np.mean(np.asarray(curves, dtype=float), axis=0)
-        self.best_rounds_ = _select_cv_round(self.cv_curve_)
-        if self.preprocessor is not None:
-            self.preprocessor_ = clone(self.preprocessor).fit(X)
-            dtrain = xgb.DMatrix(self.preprocessor_.transform(X), label=np.asarray(y))
-        self.model_ = xgb.train(
-            self.params_, dtrain, num_boost_round=self.best_rounds_
-        )
-        return self
+        return _select_cv_round(self.cv_curve_)
 
     def predict(self, X):
         import xgboost as xgb
@@ -429,7 +438,11 @@ class XGBoostCVRegressor(BaseEstimator, RegressorMixin):
 
 
 class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
-    """LightGBM extension with CV-selected boosting rounds."""
+    """LightGBM extension with CV-selected boosting rounds.
+
+    A given ``selected`` number of rounds skips the CV and refits once;
+    ``selection_`` holds the rounds used.
+    """
 
     def __init__(
         self,
@@ -446,6 +459,7 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
         cv_folds: int,
         early_stopping_rounds: int,
         preprocessor=None,
+        selected=None,
     ):
         self.seed = seed
         self.n_jobs = n_jobs
@@ -459,6 +473,7 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
         self.cv_folds = cv_folds
         self.early_stopping_rounds = early_stopping_rounds
         self.preprocessor = preprocessor
+        self.selected = selected
 
     def fit(self, X, y):
         import lightgbm as lgb
@@ -474,6 +489,18 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
             "seed": self.seed,
             "verbosity": self.verbosity,
         }
+        self.best_rounds_ = self.selection_ = self._search(X, y, train) if self.selected is None else int(self.selected)
+        if self.preprocessor is not None:
+            self.preprocessor_ = clone(self.preprocessor).fit(X)
+            train = lgb.Dataset(self.preprocessor_.transform(X), label=np.asarray(y))
+        self.model_ = lgb.train(
+            self.params_, train, num_boost_round=self.best_rounds_
+        )
+        return self
+
+    def _search(self, X, y, train):
+        import lightgbm as lgb
+
         if len(y) < self.cv_folds:
             raise ValueError("LightGBM requires at least cv_folds training rows")
         # Preserve 4.6.0 _make_n_folds, including its remainder behavior and
@@ -506,14 +533,7 @@ class LightGBMCVRegressor(BaseEstimator, RegressorMixin):
             finally:
                 del booster, fold_train, fold_valid
         self.cv_curve_ = np.mean(np.asarray(curves, dtype=float), axis=0)
-        self.best_rounds_ = _select_cv_round(self.cv_curve_, self.early_stopping_rounds)
-        if self.preprocessor is not None:
-            self.preprocessor_ = clone(self.preprocessor).fit(X)
-            train = lgb.Dataset(self.preprocessor_.transform(X), label=np.asarray(y))
-        self.model_ = lgb.train(
-            self.params_, train, num_boost_round=self.best_rounds_
-        )
-        return self
+        return _select_cv_round(self.cv_curve_, self.early_stopping_rounds)
 
     def predict(self, X):
         if self.preprocessor is not None:
@@ -526,7 +546,8 @@ class _BoostingCVClassifier(BaseEstimator, ClassifierMixin):
 
     As in the regressors, the folds are shuffled with the model seed. Every fold
     refits the preprocessing on its own training rows. The fitted booster
-    predicts the positive-class probability.
+    predicts the positive-class probability. A given ``selected`` number of
+    rounds skips the CV and refits once; ``selection_`` holds the rounds used.
     """
 
     def _fold_curve(self, train_X, train_y, valid_X, valid_y):
@@ -540,13 +561,17 @@ class _BoostingCVClassifier(BaseEstimator, ClassifierMixin):
 
         y = np.asarray(y, dtype=int)
         process = classification_preprocessor(self.preprocessor)
-        curves = []
-        for train, valid in stratified_cv_folds(y, self.cv_folds, self._model_name, shuffle_seed=self.seed):
-            fitted = clone(process).fit(_rows(X, train))
-            curves.append(self._fold_curve(fitted.transform(_rows(X, train)), y[train],
-                                           fitted.transform(_rows(X, valid)), y[valid]))
-        self.cv_curve_ = np.mean(np.asarray(curves, dtype=float), axis=0)
-        self.best_rounds_ = _select_cv_round(self.cv_curve_, getattr(self, "early_stopping_rounds", None))
+        if self.selected is None:
+            curves = []
+            for train, valid in stratified_cv_folds(y, self.cv_folds, self._model_name, shuffle_seed=self.seed):
+                fitted = clone(process).fit(_rows(X, train))
+                curves.append(self._fold_curve(fitted.transform(_rows(X, train)), y[train],
+                                               fitted.transform(_rows(X, valid)), y[valid]))
+            self.cv_curve_ = np.mean(np.asarray(curves, dtype=float), axis=0)
+            self.best_rounds_ = _select_cv_round(self.cv_curve_, getattr(self, "early_stopping_rounds", None))
+        else:
+            self.best_rounds_ = int(self.selected)
+        self.selection_ = self.best_rounds_
         self.preprocessor_ = clone(process).fit(X)
         self.model_ = self._refit(self.preprocessor_.transform(X), y, self.best_rounds_)
         self.classes_ = np.asarray([0, 1])
@@ -564,7 +589,8 @@ class XGBoostCVClassifier(_BoostingCVClassifier):
     _model_name = "xgboost"
 
     def __init__(self, seed: int, n_jobs: int, *, objective: str, eval_metric: str,
-                 max_depth: int, eta: float, max_rounds: int, cv_folds: int, preprocessor=None):
+                 max_depth: int, eta: float, max_rounds: int, cv_folds: int, preprocessor=None,
+                 selected=None):
         self.seed = seed
         self.n_jobs = n_jobs
         self.objective = objective
@@ -574,6 +600,7 @@ class XGBoostCVClassifier(_BoostingCVClassifier):
         self.max_rounds = max_rounds
         self.cv_folds = cv_folds
         self.preprocessor = preprocessor
+        self.selected = selected
 
     def _params(self):
         return {"objective": self.objective, "eval_metric": self.eval_metric, "max_depth": self.max_depth,
@@ -604,7 +631,8 @@ class LightGBMCVClassifier(_BoostingCVClassifier):
 
     def __init__(self, seed: int, n_jobs: int, *, objective: str, metric: str,
                  learning_rate: float, num_leaves: int, min_data_in_leaf: int, verbosity: int,
-                 max_rounds: int, cv_folds: int, early_stopping_rounds: int, preprocessor=None):
+                 max_rounds: int, cv_folds: int, early_stopping_rounds: int, preprocessor=None,
+                 selected=None):
         self.seed = seed
         self.n_jobs = n_jobs
         self.objective = objective
@@ -617,6 +645,7 @@ class LightGBMCVClassifier(_BoostingCVClassifier):
         self.cv_folds = cv_folds
         self.early_stopping_rounds = early_stopping_rounds
         self.preprocessor = preprocessor
+        self.selected = selected
 
     def _params(self):
         return {"objective": self.objective, "metric": self.metric, "learning_rate": self.learning_rate,
@@ -1149,6 +1178,7 @@ def _make_classification_model(
     n_jobs: int,
     params: Mapping[str, Any],
     preprocessor,
+    selected=None,
 ):
     """Every classifier refits the typed preprocessing inside each CV fold.
 
@@ -1160,9 +1190,9 @@ def _make_classification_model(
     name = model_name.lower()
     process = classification_preprocessor(preprocessor)
     if name == "xgboost":
-        return XGBoostCVClassifier(seed=seed, n_jobs=n_jobs, preprocessor=process, **params)
+        return XGBoostCVClassifier(seed=seed, n_jobs=n_jobs, preprocessor=process, selected=selected, **params)
     if name == "lightgbm":
-        return LightGBMCVClassifier(seed=seed, n_jobs=n_jobs, preprocessor=process, **params)
+        return LightGBMCVClassifier(seed=seed, n_jobs=n_jobs, preprocessor=process, selected=selected, **params)
     if name == "ols":
         return make_pipeline(
             clone(process),
@@ -1170,9 +1200,9 @@ def _make_classification_model(
             LogisticRegression(**params, random_state=seed),
         )
     if name == "ridge":
-        return FoldLocalLogisticRidge(preprocessor=process, **params)
+        return FoldLocalLogisticRidge(preprocessor=process, selected=selected, **params)
     if name == "lasso":
-        return FoldLocalLogisticLasso(preprocessor=process, seed=seed, **params)
+        return FoldLocalLogisticLasso(preprocessor=process, seed=seed, selected=selected, **params)
     if name == "random_forest":
         return make_pipeline(
             clone(process),
@@ -1184,7 +1214,7 @@ def _make_classification_model(
             ExtraTreesClassifier(**params, n_jobs=n_jobs, random_state=seed),
         )
     if name == "shallow_neural_network":
-        return FoldLocalMLPClassifier(process, seed, params)
+        return FoldLocalMLPClassifier(process, seed, params, selected)
     if name == "super_learner":
         return AdaptiveStackingClassifier(seed=seed, n_jobs=n_jobs, preprocessor=preprocessor, **params)
     reject_removed_model(name)
@@ -1201,8 +1231,14 @@ def make_model(
     task: str = "regression",
     params: Mapping[str, Any] | None = None,
     preprocessor=None,
+    selected=None,
 ):
-    """Construct one model using source-aligned or documented extension settings."""
+    """Construct one model using source-aligned or documented extension settings.
+
+    ``selected`` is a full-sample fit's ``selection_`` (its chosen penalty,
+    Lasso ratio, MLP alpha and batch size, or number of rounds); the tuned
+    fold-local models then refit at it without searching.
+    """
 
     if task not in {"regression", "classification"}:
         raise ValueError("task must be 'regression' or 'classification'")
@@ -1219,22 +1255,25 @@ def make_model(
     resolved_params = _apply_environment_overrides(name, resolved_params)
 
     if task == "classification":
-        return _make_classification_model(name, seed, n_jobs, resolved_params, preprocessor)
+        return _make_classification_model(name, seed, n_jobs, resolved_params, preprocessor, selected)
     if name == "shallow_neural_network" and resolved_params["mlp_batch_size"] == "cv":
         from .fold_local import FoldLocalMLP
-        return FoldLocalMLP(preprocessor, seed, resolved_params)
+        return FoldLocalMLP(preprocessor, seed, resolved_params, selected)
     if preprocessor is not None:
         from .fold_local import FoldLocalRidge, FoldLocalLasso, FoldLocalMLP
         if name == "ridge":
-            return FoldLocalRidge(preprocessor=preprocessor, **resolved_params)
+            return FoldLocalRidge(preprocessor=preprocessor, selected=selected, **resolved_params)
         if name == "lasso":
-            return FoldLocalLasso(preprocessor=preprocessor, seed=seed, n_jobs=n_jobs, **resolved_params)
+            return FoldLocalLasso(preprocessor=preprocessor, seed=seed, n_jobs=n_jobs, selected=selected,
+                                  **resolved_params)
         if name == "shallow_neural_network":
-            return FoldLocalMLP(preprocessor, seed, resolved_params)
-        if name in {"xgboost", "lightgbm", "super_learner"}:
-            constructor = {"xgboost": XGBoostCVRegressor, "lightgbm": LightGBMCVRegressor,
-                           "super_learner": AdaptiveStackingRegressor}[name]
-            return constructor(seed=seed, n_jobs=n_jobs, preprocessor=preprocessor, **resolved_params)
+            return FoldLocalMLP(preprocessor, seed, resolved_params, selected)
+        if name in {"xgboost", "lightgbm"}:
+            constructor = {"xgboost": XGBoostCVRegressor, "lightgbm": LightGBMCVRegressor}[name]
+            return constructor(seed=seed, n_jobs=n_jobs, preprocessor=preprocessor, selected=selected,
+                               **resolved_params)
+        if name == "super_learner":
+            return AdaptiveStackingRegressor(seed=seed, n_jobs=n_jobs, preprocessor=preprocessor, **resolved_params)
     if preprocessor is not None:
         # Models without nested parameter selection fit this chain once.
         estimator = make_model(name, seed, n_jobs, task, params)

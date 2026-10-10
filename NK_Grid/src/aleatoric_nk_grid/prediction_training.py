@@ -18,6 +18,8 @@ from sklearn.model_selection import KFold, StratifiedKFold, check_cv
 BASE_MODELS = ("ols", "ridge", "lasso", "random_forest", "xgboost", "lightgbm",
                "shallow_neural_network", "extra_trees")
 BASE_LIBRARY = "standalone8-v1"
+# Their OOF fits reuse the full fit's ``selection_`` instead of searching.
+TUNED_MODELS = ("ridge", "lasso", "xgboost", "lightgbm", "shallow_neural_network")
 
 
 def rows(X, indexes):
@@ -153,6 +155,8 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
                            persist_fold=None, pipeline_id=None, formal_params=None):
     """Fit each full/OOF pipeline once, sharing the full prediction with scoring.
 
+    OOF fits of tuned models reuse the full fit's selected value (recorded as
+    fold -1's ``oof_selection``) and do not repeat its parameter search.
     ``persist_fold`` runs immediately after a valid prediction, before the next
     fit, allowing durable recovery of folds and the full fit (-1). Resume entries
     contain ``prediction``, ``positions`` and ``metadata`` and are supplied only
@@ -226,6 +230,8 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
     oof = np.empty(len(y), dtype=np.float64)
     fold_ids = np.full(len(y), -1, dtype=np.int64)
     full_model = None
+    fixed = not is_formal and model_name in TUNED_MODELS
+    selection = None
     def fit_one(fold, train, valid):
         nonlocal full_model
         if fold in resumed:
@@ -242,7 +248,7 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
             return prediction
         estimator = (clone(formal_template) if is_formal else
             make_model(model_name, seed=model_seed, n_jobs=n_jobs, task=task,
-                       params=params, preprocessor=process))
+                       params=params, preprocessor=process, selected=selection))
         started = time.perf_counter()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", ConvergenceWarning)
@@ -255,6 +261,8 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
         record = {"fold": fold, "train_size": len(train), "seconds": seconds,
                   "selected_parameters": selected, "converged": converged,
                   "convergence_warnings": convergence}
+        if fold == -1 and fixed:
+            record["oof_selection"] = estimator.selection_
         metadata["folds"].append(record)
         metadata["base_fit_count"] += 1
         metadata["full_fit_seconds" if fold == -1 else "oof_fit_seconds"] += seconds
@@ -268,6 +276,9 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
         return prediction
     # Full first: same independent fit and score, before additional OOF work.
     holdout = fit_one(-1, np.arange(len(y)), None)
+    if fixed:
+        # Fold -1 is the first record, fitted now or resumed from its checkpoint.
+        selection = metadata["folds"][0]["oof_selection"]
     for fold, (train, valid) in enumerate(folds):
         if np.intersect1d(train, valid).size:
             raise RuntimeError("OOF training/validation overlap")
