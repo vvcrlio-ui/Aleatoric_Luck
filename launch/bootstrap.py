@@ -1,8 +1,9 @@
-"""Compute-node bootstrap for the shared single-model cluster scheduler.
+"""Bootstrap job and worker allocations of one run.
 
 The login node uses only the standard library to check arguments, the checkout
-and the run directory. Numerical imports, pip, data preparation and task-design
-generation run inside the bootstrap allocation.
+and the run directory. Numerical imports, pip, data preparation and the frozen
+plan come from the bootstrap job, which then submits one worker allocation.
+A resumed run submits another allocation for the cells still missing.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import sys
 import uuid
 
 import experiment as common
+import slurm_resources as resources
 from slurm_submission import Journal, Slurm, _lock, batch_environment, now, read
 
 def bootstrap_command(spec, request):
@@ -57,8 +59,9 @@ def submit_bootstrap(request, *, slurm=None):
 def launch(args, spec):
     if args.dry_run:
         print(json.dumps({"launch": spec, "actions": ["submit compute-node bootstrap",
-              "reuse or create the shared dependency environment", "prepare data if requested", "freeze single-model design", "start shared single-model scheduler"],
-              "note": "No data reads, installation or submission. Each round fits workers onto at most --nodes minus two nodes, using the partition's node geometry; --rounds is a hard bound."}, indent=2))
+              "reuse or create the shared dependency environment", "prepare data if requested", "freeze the plan",
+              "submit one worker allocation of --nodes nodes"],
+              "note": "No data reads, installation or submission. Workers per node follow the partition's cores and --memory."}, indent=2))
         return
     if sys.platform == "win32":
         raise ValueError("Run this command in a Linux cluster login shell; --dry-run works locally")
@@ -113,3 +116,68 @@ def bootstrap(request):
                        PYTHONPATH=str(common.ENGINE_SRC))
     # Relaunch inside the verified venv before importing adapter/engine modules.
     common.command([python, common.ROOT / "launch/experiment.py", "execute", "--request", request], env=environment)
+
+
+def worker_arguments(spec, plan_path, python):
+    """sbatch arguments of a worker allocation: one worker per physical core, as many as memory allows."""
+    cluster = spec["cluster"]
+    nodes = resources.node_geometry(cluster["partition"])
+    threads = max(int(node["threads"]) for node in nodes)
+    memory = resources.memory_mb(cluster["memory"])
+    per_node = min(min(int(node["cpu"]) // threads, int(float(node["mem"]) // memory)) for node in nodes)
+    if per_node < 1:
+        raise ValueError("No node of the partition fits one worker with the requested --memory")
+    output = Path(spec["output"])
+    arguments = ["--nodes=" + str(cluster["nodes"]), "--ntasks-per-node=" + str(per_node),
+                 "--cpus-per-task=" + str(threads), "--mem=" + str(int(per_node * memory)) + "M",
+                 "--time=" + cluster["time_limit"], "--account=" + cluster["account"],
+                 "--partition=" + cluster["partition"], "--chdir=" + str(output),
+                 "--output=" + str(output / "logs/work-%j.out"), "--error=" + str(output / "logs/work-%j.err"),
+                 "--export=ALL"]
+    if cluster.get("qos"):
+        arguments.append("--qos=" + cluster["qos"])
+    if cluster["constraint"] != "none":
+        arguments.append("--constraint=" + cluster["constraint"])
+    return arguments + [str(common.ROOT / "launch/cells.sbatch"), str(plan_path), python,
+                        str(common.ENGINE_SRC), spec["bootstrap"]["python_module"]]
+
+
+def submit_allocation(spec, arguments):
+    """Submit the next worker allocation unless an earlier one is still queued or running."""
+    output = Path(spec["output"])
+    with _lock(output / ".bootstrap.lock"):
+        path = output / "bootstrap-journal.json"
+        journal = Journal(path, read(path), Slurm(spec))
+        labels = sorted((label for label in journal.state["jobs"] if label.startswith("W")), key=lambda label: int(label[1:]))
+        if journal.active(labels):
+            raise ValueError("A worker allocation of this run is still queued or running")
+        label = "W" + str(len(labels) + 1)
+        job = journal.submit(label, arguments)
+    print(f"Worker allocation {label}: {job}", flush=True)
+    return job
+
+
+def submit_workers(plan_path, *, python):
+    """Called by the bootstrap job once the plan is frozen."""
+    plan_path = Path(plan_path)
+    spec = read(plan_path.parent / "launch.json")
+    arguments = worker_arguments(spec, plan_path, python)
+    common.atomic_json(plan_path.parent / "allocation.json", {"arguments": arguments})
+    return submit_allocation(spec, arguments)
+
+
+def resume(args):
+    """Login node: another allocation with the frozen arguments, for the cells still missing."""
+    plan_path = Path(args.resume).resolve()
+    output = plan_path.parent
+    spec = read(output / "launch.json")
+    common.validate_source(spec)
+    if args.account != spec["cluster"]["account"]:
+        raise ValueError("--account differs from the run's account")
+    if (output / "verified.json").exists():
+        raise ValueError("The run is complete; a completed run cannot be resumed")
+    arguments = read(output / "allocation.json")["arguments"]
+    if args.dry_run:
+        print(json.dumps({"resume": str(plan_path), "sbatch": arguments}, indent=2))
+        return None
+    return submit_allocation(spec, arguments)

@@ -48,20 +48,22 @@ Comparison at equal cost (500 seed-draw pairs), job 4457910 (`runs/seed-draw-des
 
 Together with decision 1, 100 × 5 would bring a panel to roughly 3% of its previous model-fitting work. This is an estimate (0.1 × about 0.3), not a measurement; a timing_full run is needed before sizing production.
 
-## 3. Planned: a simpler execution pipeline
+## 3. A simpler execution pipeline
 
-Status: planned. The full pipeline used for the finished production runs is preserved at tag `multiround-pipeline-v1` (`3f4fa6c`), which already includes decision 1.
+Status: in the code on branch `per-cell-pipeline`; not yet run as a dev experiment. The full pipeline used for the finished production runs is preserved at tag `multiround-pipeline-v1` (`3f4fa6c`), which already includes decision 1.
 
 The current pipeline was built for 16 million base fits and 2 million SL7 fits per panel, run by about 14,000 workers on 300 nodes over several allocations. At the smaller scale most of that machinery is no longer needed.
 
-Planned changes:
+Changes:
 
 - One task per cell (seed, draw, N, K) instead of one per model: the worker fits the eight models one after another and fits SL7 from the seven OOF predictions in memory. There is no dependency between tasks, no separate SL phase and no index of saved predictions. Test and OOF predictions are still saved, appended to one file per worker rather than one file per cell.
 - Workers claim cells from shared storage, largest estimated cost first, and each writes its own result file. This replaces the queue service, node relays, dispatcher shards, heartbeats and leases, and removes the requirement that compute nodes reach each other over TLS.
 - One allocation per run; an interrupted run is resumed by skipping finished cells. This replaces the multi-round controller, its controller jobs and lock, round limits and online cost scheduling.
 - One completeness check of every expected result before `final.csv` is written, instead of parallel verification and sealing.
 - Run-level identity (commit, settings, input data) instead of a content identity per saved record.
-- Removed: fold-level checkpoints, storage reservation beyond a free-space check, and the isolated process for native libraries. The production cache path already bypasses that process (`nk_grid.py`, whenever folds are persisted), and the three cached production runs finished without it.
+- Removed: fold-level checkpoints, storage reservation and quota ledgers, and the isolated process for native libraries. The production cache path already bypassed that process (`nk_grid.py`, whenever folds were persisted), and the three cached production runs finished without it.
+- Removed with them: the model code no run reached any more, namely the stacking Super Learner fitted as one model (with its own copies of the base learners and the optional SL4 control) and every model built without the fold-local preprocessor, and the `super_learner` parameters in `model_params.yaml`. SL7 has no parameters of its own.
+- Every run now saves per-row predictions, so every dataset needs a row ID (`id_column`).
 
 Why this is expected to be enough (estimates unless stated):
 
@@ -70,4 +72,4 @@ Why this is expected to be enough (estimates unless stated):
 - Keeping a cell's OOF predictions in memory costs under 1 MB for the largest SMR cell. Peak memory is set by the largest single model fit, as now, provided each fitted model is released after predicting. To be confirmed with timing_full.
 - The queue and controller code (about 6,500 lines across the engine and launcher) was the source of several recent failures, among them node-relay endpoints overwriting each other (2026-09-24), cross-node submission locking and `sinfo` parsing on BMRC.
 
-The new pipeline will be checked by recomputing a sample of cells and comparing results and saved predictions with the current pipeline bit for bit.
+The engine went from 18,145 to 6,349 lines of Python and the launcher from 1,985 to 877. Checks so far: local tests of the engine, launcher and adapters, and new checks that one cell's rows, saved arrays and SL7 equal a fresh computation and that publication refuses missing, duplicate or failed cells. Still to do: a Linux test run and a dev run of the same panel with both pipelines, comparing `final.csv` and the saved predictions bit for bit.

@@ -4,7 +4,7 @@ Every sbatch intent is persisted before the call. An uncertain response is
 matched against squeue AND accounting by an immutable unique job name and is
 never sent a second time. A job's terminal state is recorded once and never
 queried again. All squeue/sacct calls of one run keep the profile's minimum
-spacing, recorded in the run directory across its controller jobs.
+spacing, recorded in the run directory.
 """
 from __future__ import annotations
 
@@ -54,8 +54,8 @@ def _write(path, value):
 
 @contextmanager
 def _lock(path):
-    # Keep a persistent inode. POSIX record locks exclude other controller
-    # processes across nodes; flock was node-local in the BMRC GPFS probe.
+    # Keep a persistent inode. POSIX record locks exclude other processes
+    # across nodes; flock was node-local in the BMRC GPFS probe.
     # Own this file through one descriptor until release: closing another
     # descriptor for the same inode would release this process's record lock.
     with Path(path).open("a+b") as handle:
@@ -78,26 +78,6 @@ def _lock(path):
                 yield
             finally:
                 fcntl.lockf(handle.fileno(), fcntl.LOCK_UN)
-
-
-@contextmanager
-def controller_lock(path, *, timeout=240):
-    """A normal successor must not die while a guard briefly owns the lock."""
-    deadline = time.monotonic() + timeout
-    while True:
-        manager = _lock(path)
-        try:
-            manager.__enter__()
-            break
-        except OSError as exc:
-            import errno
-            if exc.errno not in (errno.EACCES, errno.EAGAIN) or time.monotonic() >= deadline:
-                raise
-            time.sleep(1)
-    try:
-        yield
-    finally:
-        manager.__exit__(None, None, None)
 
 
 def batch_environment():
@@ -211,10 +191,6 @@ class Journal:
         if entry and entry.get("job_id"):
             return entry["job_id"]
         if entry is None:
-            if label.startswith(("C", "G")) and "limits" in self.state:
-                controls = sum(key.startswith(("C", "G")) for key in jobs)
-                if controls >= self.state["limits"]["max_control_jobs"]:
-                    raise ValueError("Maximum control submission budget exhausted")
             name = "al-" + self.state["run_id"][:16] + "-" + label
             if len(name) > 64:
                 raise ValueError("Internal job label is too long")

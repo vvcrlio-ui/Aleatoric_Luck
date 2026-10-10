@@ -21,7 +21,7 @@ sections provide the details.
 | 7 | The feature universe has a valid origin: internal splitting requires `fixed_a_priori`; under external splitting, the vocabulary can be learned only from the training table. |
 | 8 | `group_column` is `null`; `exchangeable` is `true`. |
 | 9 | `schema_version=1`; with a manifest, `feature_manifest_version=1`; otherwise it is `null`. |
-| 10 | Runs that export per-row predictions or use the prediction cache, as every current FFCWS and SMR panel does, require `id_column` under either split mode, with non-missing, unique IDs (Section 5). |
+| 10 | Every run saves per-row predictions, so `id_column` is required under either split mode, with non-missing, unique IDs (Section 5). |
 
 ## 1. What an adapter is, and terminology
 
@@ -180,7 +180,7 @@ includes any subsequently added column with the same prefix.
 to learn vocabularies.
 
 **`internal_random`** — The adapter delivers one table, which the engine splits.
-It still needs a row ID for runs that use the prediction cache; see Row IDs
+It still needs a row ID, because every run saves per-row predictions; see Row IDs
 below. The feature universe must be `fixed_a_priori`, which means that
 categorical vocabularies also must not be learned from this table.
 
@@ -199,19 +199,15 @@ exactly, deliver two tables, and satisfy the following requirements:
 
 ### Row IDs
 
-Runs that export per-row predictions or use the prediction cache require
-`id_column` under both split modes. Every panel in `FFCWS/panels.yaml` and
-`SMR/panels.yaml` uses the prediction cache, so give every new dataset an ID.
-IDs must be non-missing and unique within each table. The engine never uses them
-to sample or split; it records them to identify the rows behind each exported or
-cached prediction, and there is no fallback to row positions.
+Every run saves each model's per-row predictions, so `id_column` is required
+under both split modes. IDs must be non-missing and unique within each table.
+The engine never uses them to sample or split; it records them to identify the
+rows behind each saved prediction, and there is no fallback to row positions.
 
 Use a stable identifier from the data provider when one exists, as FFCWS does
 with `challengeID`. Otherwise, assign one deterministically from each record's
 position in the raw table before any filtering, so that a record keeps the same
-ID for every outcome; the SMR adapter does this with `smr_row_id`. `id_column`
-may be `null` only under `internal_random`, for runs without prediction export or
-the prediction cache.
+ID for every outcome; the SMR adapter does this with `smr_row_id`.
 
 ## 6. Feature universe
 
@@ -355,7 +351,7 @@ are absent from this table.
 | `split_mode` | `internal_random` or `external_test`. |
 | `task` | `regression` or `classification`; the latter is binary `{0,1}` only. |
 | `outcome_columns` | Nonempty list of unique strings. |
-| `id_column` | Required under `external_test`, and under either split mode for runs that export per-row predictions or use the prediction cache (Section 5); must not also be an outcome. |
+| `id_column` | Required under either split mode, because every run saves per-row predictions (Section 5); must not also be an outcome. |
 | `predictor_columns` / `predictor_prefix` | Both are lists of strings; set exactly one; neither may contain an outcome or ID. |
 | `feature_manifest` | See Section 7. |
 | `exchangeable` | Must be `true` and requires research justification. |
@@ -496,8 +492,8 @@ predictor then becomes its own continuous source.
 by the validation call and are unrelated to adapter artifacts. Use any
 registered model; it affects only the check of the training-row lower bound. Set
 `min_n` and `test_size` to the values planned for the experiment. Under
-`external_test`, `test_size` is ignored. Pass `require_id=True`, as runs with the
-prediction cache do, to include the row-ID check.
+`external_test`, `test_size` is ignored. Pass `require_id=True`, as every run
+does, to include the row-ID check.
 
 `validate_input` checks that data tables are readable; version numbers are
 recognized; exactly one predictor rule is

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-CELL_SPEC_FORMAT_VERSION = 2
+CELL_SPEC_FORMAT_VERSION = 3
 
 
 class ContractError(ValueError):
@@ -190,13 +190,6 @@ class CellExecutionSpec:
                 raise ContractError("cell execution spec provenance locator is not canonical")
         if not isinstance(value.get("require_clean_worktree"), bool):
             raise ContractError("cell execution spec requires clean-worktree policy")
-        from .prediction_contract import normalize_prediction_options
-        try:
-            cache, execution = normalize_prediction_options(value.get("prediction_cache"), value.get("execution"))
-        except ValueError as exc:
-            raise ContractError(str(exc)) from exc
-        if cache and (cache != value.get("prediction_cache") or execution != value.get("execution", {})):
-            raise ContractError("prediction cache contract must be normalized before freezing")
         return cls(value)
 
     @classmethod
@@ -283,16 +276,9 @@ class CellExecutionSpec:
             "execution_groups": groups,
             "input_provenance": provenance,
             "require_clean_worktree": bool(require_clean_worktree),
-            "native_process_max_attempts": int(config.native_process_max_attempts),
-            "native_process_timeout_seconds": float(config.native_process_timeout_seconds),
             "min_n": int(config.min_n),
             "git_commit": git_commit,
         }
-        from .prediction_contract import normalize_prediction_options
-        cache, execution = normalize_prediction_options(config.prediction_cache, config.execution)
-        if cache:
-            payload["prediction_cache"] = cache
-            payload["execution"] = execution
         return cls.from_payload(payload)
 
     @property

@@ -16,8 +16,6 @@ MODEL_ENV_KEYS = (
     "XGB_MAX_ROUNDS",
 )
 
-SERIAL_OUTER_MODELS = frozenset({"lightgbm", "super_learner"})
-
 
 def build_experiment_metadata(
     *,

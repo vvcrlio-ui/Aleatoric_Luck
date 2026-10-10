@@ -1,4 +1,4 @@
-"""Single-command bootstrap and shared single-model cluster orchestration.
+"""Single-command launch of one panel on a Slurm cluster.
 
 Numerical work runs in the shared dependency environment and imports the engine from this checkout.
 """
@@ -78,8 +78,6 @@ def parser():
     p.add_argument("--schema", help="Use existing prepared data via its schema; never rewrite tracked schema")
     p.add_argument("--models", nargs="+", help="Optional explicit subset of the panel's models")
     p.add_argument("--allow-large-run", action="store_true")
-    p.add_argument("--checkpoints", choices=("keep", "delete"),
-                   help="Keep (default) or delete checkpoint data only after verified success")
     p.add_argument("--dry-run", action="store_true", help="Read-only launch preview; no installation, data reads or submission")
     p.add_argument("--resume", help="Resume a run from its plan.json")
     p.add_argument("--account", help="Required for Slurm, including resume; explicitly enter your authorized project account")
@@ -89,16 +87,10 @@ def parser():
     p.add_argument("--constraint")
     p.add_argument("--partition")
     p.add_argument("--time", dest="time_limit")
-    p.add_argument("--nodes", type=positive,
-                   help="Total nodes the run may occupy, including two reserved for controllers")
-    p.add_argument("--workers", type=positive, help="Optional cap on numerical workers per round")
-    p.add_argument("--rounds", type=positive, help="Maximum continuation rounds; all clusters submit only the current worker allocation")
-    p.add_argument("--memory", help="Base-worker memory request; default 2G")
-    p.add_argument('--dispatcher-shards', type=int, choices=range(1, 9), metavar='1..8',
-                   help='New shared Slurm run: requested dispatcher shards for both base and SL; >1 defaults to two validators per shard')
-    p.add_argument('--scheduler-policy', help='New shared Slurm run: operational policy JSON; explicit shard option overrides this file')
-    p.add_argument("--plan-memory")
-    p.add_argument("--plan-time", help="Bootstrap and controller time; default 2h")
+    p.add_argument("--nodes", type=positive, help="Nodes of the worker allocation")
+    p.add_argument("--memory", help="Memory of each worker; default 2G")
+    p.add_argument("--plan-memory", help="Memory of the bootstrap job; default 48G")
+    p.add_argument("--plan-time", help="Time limit of the bootstrap job; default 2h")
     p.add_argument("--request", help=argparse.SUPPRESS)
     return p
 
@@ -130,8 +122,7 @@ def launch_spec(args):
         raise ValueError("panel name may contain only letters, digits, _, . and -")
     if args.resume and (args.schema or args.models or args.preset != "dev"
                         or args.manifest != "FFCWS/panels.yaml" or args.panel != "ffc_median_mode_gpa"
-                        or any((args.nodes, args.workers, args.rounds, args.partition, args.time_limit, args.memory,
-                                args.dispatcher_shards, args.scheduler_policy, args.prepare, args.data_dir,
+                        or any((args.nodes, args.partition, args.time_limit, args.memory, args.prepare, args.data_dir,
                                 args.plan_time, args.plan_memory, args.constraint))):
         raise ValueError("resume reuses frozen design/resources; do not combine it with design/resource overrides")
     if not args.account or not args.account.strip():
@@ -142,9 +133,8 @@ def launch_spec(args):
         raise ValueError("--prepare requires --data-dir, and --data-dir requires --prepare")
     if args.preset == "production" and not args.allow_large_run and not args.dry_run:
         raise ValueError("production requires explicit --allow-large-run")
-    from aleatoric_nk_grid.scheduler_policy import CONTROL_NODE_RESERVE, validate_policy
-    if not args.resume and (args.nodes is None or args.nodes < CONTROL_NODE_RESERVE + 1):
-        raise ValueError(f"New runs require --nodes, the total nodes including {CONTROL_NODE_RESERVE} reserved for controllers")
+    if not args.resume and args.nodes is None:
+        raise ValueError("New runs require --nodes, the nodes of the worker allocation")
     defaults = os.environ if args.profile else {}
     partition = args.partition or defaults.get("NKGRID_PARTITION")
     if not args.resume and not partition:
@@ -163,8 +153,8 @@ def launch_spec(args):
     qos = args.qos or (args.account if default_qos == "account" else default_qos)
     cluster = dict(account=args.account, qos=qos,
                    constraint=args.constraint or defaults.get("NKGRID_CONSTRAINT") or "none",
-                   partition=partition, nodes=args.nodes, time_limit=time_limit, rounds=args.rounds or 2,
-                   memory_override=args.memory or "2G",
+                   partition=partition, nodes=args.nodes, time_limit=time_limit,
+                   memory=args.memory or "2G",
                    query_interval=int(defaults.get("NKGRID_SLURM_QUERY_INTERVAL", 0)))
     for value in [*cluster.values(), args.plan_time, args.plan_memory]:
         if isinstance(value, str) and ("\n" in value or "\r" in value or "\x00" in value):
@@ -177,24 +167,12 @@ def launch_spec(args):
                 manifest=str(manifest), schema=str(path_from_repo(args.schema)) if args.schema else None,
                 models=args.models, output=str(output), allow_large_run=args.allow_large_run,
                 cluster=cluster, plan_memory=args.plan_memory or "48G",
-                checkpoint_retention=args.checkpoints or "keep",
                 plan_time=plan_time)
-    result["continuation"] = {"worker_cap": args.workers, "max_rounds": args.rounds or 2,
-                              "max_no_progress_rounds": 2, "max_control_failures": 3,
-                              "max_control_jobs": 4 * (args.rounds or 2) + 8}
     result["bootstrap"] = {"shared_env_root": str(shared_env_root()),
                            "python_module": defaults.get("PYTHON_MODULE", ""),
                            "wheelhouse": str(wheelhouse(shared_env_root())) if defaults.get("NKGRID_OFFLINE_COMPUTE") else None,
                            "prepare": args.prepare,
                            "data_dir": str(path_from_repo(args.data_dir)) if args.data_dir else None}
-    if args.dispatcher_shards is not None or args.scheduler_policy is not None:
-        policy = json.loads(path_from_repo(args.scheduler_policy).read_text(encoding='utf-8')) if args.scheduler_policy else {}
-        if not isinstance(policy, dict): raise ValueError('Scheduler policy must be a JSON object')
-        if args.dispatcher_shards is not None:
-            policy['dispatcher_shards'] = args.dispatcher_shards
-            if args.dispatcher_shards > 1 and 'validation_processes' not in policy:
-                policy['validation_processes'] = 2
-        result['scheduler_policy'] = validate_policy(policy)
     return result
 
 
@@ -298,8 +276,7 @@ def resolve_experiment(spec):
         raise ValueError("--models must be a unique subset of the declared panel models")
     config = replace(config, out=Path(spec["output"]) / "final.csv", models=models,
                      schema=Path(spec["schema"]) if spec["schema"] else config.schema,
-                     n_jobs=1, allow_large_run=spec["allow_large_run"],
-                     checkpoint_retention=spec["checkpoint_retention"])
+                     n_jobs=1, allow_large_run=spec["allow_large_run"])
     try:
         loaded = load_input(config.schema, config.outcome)
     except FileNotFoundError as exc:
@@ -321,20 +298,15 @@ def resolve_experiment(spec):
 def execute(spec):
     validate_source(spec)
     config = resolve_experiment(spec)
-    from aleatoric_nk_grid.cluster_queue import prepare
-    from cluster_scheduler import start
-    output = Path(spec["output"])
-    atomic_json(output / 'cluster-environment.json', {'python': str(Path(sys.executable).absolute()),
-                'python_module': os.environ.get('PYTHON_MODULE', '')})
+    from aleatoric_nk_grid.cell_pipeline import prepare
+    from bootstrap import submit_workers
     plan_path = prepare(config, spec, ROOT)
-    start(plan_path)
+    submit_workers(plan_path, python=str(Path(sys.executable).absolute()))
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser().parse_args(argv)
-    if args.target != 'slurm' and (args.dispatcher_shards is not None or args.scheduler_policy is not None):
-        raise ValueError('Dispatcher options apply to new shared Slurm launches')
     if args.target == "recover-bootstrap":
         if not args.request:
             raise ValueError("recover-bootstrap requires --request")
@@ -342,16 +314,12 @@ def main(argv=None):
         print("Bootstrap job: " + submit_bootstrap(args.request))
         return
     if args.target == "bootstrap":
-        if args.checkpoints is not None:
-            raise ValueError("bootstrap reuses the frozen launch request; set --checkpoints on slurm instead")
         from bootstrap import bootstrap
         bootstrap(args.request)
         return
     if args.target == "execute":
         if not args.request:
             raise ValueError("execute requires --request")
-        if args.checkpoints is not None:
-            raise ValueError("execute reuses the frozen launch request; set --checkpoints on slurm instead")
         if sys.platform == "win32":
             raise ValueError("Full engine execution requires Linux/WSL")
         if not os.environ.get("SLURM_JOB_ID"):
@@ -368,7 +336,7 @@ def main(argv=None):
         raise ValueError("New runs require an explicit --preset")
     spec = launch_spec(args)
     if args.resume:
-        from cluster_scheduler import resume
+        from bootstrap import resume
         resume(args)
         return
     from bootstrap import launch

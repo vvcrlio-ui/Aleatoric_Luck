@@ -63,13 +63,10 @@ PRESETS: dict[str, dict[str, int]] = {
 DEFAULTS: dict[str, Any] = {
     "seed": 12345,
     "test_size": 0.3,
-    "checkpoint_retention": "keep",
     # Panel resolution must not depend on the submit host's environment.
     # Slurm workers replace this scheduler-only value from their allocation.
     "n_jobs": 4,
     "model_params": DEFAULT_MODEL_PARAMS_PATH,
-    "native_process_max_attempts": 2,
-    "native_process_timeout_seconds": 21_600,
     "allow_large_run": False,
     "experiment_id": "nkgrid-dev-v1",
     "data_version": "dev-data-v1",
@@ -90,12 +87,9 @@ PANEL_FIELDS = frozenset(
         "min_n",
         "max_n",
         "max_k",
-        "checkpoint_retention",
         "n_jobs",
         "test_size",
         "allow_large_run",
-        "native_process_max_attempts",
-        "native_process_timeout_seconds",
         "outcome",
         "out",
         "experiment_id",
@@ -104,8 +98,6 @@ PANEL_FIELDS = frozenset(
         "repeat_plan",
         "n_grid",
         "k_grid",
-        "prediction_cache",
-        "execution",
     }
 )
 CONFIG_FIELDS = set(NKGridConfig.__dataclass_fields__)
@@ -189,9 +181,6 @@ def resolve_panel(panel: dict[str, Any], manifest_dir: Path) -> tuple[str, NKGri
             if not isinstance(values[grid_name], list) or not values[grid_name]:
                 raise ValueError(f"Panel {name} {grid_name} must be a non-empty list")
             values[grid_name] = tuple(int(value) for value in values[grid_name])
-    retention = values["checkpoint_retention"]
-    if type(retention) is not str or retention not in {"keep", "delete"}:
-        raise ValueError(f"Panel {name} checkpoint_retention must be keep or delete")
     extra = sorted(set(values) - CONFIG_FIELDS)
     if extra:
         raise ValueError(f"Panel {name} did not resolve cleanly: {extra}")

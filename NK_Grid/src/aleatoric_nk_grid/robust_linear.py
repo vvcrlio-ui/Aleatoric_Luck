@@ -13,7 +13,6 @@ from types import FunctionType
 from sklearn.base import _fit_context
 from sklearn.linear_model import LinearRegression as _LinearRegression
 from sklearn.linear_model import Ridge as _Ridge
-from sklearn.linear_model import RidgeCV as _RidgeCV
 from sklearn.linear_model import _ridge
 
 from .svd_fallback import safe_lstsq, safe_svd
@@ -72,15 +71,3 @@ class _RecoveringBaseRidge(_ridge._BaseRidge):
 class Ridge(_Ridge, _RecoveringBaseRidge):
     # Original Ridge.fit validates inputs, then super() resolves to our base.
     pass
-
-
-class _RecoveringRidgeGCV(_ridge._RidgeGCV):
-    _svd_decompose_design_matrix = _bind(
-        _ridge._RidgeGCV._svd_decompose_design_matrix,
-        get_namespace_and_device=_namespace_binding(
-            _ridge._RidgeGCV._svd_decompose_design_matrix, "get_namespace_and_device"))
-
-
-class RidgeCV(_RidgeCV):
-    fit = _fit_context(prefer_skip_nested_validation=True)(_bind(
-        _ridge._BaseRidgeCV.fit, _RidgeGCV=_RecoveringRidgeGCV, Ridge=Ridge))
