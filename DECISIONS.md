@@ -25,9 +25,9 @@ Evidence:
 
 Already finished experiments (materialHardship, GPA, SMR hourlywage) used nested OOF fits and are not recomputed. A paper's methods should say which version produced which results.
 
-## 2. Proposal: 100 seeds × 5 draws instead of 100 × 50
+## 2. 100 seeds × 5 draws instead of 100 × 50
 
-Status: proposed, waiting for the team. The production preset in the code is still 100 × 50.
+Status: adopted on 2026-10-10; the `production` preset is 100 × 5. Runs finished before then (materialHardship, GPA and SMR hourly wage) used 100 × 50.
 
 A seed sets the train/test split (for SMR) and, together with the draw, the random ordering of rows and variables; a draw only reorders. For FFC the test set is given by the data provider, so seed and draw play the same role.
 
@@ -68,7 +68,7 @@ Changes:
 Why this is expected to be enough (estimates unless stated):
 
 - Longest single cell, measured in the 2026-10-08 trial (seven SL7 models fitted one after another on one core, fixed OOF): 16 minutes for GPA, 18 minutes for materialHardship, 51 minutes for layoff, 79 minutes for eviction and 3.2 hours for SMR at N = 5224, K = 497. Every cell fits well inside one allocation.
-- SMR hourlywage needed about 996 million worker-seconds of base fitting at 100 × 50 with nested OOF. With decisions 1 and 2 this becomes roughly 34 million worker-seconds, about 9,500 worker-hours, or about 200 node-hours on Discoverer. With 100 × 50 kept, it is about ten times that; the longest cell is the same, so one allocation per run still holds, but a run needs more nodes or a longer limit.
+- SMR hourlywage needed about 996 million worker-seconds of base fitting at 100 × 50 with nested OOF. With decisions 1 and 2 this becomes roughly 34 million worker-seconds, about 9,500 worker-hours, or about 200 node-hours on Discoverer.
 - Keeping a cell's OOF predictions in memory costs under 1 MB for the largest SMR cell. Peak memory is set by the largest single model fit, as now, provided each fitted model is released after predicting. To be confirmed with timing_full.
 - The queue and controller code (about 6,500 lines across the engine and launcher) was the source of several recent failures, among them node-relay endpoints overwriting each other (2026-09-24), cross-node submission locking and `sinfo` parsing on BMRC.
 

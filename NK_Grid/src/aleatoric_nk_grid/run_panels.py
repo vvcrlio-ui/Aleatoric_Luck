@@ -49,7 +49,7 @@ PRESETS: dict[str, dict[str, int]] = {
     },
     "production": {
         "n_seeds": 100,
-        "n_draws": 50,
+        "n_draws": 5,
         **PRODUCTION_GRID,
     },
     "pilot": {

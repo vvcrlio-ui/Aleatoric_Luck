@@ -60,7 +60,7 @@ Go through the presets in this order. Each run writes to its own new directory.
 |---|---|---|---|
 | `dev` | 3 × 3 | 3 × 3, N and K at most 100 | Checks the whole path from raw data to the result table on a small grid |
 | `timing_full` | 1 × 1 | 20 × 20 over the full data | Fits every grid point once, so memory use and run time over the whole N and K range are known |
-| `production` | 100 × 50 | 20 × 20 over the full data | The full design; needs `--allow-large-run` |
+| `production` | 100 × 5 | 20 × 20 over the full data | The full design; needs `--allow-large-run` |
 
 Two more presets are available: `medium` (8 × 8 seeds and draws on a 10 × 10 grid, N and K at most 100) and `pilot` (84 seeds with one draw each, at the smallest, middle and largest point of each production axis).
 

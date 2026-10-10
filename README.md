@@ -22,7 +22,7 @@ For each seed and draw, the training rows are put in one random order and the pr
 
 ### Repetition
 
-The production design repeats the grid for 100 seeds with 50 draws each. When the engine makes the train/test split, each seed also draws a new split; a test set defined by the data provider stays the same in every seed. With 400 grid points this gives 2,000,000 training samples per model, and 18,000,000 result rows for a panel with nine models. The spread across seeds and draws shows how much prediction quality at a given N and K depends on which observations and variables happen to be drawn.
+The production design repeats the grid for 100 seeds with 5 draws each. When the engine makes the train/test split, each seed also draws a new split; a test set defined by the data provider stays the same in every seed. With 400 grid points this gives 200,000 training samples per model, and 1,800,000 result rows for a panel with nine models. Seeds outnumber draws because at large N and K the draws of one seed train on nearly the same rows, so most of the variation there comes from the split. The spread across seeds and draws shows how much prediction quality at a given N and K depends on which observations and variables happen to be drawn.
 
 ## Models
 
