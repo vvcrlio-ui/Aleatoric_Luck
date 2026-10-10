@@ -90,6 +90,7 @@ ROW_METADATA_FIELDS = (
 METRIC_COLUMNS = (
     "r2_test",
     "mse", "null_mse_train_mean", "test_target_variance", "skill_train_mean", "r2_test_mean",
+    "null_mse_full_train_mean", "r2_full_train_mean",
     "skill_score_pct",
     "rmse",
     "mae",
@@ -130,6 +131,7 @@ CLASSIFICATION_METRIC_COLUMNS = (
     "f1",
     "accuracy",
     "mcfadden_pseudo_r2",
+    "mcfadden_full_train_pseudo_r2",
 )
 
 BASE_RESULT_COLUMNS = (
@@ -408,12 +410,13 @@ def _concordance_correlation_coefficient(y_true: np.ndarray, y_pred: np.ndarray)
     return 2.0 * covariance / denominator
 
 
-def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
+def compute_regression_metrics(y_test, y_pred, y_train, y_train_full) -> dict[str, float]:
     """Compute continuous-outcome metrics for one fitted model run."""
 
     y_true = _as_float_array(y_test)
     preds = _as_float_array(y_pred)
     train = _as_float_array(y_train)
+    full = _as_float_array(y_train_full)
     mse = float(mean_squared_error(y_true, preds))
     rmse = float(np.sqrt(mse))
     mae = float(mean_absolute_error(y_true, preds))
@@ -432,7 +435,7 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
     bottom_pred = preds <= np.quantile(preds, 0.10)
     return {
         "r2_test": r2_test,
-        **regression_denominators(y_true, preds, train),
+        **regression_denominators(y_true, preds, train, full),
         "skill_score_pct": 100.0 * r2_test,
         "rmse": rmse,
         "mae": mae,
@@ -477,41 +480,36 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
     }
 
 
-def compute_classification_metrics(y_test, y_score, y_train) -> dict[str, float]:
-    """Compute binary classification metrics from positive-class probabilities."""
+def _mcfadden_pseudo_r2(y_true: np.ndarray, clipped: np.ndarray, y_null: np.ndarray) -> float:
+    """McFadden pseudo R-squared against a null that predicts the positive rate of ``y_null``."""
+
+    positive_rate = float(np.mean(y_null)) if len(y_null) else np.nan
+    if len(np.unique(y_true)) != 2 or not np.isfinite(positive_rate) or not 0.0 < positive_rate < 1.0:
+        return np.nan
+    model_loglik = float(np.sum(y_true * np.log(clipped) + (1 - y_true) * np.log(1 - clipped)))
+    null_loglik = float(np.sum(y_true * np.log(positive_rate) + (1 - y_true) * np.log(1 - positive_rate)))
+    return 1.0 - model_loglik / null_loglik if null_loglik != 0 else np.nan
+
+
+def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> dict[str, float]:
+    """Compute binary classification metrics from positive-class probabilities.
+
+    ``y_train`` is the N sampled training rows. ``y_train_full`` is the whole training pool the
+    rows were drawn from, so its null is one constant across every N, K, seed and draw.
+    """
 
     y_true = np.asarray(y_test, dtype=int)
     score = np.asarray(y_score, dtype=float)
     train = np.asarray(y_train, dtype=int)
+    full = np.asarray(y_train_full, dtype=int)
     has_two_test_classes = len(np.unique(y_true)) == 2
     finite_scores = np.all(np.isfinite(score))
     if not finite_scores:
         return _empty_classification_metrics()
     labels = (score >= 0.5).astype(int)
-    if finite_scores:
-        clipped = np.clip(score, 1e-15, 1 - 1e-15)
-    else:
-        clipped = score
-
-    positive_rate = float(np.mean(train)) if len(train) else np.nan
-    if (
-        has_two_test_classes
-        and finite_scores
-        and np.isfinite(positive_rate)
-        and 0.0 < positive_rate < 1.0
-    ):
-        model_loglik = float(
-            np.sum(y_true * np.log(clipped) + (1 - y_true) * np.log(1 - clipped))
-        )
-        null_loglik = float(
-            np.sum(
-                y_true * np.log(positive_rate)
-                + (1 - y_true) * np.log(1 - positive_rate)
-            )
-        )
-        mcfadden = 1.0 - model_loglik / null_loglik if null_loglik != 0 else np.nan
-    else:
-        mcfadden = np.nan
+    clipped = np.clip(score, 1e-15, 1 - 1e-15)
+    mcfadden = _mcfadden_pseudo_r2(y_true, clipped, train)
+    mcfadden_full = _mcfadden_pseudo_r2(y_true, clipped, full)
 
     return {
         "roc_auc": (
@@ -538,6 +536,7 @@ def compute_classification_metrics(y_test, y_score, y_train) -> dict[str, float]
         "f1": float(f1_score(y_true, labels, zero_division=0)),
         "accuracy": float(accuracy_score(y_true, labels)),
         "mcfadden_pseudo_r2": float(mcfadden),
+        "mcfadden_full_train_pseudo_r2": float(mcfadden_full),
     }
 
 
@@ -780,7 +779,7 @@ class NKGridExecutionSession:
         self.repeat_pairs = resolve_repeat_pairs(config)
         self.n_grid, self.k_grid = resolve_input_grids(config, loaded, source_definitions)
         self.semantic_contract = {
-            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else "classification-v1",
+            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else "classification-v2",
             "kind": "nk_grid" if self.task == "regression" else "nk_grid_classification",
             "algorithm_version": algorithm_version,
             "dataset": self.dataset,
@@ -956,6 +955,7 @@ class NKGridExecutionSession:
         started = time.perf_counter()
         X_sub_raw = self.frame.loc[selected_rows, selected_cols]
         y_sub = self.frame.loc[selected_rows, self.config.outcome]
+        y_train_full = self.frame.loc[indexes.train_index, self.config.outcome]
         X_test_raw = test_frame.loc[indexes.test_index, selected_cols]
         y_test = test_frame.loc[indexes.test_index, self.config.outcome]
         slice_seconds = time.perf_counter() - started
@@ -967,7 +967,8 @@ class NKGridExecutionSession:
             row, arrays[model_name] = self._run_model(
                 model_name=model_name, position=position, seed=int(seed), draw=int(draw),
                 n_samples=int(n_samples), k_features=int(k_features), X_sub_raw=X_sub_raw,
-                y_sub=y_sub, X_test_raw=X_test_raw, y_test=y_test, selected_groups=selected_groups,
+                y_sub=y_sub, y_train_full=y_train_full, X_test_raw=X_test_raw, y_test=y_test,
+                selected_groups=selected_groups,
                 unobserved=unobserved, slice_seconds=slice_seconds, prepared=prepared,
                 preparation_errors=preparation_errors, n_train_total=len(indexes.train_index),
                 n_test_total=len(indexes.test_index),
@@ -975,7 +976,8 @@ class NKGridExecutionSession:
             rows.append(row)
         return {"rows": rows, "arrays": arrays,
                 "train_ids": _identifiers(self.frame.loc[selected_rows, self.schema.id_column]),
-                "y_train": y_sub.to_numpy(dtype=np.float64), "y_test": y_test.to_numpy(dtype=np.float64)}
+                "y_train": y_sub.to_numpy(dtype=np.float64), "y_test": y_test.to_numpy(dtype=np.float64),
+                "y_train_full": y_train_full.to_numpy(dtype=np.float64)}
 
     def test_ids(self, seed: int) -> np.ndarray:
         """Sample IDs of one seed's test rows, in the order of every test prediction."""
@@ -993,7 +995,7 @@ class NKGridExecutionSession:
             k_expanded=0, n_expanded_features_total=len(self.predictors),
         )
 
-    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> tuple[dict[str, object], dict[str, np.ndarray]]:
+    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, y_train_full: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> tuple[dict[str, object], dict[str, np.ndarray]]:
         """One base model's result row and its test/OOF predictions (empty unless fitted)."""
         if len(X_sub_raw) != n_samples or len(y_sub) != n_samples or len(sampling_units(selected_groups)) != k_features:
             raise ValueError("fit input does not match declared N/K")
@@ -1055,7 +1057,7 @@ class NKGridExecutionSession:
                 return result(empty_metrics, status="skipped", error=fit["reason"], arrays=fit["arrays"])
             predictions = np.asarray(fit["predictions"])
             diagnostics["_fit_seconds"] = fit["fit_seconds"]; diagnostics["_best_rounds"] = fit["best_rounds"]; diagnostics["converged"] = fit["converged"]; diagnostics["constant_prediction"] = _constant_prediction(predictions)
-            metrics = compute_classification_metrics(y_test, predictions, y_sub) if self.task == "classification" else compute_regression_metrics(y_test, predictions, y_sub)
+            metrics = compute_classification_metrics(y_test, predictions, y_sub, y_train_full) if self.task == "classification" else compute_regression_metrics(y_test, predictions, y_sub, y_train_full)
             return result(metrics, status="ok", error="", peak=int(fit["peak_rss_bytes"]), arrays=fit["arrays"])
         except Exception as exc:
             return result(empty_metrics, status="failed", error=f"{type(exc).__name__}: {exc}")

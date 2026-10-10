@@ -103,7 +103,7 @@ def prepare(config, launch, repo):
 
 # One cell -------------------------------------------------------------------
 
-def _sl7_row(task, rows, arrays, y_train, y_test):
+def _sl7_row(task, rows, arrays, y_train, y_test, y_train_full):
     """SL7 from the seven models' OOF predictions, laid out like their rows."""
     from .nk_grid import (CLASSIFICATION_METRIC_COLUMNS, METRIC_COLUMNS,
                           compute_classification_metrics, compute_regression_metrics)
@@ -135,8 +135,10 @@ def _sl7_row(task, rows, arrays, y_train, y_test):
                 row[name] = None
         combiner_converged = None
     else:
-        metric = compute_classification_metrics if task == "classification" else compute_regression_metrics
-        row.update(metric(y_test, answer["holdout_prediction"], y_train))
+        if task == "classification":
+            row.update(compute_classification_metrics(y_test, answer["holdout_prediction"], y_train, y_train_full))
+        else:
+            row.update(compute_regression_metrics(y_test, answer["holdout_prediction"], y_train, y_train_full))
         row.update(status="ok", error="")
         combined = {"holdout_prediction": answer["holdout_prediction"], "coefficients": answer["coefficients"],
                     "intercept": np.asarray([answer["intercept"]], dtype=np.float64)}
@@ -168,7 +170,8 @@ def compute_cell(session, panel_id, seed, draw, n, k):
             if key in values:
                 arrays[f"{name}/{label}"] = values[key]
     if "super_learner" in session.config.models:
-        row, combined = _sl7_row(session.task, rows, model_arrays, cell["y_train"], cell["y_test"])
+        row, combined = _sl7_row(session.task, rows, model_arrays, cell["y_train"], cell["y_test"],
+                                 cell["y_train_full"])
         rows.append(row)
         for key, values in combined.items():
             arrays["super_learner/" + key.replace("_prediction", "")] = values
