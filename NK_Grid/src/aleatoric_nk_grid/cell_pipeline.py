@@ -312,16 +312,16 @@ def finalize(plan_path):
     columns = plan["public_columns"]
     counts, failed = {}, []
     final_tmp, index_tmp = root / f".final.csv.tmp-{uuid.uuid4().hex}", root / f".predictions.jsonl.tmp-{uuid.uuid4().hex}"
-    handles = {}
     try:
         with final_tmp.open("x", newline="", encoding="utf-8") as out, index_tmp.open("x", encoding="utf-8") as index:
             writer = csv.DictWriter(out, fieldnames=columns, lineterminator="\n")
             writer.writeheader()
             for cell in design:
                 path, offset = found[cell]
-                handle = handles.get(path) or handles.setdefault(path, path.open("rb"))
-                handle.seek(offset)
-                record = json.loads(handle.readline())
+                # One worker file per worker: thousands of them, more than a process may keep open.
+                with path.open("rb") as handle:
+                    handle.seek(offset)
+                    record = json.loads(handle.readline())
                 for row in record["rows"]:
                     if row["status"] == "failed":
                         failed.append((cell, row["model"], row["error"]))
@@ -339,8 +339,6 @@ def finalize(plan_path):
         os.replace(index_tmp, root / "predictions.jsonl")
         os.replace(final_tmp, root / "final.csv")
     finally:
-        for handle in handles.values():
-            handle.close()
         final_tmp.unlink(missing_ok=True)
         index_tmp.unlink(missing_ok=True)
     receipt = {"format": FORMAT, "complete": True, "cells": len(design), "rows": sum(counts.values()),
