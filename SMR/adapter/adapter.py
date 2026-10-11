@@ -8,11 +8,13 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Sequence
 
 import pandas as pd
 
 from aleatoric_nk_grid.ingest import canonical_json, load_input
+from aleatoric_nk_grid.input_publication import publish_validated_inputs, validate_dataset_name
 from aleatoric_nk_grid.preprocessing import source_groups
 from aleatoric_nk_grid.validate_input import (
     canonical_feature_universe,
@@ -20,7 +22,12 @@ from aleatoric_nk_grid.validate_input import (
 )
 
 
-ADAPTER_VERSION = "smr-adapter-v1"
+ADAPTER_VERSION = "smr-adapter-v2"
+# The provider matrix has no identifier. The prediction cache needs one that
+# survives outcome-specific row removal, so each record is identified by its
+# 1-based position among the source table's data records, fixed before any
+# filtering. Sampling and splits use row positions and never read it.
+ID_COLUMN = "smr_row_id"
 DEFAULT_CONTRACT = "asample2_withlag.json"
 MANIFEST_COLUMNS = (
     "source_column",
@@ -87,6 +94,7 @@ def _load_contract(path: Path) -> dict[str, Any]:
         raise ValueError(f"SMR feature contract is missing fields: {missing}")
     if contract["contract_version"] != 1:
         raise ValueError("SMR feature contract contract_version must be 1")
+    validate_dataset_name(contract["dataset"])
     if not str(contract["exchangeability_justification"]).strip():
         raise ValueError("SMR feature contract requires exchangeability justification")
     outcomes = contract["outcome_columns"]
@@ -258,6 +266,36 @@ def build_adapter(
     test_size: float = 0.3,
     seed: int = 12345,
 ) -> AdapterResult:
+    """Validate a complete staged build before switching its stable schema."""
+    article_root = Path(article_root).resolve()
+    article_root.mkdir(parents=True, exist_ok=True)
+    validation_models = tuple(validation_models)
+    with TemporaryDirectory(prefix=".adapter-staging-", dir=article_root) as temporary:
+        staged = _build_staged_adapter(
+            source, article_root=Path(temporary), contract_path=contract_path,
+            validation_models=validation_models, min_n=min_n,
+            test_size=test_size, seed=seed,
+        )
+        published = publish_validated_inputs(
+            [staged.schema_path], schema_root=article_root / "schema",
+            ard_root=article_root / "data" / "ard",
+        )
+        return AdapterResult(
+            schema_path=published[staged.schema_path],
+            predictor_count=staged.predictor_count, source_count=staged.source_count,
+        )
+
+
+def _build_staged_adapter(
+    source: Path,
+    *,
+    article_root: Path,
+    contract_path: Path,
+    validation_models: Sequence[str],
+    min_n: int,
+    test_size: float,
+    seed: int,
+) -> AdapterResult:
     source = Path(source).resolve()
     article_root = Path(article_root).resolve()
     contract_path = Path(contract_path).resolve()
@@ -268,11 +306,14 @@ def build_adapter(
 
     header = pd.read_csv(source, nrows=0).columns.astype(str).tolist()
     _validate_source_header(header, outcomes=outcomes, predictors=predictors)
+    if ID_COLUMN in header:
+        raise ValueError(f"Source table already has a column named {ID_COLUMN!r}")
     projected = pd.read_csv(source, usecols=[*outcomes, *predictors])
     projected = projected.loc[:, [*outcomes, *predictors]]
     projected = _normalize_missing_codes(
         projected, dict(contract["missing_value_codes"])
     )
+    projected.insert(0, ID_COLUMN, range(1, len(projected) + 1))
 
     # Required generation order: ARD -> manifest -> universe -> schema.
     ard_dir = article_root / "data" / "ard" / dataset
@@ -304,7 +345,7 @@ def build_adapter(
         "split_mode": "internal_random",
         "task": "regression",
         "outcome_columns": outcomes,
-        "id_column": None,
+        "id_column": ID_COLUMN,
         "predictor_columns": predictors,
         "predictor_prefix": None,
         "feature_manifest": os.path.relpath(manifest_path, schema_dir),
@@ -352,6 +393,7 @@ def build_adapter(
             min_n=min_n,
             test_size=test_size,
             seed=seed,
+            require_id=True,
         )
     return AdapterResult(
         schema_path=schema_path,
@@ -367,6 +409,7 @@ def main(argv: list[str] | None = None) -> None:
         type=Path,
         default=Path(__file__).resolve().parents[1],
     )
+    parser.add_argument("--output-root", type=Path, help="Write prepared schema and data under this directory")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--contract", type=Path)
     parser.add_argument("--validation-model", nargs="+", default=["ols"])
@@ -392,7 +435,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     result = build_adapter(
         source,
-        article_root=article_root,
+        article_root=args.output_root or article_root,
         contract_path=contract,
         validation_models=args.validation_model,
         min_n=args.min_n,

@@ -21,15 +21,17 @@ _FFC_MISSING_RE = re.compile(r"^-(?:[1-9])(?:\.0+)?$")
 class SchemaConfig:
     id_column: str = "challengeID"
     min_valid_rate: float = 0.5
-    min_numeric_fraction: float = 0.95
     categorical_max_levels: int = 15
     min_binary_prevalence: float = 0.01
+    # Reviewed variable types take precedence over cardinality heuristics.
+    variable_types: dict[str, str] = field(default_factory=dict)
 
     def validate(self) -> None:
+        for column, kind in self.variable_types.items():
+            if kind not in {"numeric", "categorical"}:
+                raise ValueError(f"Invalid variable type for {column}: {kind}")
         if not 0.0 <= self.min_valid_rate <= 1.0:
             raise ValueError("min_valid_rate must be between 0 and 1")
-        if not 0.0 <= self.min_numeric_fraction <= 1.0:
-            raise ValueError("min_numeric_fraction must be between 0 and 1")
         if self.categorical_max_levels < 1:
             raise ValueError("categorical_max_levels must be positive")
         if not 0.0 <= self.min_binary_prevalence <= 0.5:
@@ -197,6 +199,9 @@ def build_shared_schema(
 
     config = config or SchemaConfig()
     config.validate()
+    unknown_columns = set(config.variable_types) - set(background.columns)
+    if unknown_columns:
+        raise ValueError(f"Variable types reference unknown columns: {sorted(unknown_columns)}")
     if config.id_column not in background:
         raise KeyError(f"ID column not found: {config.id_column}")
     if background[config.id_column].duplicated().any():
@@ -239,8 +244,6 @@ def build_shared_schema(
 
         if raw_valid_rate < config.min_valid_rate:
             reason = "below_min_valid_rate"
-        elif numeric_fraction < config.min_numeric_fraction:
-            reason = "below_min_numeric_fraction"
         elif distinct <= 1:
             reason = "constant_after_missing"
         else:
@@ -252,6 +255,9 @@ def build_shared_schema(
             is_categorical = distinct <= config.categorical_max_levels and (
                 bool(labels) or all_integer
             )
+            declared_type = config.variable_types.get(source_column)
+            if declared_type is not None:
+                is_categorical = declared_type == "categorical"
             if is_categorical:
                 status = "categorical"
                 levels = [float(level) for level in sorted(observed.unique())]

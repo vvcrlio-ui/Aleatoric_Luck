@@ -14,12 +14,26 @@
 __pycache__/
 *.py[cod]
 .venv/
+# Named local environments such as .venv-remediation
+.venv-*/
+*.nkgrid-env.lock
 venv/
 .ipynb_checkpoints/
 dist/
 build/
 *.egg-info/
 .pytest_cache/
+
+# Tests, checks/ and NK_Grid/validation/ are maintained locally.
+# Keep their source and evidence in local backups; they are not published by Git.
+tests/
+test/
+__tests__/
+test_*.py
+*_test.py
+conftest.py
+/pytest.ini
+/NK_Grid/validation/
 
 # R
 .Rhistory
@@ -32,12 +46,24 @@ build/
 datasets/
 **/outputs/*
 !**/outputs/.gitkeep
-!**/outputs/README.md
 results/
 runs/
 plans/
+/aleatoric-production/
+/aleatoric-pilot/
+reports/
 
 # Local implementation/review notes
+/WORKSPACE.md
+/checks/
+/*_VALIDATION.md
+/LOAD_BALANCE_698.md
+/SCHEDULER_DEVELOPMENT.md
+/SCHEDULER_RELEASE.md
+# Keep launch/ source tracked; docs/ is maintained locally only.
+/docs/
+/AGENTS.md
+/stage_v4.py
 NK_Grid/CODE_REVIEW_REPORT_*.md
 NK_Grid/ADAPTER_TO_NK_GRID_WORKFLOW_HARDENING_PROPOSAL_*.md
 NK_Grid/RISK_REMEDIATION_REVIEW_*.md
@@ -60,6 +86,7 @@ env/
 .tox/
 .nox/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
 
@@ -67,3 +94,6 @@ htmlcov/
 core
 core.[0-9]*
 joblib_memmapping_folder_*/
+
+# Calibration scratch bundles (regenerable, can be >10MB)
+**/calibration/_scratch/

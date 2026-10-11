@@ -1,130 +1,54 @@
 # Aleatoric Luck
 
-## 1. Research question and method
+This repository runs a repeated-sampling prediction experiment. For an outcome in a dataset, we ask how well it can be predicted from a training sample of N observations using K of the available predictor variables, and how that changes as N and K grow. Each dataset is prepared by its own adapter; the engine then applies the same design to every dataset.
 
-Aleatoric Luck asks how out-of-sample predictive performance changes as a
-researcher has more training cases (\(N\)) and more eligible predictor
-variables (\(K\)). The design compares these gains across outcomes, datasets,
-and statistical or machine-learning models, so that the value of collecting
-more observations can be separated from the value of measuring more
-variables.
+## Data
 
-For every outcome and model, the analysis repeatedly chooses \(N\) training
-cases and \(K\) raw predictors, estimates all data-dependent preprocessing on
-that training sample, fits the model, and evaluates it on held-out cases.
-Repeated seeds and draws quantify sampling variation. Encoded columns from one
-categorical source are selected as a unit; a declared missingness indicator is
-its own predictor.
+An adapter turns a dataset into an analysis table, a description of its variables, and a schema that ties them together ([adapter principles](Adapter/README.md)). The test set is either the one defined by the data provider or, when there is none, a random 30% of the observations with an observed outcome, drawn anew for each seed. Variables are screened and categories coded without using the test set.
 
-## 2. How to run on Slurm
+K counts variables, not columns. The dummy columns of a categorical variable, together with any missingness indicators attached to it, enter and leave the model as one unit and count once. The adapter files call this unit a source.
 
-Run commands from the repository root with Python 3.11 or newer. Create one
-environment and install the requirements for the application you will run
-(`FFCWS` adds Parquet support):
+Missing values stay missing in the prepared data. Imputation, scaling and model tuning are learned from the sampled training rows only, and inside cross-validation from each training fold only, so a small training sample does not borrow information from the rest of the data or from the test set ([why](Adapter/README.md#why-imputation-happens-during-training)).
 
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r SMR/requirements.txt
-# Also run this line when using FFCWS:
-python -m pip install -r FFCWS/requirements.txt
-```
+## Experimental design
 
-Put the private source data in these untracked locations:
+### The N × K grid
 
-```text
-SMR/data/private/asample2_withlag.csv
-FFCWS/data/private/background.dta
-FFCWS/data/private/train.csv
-FFCWS/data/private/test.csv
-```
+Each axis has 20 sizes spaced evenly on a log scale. N runs from 10 up to the whole training sample, and K from 1 up to all predictor variables.
 
-Build the analysis-ready data before submitting jobs:
+### Nested samples
 
-```bash
-.venv/bin/python SMR/adapter/adapter.py
-.venv/bin/python FFCWS/adapter/adapter.py
-```
+For each seed and draw, the training rows are put in one random order and the predictor variables in another. The training data for a grid point are the first N rows and the first K variables in those orders. Within a draw, a smaller sample is therefore always part of a larger one, and moving along the grid adds data instead of switching to an unrelated subset.
 
-Start with this two-cell smoke test. It uses one OLS model, two seeds, one draw,
-one \(N\), and one \(K\):
+### Repetition
 
-```bash
-cat > SMR/panels-smoke.yaml <<'YAML'
-model_params: model_params.yaml
-preset: dev
-experiment_id: smr-smoke-v1
-data_version: smr-ard-v1
-model_spec_version: nkgrid-models-v1
+The production design repeats the grid for 100 seeds with 5 draws each. When the engine makes the train/test split, each seed also draws a new split; a test set defined by the data provider stays the same in every seed. With 400 grid points this gives 200,000 training samples per model, and 1,800,000 result rows for a panel with nine models. Seeds outnumber draws because at large N and K the draws of one seed train on nearly the same rows, so most of the variation there comes from the split. The spread across seeds and draws shows how much prediction quality at a given N and K depends on which observations and variables happen to be drawn.
 
-panels:
-  - name: smr_smoke
-    schema: schema/asample2_withlag.json
-    outcome: Cm_lhourlywage
-    models: [ols]
-    repeat_plan:
-      - seeds: [1101, 1102]
-        draws: [0]
-    n_grid: [10]
-    k_grid: [1]
-    out: outputs/nk_grid_smr_smoke.csv
-YAML
+## Models
 
-bash NK_Grid/slurm/submit_nk_grid.sh \
-  --manifest SMR/panels-smoke.yaml
-```
+Eight models are fit separately on every training sample: OLS, Ridge, Lasso, random forest, extra trees, XGBoost, LightGBM and a neural network with one hidden layer. For binary outcomes, OLS, Ridge and Lasso are logistic regressions with different penalties. Ridge, Lasso and the neural network choose their penalty, and the two boosting models their number of rounds, by cross-validation within the training sample, for binary outcomes as for continuous ones.
 
-The smoke run should finish with two data rows in
-`SMR/outputs/nk_grid_smr_smoke.csv` and a complete
-`SMR/outputs/nk_grid_smr_smoke.manifest.json`. In `squeue`, the chain first
-shows seed arrays named `al-nk-grid-parallel`, `al-nk-grid-serial`, or
-`al-nk-grid-super_learner` (only the parallel array is present in this smoke
-test), followed by `al-nk-finalize`, then `al-nk-publish`. The latter two remain
-pending on dependencies until the preceding stage finishes:
+The ninth model, the Super Learner (SL7), is a weighted combination of the seven models other than OLS. Its weights are estimated from predictions each model makes for training rows it was not fit on, so it never sees test outcomes. The [experiment methods](NK_Grid/README.md#model-fitting) describe the tuning and the Super Learner in full.
 
-```text
-JOBID       NAME                    ST  NODELIST(REASON)
-12345_[0-1] al-nk-grid-parallel     R   ...
-12346_[0]   al-nk-finalize          PD  (Dependency)
-12347_[0]   al-nk-publish           PD  (Dependency)
-```
+## Reading the results
 
-For a full run, copy the relevant `panels.yaml`, change its top-level
-`preset: dev` to `preset: production`, review its output paths, and submit the
-copy with explicit large-run authorization:
+Every run writes to a new directory in its dataset folder, `<dataset>/outputs/<panel>-<ID>/`, which Git ignores. Each row of `final.csv` there is one model fitted at one seed, draw, N and K. `status` is `ok` for a completed fit and `skipped` when the sampled data do not allow a fit (for example, a binary outcome with only one class in the training sample). A run in which any fit failed is not published. `K_expanded` is the number of model columns behind the K variables.
 
-```bash
-bash NK_Grid/slurm/submit_nk_grid.sh \
-  --manifest SMR/panels.production.yaml \
-  --allow-large-run
+For continuous outcomes, `mse` is the mean squared error on the test set. Each R² column compares it with the error of a prediction that ignores the predictors. `r2_full_train_mean` predicts the mean outcome of the whole training pool, `r2_test` the mean of the N rows sampled in that fit, and `r2_test_mean` the test-sample mean.
 
-bash NK_Grid/slurm/submit_nk_grid.sh \
-  --manifest FFCWS/panels.production.yaml \
-  --allow-large-run
-```
+For binary outcomes the table has `roc_auc`, `brier`, `log_loss` and `accuracy`. `brier_full_train_r2` compares the Brier score, the squared error of the predicted probability, with that of predicting the training pool's positive rate. `mcfadden_full_train_pseudo_r2` and `mcfadden_pseudo_r2` compare log-likelihoods with those of predicting the pool's and the sampled rows' positive rate. A metric that cannot be computed for a particular sample is stored as NaN, which is different from a failed fit.
 
-The finalizer/publish command exit codes mean: `0` completed successfully
-(`missing` also returns `0` when its JSON reports missing work); `1` is an
-invalid design, duplicate/out-of-design key, identity/semantic-contract error,
-or other program failure; `3` means a shard or per-model final is
-missing/incomplete and recovery can recreate it; `4` is an environment I/O
-failure such as no space, permissions, or storage errors; `5` means another
-process already held the publication lease for that output, so this task
-published nothing. Exit code `5` is usually a duplicate submission for the same
-target and is harmless: confirm the output and its manifest exist, and rerun
-the command if they do not.
+## Running experiments
 
-## 3. What to send back when something fails
+The [launch guide](launch/README.md) starts with a command that only previews a run, then a small real run, and then the steps up to a full production run. It also explains how to follow a run on the cluster and how to resume one that stopped.
 
-Send the following files and raw command output together; do not summarize or
-rewrite them:
+## Where to read more
 
-- the affected `NK_Grid/logs/*.out` and `NK_Grid/logs/*.err` files;
-- the matching job snapshot and submission receipt JSON files under
-  `NK_Grid/logs/slurm-specs/`;
-- the `MaxArraySize` line from `scontrol show config`;
-- the unedited output of `squeue -j <job-id>` and that command's exit code;
-- the mount parameters for the shared filesystem containing the configured
-  output directory, for example the unedited output of
-  `findmnt -T <output-directory> -o TARGET,SOURCE,FSTYPE,OPTIONS`.
+| Topic | Document |
+|---|---|
+| What adapters do, and why imputation waits for the training sample | [Adapter principles](Adapter/README.md) |
+| Writing an adapter for a new dataset | [Adapter specification](Adapter/ADAPTER.md) |
+| How a particular dataset is prepared | `adapter/README.md` in that dataset's folder |
+| Sampling, preprocessing, models and metrics in detail | [Experiment methods](NK_Grid/README.md) |
+| How the code carries out one experiment | [Core code](NK_Grid/src/aleatoric_nk_grid/README.md) |
+| Launching, following and resuming a run | [Running experiments](launch/README.md) |

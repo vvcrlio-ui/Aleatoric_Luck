@@ -1,92 +1,35 @@
 # SMR data preparation
 
-## Role in the research design
+SMR uses the provider's existing analysis matrix, `asample2_withlag.csv`. The adapter selects predictors and outcomes using fixed definitions, describes category groups, and passes them to the shared engine. It does not reconstruct wages, income, lagged variables, or existing missingness indicators.
 
-The SMR adapter converts the provider-supplied analysis matrix into the
-versioned inputs required for the \(N\)-by-\(K\) analysis. It preserves the
-substantive distinction between a predictor variable and the numeric columns
-used to represent that variable in a statistical model.
+## Preparing a run
 
-The source matrix contains:
+Use the shared launcher with `--manifest SMR/panels.yaml --panel smr_totalincome --prepare --data-dir DIR`, where DIR contains `asample2_withlag.csv`. Preparation runs in the compute bootstrap and publishes under that run's `prepared/` directory. For `timing_full` or `production`, include `--memory 4G` for the workers.
 
-| Quantity | Count |
-|---|---:|
-| Model input columns | 4,252 |
-| Predictor variables counted in \(K\) | 497 |
-| Categorical variables represented by grouped indicator columns | 29 |
+## Fixed variable definitions
 
-The 3,784 indicator columns belonging to those 29 categorical variables are
-kept in atomic groups. When a categorical variable is selected, all of its
-indicator columns are supplied to the model together.
+The [feature definition file](config/asample2_withlag.json) lists predictor columns and their order, the two outcomes, and one-hot groups. The current definition contains 4,252 predictor columns and 29 one-hot groups, which make up 497 variables. Predictors outside one-hot groups are treated as individual continuous columns.
 
-## Data transformations
+Loading checks column names, order, and category groups against this fixed list. Variable definitions remain fixed; the engine performs the train/test split.
 
-The source is already a numeric, analysis-ready matrix. The adapter therefore:
+## Row numbers
 
-- retains the supplied numeric representation of continuous and scalar
-  variables;
-- records which indicator columns belong to the same categorical variable;
-- records the two outcome columns and the eligible predictor variables; and
-- validates the resulting data and analysis specifications.
+The matrix has no person identifier, so the adapter numbers the records in file order, starting at 1, before any row is filtered. The number, `smr_row_id`, is not a predictor and plays no part in sampling or in the train/test split. The engine records it for each training and test sample, so that predictions saved by separately trained models can be matched to the same person when the Super Learner combines them.
 
-The source matrix is free of non-finite values and the negative sentinel codes
-commonly used to denote missingness. It enters the analysis with its supplied
-values, rows, and predictor set unchanged. Any imputation parameters required
-during analysis are estimated within the selected training sample.
+## Missing values
 
-The \(K\)-dimension treats the 497 declared predictor variables as eligible
-units of prior information. This is a research-design assumption: it gives
-each declared predictor variable an opportunity to enter the random
-predictor-availability experiment, while preventing the arbitrary selection of
-individual indicator columns from the same categorical variable.
+No missing-value codes are declared, so negative values are kept as values. Missing cells in the CSV stay NaN; a special code would be replaced only if it were declared for its column.
 
-## Inputs and generated files
+The adapter keeps rows with missing predictors and does not impute outcomes. The outcomes are `Cm_lhourlywage` and `Cm_ltotalincome`. For each outcome, the engine first checks its missingness rate: a rate above 50% raises an error; otherwise, rows missing that outcome are removed before the seed-specific train/test split. The two outcomes can therefore have different eligible samples.
 
-```text
-SMR/
-├── adapter/
-│   ├── config/asample2_withlag.json     reviewed variable specification
-│   ├── adapter.py                       data-preparation entry point
-│   ├── build_contract.py                specification-authoring utility
-│   └── tests/
-├── schema/                              generated, versioned analysis specifications
-└── data/
-    ├── private/asample2_withlag.csv     source data; excluded from Git
-    └── ard/asample2_withlag/            generated data; excluded from Git
-        ├── data.csv
-        ├── feature_manifest.csv
-        └── provenance.json
-```
+A predictor column that is entirely missing is rejected by the input check. Partial missingness is imputed within each training sample and cross-validation training fold, following the rules in the [experiment methods](../../NK_Grid/README.md#learn-preprocessing-from-the-current-training-data).
 
-The schema and predictor-universe files are versioned because they define how
-the generated data are interpreted. Git excludes the source and generated data
-tables.
+## Why categorical columns are grouped
 
-## Reproduction
+One-hot groups retain all declared levels. An observed row must contain exactly one 1; a missing row may contain NaN across the entire group. All-zero and partially missing groups are not valid category states.
 
-From the repository root:
+All dummy columns for an original variable are sampled together and count once toward K, including the reference-level column. Other predictors are treated as continuous variables.
 
-```bash
-python SMR/adapter/adapter.py
-```
+## Lasso penalty search
 
-To use validation settings that match a planned analysis:
-
-```bash
-python SMR/adapter/adapter.py \
-  --validation-model ols ridge lasso elastic_net random_forest \
-  --min-n 10 \
-  --test-size 0.3 \
-  --seed 12345
-```
-
-`build_contract.py` is used only when the reviewed source header or grouped
-categorical-variable declarations change. Its output must be reviewed before
-it replaces the existing specification:
-
-```bash
-python SMR/adapter/build_contract.py
-```
-
-The generated files follow the common
-[adapter specification](../../Adapter/ADAPTER.md).
+For SMR, Lasso chooses its penalty from values set relative to alpha_max, the smallest penalty at which every coefficient is zero, computed separately in each training fold. It uses three folds and 25 values from alpha_max down to 0.001 × alpha_max, spaced evenly on a log scale. Each fold learns its own imputation and scaling. The value with the lowest mean validation MSE is chosen, and ties go to the stronger penalty. The final fit on all N training rows recomputes alpha_max from those rows. The convergence tolerance is 1e-4 and the iteration limit 20,000. The range is the same for every N and K, and no test outcome is used.

@@ -1,230 +1,81 @@
-# N-by-K analysis implementation
+# How N × K experiments work
 
-## Research design
+The engine measures how prediction quality changes as more samples and variables become available for learning. Each training combination is defined by model, seed, draw, N, and K. All combinations follow the same preprocessing and evaluation rules.
 
-This package implements the repeated sampling design used to estimate how
-out-of-sample predictive performance changes with:
+## Split first, then sample
 
-- training sample size (\(N\)); and
-- number of available predictor variables (\(K\)).
+The engine first removes rows missing the selected outcome. When the data provider defines a test set, the engine uses it as given. Otherwise it holds out a random 30% of the remaining rows for testing, drawn anew for each seed. Every draw, N and K within a seed is evaluated on the same test set.
 
-For every outcome, model, random seed, and repeated draw, the program selects
-training cases and eligible predictor variables, estimates data-dependent
-preprocessing using the selected training data, fits the model, and evaluates
-predictions on held-out cases.
+Each seed can have multiple draws. A draw generates one random ordering of training rows and one of variables. The first N rows and K variables form the training input. Smaller samples are therefore nested within larger samples, and smaller variable sets within larger ones, reducing variation caused by comparing unrelated subsets.
 
-Each empirical application defines its substantive outcomes and eligible
-predictors in a data-preparation configuration, schema, and panel
-specification.
+K counts variables. The dummy columns of a categorical variable and the missingness indicators attached to it are selected together, and the number of model columns behind the K variables is stored as `K_expanded`. Different encodings of the same data can therefore have different column counts at the same K.
 
-## Inputs
+By default, the N/K axes use integer points spaced on a logarithmic scale. Duplicate integers are adjusted to distinct points; an insufficient range raises an error. N cannot exceed the available training rows, and K cannot exceed the number of retained variables.
 
-An analysis requires:
+## Learn preprocessing from the current training data
 
-| Input | Purpose |
-|---|---|
-| Analysis-ready dataset | Outcome and model input columns |
-| Predictor manifest | Maps model input columns to the predictor variables counted in \(K\) |
-| Schema | Defines outcomes, data split, variable types, missing-value treatment, and predictor eligibility |
-| Panel specification | Defines the \(N\) and \(K\) values, repeated draws, seeds, outcomes, models, and explicit run identity |
-| Model parameters | Records model-specific settings |
+Adapters preserve NaN. After sampling training rows, the engine learns imputation for each column type:
 
-For a real run, declare `experiment_id`, `data_version`, and
-`model_spec_version` at the manifest root or on each panel. These values identify
-the experiment, analysis-ready data, and model specification carried into every
-result manifest.
+- continuous columns take the median of the training rows;
+- a group of dummy columns takes the most frequent complete category among the training rows, so a missing row gets one whole category such as `[0,1,0]` instead of column-by-column values;
+- a category stored as one integer column (`ordinal`) takes the observed level nearest the training median, the lower one on a tie, unless the dataset declares another rule.
 
-The common data-preparation requirements are documented in
-[`../Adapter/ADAPTER.md`](../Adapter/ADAPTER.md).
+XGBoost and LightGBM receive missing values as NaN and handle them themselves. Models requiring standardization also learn location and scale from training rows only.
 
-## Installation and validation
+Each cross-validation training fold learns these parameters independently and applies them to its validation fold. After parameter selection, preprocessing and the model are refitted on all N training rows, followed by test-set evaluation. Target standardization for regression MLP follows the same sequence.
 
-Python 3.11–3.14 is supported.
+If a variable is entirely missing in a small training fold, both sides are set to a prior value or NaN, so test data cannot supply information the training rows lack. A combination is skipped when none of the selected variables has an observed value in the training sample, or when a binary outcome has only one class there.
 
-```bash
-python -m pip install -e "NK_Grid[models,parquet,test]"
-python -m pytest -q NK_Grid/tests
+## Model fitting
+
+Eight models are fit separately: OLS, Ridge, Lasso, Random Forest, Extra Trees, XGBoost, LightGBM and a shallow neural network. A ninth, the Super Learner, combines seven of them.
+
+Ridge, Lasso and the neural network choose their penalty by cross-validation on the training rows, and XGBoost and LightGBM choose their number of boosting rounds the same way. Each model is then refit on all N rows. The candidate values and fold counts are in each dataset's `model_params.yaml`.
+
+The neural network has one hidden layer of 32 units. Each fit splits its training rows into mini-batches of at most 200 rows and of nearly equal size, so the last batch is never much smaller than the others. Training runs for at most 2,000 epochs and stops earlier once the training loss stops improving.
+
+The Super Learner (SL7) combines the seven models other than OLS. Each of the seven is fit five more times, on about four fifths of the training rows each time, to predict the remaining rows; this gives an out-of-fold prediction for every training row. These fits reuse the penalty or number of boosting rounds chosen when the model was fit on all N rows and do not search again. Lasso's penalty is chosen as a fraction of the smallest penalty that removes every variable, and each of these fits applies that fraction to its own rows. SL7 finds the nonnegative weights, plus an intercept, that best predict the training outcome from these predictions, and applies them to the seven models' test predictions. It uses no test outcomes and retrains nothing.
+
+Binary outcomes use the same models, search grids, fold counts and network settings. The differences follow from the outcome:
+
+- OLS, Ridge and Lasso are logistic regressions: unpenalized, L2-penalized and L1-penalized.
+- A penalty is chosen with the same alpha grid as for continuous outcomes. Ridge and Lasso regression put alpha on the Gaussian negative log-likelihood, as its sum for Ridge and its mean for Lasso, and the logistic versions put the same alpha on the Bernoulli negative log-likelihood.
+- Cross-validation selects by log loss instead of squared error, and its folds are stratified so every fold holds both classes. As for continuous outcomes, XGBoost and LightGBM shuffle the rows with the model's seed before splitting; the other models split the rows in their sampled order. With fewer rows of the rarer class than the declared number of folds, the number of folds drops to that count; below two, the model is skipped.
+- SL7 combines predicted probabilities with a logistic regression that has nonnegative weights and an intercept and no penalty.
+
+## Interpreting prediction quality
+
+MSE is the mean squared prediction error on the test set. An R² divides it by the test MSE of a baseline that predicts one value for everyone, and the baselines differ in what that value is:
+
+```text
+r2_full_train_mean
+  = 1 - model MSE / null_mse_full_train_mean
+    null: the mean outcome of the whole training pool the N rows are drawn from
+
+r2_test, skill_train_mean
+  = 1 - model MSE / null_mse_train_mean
+    null: the mean outcome of the N rows sampled for this fit
+
+r2_test_mean
+  = 1 - model MSE / test_target_variance
+    null: the mean outcome of the test set
 ```
 
-Review a resolved analysis design while leaving the data unread and all models
-unfitted:
+For binary outcomes the predictions are probabilities of the positive class. The Brier score is the MSE of those probabilities, and the R² measures compare a model with a prediction of one positive rate for everyone:
 
-```bash
-aleatoric-nk-grid-panels \
-  --manifest SMR/panels.yaml \
-  --dry-run
+```text
+brier_full_train_r2
+  = 1 - Brier score / Brier score of predicting the training pool's positive rate
+
+mcfadden_full_train_pseudo_r2
+  = 1 - log-likelihood / log-likelihood of predicting the training pool's positive rate
+
+mcfadden_pseudo_r2
+  = 1 - log-likelihood / log-likelihood of predicting the sampled rows' positive rate
 ```
 
-The dry run reports the number of analysis cells and expected checkpoint
-writes. Integer-valued grids can contain repeated values after rounding; the
-resolved design records the actual values used.
+The table also has AUC, average precision, log loss, balanced accuracy, F1 and accuracy. A metric that cannot be computed for a particular sample is stored as NaN, which is distinct from a failed model fit.
 
-## Analysis scale
+Each result also has a status: `ok` for a completed fit, `skipped` when the sampled data do not allow a fit, and `failed` when fitting failed. Diagnostics also flag OLS fits with more columns than rows, constant predictions and convergence problems. An experiment is complete only when every combination in the design has a result.
 
-Each panel specification selects one of four standard scales:
-
-| Scale | Seeds | Draws per seed | \(N\) values | \(K\) values | Cells per outcome–model combination |
-|---|---:|---:|---:|---:|---:|
-| `dev` | 3 | 3 | 3 | 3 | 81 |
-| `medium` | 8 | 8 | 10 | 10 | 6,400 |
-| `timing_full` | 1 | 1 | 20 | 20 | 400 |
-| `production` | 100 | 50 | 20 | 20 | 2,000,000 |
-
-These identifiers are execution settings. Research reports should state the
-resolved numbers of seeds, draws, \(N\) values, and \(K\) values.
-
-Create a separate reviewed panel specification for timing or production runs:
-
-```bash
-cp SMR/panels.yaml SMR/panels.timing.yaml
-```
-
-Then change the top-level `preset` value in the copied file. Panel
-specifications provide the authoritative preset selection.
-
-## Local execution
-
-Run one panel:
-
-```bash
-aleatoric-nk-grid-panels \
-  --manifest SMR/panels.yaml \
-  --only smr_hourlywage
-```
-
-Limit the number of analysis cells for a smoke test:
-
-```bash
-aleatoric-nk-grid-panels \
-  --manifest SMR/panels.yaml \
-  --only smr_hourlywage \
-  --max-jobs 20
-```
-
-Run every outcome and model in a panel specification:
-
-```bash
-aleatoric-nk-grid-panels --manifest SMR/panels.yaml
-```
-
-Runs exceeding 250,000 cells require explicit authorization after the dry-run
-estimate has been reviewed:
-
-```bash
-aleatoric-nk-grid-panels \
-  --manifest SMR/panels.production.yaml \
-  --allow-large-run
-```
-
-## Slurm execution
-
-Before submission:
-
-1. use a clean, reviewed, committed checkout;
-2. generate and validate the application data;
-3. ensure that the checkout, environment, private data, generated data, and
-   output directories are visible to every compute node at the same paths; and
-4. review both the local dry run and the Slurm dry run.
-
-Preview the seed-shard task mapping:
-
-```bash
-bash NK_Grid/slurm/submit_nk_grid.sh \
-  --manifest SMR/panels.yaml \
-  --dry-run
-```
-
-Submit the reviewed specification:
-
-```bash
-bash NK_Grid/slurm/submit_nk_grid.sh \
-  --manifest SMR/panels.yaml \
-  --max-concurrent-per-class 4 \
-  --cpus-per-task 8 \
-  --serial-cpus-per-task 1 \
-  --mem 48G \
-  --time 4-00:00:00
-```
-
-Production submission additionally requires `--allow-large-run`.
-
-The launcher freezes one task per `(panel, model, seed)` and partitions tasks
-into `parallel`, `serial`, and `super_learner` arrays. Each seed task writes one
-shard; one finalizer task per `(panel, model)` merges its seeds, then one publish
-task per panel merges the complete model results. `--max-concurrent-per-class`
-limits each seed execution class separately.
-
-The repository-root `.venv` is used by default. On clusters that require
-different paths or a Python module:
-
-```bash
-export VENV=/shared/path/to/venv
-export PYTHON="$VENV/bin/python"
-export PYTHON_MODULE=Python/3.11
-```
-
-Submit jobs through `submit_nk_grid.sh`. The wrapper records the resolved
-mapping, resource settings, and a recovery command for each accepted Slurm job.
-
-## Monitoring and recovery
-
-Use the job identifiers printed during submission:
-
-```bash
-squeue -j JOB_ID
-
-sacct -j JOB_ID \
-  --format=JobID,JobName%30,State,Elapsed,MaxRSS,ExitCode
-
-tail -f NK_Grid/logs/al-nk-grid-serial-JOB_ID_ARRAY_INDEX.out
-tail -f NK_Grid/logs/al-nk-finalize-JOB_ID_ARRAY_INDEX.out
-tail -f NK_Grid/logs/al-nk-publish-JOB_ID_ARRAY_INDEX.out
-```
-
-Execution records and Slurm logs are written below `NK_Grid/logs/`.
-
-In `squeue`, seed arrays are named `al-nk-grid-parallel`,
-`al-nk-grid-serial`, or `al-nk-grid-super_learner`; they are followed by
-`al-nk-finalize` and `al-nk-publish`. Workers checkpoint within their seed
-shard and may requeue at a checkpoint boundary. Finalizers and publishers run
-after their dependencies and refuse incomplete inputs instead of publishing a
-partial result.
-
-Diagnose a frozen snapshot before recovery:
-
-```bash
-python -m aleatoric_nk_grid.seed_shards missing \
-  --snapshot NK_Grid/logs/slurm-specs/jobs-TIMESTAMP-PID.json
-```
-
-The JSON reports missing and incomplete master indices plus invalid targets.
-Recover a chosen resource class from that snapshot; omit `--master-indices` to
-select all missing or incomplete tasks in the class, or pass the diagnosed
-subset:
-
-```bash
-bash NK_Grid/slurm/submit_nk_grid.sh \
-  --snapshot NK_Grid/logs/slurm-specs/jobs-TIMESTAMP-PID.json \
-  --resource-class serial \
-  --master-indices 12,90 \
-  --max-concurrent-per-class 4 \
-  --serial-cpus-per-task 1 \
-  --mem 48G \
-  --time 4-00:00:00
-```
-
-Repeat per affected resource class. Recovery starts from the selected seed
-tasks, then submits fresh finalizer and publish arrays. Reusing the snapshot
-preserves the reviewed mapping.
-
-## Output integrity
-
-Every shard carries `experiment_id`, `data_version`, and
-`model_spec_version`, plus its model, seed, draws, and resolved \(N\)/\(K\)
-design. Finalizers compare identity and semantic contracts across seed shards;
-publishers repeat those checks across model results. Duplicate publishers for
-the same output are rejected through a filesystem lease, and completed results
-are published atomically.
-
-Checkpointing protects against interrupted execution. Long-term preservation
-requires checksums and independent archival storage.
+See the [core code description](src/aleatoric_nk_grid/README.md) for how the code carries this out, and the [launch guide](../launch/README.md) for running an experiment.

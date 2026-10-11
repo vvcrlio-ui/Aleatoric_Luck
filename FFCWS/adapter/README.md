@@ -1,93 +1,76 @@
-# FFCWS data preparation
+# FFCWS preprocessing and missing values
 
-## Role in the research design
+FFCWS inputs comprise a background-variable table and official train/test outcome tables. The code joins them by `challengeID`, preserving the official split and the row order of each outcome table. Only the official training pool determines variable retention and encoding; the same rules are then applied to test data.
 
-The FFCWS adapter prepares information collected from birth through age 9 for
-predicting six age-15 outcomes. It preserves the predefined training and test
-samples and produces three alternative representations of the same source
-information.
+FFC has six outcomes. GPA, grit and material hardship are continuous; eviction, layoff and job training are binary. Each outcome is prepared in each of the three encodings described in section 2, which gives the 18 panels in [panels.yaml](../panels.yaml), named `ffc_<encoding>_<outcome>`.
 
-All decisions that depend on observed values—including predictor eligibility,
-categorical value sets, and prevalence-based screening—are estimated using the
-predefined training sample only. The test sample is reserved exclusively for
-evaluating predictive performance.
+The steps are: identify missing values, screen variables in the training pool, determine variable types and category vocabularies, build the three representations, join the selected outcome, and validate the inputs before they go to the training engine.
 
-Rows with missing outcomes are retained in the prepared data. They are removed
-separately for each outcome during validation and model fitting, which avoids
-discarding a family merely because another outcome is unavailable.
+## Preparing a run
 
-## Predictor representations
+Use the shared launcher with `--manifest FFCWS/panels.yaml --panel PANEL --prepare --data-dir DIR`, where DIR contains `background.dta`, `train.csv` and `test.csv`. The panel name selects the strategy and outcome, for example `ffc_median_mode_gpa`. Preparation runs in the compute bootstrap, builds only that strategy and outcome, and publishes under that run's `prepared/` directory.
 
-| Representation used in research text | Configuration ID | Definition |
-|---|---|---|
-| One-hot representation with within-sample imputation | `median_mode` | Continuous variables remain numeric. Each categorical variable becomes a grouped set of indicator columns. Imputation values are estimated within each selected training sample. |
-| One-hot representation with missingness indicators | `median_missing_indicator` | Uses the same value representation and adds screened binary indicators for missing source values. Each declared missingness indicator counts as a separate predictor variable. |
-| Ordinal representation for categorical variables | `tree_ordinal` | Continuous variables remain numeric. Categorical values receive stable integer codes learned from the predefined training sample. |
+## 1. Row and column handling
 
-The configuration IDs are used in file and command names only. Manuscripts and
-research summaries should use the descriptive representation names.
+Families are not removed based on the number of missing predictors. Missing predictors are handled during training. Data are aligned by unique `challengeID`.
 
-Provider missing-value codes from `-9` through `-1`, together with blank values,
-are converted to explicit missing values. Categorical values observed only in
-the test sample are also treated as missing. Categorical value sets are derived
-exclusively from the training sample.
+Each outcome uses families with an observed value for that outcome. For example, a family with observed GPA but missing grit can still be used in the GPA experiment. The engine checks the selected outcome separately in the training and test tables: missingness above 50% raises an error; otherwise, rows missing that outcome are removed. Outcomes are not imputed.
 
-For both one-hot representations, all columns derived from one categorical
-variable enter or leave the analysis together. They therefore count as one
-predictor variable in \(K\). The missingness-indicator representation counts
-each separately declared indicator as one additional predictor variable.
-Consequently, equal values of \(K\) may represent different source information
-across the three representations.
+Column screening uses only the official training pool, with rules from the [configuration file](config/ffc.yaml):
 
-## Inputs and generated files
+| Check | Current rule |
+|---|---|
+| Missing-value recognition | Blanks, NA-like markers, and codes −9 through −1 are treated as missing; values that cannot be parsed as numbers also become NaN |
+| Valid-value rate | After excluding recognized blanks and negative missing codes, discard the variable if fewer than 50% of its original values are valid; exactly 50% passes |
+| Variation | If conversion leaves no observed numeric values or only one distinct value, discard the entire variable and its missingness indicators |
+| Categorical-variable retention | At least one observed level must satisfy `min(p,1-p) >= 0.01`, where p is its proportion of all training-pool rows |
 
-```text
-FFCWS/
-├── adapter/
-│   ├── config/ffc.yaml                  reviewed preparation specification
-│   ├── adapter.py                       data-preparation entry point
-│   ├── src/ffcws_data_processor/
-│   └── tests/
-├── schema/                              generated, versioned analysis specifications
-└── data/
-    ├── private/
-    │   ├── background.dta               source data; excluded from Git
-    │   ├── train.csv
-    │   └── test.csv
-    ├── adapter_work/                    generated validation records; excluded from Git
-    └── ard/<representation>/            generated analysis-ready data; excluded from Git
-```
+Here, structural missingness includes blanks, NA markers, and codes -9 through -1. Numeric parsing failures become NaN, but parsing success rates do not determine column retention. The 50% threshold is based on structural missingness. The negative-code rule for predictors is not automatically applied to outcomes.
 
-For each representation, the adapter writes a training table, a test table, a
-predictor manifest, provenance information, a canonical predictor-universe
-definition, and one analysis schema per outcome. Schemas and predictor-universe
-definitions are versioned because they determine how the untracked generated
-tables are interpreted.
+If a prepared column is entirely NaN, the engine reports an input problem.
 
-## Reproduction
+## 2. Variable encoding
 
-From the repository root, prepare and validate all three representations:
+Numbers can represent quantities or category identifiers. For example, 1, 2, and 3 children are counts, whereas marital-status codes 1, 2, and 3 identify categories.
 
-```bash
-python FFCWS/adapter/adapter.py
-```
+A type declared in the configuration, `numeric` or `categorical` under `schema.variable_types`, takes precedence. Without a declaration, a variable is treated as categorical if it has at most 15 observed levels and either Stata value labels or only integer values, and as numeric otherwise. No types are declared at present, so this rule decides every variable; any declaration added later should be checked against the variable documentation. Category vocabularies are built only from the official training pool.
 
-To prepare selected representations only:
+The same retained variables are represented in three ways:
 
-```bash
-python FFCWS/adapter/adapter.py \
-  --strategy median_mode median_missing_indicator tree_ordinal
-```
+| Representation | Numeric variables | Categorical variables | Additional missingness information |
+|---|---|---|---|
+| `median_mode` | Values and NaN | Full one-hot encoding; missing values set the entire group to NaN | None |
+| `median_missing_indicator` | Values and NaN | Same as above | Retained 0/1 indicators for declared missing codes or blanks |
+| `tree_ordinal` | Values and NaN | Categories sorted by original numeric code and mapped to 0, 1, 2, … | None |
 
-To align validation settings with a planned analysis:
+Once a categorical variable is retained, its one-hot representation keeps all known observed levels, including rare levels. Missingness indicators remain subject to the 1% binary-prevalence threshold.
 
-```bash
-python FFCWS/adapter/adapter.py \
-  --validation-model ols ridge lasso elastic_net random_forest \
-  --min-n 10 \
-  --seed 12345
-```
+In the missing-indicator representation, codes −9 through −1 become NaN in the value column. Separate 0/1 indicators are generated for specific codes observed in the training pool, preserving their different meanings as defined by the variable's labels. The value column is imputed during training; linear models and neural networks can also use these indicators.
 
-Preparing all three representations produces six outcome-specific schemas for
-each representation. The generated files follow the common
-[adapter specification](../../Adapter/ADAPTER.md).
+For example, suppose a variable labels −1 as refusal and −2 as “don't know,” and both indicators pass screening:
+
+| Original value | Value column before imputation | Refusal indicator | Don't-know indicator |
+|---|---:|---:|---:|
+| 10 | 10 | 0 | 0 |
+| −1 | NaN | 1 | 0 |
+| −2 | NaN | 0 | 1 |
+
+These columns let models learn from reasons for missingness without treating −1 and −2 as quantities. Only `median_missing_indicator` adds these columns.
+
+All three representations retain the same variables, although their column counts can differ. Value columns and missingness indicators are sampled together, and K counts the original variable once. See the [three encoding methods](src/ffcws_data_processor/strategies/README.md) for examples.
+
+## 3. When and how imputation occurs
+
+The adapter identifies missing values and keeps them as NaN; imputation takes place during training, learned from each training sample and each cross-validation training fold. The rules for each column type are in the [experiment methods](../../NK_Grid/README.md#learn-preprocessing-from-the-current-training-data). A variable observed in the full training pool can be entirely missing in a small training sample; it still counts toward K, and a combination is skipped if none of the selected variables is observed.
+
+## 4. New categories in test data
+
+For categories outside the training vocabulary, the code records counts and rates and converts them to missing values without extending the vocabulary. By default, an unknown rate strictly above 95% raises an error. The denominator is the count of parseable, nonmissing numeric values for that variable in the test data.
+
+Coverage is checked again for each outcome. A category may occur in the official training pool only in rows missing the selected outcome. The code therefore checks coverage using training rows with an observed outcome. Uncovered categories in test rows with an observed outcome become NaN, subject to the same rate threshold. This check uses outcome availability, not outcome values, to determine category coverage.
+
+## 5. Code locations
+
+[pipeline.py](src/ffcws_data_processor/pipeline.py) coordinates the process. [common/schema.py](src/ffcws_data_processor/common/schema.py) identifies missingness, screens variables, and defines their representations. [common/io.py](src/ffcws_data_processor/common/io.py) joins official outcome tables. [contract.py](src/ffcws_data_processor/contract.py) handles category coverage for rows with observed outcomes and generates engine input definitions.
+
+A new data version is published only after all selected input checks pass. Reports record why each variable was discarded and which test values became missing. Prepared data keep the rules in force when they were built; regenerating the inputs applies the current rules.

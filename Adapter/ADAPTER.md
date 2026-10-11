@@ -1,15 +1,12 @@
-# Writing an Adapter for the NK Grid Engine
+# Writing an adapter for the NK grid engine
 
-This document explains **how to transform the raw data from a paper into adapter
-artifacts that the engine can accept, audit, and reproduce.**
+This document explains how to turn a study's raw data into adapter artifacts that
+the engine can accept, audit, and reproduce. It is the complete specification for
+the adapter side.
 
-This is the **complete specification** for the adapter side.
+## 0. Contract summary
 
-It is **recommended to use AI tools** to assist in constructing the Adapter.
-
-## 0. Contract Summary
-
-Adapter artifacts must satisfy all nine constraints below. If any constraint is
+Adapter artifacts must satisfy all ten constraints below. If any constraint is
 not met, `validate_input` will reject the artifacts before sampling begins. Later
 sections provide the details.
 
@@ -24,8 +21,9 @@ sections provide the details.
 | 7 | The feature universe has a valid origin: internal splitting requires `fixed_a_priori`; under external splitting, the vocabulary can be learned only from the training table. |
 | 8 | `group_column` is `null`; `exchangeable` is `true`. |
 | 9 | `schema_version=1`; with a manifest, `feature_manifest_version=1`; otherwise it is `null`. |
+| 10 | Every run saves per-row predictions, so `id_column` is required under either split mode, with non-missing, unique IDs (Section 5). |
 
-## 1. What an Adapter Is and Terminology
+## 1. What an adapter is, and terminology
 
 An adapter is a preprocessing program that you write for each dataset: it takes
 raw data as input and produces several files in prescribed formats. It is usually
@@ -44,24 +42,25 @@ artifact passes the engine's input validation.
 
 | Term | Meaning |
 |---|---|
+| **ARD** | The analysis-ready data: the table of predictors, outcomes and row IDs that the adapter writes. |
 | **predictor** | A column in the ARD that is actually passed to the model. |
 | **source** | The atomic sampling unit; one source corresponds to one or more predictor columns. |
 | **feature** | A column-level record in the universe or manifest; a feature with `keep=true` corresponds to an ARD predictor. |
 | **training cell** | A training subsample used for one engine fit (called a cell in the code). |
 
-## 2. Responsibility Boundary
+## 2. Responsibility boundary
 
 | Category | Owner | Description |
 |---|---|---|
-| Deterministic row-wise transformations | Adapter | Depend only on the current row: map yes/no to 1/0, take the log of income, or calculate age using a **reference date fixed in advance**. |
+| Deterministic row-wise transformations | Adapter | Depend only on the current row: map yes/no to 1/0, take the log of income, or calculate age using a reference date fixed in advance. |
 | Missing-value code conversion | Adapter | Deterministically convert sentinel values such as `-9`, `-99`, and `N/A` to `NaN`. |
-| Categorical encoding and vocabularies | Adapter | A vocabulary may require multiple rows, but is **fixed once and remains unchanged throughout**; the rows it may inspect are restricted as described in Section 5. |
+| Categorical encoding and vocabularies | Adapter | A vocabulary may require multiple rows, but is fixed once and remains unchanged throughout; the rows it may inspect are restricted as described in Section 5. |
 | Feature-set declaration | Adapter | Governed by the feature-universe contract in Section 6. |
-| Training/test splitting | Engine | The adapter must not create its own random split, but it **must preserve any split predefined by the data provider exactly as supplied**. |
+| Training/test splitting | Engine | The adapter must not create its own random split, but it must preserve any split predefined by the data provider exactly as supplied. |
 | Imputation and standardization | Engine | The engine refits these statistics within each training subsample. |
 | Sample and feature sampling, modeling, and metrics | Engine | The adapter has no involvement. |
 
-**The adapter must not impute in advance.** This is the rule most easily
+The adapter must not impute in advance. This is the rule most easily
 violated. If statistics are computed from the entire table, a small training
 subsample will use a median estimated from the full sample. Its performance will
 therefore be artificially inflated, systematically underestimating the sample-size
@@ -69,9 +68,9 @@ effect. Under `internal_random`, this also leaks information from test rows into
 training. Missing values in the ARD must therefore remain `NaN` so that the engine
 can handle them within each training subsample.
 
-## 3. Artifacts, Directories, and Paths
+## 3. Artifacts, directories and paths
 
-**The schema is the sole semantic entry point:** it references the ARD, feature
+The schema is the sole semantic entry point: it references the ARD, feature
 universe, and feature manifest by path. The one exception is `provenance.json`, which the engine discovers by location rather than by reference.
 
 | Artifact | When required |
@@ -93,13 +92,16 @@ YourArticle/
 ```
 
 The schema and feature-universe definition must be under version control; data
-must not be.
+must not be. This layout applies when the adapter is run by hand. When a cluster
+launch prepares the data (Section 10), the adapter writes every artifact under
+that run's `prepared/` directory instead, and the tracked `schema/` and `data/`
+directories stay unchanged.
 
-### Path Resolution
+### Path resolution
 
 The schema fields `table`, `test_table`, `feature_manifest`, and
-`feature_universe.definition_file` are all resolved **relative to the directory
-containing the schema file**. Absolute paths are also accepted. When the schema is
+`feature_universe.definition_file` are all resolved relative to the directory
+containing the schema file. Absolute paths are also accepted. When the schema is
 in `YourArticle/schema/`, use the following values:
 
 | Schema field | Value |
@@ -109,21 +111,36 @@ in `YourArticle/schema/`, use the following values:
 | `feature_manifest` | `../data/ard/my_dataset/feature_manifest.csv` |
 | `feature_universe.definition_file` | `my_dataset.feature_universe.json` |
 
+The bundled FFCWS and SMR adapters first generate and validate all selected
+inputs in a temporary directory. They then publish complete immutable bundles
+under `data/ard/<dataset>/.releases/<content-hash>/`, and feature universes under
+`schema/.universes/<content-hash>/`. The stable `schema/<dataset>.json` entry is
+replaced atomically only after its referenced files are complete. Read the paths
+from that schema; the flat ARD layout shown in the example is simplified.
+
+A failed build leaves existing schema entries and their inputs unchanged.
+Publication switches each schema independently: interruption during the final
+switches may leave different panels on different complete versions, but never
+combines a new training table with an old test table within one schema. Previous
+versions are retained for readers that already loaded them; there is no automatic
+release cleanup. Existing frozen-run checks still reject a changed stable schema.
+The FFCWS work directory contains derived reports, not authoritative engine input.
+
 ### Provenance
 
 `provenance.json` is optional audit metadata. Its location is fixed by the
-engine: it must sit in the same directory as the **training table** referenced by
+engine: it must sit in the same directory as the training table referenced by
 `table`, and its filename cannot change. If the file is present the engine reads
-it and rejects the run when it is not valid JSON; it no longer validates
+it and rejects the run when it is not valid JSON; it does not validate
 `schema_sha256` or any other digest from it. Do not record raw IDs or absolute
 paths.
 
-## 4. ARD Requirements
+## 4. ARD requirements
 
 An ARD is a flat table: each row corresponds to one observational unit, and
 columns are not nested. It contains only the outcomes declared in the schema
-(there may be more than one), predictors, and the ID column required by
-`external_test`.
+(there may be more than one), predictors, and the row-ID column described in
+Section 5.
 
 - **Deterministic row-wise behavior:** once the vocabulary is fixed, the output
   for each row may depend only on that row's raw values and the fixed vocabulary,
@@ -157,16 +174,15 @@ rejects such overlaps to prevent target leakage into the feature set. When the
 column set is stable, prefer an explicit list because a prefix rule automatically
 includes any subsequently added column with the same prefix.
 
-## 5. Internal / External
+## 5. Internal and external splits
 
 `split_mode` determines what the adapter must deliver and which rows may be used
 to learn vocabularies.
 
 **`internal_random`** — The adapter delivers one table, which the engine splits.
-`id_column` may be `null`. If the data already contains a stable identifier,
-retain it for provenance, although the engine will not use it. The feature
-universe must be `fixed_a_priori`, **which means that categorical vocabularies
-also must not be learned from this table.**
+It still needs a row ID, because every run saves per-row predictions; see Row IDs
+below. The feature universe must be `fixed_a_priori`, which means that
+categorical vocabularies also must not be learned from this table.
 
 **`external_test`** — The data provider has already defined the training and test
 sets, as with an official competition split. The adapter must preserve that split
@@ -181,7 +197,19 @@ exactly, deliver two tables, and satisfy the following requirements:
   If the test table contains a category outside the training vocabulary, raise an
   error; do not expand the vocabulary using the test table.
 
-## 6. Feature Universe
+### Row IDs
+
+Every run saves each model's per-row predictions, so `id_column` is required
+under both split modes. IDs must be non-missing and unique within each table.
+The engine never uses them to sample or split; it records them to identify the
+rows behind each saved prediction, and there is no fallback to row positions.
+
+Use a stable identifier from the data provider when one exists, as FFCWS does
+with `challengeID`. Otherwise, assign one deterministically from each record's
+position in the raw table before any filtering, so that a record keeps the same
+ID for every outcome; the SMR adapter does this with `smr_row_id`.
+
+## 6. Feature universe
 
 The feature universe is a normalized snapshot of the feature space. It contains
 the source list, the features under each source and their order, the set of
@@ -222,22 +250,25 @@ purposes: they can be treated as units randomly sampled from the same population
 If this assumption does not hold, stop the integration rather than setting it to
 `true` merely to pass validation.
 
-## 7. Feature Manifest
+## 7. Feature manifest
 
 > Throughout this document, “manifest” always means `feature_manifest.csv`.
 
 Without a manifest, the engine treats every predictor column as an independent
-continuous source. A manifest is required if **any** of the following conditions
+continuous source. A manifest is required if any of the following conditions
 applies:
 
-1. **An ordinal feature exists**, even if it occupies only one column. Otherwise,
+1. An ordinal feature exists, even if it occupies only one column. Otherwise,
    the engine treats it as continuous and imputes the median, potentially
    producing a nonexistent level such as 2.5.
-2. **A one-hot group exists**, meaning that one source spans multiple modeling
+2. A one-hot group exists, meaning that one source spans multiple modeling
    columns.
-3. **Audit rows must be recorded**, meaning rows with `keep=false`. Such rows
+3. Audit rows must be recorded, meaning rows with `keep=false`. Such rows
    exist only in the manifest; their columns need not appear in the ARD and do
    not participate in modeling.
+4. One sampling source contains multiple preprocessing groups, for example
+   a value representation plus separately typed missingness indicators that
+   must follow the parent variable into or out of the model.
 
 A `continuous` or `ordinal` source must correspond to exactly one `keep=true`
 column. Therefore, one source can span multiple columns only through a
@@ -245,10 +276,11 @@ column. Therefore, one source can span multiple columns only through a
 
 | Column | Description |
 |---|---|
-| `source_column` | Name of the raw variable to which this column belongs; use the same value for multiple columns from the same variable. |
+| `source_column` | Identity of the preprocessing group. Use the same value for columns that require joint preprocessing, such as one-hot columns from one categorical variable. |
+| `sampling_source` | Optional identity of the atomic \(K\)-axis sampling unit. If the column is absent, it defaults to `source_column`. A blank `keep=false` audit cell inherits the value from kept rows in the same `source_column` group; an audit-only group falls back to `source_column`. Every `keep=true` cell must be non-empty. Give several preprocessing groups the same value when they must enter or leave the model together. |
 | `feature_name` | Column name in the ARD. |
 | `keep` | `true` to include in modeling; `false` for auditing only. |
-| `source_order` | Order among sources: an integer starting at 0 and identical within a source. |
+| `source_order` | Order among preprocessing groups: an integer starting at 0 and identical within a `source_column` group. |
 | `feature_order` | Order within a source: starts at 0 and is contiguous. |
 | `unit_type` | `continuous`, `ordinal`, or `onehot_group`. |
 | `drop_first` | Used only for one-hot rows and identical within a source; use `False` for other rows. |
@@ -261,14 +293,22 @@ column. Therefore, one source can span multiple columns only through a
 Leave inapplicable cells empty. Order fields need only be stable and valid; they
 do not carry substantive research meaning.
 
+`sampling_source` separates sampling from preprocessing. For example, a raw
+variable's value columns can form one `onehot_group`, while each missingness
+indicator remains a one-column `continuous` group. Assigning all of those groups
+the raw variable's `sampling_source` makes the engine count them once in \(K\)
+and select them together. `source_column` must remain distinct because groups
+with different `unit_type` or imputation behavior cannot be preprocessed as one
+group.
+
 `source_prior` is the fallback value used when a source is entirely missing from
 a training subsample. If not declared, the default is `0` for continuous sources,
 the first valid level for ordinal sources, and the reference category for one-hot
 sources. For all-continuous data, schema-level `continuous_priors` may be used
 instead, with no manifest required.
 
-In this case, the engine sets the source to the same prior constant on **both the
-training and test sides**; the model has not learned the source and must not
+In this case, the engine sets the source to the same prior constant on both the
+training and test sides; the model has not learned the source and must not
 extrapolate from observed test values. For `passthrough` models, both sides are
 instead forced to `NaN`. The source still counts toward K. For the models
 currently registered, the exact placeholder constant does not affect prediction:
@@ -276,20 +316,20 @@ standardization centers constant columns on linear and neural-network paths, and
 tree models do not split on constant columns. `source_prior` therefore serves
 only to improve readability and auditability; leaving it empty is safe.
 
-### Ordinal Constraints
+### Ordinal constraints
 
 `ordinal_levels` must be compact JSON (`[1,2,3]`, not `[1, 2, 3]`); the validator
 explicitly rejects noncanonical forms. Levels must be nonempty, unique, finite
 numeric values. If raw levels are text labels, map them to integer codes inside
 the adapter.
 
-### Valid One-Hot States
+### Valid one-hot states
 
 | | `drop_first=false` | `drop_first=true` |
 |---|---|---|
 | Manifest requirement | Exactly one row must have `is_reference=true`. | Do not mark a reference, but still use `reference_level` to declare the omitted category. |
 | Valid state per row | Exactly one 1. | At most one 1. |
-| All zeros | **Invalid** | **Valid; represents the reference category.** |
+| All zeros | Invalid | Valid; represents the reference category. |
 | Entire group is `NaN` | Valid (treated as missing). | Valid (treated as missing). |
 
 Values in a non-missing state must be 0 or 1. Within a source, `drop_first` must
@@ -298,8 +338,8 @@ within a group (mixed missingness) are invalid in both modes.
 
 ## 8. Schema
 
-**Except for fields marked optional, every field in the following table must be
-present**, even if its value is `null`. The schema must not contain fields that
+Except for fields marked optional, every field in the following table must be
+present, even if its value is `null`. The schema must not contain fields that
 are absent from this table.
 
 | Field | Key points |
@@ -311,7 +351,7 @@ are absent from this table.
 | `split_mode` | `internal_random` or `external_test`. |
 | `task` | `regression` or `classification`; the latter is binary `{0,1}` only. |
 | `outcome_columns` | Nonempty list of unique strings. |
-| `id_column` | Required under `external_test`; must not also be an outcome. |
+| `id_column` | Required under either split mode, because every run saves per-row predictions (Section 5); must not also be an outcome. |
 | `predictor_columns` / `predictor_prefix` | Both are lists of strings; set exactly one; neither may contain an outcome or ID. |
 | `feature_manifest` | See Section 7. |
 | `exchangeable` | Must be `true` and requires research justification. |
@@ -323,8 +363,8 @@ are absent from this table.
 
 ### Imputation
 
-This field describes engine behavior but **is part of the schema contract and
-must be declared by the adapter**. Whether a particular imputation method is
+This field describes engine behavior but is part of the schema contract and
+must be declared by the adapter. Whether a particular imputation method is
 meaningful for a variable is a domain judgment that only the adapter can make.
 All four keys must be present, even when the data contains no feature of the
 corresponding type.
@@ -349,13 +389,14 @@ corresponding type.
   `lightgbm` and `xgboost` support `NaN` natively, so only these two are allowed.
   An empty `{}` applies the strategies above to all models.
 
-## 9. Complete Example and Validation
+## 9. Complete example and validation
 
 This example contains three sources: `age` (continuous), `sat` (ordinal, levels
 1–5), and `edu` (three categories, one-hot). The raw data contains sentinel
-missing-value codes and text categories.
+missing-value codes and text categories, and no identifier, so the adapter
+numbers the records as `row_id` (Section 5).
 
-**The required generation order is ARD → manifest → universe → schema**: the
+The required generation order is ARD → manifest → universe → schema: the
 universe depends on the manifest, and the schema references the universe.
 
 ```python
@@ -375,7 +416,10 @@ SAT_LEVELS = [1, 2, 3, 4, 5]
 raw = pd.read_csv("raw.csv")
 raw["age"] = raw["age"].replace(-9, np.nan)        # Missing-value sentinel -> NaN
 
-ard = pd.DataFrame({"y": raw["y"], "X_age": raw["age"], "O_sat": raw["sat"]})
+ard = pd.DataFrame({
+    "row_id": np.arange(1, len(raw) + 1),          # Row ID fixed before any filtering
+    "y": raw["y"], "X_age": raw["age"], "O_sat": raw["sat"],
+})
 missing_edu = raw["edu"].isna()                    # Missing category -> entire group is NaN
 for i, level in enumerate(EDU_LEVELS):
     ard[f"C_edu__{i}"] = np.where(
@@ -418,7 +462,7 @@ schema = {
     "schema_version": 1, "feature_manifest_version": 1,
     "dataset": "typed", "table": "data.csv", "test_table": None,
     "split_mode": "internal_random", "task": "regression",
-    "outcome_columns": ["y"], "id_column": None,
+    "outcome_columns": ["y"], "id_column": "row_id",
     "predictor_columns": predictors, "predictor_prefix": None,
     "feature_manifest": "feature_manifest.csv", "exchangeable": True,
     "feature_universe": {
@@ -437,15 +481,19 @@ Path("typed.json").write_text(json.dumps(schema, indent=2))
 ```
 
 If all predictors are mutually independent continuous columns, the manifest may
-be omitted. [`README.md`](README.md) provides a complete template for that case.
+be omitted: set `feature_manifest` and `feature_manifest_version` to `null`, and
+build the universe in step 3 from `source_groups(predictors, None, priors)` with
+`manifest=None`, where `priors` is the schema's `continuous_priors` or `{}`. Each
+predictor then becomes its own continuous source.
 
 ### Validation
 
-`models`, `min_n`, `test_size`, and `seed` are **validation parameters required
-by the validation call** and are unrelated to adapter artifacts. Use any
+`models`, `min_n`, `test_size`, and `seed` are validation parameters required
+by the validation call and are unrelated to adapter artifacts. Use any
 registered model; it affects only the check of the training-row lower bound. Set
 `min_n` and `test_size` to the values planned for the experiment. Under
-`external_test`, `test_size` is ignored.
+`external_test`, `test_size` is ignored. Pass `require_id=True`, as every run
+does, to include the row-ID check.
 
 `validate_input` checks that data tables are readable; version numbers are
 recognized; exactly one predictor rule is
@@ -457,7 +505,8 @@ missing outcomes are removed; required manifest fields are present and
 one-hot row has a valid state; `exchangeable` is true and `group_column` is null;
 and the feature-universe content matches. Under `external_test`,
 it additionally checks matching table structures, ID integrity, and class
-coverage.
+coverage. With `require_id=True`, it also rejects a `null` `id_column`, and under
+`internal_random` it checks that the IDs are non-missing and unique.
 
 Degenerate cases within training subsamples—constant columns, a single class,
 too few samples, or an entirely missing source—are not covered by this
@@ -470,12 +519,12 @@ from aleatoric_nk_grid.validate_input import validate_input
 
 loaded = load_input(Path("typed.json"), "y")
 _, groups = validate_input(loaded, "y", models=["ols"],
-                           min_n=10, test_size=0.3, seed=1)
+                           min_n=10, test_size=0.3, seed=1, require_id=True)
 print([(g.name, g.unit_type, len(g.features)) for g in groups])
 # [('age', 'continuous', 1), ('sat', 'ordinal', 1), ('edu', 'onehot_group', 3)]
 ```
 
-### Pre-Delivery Checklist
+### Pre-delivery checklist
 
 - [ ] Repeated runs on identical input produce identical ARD, manifest, and
       universe content.
@@ -484,6 +533,8 @@ print([(g.name, g.unit_type, len(g.features)) for g in groups])
       been performed.
 - [ ] Rows with missing outcomes have not been removed in advance.
 - [ ] The predictor rule cannot match an outcome or ID column.
+- [ ] `id_column` is set, and its IDs are non-missing and unique within each
+      table (Section 5).
 - [ ] The schema, manifest, universe, and actual predictors are synchronized
       exactly.
 - [ ] Under `internal_random`, perturbing row-level data leaves the fixed universe
@@ -494,6 +545,56 @@ print([(g.name, g.unit_type, len(g.features)) for g in groups])
 - [ ] If provenance is provided, it contains no raw IDs or absolute paths.
 - [ ] `validate_input` raises no errors.
 
-After the adapter artifacts pass validation, see
-[`../NK_Grid/README.md`](../NK_Grid/README.md) for experiment configuration and
-execution instructions.
+## 10. Registering panels and preparing runs
+
+After the adapter artifacts pass validation, register the schema as a panel: add
+an entry whose `schema` field points to it in a panel manifest, as
+`FFCWS/panels.yaml` and `SMR/panels.yaml` do. Launch it with `--manifest` and
+`--panel` as described in the [launch guide](../launch/README.md). A launch either uses existing artifacts
+through `--schema`, or builds them for that run with `--prepare --data-dir DIR`.
+[`../NK_Grid/README.md`](../NK_Grid/README.md) explains how the engine samples N
+and K and fits models.
+
+### The `preparation` declaration
+
+`--prepare` requires a top-level `preparation` mapping in the manifest. Paths are
+relative to the manifest's directory unless stated otherwise.
+
+| Key | Meaning |
+|---|---|
+| `adapter` | Adapter script, run with the compute environment's Python. |
+| `inputs` | Name → raw file, relative to `--data-dir`. Absolute paths and `..` are rejected. |
+| `schema` | Generated schema, relative to the run's `prepared/` directory. |
+| `config` | YAML adapter configuration that the launcher rewrites for the run (FFCWS). |
+| `contract` | Fixed feature contract passed to the adapter; used when there is no `config` (SMR). |
+| `panel_pattern` | Optional regular expression over the panel name; its named groups become fields. A group named `outcome` must equal the panel's outcome. |
+| `arguments` | Optional extra adapter arguments. |
+
+`inputs`, `schema` and `arguments` may contain `{panel}`, `{outcome}` and the
+named groups of `panel_pattern`, filled from the selected panel. FFCWS uses
+`panel_pattern` to take the strategy from the panel name and passes it as
+`--strategy {strategy}`.
+
+### How the launcher calls the adapter
+
+Preparation runs in the bootstrap allocation, after the shared environment is
+ready. The launcher first checks that every declared input exists, then creates
+`<run>/prepared/` and runs the adapter once:
+
+- With `config`, it copies that YAML to `prepared/adapter.yaml`, sets its `paths`
+  entries for each input name, `output_root` (`prepared/work`), `ard_root`
+  (`prepared/ard`) and `schema_root` (`prepared/schema`), restricts `outcomes` to
+  the panel's outcome and `strategies` to the `strategy` field, and passes
+  `--config prepared/adapter.yaml`.
+- Without `config`, it passes `--article-root` (the manifest's directory),
+  `--contract`, `--source` (the input named `source`) and
+  `--output-root prepared/`.
+- It then appends the declared `arguments`, followed by
+  `--validation-model MODEL...`, `--min-n`, `--test-size` and `--seed` from the
+  selected panel, preset and `--models`. The adapter runs `validate_input` with
+  these values before it publishes anything.
+
+The adapter must write all of its outputs under the directories it is given. The
+generated schema must lie inside `prepared/`; the launcher uses it in place of the
+panel's `schema` entry and records its path and SHA-256 in `prepared-launch.json`.
+Raw inputs and tracked files are only read.

@@ -1,6 +1,7 @@
 """Source-aware, per-cell preprocessing for the shared engine."""
 
 from __future__ import annotations
+from sklearn.base import BaseEstimator, TransformerMixin
 
 import json
 from dataclasses import dataclass
@@ -91,6 +92,42 @@ class SourceGroup:
     level_values: tuple[Any, ...] = ()
     ordinal_levels: tuple[Any, ...] = ()
     source_prior: Any = None
+    sampling_source: str | None = None
+
+
+@dataclass(frozen=True)
+class SamplingUnit:
+    """One K-axis unit containing all preprocessing groups from one source."""
+
+    name: str
+    groups: tuple[SourceGroup, ...]
+
+    @property
+    def primary(self) -> SourceGroup:
+        for group in self.groups:
+            if group.name == self.name:
+                return group
+        raise ValueError(f"sampling source {self.name!r} has no primary group")
+
+    @property
+    def features(self) -> tuple[str, ...]:
+        return tuple(
+            feature for group in self.groups for feature in group.features
+        )
+
+
+def sampling_units(groups: Sequence[SourceGroup]) -> tuple[SamplingUnit, ...]:
+    """Bundle derived columns that must enter whenever their source is sampled."""
+
+    bundled: dict[str, list[SourceGroup]] = {}
+    for group in sorted(groups, key=lambda item: item.source_order):
+        source = group.sampling_source or group.name
+        bundled.setdefault(source, []).append(group)
+    units = tuple(
+        SamplingUnit(name=source, groups=tuple(source_groups))
+        for source, source_groups in bundled.items()
+    )
+    return tuple(sorted(units, key=lambda unit: unit.primary.source_order))
 
 
 def source_groups(
@@ -116,9 +153,18 @@ def source_groups(
     if missing:
         raise ValueError(f"Feature manifest is missing columns: {missing}")
     normalized = manifest.copy()
+    if "sampling_source" not in normalized:
+        normalized["sampling_source"] = normalized["source_column"]
     keep = normalized["keep"].map(
         lambda value: _as_bool(value, "manifest.keep")
     )
+    sampling_source = normalized["sampling_source"]
+    kept_sampling_source = sampling_source.loc[keep]
+    if (
+        kept_sampling_source.isna().any()
+        or kept_sampling_source.astype(str).str.strip().eq("").any()
+    ):
+        raise ValueError("manifest.sampling_source must not be empty")
     for field in ("source_order", "feature_order"):
         normalized[field] = pd.to_numeric(
             normalized[field], errors="raise"
@@ -126,6 +172,20 @@ def source_groups(
         if (normalized[field] < 0).any():
             raise ValueError(f"manifest.{field} must be non-negative")
     kept_sources = set(normalized.loc[keep, "source_column"].astype(str))
+    audit_missing = (~keep) & (
+        sampling_source.isna()
+        | sampling_source.astype(str).str.strip().eq("")
+    )
+    for source, audit_rows in normalized.loc[audit_missing].groupby(
+        "source_column", sort=False
+    ):
+        kept_rows = normalized.loc[
+            keep & normalized["source_column"].eq(source), "sampling_source"
+        ]
+        normalized.loc[audit_rows.index, "sampling_source"] = (
+            kept_rows.iloc[0] if not kept_rows.empty else source
+        )
+    normalized["sampling_source"] = normalized["sampling_source"].astype(str)
     source_order_owners: dict[int, str] = {}
     for source, all_rows in normalized.groupby("source_column", sort=False):
         source = str(source)
@@ -143,6 +203,9 @@ def source_groups(
         source_order_owners[order] = source
         if len(all_rows["unit_type"].astype(str).unique()) != 1:
             raise ValueError(f"source {source!r} has inconsistent unit_type")
+        sampling_sources = all_rows["sampling_source"].astype(str).unique()
+        if len(sampling_sources) != 1:
+            raise ValueError(f"source {source!r} has inconsistent sampling_source")
         drop_values = all_rows["drop_first"].map(
             lambda value: _as_bool(value, "manifest.drop_first")
         )
@@ -307,6 +370,7 @@ def source_groups(
                 features=features,
                 source_order=source_order,
                 unit_type=unit_type,
+                sampling_source=str(rows["sampling_source"].iloc[0]),
                 drop_first=drop_first,
                 reference_feature=reference_feature,
                 reference_level=reference_level,
@@ -316,6 +380,15 @@ def source_groups(
             )
         )
     groups.sort(key=lambda group: group.source_order)
+    names = {group.name for group in groups}
+    orphans = sorted(
+        {group.sampling_source for group in groups if group.sampling_source}
+        - names
+    )
+    if orphans:
+        raise ValueError(
+            f"manifest.sampling_source has no kept source_column: {orphans[0]!r}"
+        )
     return tuple(groups)
 
 
@@ -355,9 +428,30 @@ def _source_observed(frame: pd.DataFrame, group: SourceGroup) -> pd.Series:
 def count_unobserved_sources(
     frame: pd.DataFrame, groups: Sequence[SourceGroup]
 ) -> int:
-    """Count selected sources with no observation in one training cell."""
+    """Count sampled sources whose own value representation is unobserved."""
 
-    return int(sum(not _source_observed(frame, group).any() for group in groups))
+    return int(
+        sum(
+            not _source_observed(frame, unit.primary).any()
+            for unit in sampling_units(groups)
+        )
+    )
+
+
+def count_varying_sources(
+    frame: pd.DataFrame, groups: Sequence[SourceGroup]
+) -> int:
+    """Count sampled sources with variation in at least one derived column."""
+
+    return int(
+        sum(
+            frame.loc[:, list(unit.features)]
+            .nunique(dropna=True)
+            .gt(1)
+            .any()
+            for unit in sampling_units(groups)
+        )
+    )
 
 
 def _reference_vector(group: SourceGroup) -> np.ndarray:
@@ -440,7 +534,7 @@ class CellPreprocessingResult:
     passthrough: bool
 
 
-def preprocess_cell(
+def _preprocess_cell_reference(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     groups: Sequence[SourceGroup],
@@ -448,7 +542,7 @@ def preprocess_cell(
     *,
     model_name: str,
 ) -> CellPreprocessingResult:
-    """Fit preprocessing only on one cell and apply the learned state to test."""
+    """Original pandas implementation, retained only as the test oracle."""
 
     train = X_train.copy()
     test = X_test.copy()
@@ -457,7 +551,8 @@ def preprocess_cell(
     for group in groups:
         observed = _source_observed(train, group)
         if not observed.any():
-            unobserved += 1
+            if (group.sampling_source or group.name) == group.name:
+                unobserved += 1
             if passthrough:
                 train.loc[:, list(group.features)] = np.nan
                 test.loc[:, list(group.features)] = np.nan
@@ -516,3 +611,327 @@ def preprocess_cell(
         K_unobserved=unobserved,
         passthrough=passthrough,
     )
+
+
+def _validate_disjoint_group_features(groups: Sequence[SourceGroup]) -> None:
+    """Reject input for which delayed writes would change legacy semantics."""
+
+    owners: dict[str, str] = {}
+    for group in groups:
+        for feature in group.features:
+            previous = owners.get(feature)
+            if previous is not None:
+                raise ValueError(
+                    f"source groups {previous!r} and {group.name!r} share feature "
+                    f"{feature!r}"
+                )
+            owners[feature] = group.name
+
+
+def _supports_vectorized_preprocessing(
+    X_train: pd.DataFrame, X_test: pd.DataFrame
+) -> bool:
+    """Return whether numeric numpy columns can retain legacy dtype semantics."""
+
+    if not X_train.columns.is_unique or not X_test.columns.is_unique:
+        return False
+    if not len(X_train.columns) or not len(X_test.columns):
+        return False
+    return all(
+        train_dtype == test_dtype
+        and pd.api.types.is_numeric_dtype(train_dtype)
+        and not pd.api.types.is_extension_array_dtype(train_dtype)
+        for train_dtype, test_dtype in zip(X_train.dtypes, X_test.dtypes)
+    )
+
+
+def _homogeneous_float_frame(frame: pd.DataFrame) -> bool:
+    dtypes = tuple(frame.dtypes)
+    return bool(dtypes) and all(dtype == dtypes[0] for dtype in dtypes) and (
+        pd.api.types.is_float_dtype(dtypes[0])
+    )
+
+
+def _vectorized_onehot_fill(
+    train_values: np.ndarray,
+    test_values: np.ndarray,
+    positions: np.ndarray,
+    group: SourceGroup,
+) -> None:
+    """Apply `_fill_onehot`'s exact state and tie-break rules to ndarrays."""
+
+    train_group = train_values[:, positions]
+    test_group = test_values[:, positions]
+    train_missing = np.isnan(train_group).all(axis=1)
+    test_missing = np.isnan(test_group).all(axis=1)
+    if not train_missing.any() and not test_missing.any():
+        return
+
+    observed = train_group[~train_missing]
+    states = observed.argmax(axis=1)
+    if group.drop_first:
+        states = states.copy()
+        states[observed.sum(axis=1) == 0] = len(group.features)
+    counts = np.bincount(states, minlength=len(group.features) + 1)
+    max_count = counts.max()
+    candidates = np.flatnonzero(counts == max_count)
+    mode_state = min(
+        (int(state) for state in candidates),
+        key=lambda state: -1 if state == len(group.features) else state,
+    )
+    if mode_state == len(group.features):
+        fill = _reference_vector(group)
+    else:
+        fill = np.zeros(len(group.features), dtype=float)
+        fill[mode_state] = 1.0
+    if train_missing.any():
+        train_values[np.ix_(train_missing, positions)] = fill
+    if test_missing.any():
+        test_values[np.ix_(test_missing, positions)] = fill
+
+
+def _preprocess_cell_vectorized(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    groups: Sequence[SourceGroup],
+    imputation: Mapping[str, Any],
+) -> CellPreprocessingResult:
+    """Vectorized imputed preprocessing for homogeneous floating-point frames."""
+
+    train_values = X_train.to_numpy(copy=True)
+    test_values = X_test.to_numpy(copy=True)
+    positions = {column: index for index, column in enumerate(X_train.columns)}
+    unobserved = 0
+    for group in groups:
+        group_positions = np.fromiter(
+            (positions[feature] for feature in group.features), dtype=np.intp
+        )
+        train_group = train_values[:, group_positions]
+        missing = np.isnan(train_group).all(axis=1)
+        observed = ~missing
+        if not observed.any():
+            if (group.sampling_source or group.name) == group.name:
+                unobserved += 1
+            if group.unit_type == "onehot_group":
+                prior = _reference_vector(group)
+                train_values[:, group_positions] = prior
+                test_values[:, group_positions] = prior
+            else:
+                feature_position = int(group_positions[0])
+                train_values[:, feature_position] = group.source_prior
+                test_values[:, feature_position] = group.source_prior
+            continue
+        if group.unit_type == "continuous":
+            feature = group.features[0]
+            feature_position = int(group_positions[0])
+            train_missing = ~observed
+            test_missing = np.isnan(test_values[:, feature_position])
+            if not train_missing.any() and not test_missing.any():
+                continue
+            values = X_train[feature]
+            statistic = (
+                float(values.median())
+                if imputation["continuous"] == "median"
+                else float(values.mean())
+            )
+            if train_missing.any():
+                train_values[train_missing, feature_position] = statistic
+            if test_missing.any():
+                test_values[test_missing, feature_position] = statistic
+        elif group.unit_type == "ordinal":
+            feature = group.features[0]
+            feature_position = int(group_positions[0])
+            train_missing = ~observed
+            test_missing = np.isnan(test_values[:, feature_position])
+            if not train_missing.any() and not test_missing.any():
+                continue
+            statistic = _ordinal_statistic(
+                X_train[feature], group, imputation["ordinal"]
+            )
+            if train_missing.any():
+                train_values[train_missing, feature_position] = statistic
+            if test_missing.any():
+                test_values[test_missing, feature_position] = statistic
+        else:
+            _vectorized_onehot_fill(
+                train_values, test_values, group_positions, group
+            )
+    return CellPreprocessingResult(
+        X_train=pd.DataFrame(train_values, index=X_train.index, columns=X_train.columns),
+        X_test=pd.DataFrame(test_values, index=X_test.index, columns=X_test.columns),
+        K_unobserved=unobserved,
+        passthrough=False,
+    )
+
+
+def _preprocess_cell_vectorized_mixed(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    groups: Sequence[SourceGroup],
+    imputation: Mapping[str, Any],
+) -> CellPreprocessingResult:
+    """Vectorize writes to float columns while preserving integer columns.
+
+    Integer numpy columns cannot contain NaN, so they need no imputation writes.
+    Group-level observation decisions are nevertheless made from every feature,
+    which preserves mixed one-hot group semantics.
+    """
+
+    train = X_train.copy()
+    test = X_test.copy()
+    float_columns = [
+        column for column, dtype in X_train.dtypes.items()
+        if pd.api.types.is_float_dtype(dtype)
+    ]
+    train_values = {
+        column: X_train[column].to_numpy(copy=True) for column in float_columns
+    }
+    test_values = {
+        column: X_test[column].to_numpy(copy=True) for column in float_columns
+    }
+
+    def values(column: str, *, is_test: bool = False) -> np.ndarray:
+        if column in train_values:
+            return (test_values if is_test else train_values)[column]
+        return (X_test if is_test else X_train)[column].to_numpy(copy=False)
+
+    unobserved = 0
+    for group in groups:
+        features = list(group.features)
+        train_group = np.column_stack([values(feature) for feature in features])
+        missing = pd.isna(train_group).all(axis=1)
+        observed = ~missing
+        if not observed.any():
+            if (group.sampling_source or group.name) == group.name:
+                unobserved += 1
+            if group.unit_type == "onehot_group":
+                fill = _reference_vector(group)
+                for feature, value in zip(features, fill):
+                    train_values[feature][:] = value
+                    test_values[feature][:] = value
+            else:
+                feature = features[0]
+                train_values[feature][:] = group.source_prior
+                test_values[feature][:] = group.source_prior
+            continue
+        if group.unit_type == "continuous":
+            feature = features[0]
+            if feature not in train_values:
+                continue
+            train_missing = ~observed
+            test_missing = np.isnan(test_values[feature])
+            if not train_missing.any() and not test_missing.any():
+                continue
+            source = X_train[feature]
+            statistic = (
+                float(source.median())
+                if imputation["continuous"] == "median"
+                else float(source.mean())
+            )
+            train_values[feature][train_missing] = statistic
+            test_values[feature][test_missing] = statistic
+        elif group.unit_type == "ordinal":
+            feature = features[0]
+            if feature not in train_values:
+                continue
+            train_missing = ~observed
+            test_missing = np.isnan(test_values[feature])
+            if not train_missing.any() and not test_missing.any():
+                continue
+            statistic = _ordinal_statistic(X_train[feature], group, imputation["ordinal"])
+            train_values[feature][train_missing] = statistic
+            test_values[feature][test_missing] = statistic
+        else:
+            test_group = np.column_stack(
+                [values(feature, is_test=True) for feature in features]
+            )
+            train_missing = pd.isna(train_group).all(axis=1)
+            test_missing = pd.isna(test_group).all(axis=1)
+            if not train_missing.any() and not test_missing.any():
+                continue
+            observed_values = train_group[~train_missing]
+            states = observed_values.argmax(axis=1)
+            if group.drop_first:
+                states = states.copy()
+                states[observed_values.sum(axis=1) == 0] = len(features)
+            counts = np.bincount(states, minlength=len(features) + 1)
+            candidates = np.flatnonzero(counts == counts.max())
+            mode = min(
+                (int(state) for state in candidates),
+                key=lambda state: -1 if state == len(features) else state,
+            )
+            fill = _reference_vector(group) if mode == len(features) else np.eye(1, len(features), mode)[0]
+            for feature, value in zip(features, fill):
+                train_values[feature][train_missing] = value
+                test_values[feature][test_missing] = value
+    for column in float_columns:
+        train[column] = train_values[column]
+        test[column] = test_values[column]
+    train.attrs["_preprocess_vectorized"] = True
+    test.attrs["_preprocess_vectorized"] = True
+    return CellPreprocessingResult(train, test, unobserved, False)
+
+
+class FoldPreprocessor(TransformerMixin, BaseEstimator):
+    """Learn the existing typed fill/prior contract using training rows only."""
+
+    def __init__(self, groups, imputation, model_name):
+        self.groups = groups
+        self.imputation = imputation
+        self.model_name = model_name
+
+    def _fit_cell(self, X):
+        self.columns_ = tuple(X.columns)
+        probe = pd.DataFrame(np.nan, index=[0], columns=self.columns_)
+        result = preprocess_cell(X, probe, self.groups, self.imputation, model_name=self.model_name)
+        self.fill_ = result.X_test.iloc[0].copy()
+        self.unobserved_ = tuple(not _source_observed(X, group).any() for group in self.groups)
+        self.passthrough_ = result.passthrough
+        return result
+
+    def fit(self, X, y=None):
+        self._fit_cell(X)
+        return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        return self._fit_cell(X).X_train
+
+    def transform(self, X):
+        if tuple(X.columns) != self.columns_:
+            raise ValueError("fold preprocessing column order mismatch")
+        # Validated one-hot sources are either observed atomically or all NaN.
+        # Applying the learned fill row in one operation preserves that rule
+        # without repeated group-wise DataFrame indexing on every LOO fold.
+        result = X.copy() if self.passthrough_ else X.fillna(self.fill_)
+        forced = [feature for group, absent in zip(self.groups, self.unobserved_, strict=True)
+                  if absent for feature in group.features]
+        if forced:
+            result.loc[:, forced] = self.fill_.loc[forced].to_numpy()
+        return result
+
+
+def preprocess_cell(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    groups: Sequence[SourceGroup],
+    imputation: Mapping[str, Any],
+    *,
+    model_name: str,
+) -> CellPreprocessingResult:
+    """Fit preprocessing only on one cell and apply the learned state to test."""
+
+    _validate_disjoint_group_features(groups)
+    passthrough = imputation["model_overrides"].get(model_name) == "passthrough"
+    if passthrough or not _supports_vectorized_preprocessing(X_train, X_test):
+        result = _preprocess_cell_reference(
+            X_train, X_test, groups, imputation, model_name=model_name
+        )
+        result.X_train.attrs["_preprocess_vectorized"] = False
+        result.X_test.attrs["_preprocess_vectorized"] = False
+        return result
+    if _homogeneous_float_frame(X_train) and _homogeneous_float_frame(X_test):
+        result = _preprocess_cell_vectorized(X_train, X_test, groups, imputation)
+        result.X_train.attrs["_preprocess_vectorized"] = True
+        result.X_test.attrs["_preprocess_vectorized"] = True
+        return result
+    return _preprocess_cell_vectorized_mixed(X_train, X_test, groups, imputation)

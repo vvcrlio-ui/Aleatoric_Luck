@@ -1,0 +1,3 @@
+# Linux/Slurm entry points must survive Windows checkouts with LF endings.
+*.sh text eol=lf
+*.sbatch text eol=lf

@@ -1,18 +1,27 @@
+# One catalog for both SMR experiments. Select one with --panel.
+# Each cell fits the eight base models and combines SL7 (super_learner) from their OOF predictions.
 model_params: model_params.yaml
 preset: dev
 experiment_id: smr-aleatoric-v1
-data_version: smr-ard-v1
-model_spec_version: nkgrid-models-v1
+data_version: smr-ard-v2
+model_spec_version: nkgrid-models-v7-relative-lasso-3fold-1
+
+preparation:
+  adapter: adapter/adapter.py
+  contract: adapter/config/asample2_withlag.json
+  inputs:
+    source: asample2_withlag.csv
+  schema: schema/asample2_withlag.json
 
 panels:
-  - name: smr_hourlywage
+  - &smr_panel
+    name: smr_hourlywage
     schema: schema/asample2_withlag.json
     outcome: Cm_lhourlywage
-    models: &smr_models
+    models:
       - ols
       - ridge
       - lasso
-      - elastic_net
       - random_forest
       - xgboost
       - lightgbm
@@ -21,8 +30,7 @@ panels:
       - super_learner
     out: outputs/nk_grid_smr_hourlywage.csv
 
-  - name: smr_totalincome
-    schema: schema/asample2_withlag.json
+  - <<: *smr_panel
+    name: smr_totalincome
     outcome: Cm_ltotalincome
-    models: *smr_models
     out: outputs/nk_grid_smr_totalincome.csv

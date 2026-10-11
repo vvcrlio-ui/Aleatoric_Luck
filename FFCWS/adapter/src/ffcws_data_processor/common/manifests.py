@@ -58,10 +58,15 @@ def feature_row(
     source_prior: Any = None,
     force_keep: bool | None = None,
     source_column: str | None = None,
+    sampling_source: str | None = None,
     source_order: int | None = None,
 ) -> dict[str, Any]:
+    resolved_source = source.source_column if source_column is None else source_column
     return {
-        "source_column": source.source_column if source_column is None else source_column,
+        "source_column": resolved_source,
+        "sampling_source": (
+            source.source_column if sampling_source is None else sampling_source
+        ),
         "feature_name": feature.feature_name,
         "kind": feature.kind,
         "strategy": strategy,
@@ -89,6 +94,7 @@ def feature_row(
 def manifest_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
     columns = [
         "source_column",
+        "sampling_source",
         "feature_name",
         "kind",
         "strategy",
@@ -113,10 +119,14 @@ def manifest_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
 
 def kept_source_order(manifest: pd.DataFrame) -> list[str]:
     kept = manifest[manifest["keep"].astype(bool)]
+    source_field = (
+        "sampling_source" if "sampling_source" in kept.columns else "source_column"
+    )
     return (
-        kept.loc[:, ["source_column", "source_order"]]
-        .drop_duplicates()
-        .sort_values("source_order", kind="stable")["source_column"]
+        kept.loc[:, [source_field, "source_order"]]
+        .groupby(source_field, sort=False, as_index=False)["source_order"]
+        .min()
+        .sort_values("source_order", kind="stable")[source_field]
         .astype(str)
         .tolist()
     )

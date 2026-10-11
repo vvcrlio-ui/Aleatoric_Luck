@@ -1,6 +1,7 @@
 """Fail-fast validation for adapter schemas and projected ARD tables."""
 
 from __future__ import annotations
+from .phase_timing import timed_phase
 
 import json
 from pathlib import Path
@@ -17,10 +18,14 @@ from .preprocessing import SourceGroup, source_groups, validate_onehot_states
 REGRESSION_CV_MIN_N = {
     "ridge": 2,
     "lasso": 2,
-    "elastic_net": 2,
+    "shallow_neural_network": 2,
     "lightgbm": 5,
-    "super_learner": 5,
 }
+
+# Classification CV uses stratified folds, which need two rows of each class.
+CLASSIFICATION_CV_MODELS = frozenset(
+    ("ridge", "lasso", "shallow_neural_network", "xgboost", "lightgbm")
+)
 
 
 def canonical_feature_universe(
@@ -34,6 +39,12 @@ def canonical_feature_universe(
         "sources": [
             {
                 "source": group.name,
+                **(
+                    {"sampling_source": group.sampling_source}
+                    if group.sampling_source
+                    and group.sampling_source != group.name
+                    else {}
+                ),
                 "source_order": group.source_order,
                 "unit_type": group.unit_type,
                 "features": [
@@ -90,6 +101,12 @@ def canonical_feature_universe(
             result["audit_features"] = [
                 {
                     "source": str(row.source_column),
+                    **(
+                        {"sampling_source": str(row.sampling_source)}
+                        if hasattr(row, "sampling_source")
+                        and str(row.sampling_source) != str(row.source_column)
+                        else {}
+                    ),
                     "feature": str(row.feature_name),
                     "source_order": int(row.source_order),
                     "feature_order": int(row.feature_order),
@@ -200,6 +217,15 @@ def _validate_ids(train: pd.DataFrame, test: pd.DataFrame, id_column: str) -> No
         )
 
 
+def _validate_single_frame_ids(
+    frame: pd.DataFrame, id_column: str, *, label: str
+) -> None:
+    if frame[id_column].isna().any():
+        raise ValueError(f"{label} id_column {id_column!r} contains missing IDs")
+    if frame[id_column].duplicated().any():
+        raise ValueError(f"{label} id_column {id_column!r} contains duplicate IDs")
+
+
 def _validate_typed_values(
     frame: pd.DataFrame, groups: Sequence[SourceGroup], label: str
 ) -> None:
@@ -307,6 +333,7 @@ def _validate_provenance(schema: InputSchema) -> None:
         raise ValueError("provenance.json is invalid JSON") from exc
 
 
+@timed_phase("input.validate_and_hash")
 def validate_input(
     loaded: LoadedInput,
     outcome: str,
@@ -315,10 +342,16 @@ def validate_input(
     min_n: int,
     test_size: float,
     seed: int,
+    require_id: bool = False,
 ) -> tuple[LoadedInput, tuple[SourceGroup, ...]]:
     """Validate all global contracts before sampling creates any model cell."""
 
     schema = loaded.schema
+    if require_id and schema.id_column is None:
+        raise ValueError(
+            "Per-row prediction export requires schema.id_column; "
+            "index fallback is not supported"
+        )
     groups = source_groups(
         loaded.predictors, loaded.manifest, schema.continuous_priors
     )
@@ -332,6 +365,11 @@ def validate_input(
         # ID integrity is a whole-table contract and must not depend on which
         # rows survive the selected outcome's missing-value deletion.
         _validate_ids(loaded.train, loaded.test, schema.id_column)
+    elif require_id:
+        assert schema.id_column is not None
+        _validate_single_frame_ids(
+            loaded.train, schema.id_column, label="training data"
+        )
     train = _outcome_observed(
         loaded.train,
         outcome,
@@ -380,6 +418,7 @@ def validate_input(
 
 
 __all__ = [
+    "CLASSIFICATION_CV_MODELS",
     "REGRESSION_CV_MIN_N",
     "canonical_feature_universe",
     "validate_input",

@@ -1,8 +1,21 @@
+# One catalog for all 18 FFC experiments. Select one with --panel.
+# Each cell fits the eight base models and combines SL7 (super_learner) from their OOF predictions.
 model_params: model_params.yaml
 preset: dev
 experiment_id: ffcws-aleatoric-v1
 data_version: ffcws-ard-v1
-model_spec_version: nkgrid-models-v1
+model_spec_version: nkgrid-models-v6-balanced-batch-1
+
+preparation:
+  adapter: adapter/adapter.py
+  config: adapter/config/ffc.yaml
+  inputs:
+    background: background.dta
+    train: train.csv
+    test: test.csv
+  panel_pattern: 'ffc_(?P<strategy>median_mode|median_missing_indicator|tree_ordinal)_(?P<outcome>.+)'
+  arguments: [--strategy, '{strategy}']
+  schema: 'schema/{panel}.json'
 
 panels:
   - &ffc_panel
@@ -13,7 +26,6 @@ panels:
       - ols
       - ridge
       - lasso
-      - elastic_net
       - random_forest
       - xgboost
       - lightgbm

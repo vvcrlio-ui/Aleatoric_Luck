@@ -24,10 +24,6 @@ models = [
 parquet = ["pyarrow==25.0.0"]
 test = ["pytest>=8,<10"]
 
-[project.scripts]
-aleatoric-nk-grid = "aleatoric_nk_grid.nk_grid:main"
-aleatoric-nk-grid-panels = "aleatoric_nk_grid.run_panels:main"
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -36,4 +32,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not slow'"
+markers = ["slow: large synthetic performance or equivalence benchmark, run explicitly"]
