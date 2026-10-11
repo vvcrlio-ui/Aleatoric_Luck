@@ -22,7 +22,6 @@ from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     balanced_accuracy_score,
-    brier_score_loss,
     d2_absolute_error_score,
     explained_variance_score,
     f1_score,
@@ -38,7 +37,8 @@ from sklearn.model_selection import train_test_split
 
 ROOT = Path(__file__).resolve().parents[2]
 
-from .evaluation import r2_against_training_mean, regression_denominators, METRIC_DEFINITION_VERSION
+from .evaluation import (CLASSIFICATION_METRIC_DEFINITION_VERSION, METRIC_DEFINITION_VERSION, classification_denominators,
+                         r2_against_training_mean, regression_denominators)
 from .execution_contract import (
     CellExecutionSpec,
     ContractError,
@@ -481,40 +481,18 @@ def compute_regression_metrics(y_test, y_pred, y_train, y_train_full) -> dict[st
     }
 
 
-def _mcfadden_pseudo_r2(y_true: np.ndarray, clipped: np.ndarray, y_null: np.ndarray) -> float:
-    """McFadden pseudo R-squared against a null that predicts the positive rate of ``y_null``."""
-
-    positive_rate = float(np.mean(y_null)) if len(y_null) else np.nan
-    if len(np.unique(y_true)) != 2 or not np.isfinite(positive_rate) or not 0.0 < positive_rate < 1.0:
-        return np.nan
-    model_loglik = float(np.sum(y_true * np.log(clipped) + (1 - y_true) * np.log(1 - clipped)))
-    null_loglik = float(np.sum(y_true * np.log(positive_rate) + (1 - y_true) * np.log(1 - positive_rate)))
-    return 1.0 - model_loglik / null_loglik if null_loglik != 0 else np.nan
-
-
 def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> dict[str, float]:
-    """Compute binary classification metrics from positive-class probabilities.
-
-    ``y_train`` is the N sampled training rows. ``y_train_full`` is the whole training pool the
-    rows were drawn from, so its null is one constant across every N, K, seed and draw.
-    ``brier_full_train_r2`` is the Fragile Families Challenge R-squared (Salganik et al. 2020, eq. 1):
-    the Brier score rescaled by that of predicting the training pool's positive rate.
-    """
+    """Compute binary classification metrics from positive-class probabilities; see
+    ``classification_denominators`` for the scores against a null."""
 
     y_true = np.asarray(y_test, dtype=int)
     score = np.asarray(y_score, dtype=float)
-    train = np.asarray(y_train, dtype=int)
-    full = np.asarray(y_train_full, dtype=int)
     has_two_test_classes = len(np.unique(y_true)) == 2
     finite_scores = np.all(np.isfinite(score))
     if not finite_scores:
         return _empty_classification_metrics()
     labels = (score >= 0.5).astype(int)
     clipped = np.clip(score, 1e-15, 1 - 1e-15)
-    mcfadden = _mcfadden_pseudo_r2(y_true, clipped, train)
-    mcfadden_full = _mcfadden_pseudo_r2(y_true, clipped, full)
-    brier = float(brier_score_loss(y_true, score))
-    null_brier = float(np.mean((y_true - np.mean(full)) ** 2)) if len(full) else np.nan
 
     return {
         "roc_auc": (
@@ -527,7 +505,6 @@ def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> di
             if has_two_test_classes and finite_scores
             else np.nan
         ),
-        "brier": brier,
         "log_loss": (
             float(log_loss(y_true, clipped, labels=[0, 1]))
             if has_two_test_classes and finite_scores
@@ -540,9 +517,7 @@ def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> di
         ),
         "f1": float(f1_score(y_true, labels, zero_division=0)),
         "accuracy": float(accuracy_score(y_true, labels)),
-        "mcfadden_pseudo_r2": float(mcfadden),
-        "mcfadden_full_train_pseudo_r2": float(mcfadden_full),
-        "brier_full_train_r2": 1.0 - brier / null_brier if null_brier > 0 else np.nan,
+        **classification_denominators(y_true, score, y_train, y_train_full),
     }
 
 
@@ -785,7 +760,7 @@ class NKGridExecutionSession:
         self.repeat_pairs = resolve_repeat_pairs(config)
         self.n_grid, self.k_grid = resolve_input_grids(config, loaded, source_definitions)
         self.semantic_contract = {
-            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else "classification-v3",
+            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else CLASSIFICATION_METRIC_DEFINITION_VERSION,
             "kind": "nk_grid" if self.task == "regression" else "nk_grid_classification",
             "algorithm_version": algorithm_version,
             "dataset": self.dataset,
