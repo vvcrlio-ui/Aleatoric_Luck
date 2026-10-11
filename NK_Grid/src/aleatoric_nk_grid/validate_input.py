@@ -20,12 +20,11 @@ REGRESSION_CV_MIN_N = {
     "lasso": 2,
     "shallow_neural_network": 2,
     "lightgbm": 5,
-    "super_learner": 5,
 }
 
 # Classification CV uses stratified folds, which need two rows of each class.
 CLASSIFICATION_CV_MODELS = frozenset(
-    ("ridge", "lasso", "shallow_neural_network", "xgboost", "lightgbm", "super_learner")
+    ("ridge", "lasso", "shallow_neural_network", "xgboost", "lightgbm")
 )
 
 

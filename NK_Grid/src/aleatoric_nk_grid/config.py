@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
 
 DEFAULT_MODEL_PARAMS_PATH = Path(__file__).resolve().parents[2] / "model_params.yaml"
@@ -27,8 +27,6 @@ class NKGridConfig:
     n_jobs: int
     min_n: int = 10
     model_params: Path = DEFAULT_MODEL_PARAMS_PATH
-    native_process_max_attempts: int = 2
-    native_process_timeout_seconds: float = 21_600.0
     preset: str | None = None
     allow_large_run: bool = False
     # Direct construction is used by the test/dev API. Production manifests
@@ -39,15 +37,8 @@ class NKGridConfig:
     repeat_plan: tuple[tuple[int, int], ...] | None = None
     n_grid: tuple[int, ...] | None = None
     k_grid: tuple[int, ...] | None = None
-    checkpoint_retention: str = "keep"
     # Applied to the full source grid; frozen three-point grids stay unchanged.
     grid_selection: str = "all"
-    prediction_cache: Mapping[str, Any] | None = None
-    execution: Mapping[str, Any] | None = None
-
-    def __post_init__(self):
-        from .prediction_contract import normalize_prediction_options
-        normalize_prediction_options(self.prediction_cache, self.execution)
 
 
 def resolve_repeat_pairs(config: NKGridConfig) -> tuple[tuple[int, int], ...]:

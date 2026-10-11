@@ -8,14 +8,12 @@ from .config import (
     execution_groups_for_models, group_repeat_pairs_by_seed, resolve_repeat_pairs,
 )
 
-import json
 import resource
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -24,7 +22,6 @@ from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     balanced_accuracy_score,
-    brier_score_loss,
     d2_absolute_error_score,
     explained_variance_score,
     f1_score,
@@ -40,7 +37,8 @@ from sklearn.model_selection import train_test_split
 
 ROOT = Path(__file__).resolve().parents[2]
 
-from .evaluation import r2_against_training_mean, regression_denominators, METRIC_DEFINITION_VERSION
+from .evaluation import (CLASSIFICATION_METRIC_DEFINITION_VERSION, METRIC_DEFINITION_VERSION, classification_denominators,
+                         r2_against_training_mean, regression_denominators)
 from .execution_contract import (
     CellExecutionSpec,
     ContractError,
@@ -49,7 +47,6 @@ from .execution_contract import (
     sha256_file,
 )
 from .experiment import (
-    SERIAL_OUTER_MODELS,
     add_metadata,
     build_experiment_metadata,
     git_state,
@@ -61,11 +58,9 @@ from .model_registry import (
     SUPPORTED_MODEL_NAMES,
     load_algorithm_version,
     load_model_params,
-    make_model,
     reject_removed_model,
     resolved_model_params,
 )
-from .native_process import IsolatedProcessRunner
 from .preprocessing import (
     FoldPreprocessor,
     SourceGroup,
@@ -92,30 +87,10 @@ ROW_METADATA_FIELDS = (
 )
 
 
-_NATIVE_RUNNER_LOCK = threading.Lock()
-
-
-def _run_native_model_cell_locked(
-    runner: IsolatedProcessRunner,
-    *,
-    fit_arguments: dict[str, Any],
-    on_native_crash: Callable[[int, BaseException], None],
-    on_native_timeout: Callable[[int, BaseException], None],
-) -> dict[str, Any]:
-    """Serialize access to the one reusable native-model subprocess."""
-
-    with _NATIVE_RUNNER_LOCK:
-        return runner.run(
-            _fit_predict_model_cell,
-            **fit_arguments,
-            on_native_crash=on_native_crash,
-            on_native_timeout=on_native_timeout,
-        )
-
-
 METRIC_COLUMNS = (
     "r2_test",
     "mse", "null_mse_train_mean", "test_target_variance", "skill_train_mean", "r2_test_mean",
+    "null_mse_full_train_mean", "r2_full_train_mean",
     "skill_score_pct",
     "rmse",
     "mae",
@@ -156,6 +131,8 @@ CLASSIFICATION_METRIC_COLUMNS = (
     "f1",
     "accuracy",
     "mcfadden_pseudo_r2",
+    "mcfadden_full_train_pseudo_r2",
+    "brier_full_train_r2",
 )
 
 BASE_RESULT_COLUMNS = (
@@ -434,12 +411,13 @@ def _concordance_correlation_coefficient(y_true: np.ndarray, y_pred: np.ndarray)
     return 2.0 * covariance / denominator
 
 
-def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
+def compute_regression_metrics(y_test, y_pred, y_train, y_train_full) -> dict[str, float]:
     """Compute continuous-outcome metrics for one fitted model run."""
 
     y_true = _as_float_array(y_test)
     preds = _as_float_array(y_pred)
     train = _as_float_array(y_train)
+    full = _as_float_array(y_train_full)
     mse = float(mean_squared_error(y_true, preds))
     rmse = float(np.sqrt(mse))
     mae = float(mean_absolute_error(y_true, preds))
@@ -458,7 +436,7 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
     bottom_pred = preds <= np.quantile(preds, 0.10)
     return {
         "r2_test": r2_test,
-        **regression_denominators(y_true, preds, train),
+        **regression_denominators(y_true, preds, train, full),
         "skill_score_pct": 100.0 * r2_test,
         "rmse": rmse,
         "mae": mae,
@@ -503,41 +481,18 @@ def compute_regression_metrics(y_test, y_pred, y_train) -> dict[str, float]:
     }
 
 
-def compute_classification_metrics(y_test, y_score, y_train) -> dict[str, float]:
-    """Compute binary classification metrics from positive-class probabilities."""
+def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> dict[str, float]:
+    """Compute binary classification metrics from positive-class probabilities; see
+    ``classification_denominators`` for the scores against a null."""
 
     y_true = np.asarray(y_test, dtype=int)
     score = np.asarray(y_score, dtype=float)
-    train = np.asarray(y_train, dtype=int)
     has_two_test_classes = len(np.unique(y_true)) == 2
     finite_scores = np.all(np.isfinite(score))
     if not finite_scores:
         return _empty_classification_metrics()
     labels = (score >= 0.5).astype(int)
-    if finite_scores:
-        clipped = np.clip(score, 1e-15, 1 - 1e-15)
-    else:
-        clipped = score
-
-    positive_rate = float(np.mean(train)) if len(train) else np.nan
-    if (
-        has_two_test_classes
-        and finite_scores
-        and np.isfinite(positive_rate)
-        and 0.0 < positive_rate < 1.0
-    ):
-        model_loglik = float(
-            np.sum(y_true * np.log(clipped) + (1 - y_true) * np.log(1 - clipped))
-        )
-        null_loglik = float(
-            np.sum(
-                y_true * np.log(positive_rate)
-                + (1 - y_true) * np.log(1 - positive_rate)
-            )
-        )
-        mcfadden = 1.0 - model_loglik / null_loglik if null_loglik != 0 else np.nan
-    else:
-        mcfadden = np.nan
+    clipped = np.clip(score, 1e-15, 1 - 1e-15)
 
     return {
         "roc_auc": (
@@ -550,7 +505,6 @@ def compute_classification_metrics(y_test, y_score, y_train) -> dict[str, float]
             if has_two_test_classes and finite_scores
             else np.nan
         ),
-        "brier": float(brier_score_loss(y_true, score)) if finite_scores else np.nan,
         "log_loss": (
             float(log_loss(y_true, clipped, labels=[0, 1]))
             if has_two_test_classes and finite_scores
@@ -563,7 +517,7 @@ def compute_classification_metrics(y_test, y_score, y_train) -> dict[str, float]
         ),
         "f1": float(f1_score(y_true, labels, zero_division=0)),
         "accuracy": float(accuracy_score(y_true, labels)),
-        "mcfadden_pseudo_r2": float(mcfadden),
+        **classification_denominators(y_true, score, y_train, y_train_full),
     }
 
 
@@ -613,39 +567,6 @@ def _ols_is_underdetermined(X: pd.DataFrame) -> bool:
     return expanded_varying >= len(X)
 
 
-def _model_converged(model) -> bool:
-    """Read deterministic iteration limits through fitted estimator wrappers."""
-
-    statuses: list[bool] = []
-    seen: set[int] = set()
-
-    def visit(estimator) -> None:
-        if estimator is None or id(estimator) in seen:
-            return
-        seen.add(id(estimator))
-
-        if hasattr(estimator, "n_iter_") and hasattr(estimator, "max_iter"):
-            iterations = np.asarray(getattr(estimator, "n_iter_"), dtype=float)
-            finite = iterations[np.isfinite(iterations)]
-            if finite.size:
-                statuses.append(bool(np.max(finite) < float(estimator.max_iter)))
-
-        if hasattr(estimator, "steps"):
-            for _, step in estimator.steps:
-                visit(step)
-        if hasattr(estimator, "regressor_"):
-            visit(estimator.regressor_)
-        if hasattr(estimator, "model_"):
-            visit(estimator.model_)
-        if hasattr(estimator, "final_estimator_"):
-            visit(estimator.final_estimator_)
-            for fitted_estimator in getattr(estimator, "estimators_", ()):
-                visit(fitted_estimator)
-
-    visit(model)
-    return all(statuses) if statuses else True
-
-
 def _model_best_rounds(model) -> float:
     """Find a fitted boosting round count through common wrapper layers."""
 
@@ -658,78 +579,6 @@ def _model_best_rounds(model) -> float:
         return _model_best_rounds(model.steps[-1][1])
     if hasattr(model, "regressor_"):
         return _model_best_rounds(model.regressor_)
-    return np.nan
-
-
-def _model_attribute_values(model, attribute: str) -> list[Any]:
-    """Read one fitted attribute through common estimator wrappers.
-
-    The traversal is deliberately model-agnostic and shared by all fit-state
-    diagnostics so a wrapper added to one diagnostic cannot silently be absent
-    from another.
-    """
-
-    values: list[Any] = []
-    seen: set[int] = set()
-
-    def visit(estimator) -> None:
-        if estimator is None or id(estimator) in seen:
-            return
-        seen.add(id(estimator))
-        value = getattr(estimator, attribute, None)
-        if value is not None:
-            values.append(value)
-        if hasattr(estimator, "steps"):
-            for _, step in estimator.steps:
-                visit(step)
-        for child_attribute in ("regressor_", "model_", "final_estimator_"):
-            visit(getattr(estimator, child_attribute, None))
-        for fitted_estimator in getattr(estimator, "estimators_", ()):
-            visit(fitted_estimator)
-
-    visit(model)
-    return values
-
-
-def _model_solver(model) -> str | None:
-    """Find an estimator's fitted solver through common wrapper layers.
-
-    ``solver_`` records the solver actually selected by estimators that accept
-    an automatic choice, so it wins globally over a configured ``solver``.
-    The traversal is deliberately duck-typed and model-agnostic.
-    """
-
-    selected = _model_attribute_values(model, "solver_")
-    configured = _model_attribute_values(model, "solver")
-    value = selected[0] if selected else (configured[0] if configured else None)
-    return None if value is None else str(value)
-
-
-def _model_iterations(model) -> float:
-    """Return the largest finite observed ``n_iter_``, or NaN when absent."""
-
-    iterations: list[float] = []
-    for value in _model_attribute_values(model, "n_iter_"):
-        try:
-            array = np.asarray(value, dtype=float)
-        except (TypeError, ValueError):
-            continue
-        finite = array[np.isfinite(array)]
-        if finite.size:
-            iterations.append(float(np.max(finite)))
-    return max(iterations) if iterations else np.nan
-
-
-def _model_alpha(model) -> float:
-    """Return the first finite fitted ``alpha_``, or NaN when absent."""
-
-    for value in _model_attribute_values(model, "alpha_"):
-        try:
-            alpha = float(value)
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(alpha):
-            return alpha
     return np.nan
 
 
@@ -746,8 +595,6 @@ def _validate_config(config: NKGridConfig) -> None:
 
     if config.grid_selection not in ("all", "min_middle_max"):
         raise ValueError("grid_selection must be all or min_middle_max")
-    if type(config.checkpoint_retention) is not str or config.checkpoint_retention not in {"keep", "delete"}:
-        raise ValueError("checkpoint_retention must be keep or delete")
 
     for name in ("n_grid", "k_grid"):
         if getattr(config, name) is not None:
@@ -778,10 +625,6 @@ def _validate_config(config: NKGridConfig) -> None:
     unknown_models = sorted(set(config.models) - set(SUPPORTED_MODEL_NAMES))
     if unknown_models:
         raise ValueError(f"Unknown model(s): {', '.join(unknown_models)}")
-    if config.native_process_max_attempts < 1:
-        raise ValueError("native_process_max_attempts must be at least 1")
-    if config.native_process_timeout_seconds <= 0:
-        raise ValueError("native_process_timeout_seconds must be greater than zero")
     for field in ("experiment_id", "data_version", "model_spec_version"):
         value = getattr(config, field)
         if not isinstance(value, str) or not value or len(value) > 80 or not value.isascii() or not all(char.isalnum() or char in "._-" for char in value):
@@ -822,97 +665,21 @@ def _base_row(
     }
 
 
-def _positive_class_probability(model, X) -> np.ndarray:
-    # Callers guarantee a two-class training sample (single-class cells are
-    # skipped upstream), so the fitted classifier exposes predict_proba with
-    # both classes. A contract violation raises here and surfaces as a failed
-    # cell rather than silently producing NaN metrics.
-    probabilities = np.asarray(model.predict_proba(X), dtype=float)
-    classes = np.asarray(getattr(model, "classes_", []))
-    if probabilities.ndim != 2:
-        raise ValueError(
-            f"predict_proba must return a 2D array; got shape={probabilities.shape}"
-        )
-    if classes.size and 1 in classes:
-        positive = probabilities[:, int(np.where(classes == 1)[0][0])]
-    elif probabilities.ndim == 2 and probabilities.shape[1] == 2:
-        positive = probabilities[:, 1]
-    else:
-        raise ValueError(
-            f"cannot locate positive class in predict_proba output "
-            f"(classes_={classes}, shape={probabilities.shape})"
-        )
-    if not np.isfinite(positive).all():
-        raise ValueError("predict_proba returned non-finite positive-class scores")
-    return positive
+def _fit_predict_base_model(*, model_name: str, model_seed: int, task: str, params: dict,
+                            X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame,
+                            preprocessor) -> dict[str, Any]:
+    """Fit one base model on all N rows and in each OOF fold; keep only predictions."""
 
-
-def _fit_predict_model_cell(
-    *,
-    model_name: str,
-    model_seed: int,
-    task: str,
-    params: dict,
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_test: pd.DataFrame,
-    model_n_jobs: int = 1,
-    preprocessor=None,
-    prediction_request=None,
-) -> dict[str, Any]:
-    """Fit and predict one cell; safe to execute in an isolated subprocess."""
-
-    if prediction_request and model_name != "super_learner":
-        from .prediction_training import train_base_predictions
-        fitted = train_base_predictions(model_name=model_name, model_seed=model_seed,
-            task=task, params=params, X_train=X_train, y_train=y_train, X_test=X_test,
-            preprocessor=preprocessor, n_jobs=model_n_jobs,
-            mode=prediction_request["mode"], oof_folds=prediction_request.get("oof_folds", 5),
-            resume_folds=prediction_request.get("resume_folds"),
-            persist_fold=prediction_request.get("persist_fold"),
-            pipeline_id=prediction_request.get("pipeline_id"),
-            formal_params=prediction_request.get("formal_params"))
-        model = fitted.pop("model")
-        meta = fitted["metadata"]
-        return {"predictions": fitted["predictions"], "prediction_cache_data": fitted,
-                "status": meta["status"], "reason": meta["reason"],
-                "mlp_diagnostics_json": "", "fit_seconds": meta["full_fit_seconds"] + meta["oof_fit_seconds"],
-                "best_rounds": _model_best_rounds(model), "converged": meta["converged"],
-                "solver": _model_solver(model), "iterations": _model_iterations(model),
-                "alpha": _model_alpha(model), "peak_rss_bytes": _process_peak_rss_bytes()}
-    model = make_model(
-        model_name,
-        seed=model_seed,
-        n_jobs=model_n_jobs,
-        task=task,
-        params=params,
-        preprocessor=preprocessor,
-    )
-    if prediction_request and model_name == "super_learner":
-        model.capture_predictions = True
-    fit_started = time.perf_counter()
-    model.fit(X_train, y_train)
-    predictions = (
-        _positive_class_probability(model, X_test)
-        if task == "classification"
-        else np.asarray(model.predict(X_test))
-    )
-    output = {
-        "predictions": predictions,
-        "mlp_diagnostics_json": json.dumps(model.diagnostics_, sort_keys=True, separators=(",", ":"), allow_nan=False) if hasattr(model, "diagnostics_") else "",
-        "fit_seconds": time.perf_counter() - fit_started,
-        "best_rounds": _model_best_rounds(model),
-        "converged": _model_converged(model),
-        "solver": _model_solver(model),
-        "iterations": _model_iterations(model),
-        "alpha": _model_alpha(model),
-        "peak_rss_bytes": _process_peak_rss_bytes(),
-    }
-    if prediction_request and model_name == "super_learner":
-        from .prediction_training import formal_sl_predictions
-        output["prediction_cache_data"] = formal_sl_predictions(model, X_test, predictions)
-        output["prediction_cache_data"]["metadata"].update(status="ok", reason="")
-    return output
+    from .prediction_training import train_base_predictions
+    fitted = train_base_predictions(model_name=model_name, model_seed=model_seed, task=task, params=params,
+                                    X_train=X_train, y_train=y_train, X_test=X_test, preprocessor=preprocessor)
+    model = fitted.pop("model")
+    meta = fitted["metadata"]
+    return {"predictions": fitted["predictions"], "arrays": fitted["arrays"],
+            "status": meta["status"], "reason": meta["reason"],
+            "fit_seconds": meta["full_fit_seconds"] + meta["oof_fit_seconds"],
+            "best_rounds": _model_best_rounds(model), "converged": meta["converged"],
+            "peak_rss_bytes": _process_peak_rss_bytes()}
 
 
 @timed_phase("input.resolve_grids")
@@ -938,12 +705,16 @@ def resolve_input_grids(config, loaded, source_definitions):
     return np.asarray(n_grid, dtype=int), np.asarray(k_grid, dtype=int)
 
 
-class NKGridExecutionSession:
-    """One validated input/model/native-runner lifetime for many cell groups.
+def _identifiers(values: pd.Series) -> np.ndarray:
+    array = values.to_numpy()
+    return array.astype(str) if array.dtype.kind == "O" else array
 
-    It has no output-path, manifest, checkpoint, lock, assignment, round, or
-    generation knowledge.  Workers use ``run_cell_group`` as their only
-    numerical primitive.
+
+class NKGridExecutionSession:
+    """One validated input and model configuration for many cells.
+
+    It knows nothing about output files or scheduling. Workers use
+    ``run_cell`` as their only numerical primitive.
     """
 
     def __init__(
@@ -975,6 +746,8 @@ class NKGridExecutionSession:
         self.feature_groups = {unit.name: unit.features for unit in units}
         self.groups_by_unit = {unit.name: unit.groups for unit in units}
         self.selected_model_params = dict(selected_model_params)
+        # The Super Learner is combined from the base models' saved predictions, never fitted itself.
+        self.base_models = tuple(model for model in config.models if model != "super_learner")
         self.algorithm_version = algorithm_version
         self.split_manager = SplitIndexManager(
             frame=self.frame,
@@ -987,7 +760,7 @@ class NKGridExecutionSession:
         self.repeat_pairs = resolve_repeat_pairs(config)
         self.n_grid, self.k_grid = resolve_input_grids(config, loaded, source_definitions)
         self.semantic_contract = {
-            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else "classification-v1",
+            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else CLASSIFICATION_METRIC_DEFINITION_VERSION,
             "kind": "nk_grid" if self.task == "regression" else "nk_grid_classification",
             "algorithm_version": algorithm_version,
             "dataset": self.dataset,
@@ -1017,31 +790,21 @@ class NKGridExecutionSession:
         )
         self.row_metadata = {field: self.metadata[field] for field in ROW_METADATA_FIELDS}
         self._draw_orders: dict[tuple[int, int], DrawOrders] = {}
-        self._runner = IsolatedProcessRunner(
-            max_attempts=config.native_process_max_attempts,
-            timeout_seconds=config.native_process_timeout_seconds,
-        )
         self._closed = False
-        self._prediction_request = None
         self._validate_spec()
 
     @classmethod
     def _open_config(
-        cls, config: NKGridConfig, *, spec: CellExecutionSpec | None = None,
-        repo_root: Path | None = None, input_store=None,
+        cls, config: NKGridConfig, *, spec: CellExecutionSpec | None = None, repo_root: Path | None = None,
     ) -> "NKGridExecutionSession":
         _validate_config(config)
-        def validated_input():
-            raw_loaded = load_input(config.schema, config.outcome)
-            if raw_loaded.schema.split_mode == "internal_random" and not 0.0 < config.test_size < 1.0:
-                raise ValueError("test_size must be strictly between 0 and 1")
-            return validate_input(raw_loaded, config.outcome, models=config.models, min_n=config.min_n,
-                test_size=config.test_size, seed=config.seed,
-                require_id=bool(config.prediction_cache))
-        # This contains validated raw frames and fixed source definitions only.
-        # Fitted preprocessing remains exclusively inside the original folds.
-        loaded, source_definitions = (input_store.load_or_build('validated-raw-input-v1', validated_input)[0]
-                                      if input_store is not None else validated_input())
+        raw_loaded = load_input(config.schema, config.outcome)
+        if raw_loaded.schema.split_mode == "internal_random" and not 0.0 < config.test_size < 1.0:
+            raise ValueError("test_size must be strictly between 0 and 1")
+        # Validated raw frames and fixed source definitions only. Fitted
+        # preprocessing remains exclusively inside the original folds.
+        loaded, source_definitions = validate_input(raw_loaded, config.outcome, models=config.models,
+            min_n=config.min_n, test_size=config.test_size, seed=config.seed, require_id=True)
         selected_model_params = load_model_params(config.model_params, task=loaded.schema.task, models=config.models)
         return cls(
             config=config, spec=spec, repo_root=repo_root, loaded=loaded, source_definitions=source_definitions,
@@ -1050,7 +813,7 @@ class NKGridExecutionSession:
         )
 
     @classmethod
-    def open(cls, spec: CellExecutionSpec, *, repo_root: Path | None = None, input_store=None) -> "NKGridExecutionSession":
+    def open(cls, spec: CellExecutionSpec, *, repo_root: Path | None = None) -> "NKGridExecutionSession":
         """Open a session from the session-only canonical execution spec."""
 
         spec = CellExecutionSpec.from_payload(spec.payload)
@@ -1073,8 +836,6 @@ class NKGridExecutionSession:
             n_jobs=int(value["model_n_jobs"]),
             min_n=int(value["min_n"]),
             model_params=model_params,
-            native_process_max_attempts=int(value["native_process_max_attempts"]),
-            native_process_timeout_seconds=float(value["native_process_timeout_seconds"]),
             preset=value.get("preset") if isinstance(value.get("preset"), str) else None,
             experiment_id=str(value["experiment_id"]),
             data_version=str(value["data_version"]),
@@ -1082,10 +843,8 @@ class NKGridExecutionSession:
             repeat_plan=tuple((int(pair[0]), int(pair[1])) for pair in value["resolved_repeat_plan"]),
             n_grid=tuple(int(item) for item in value["resolved_n_grid"]),
             k_grid=tuple(int(item) for item in value["resolved_k_grid"]),
-            **({"prediction_cache": value["prediction_cache"]} if "prediction_cache" in value else {}),
-            **({"execution": value["execution"]} if "execution" in value else {}),
         )
-        return cls._open_config(config, spec=spec, repo_root=root, input_store=input_store)
+        return cls._open_config(config, spec=spec, repo_root=root)
 
     @classmethod
     def open_from_config(cls, config: NKGridConfig) -> "NKGridExecutionSession":
@@ -1147,22 +906,21 @@ class NKGridExecutionSession:
             self._draw_orders[key] = existing
         return existing
 
-    def run_cell_group(
-        self, *, seed: int, draw: int, n_samples: int, k_features: int, models: Sequence[str],
-    ) -> list[dict[str, object]]:
-        """Run one frozen cell group without creating any persistence artefact."""
+    def run_cell(self, *, seed: int, draw: int, n_samples: int, k_features: int) -> dict[str, object]:
+        """Fit every base model of one cell on its N rows and in its OOF folds.
+
+        Returns one result row per base model, each model's test and OOF
+        predictions, and the cell's training IDs and labels. Nothing is saved here.
+        """
 
         if self._closed:
             raise RuntimeError("NKGridExecutionSession is closed")
         validate_size_grid((n_samples,), "N")
         validate_size_grid((k_features,), "K", len(self.feature_units))
-        frozen_models = tuple(str(model) for model in models)
-        if not frozen_models or len(frozen_models) != len(set(frozen_models)) or not set(frozen_models).issubset(self.config.models):
-            raise ValueError("cell group models must be a unique subset of the frozen model list")
         if (int(seed), int(draw)) not in self.repeat_pairs:
-            raise ValueError("cell group seed/draw is outside the frozen repeat plan")
+            raise ValueError("cell seed/draw is outside the frozen repeat plan")
         if int(n_samples) not in set(map(int, self.n_grid)) or int(k_features) not in set(map(int, self.k_grid)):
-            raise ValueError("cell group N/K is outside the frozen resolved grid")
+            raise ValueError("cell N/K is outside the frozen resolved grid")
         indexes = self.split_manager.for_seed(int(seed))
         validate_size_grid((n_samples,), "N", len(indexes.train_index))
         orders = self._orders(int(seed), int(draw), indexes.train_index)
@@ -1171,137 +929,43 @@ class NKGridExecutionSession:
         if len(selected_rows) != n_samples or len(selected_units) != k_features:
             raise ValueError("sampled N/K does not match declared N/K")
         selected_cols = [feature for unit in selected_units for feature in self.feature_groups[unit]]
-        selected_groups = [
-            group
-            for unit in selected_units
-            for group in self.groups_by_unit[unit]
-        ]
+        selected_groups = [group for unit in selected_units for group in self.groups_by_unit[unit]]
         test_frame = self.external_frame if indexes.external_test else self.frame
         if test_frame is None:
             raise RuntimeError("validated external test frame is missing")
         started = time.perf_counter()
-        try:
-            X_sub_raw = self.frame.loc[selected_rows, selected_cols]
-            y_sub = self.frame.loc[selected_rows, self.config.outcome]
-            X_test_raw = test_frame.loc[indexes.test_index, selected_cols]
-            y_test = test_frame.loc[indexes.test_index, self.config.outcome]
-        except Exception as exc:
-            return self._slice_failure_rows(
-                exc, frozen_models, seed=int(seed), draw=int(draw), n_samples=int(n_samples),
-                k_features=int(k_features), slice_seconds=time.perf_counter() - started,
-                n_train_total=len(indexes.train_index), n_test_total=len(indexes.test_index),
-            )
+        X_sub_raw = self.frame.loc[selected_rows, selected_cols]
+        y_sub = self.frame.loc[selected_rows, self.config.outcome]
+        y_train_full = self.frame.loc[indexes.train_index, self.config.outcome]
+        X_test_raw = test_frame.loc[indexes.test_index, selected_cols]
+        y_test = test_frame.loc[indexes.test_index, self.config.outcome]
         slice_seconds = time.perf_counter() - started
         unobserved = count_unobserved_sources(X_sub_raw, selected_groups)
         prepared: dict[str, object] = {}; preparation_errors: dict[str, Exception] = {}
-        try:
-            rows: list[dict[str, object]] = []
-            for position, model_name in enumerate(frozen_models):
-                rows.append(self._run_model(
-                    model_name=model_name, position=position, seed=int(seed), draw=int(draw),
-                    n_samples=int(n_samples), k_features=int(k_features), X_sub_raw=X_sub_raw,
-                    y_sub=y_sub, X_test_raw=X_test_raw, y_test=y_test,
-                    selected_groups=selected_groups,
-                    unobserved=unobserved, slice_seconds=slice_seconds, prepared=prepared,
-                    preparation_errors=preparation_errors, n_train_total=len(indexes.train_index),
-                    n_test_total=len(indexes.test_index),
-                ))
-            return rows
-        finally:
-            prepared.clear(); preparation_errors.clear()
+        rows: list[dict[str, object]] = []
+        arrays: dict[str, dict[str, np.ndarray]] = {}
+        for position, model_name in enumerate(self.base_models):
+            row, arrays[model_name] = self._run_model(
+                model_name=model_name, position=position, seed=int(seed), draw=int(draw),
+                n_samples=int(n_samples), k_features=int(k_features), X_sub_raw=X_sub_raw,
+                y_sub=y_sub, y_train_full=y_train_full, X_test_raw=X_test_raw, y_test=y_test,
+                selected_groups=selected_groups,
+                unobserved=unobserved, slice_seconds=slice_seconds, prepared=prepared,
+                preparation_errors=preparation_errors, n_train_total=len(indexes.train_index),
+                n_test_total=len(indexes.test_index),
+            )
+            rows.append(row)
+        return {"rows": rows, "arrays": arrays,
+                "train_ids": _identifiers(self.frame.loc[selected_rows, self.schema.id_column]),
+                "y_train": y_sub.to_numpy(dtype=np.float64), "y_test": y_test.to_numpy(dtype=np.float64),
+                "y_train_full": y_train_full.to_numpy(dtype=np.float64)}
 
-    def run_prediction_cell(self, *, seed, draw, n_samples, k_features, model,
-                            pipeline_id=None, mode="holdout_oof", oof_folds=5,
-                            resume_folds=None, persist_fold=None):
-        """Execute one explicit cache task and expose exact ordered sample maps.
+    def test_ids(self, seed: int) -> np.ndarray:
+        """Sample IDs of one seed's test rows, in the order of every test prediction."""
 
-        Persistence is the worker's responsibility. This method never marks an
-        unpersisted prediction successful at the queue level. Formal SL capture
-        is a separate P1 interface, never a base-stage task in base_then_sl.
-        """
-        from .prediction_training import BASE_LIBRARY
-        expected = (f"reported-sl4-{self.task}-v1" if model == "super_learner"
-                    else f"{BASE_LIBRARY}/{model}")
-        formal_prefix = f"reported-sl4-{self.task}-v1/"
-        is_formal = bool(pipeline_id and pipeline_id.startswith(formal_prefix))
-        if pipeline_id is not None and pipeline_id != expected and not is_formal:
-            raise ValueError(f"unknown prediction pipeline {pipeline_id!r}; expected {expected!r}")
-        if self._prediction_request is not None:
-            raise RuntimeError("prediction session does not permit nested tasks")
-        if mode not in {"holdout", "holdout_oof"}:
-            raise ValueError("prediction mode must be holdout or holdout_oof")
-        inputs = self.prediction_cell_inputs(seed=seed, draw=draw, n_samples=n_samples,
-            k_features=k_features, model=model, oof_folds=oof_folds, pipeline_id=pipeline_id)
-        self._prediction_request = {"mode": mode, "oof_folds": oof_folds,
-                                    "resume_folds": resume_folds, "persist_fold": persist_fold,
-                                    "pipeline_id": pipeline_id,
-                                    "formal_params": self.selected_model_params.get("super_learner") if is_formal else None}
-        try:
-            row = self.run_cell_group(seed=seed, draw=draw, n_samples=n_samples,
-                                      k_features=k_features, models=(model,))[0]
-        finally:
-            self._prediction_request = None
-        captured = row.pop("_prediction_cache_data", None)
-        if captured is None:
-            captured = {"arrays": {}, "metadata": {"status": row["status"], "reason": row.get("error", "")}}
-        captured["metadata"].update(inputs["metadata"])
-        return {"row": row, "arrays": captured["arrays"], "metadata": captured["metadata"],
-                "sample_arrays": inputs["sample_arrays"]}
-
-    def prediction_cell_inputs(self, *, seed, draw, n_samples, k_features, model, oof_folds=5, pipeline_id=None):
-        """Return exact identity inputs without fitting any estimator."""
-        from .prediction_training import BASE_LIBRARY, make_oof_folds
-        formal_prefix = f"reported-sl4-{self.task}-v1/"
-        is_formal = bool(pipeline_id and pipeline_id.startswith(formal_prefix))
-        if is_formal:
-            if "super_learner" not in self.selected_model_params:
-                raise ValueError("formal SL pipeline requires configured super_learner parameters")
-            oof_folds = int(self.selected_model_params["super_learner"]["cv"])
-            internal = pipeline_id[len(formal_prefix):]
-            aliases = {"ridge": "ridge", "lightgbm": "lightgbm",
-                       "extra_trees": "extra_trees", "shallow_nn": "shallow_neural_network"}
-            if aliases.get(internal) != model:
-                raise ValueError("formal base recipe does not match the declared public model alias")
-        if (int(seed), int(draw)) not in self.repeat_pairs:
-            raise ValueError("prediction identity seed/draw outside frozen plan")
-        if int(n_samples) not in self.n_grid or int(k_features) not in self.k_grid or model not in self.config.models:
-            raise ValueError("prediction identity N/K/model outside frozen plan")
         indexes = self.split_manager.for_seed(int(seed))
-        order = self._orders(int(seed), int(draw), indexes.train_index)
-        train_index = order.row_index[:int(n_samples)]
-        units = [str(unit) for unit in order.feature_names[:int(k_features)]]
-        features = [name for unit in units for name in self.feature_groups[unit]]
-        if not self.schema.id_column:
-            raise ValueError("prediction cache requires an explicit validated sample ID column")
-        holdout_frame = self.external_frame if indexes.external_test else self.frame
-        def identifiers(values):
-            array = values.to_numpy()
-            return array.astype(str) if array.dtype.kind == "O" else array
-        sample_arrays = {
-            "train_ids": identifiers(self.frame.loc[train_index, self.schema.id_column]),
-            "holdout_ids": identifiers(holdout_frame.loc[indexes.test_index, self.schema.id_column]),
-            "train_positions": np.asarray(train_index, dtype=str),
-            "holdout_positions": np.asarray(indexes.test_index, dtype=str),
-            "y_train": self.frame.loc[train_index, self.config.outcome].to_numpy(dtype=np.float64),
-            "y_holdout": holdout_frame.loc[indexes.test_index, self.config.outcome].to_numpy(dtype=np.float64),
-            "feature_names": np.asarray(features, dtype=str), "source_names": np.asarray(units, dtype=str)}
-        try:
-            folds = make_oof_folds(sample_arrays["y_train"], self.task, oof_folds)
-            sample_arrays["oof_fold"] = np.full(n_samples, -1, dtype=np.int64)
-            for fold, (_, valid) in enumerate(folds):
-                sample_arrays["oof_fold"][valid] = fold
-            fold_status = "ok"
-        except ValueError as exc:
-            folds = ()
-            fold_status = str(exc)
-        expected = pipeline_id if is_formal else (f"reported-sl4-{self.task}-v1" if model == "super_learner"
-                    else f"{BASE_LIBRARY}/{model}")
-        return {"sample_arrays": sample_arrays, "folds": folds,
-                "metadata": {"pipeline_id": expected, "model_name": internal if is_formal else model, "task": self.task,
-                    "model_seed": _model_seed(seed, draw, n_samples, k_features),
-                    "model_params": resolved_model_params({"super_learner": self.selected_model_params["super_learner"]}) if is_formal else resolved_model_params({model: self.selected_model_params[model]}),
-                    "imputation": dict(self.schema.imputation), "fold_rule": "ordered-stratified-v1" if self.task == "classification" else "ordered-kfold-v1",
-                    "oof_folds": oof_folds, "fold_status": fold_status}}
+        test_frame = self.external_frame if indexes.external_test else self.frame
+        return _identifiers(test_frame.loc[indexes.test_index, self.schema.id_column])
 
     def _base(self, *, model_name: str, seed: int, draw: int, n_samples: int, k_features: int, n_train_total: int, n_test_total: int) -> dict[str, object]:
         return _base_row(
@@ -1312,16 +976,8 @@ class NKGridExecutionSession:
             k_expanded=0, n_expanded_features_total=len(self.predictors),
         )
 
-    def _slice_failure_rows(self, exc: Exception, models: Sequence[str], *, seed: int, draw: int, n_samples: int, k_features: int, slice_seconds: float, n_train_total: int, n_test_total: int) -> list[dict[str, object]]:
-        result: list[dict[str, object]] = []
-        metrics = _empty_metrics() if self.task == "regression" else _empty_classification_metrics()
-        for position, model_name in enumerate(models):
-            row = self._base(model_name=model_name, seed=seed, draw=draw, n_samples=n_samples, k_features=k_features, n_train_total=n_train_total, n_test_total=n_test_total)
-            diagnostics = _empty_diagnostics(); diagnostics["_slice_seconds"] = slice_seconds if position == 0 else 0.0; diagnostics["_peak_rss_bytes"] = _process_peak_rss_bytes()
-            result.append(add_metadata({**row, **metrics, **diagnostics, **({"task": self.task} if self.task == "classification" else {}), "status": "failed", "error": f"{type(exc).__name__}: {exc}"}, self.row_metadata))
-        return result
-
-    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> dict[str, object]:
+    def _run_model(self, *, model_name: str, position: int, seed: int, draw: int, n_samples: int, k_features: int, X_sub_raw: pd.DataFrame, y_sub: pd.Series, y_train_full: pd.Series, X_test_raw: pd.DataFrame, y_test: pd.Series, selected_groups: Sequence[SourceGroup], unobserved: int, slice_seconds: float, prepared: dict[str, object], preparation_errors: dict[str, Exception], n_train_total: int, n_test_total: int) -> tuple[dict[str, object], dict[str, np.ndarray]]:
+        """One base model's result row and its test/OOF predictions (empty unless fitted)."""
         if len(X_sub_raw) != n_samples or len(y_sub) != n_samples or len(sampling_units(selected_groups)) != k_features:
             raise ValueError("fit input does not match declared N/K")
         if X_sub_raw.shape[1] != sum(len(g.features) for g in selected_groups):
@@ -1332,15 +988,16 @@ class NKGridExecutionSession:
         diagnostics = _empty_diagnostics(); diagnostics["_slice_seconds"] = slice_seconds if position == 0 else 0.0
         empty_metrics = _empty_metrics() if self.task == "regression" else _empty_classification_metrics()
 
-        def result(metrics: dict[str, object], *, status: str, error: str, peak: int | None = None) -> dict[str, object]:
+        def result(metrics: dict[str, object], *, status: str, error: str, peak: int | None = None,
+                   arrays: dict[str, np.ndarray] | None = None) -> tuple[dict[str, object], dict[str, np.ndarray]]:
             diagnostics["_cell_wall_seconds"] = time.perf_counter() - model_started
             diagnostics["_peak_rss_bytes"] = _process_peak_rss_bytes() if peak is None else int(peak)
-            return add_metadata({**row, **metrics, **diagnostics, **({"task": self.task} if self.task == "classification" else {}), "status": status, "error": error}, self.row_metadata)
+            return (add_metadata({**row, **metrics, **diagnostics, **({"task": self.task} if self.task == "classification" else {}), "status": status, "error": error}, self.row_metadata),
+                    arrays or {})
 
         if unobserved == k_features:
             return result(empty_metrics, status="skipped", error="all_selected_sources_unobserved")
-        formal_recipe = bool(self._prediction_request and str(self._prediction_request.get("pipeline_id", "")).startswith(f"reported-sl4-{self.task}-v1/"))
-        if not formal_recipe and self.task == "regression" and model_name in REGRESSION_CV_MIN_N and n_samples < REGRESSION_CV_MIN_N[model_name]:
+        if self.task == "regression" and model_name in REGRESSION_CV_MIN_N and n_samples < REGRESSION_CV_MIN_N[model_name]:
             return result(empty_metrics, status="skipped", error=f"below minimum N for {model_name}'s internal CV (requires N>={REGRESSION_CV_MIN_N[model_name]})")
         try:
             mode = "passthrough" if self.schema.imputation["model_overrides"].get(model_name) == "passthrough" else "imputed"
@@ -1368,42 +1025,27 @@ class NKGridExecutionSession:
                 return result(empty_metrics, status="skipped", error="single-class training sample for classification")
             if self.task == "classification" and model_name in CLASSIFICATION_CV_MODELS and int(y_sub.value_counts().min()) < 2:
                 return result(empty_metrics, status="skipped", error=f"below minimum per-class count for {model_name}'s internal CV")
-            if model_name in {"lightgbm", "super_learner"}:
+            if model_name == "lightgbm":
                 log_progress(f"cell starting model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features}")
             # The outer transformed matrices above are diagnostics only. CV
             # must receive original missingness, including all-missing sources.
             X_fit = X_sub_raw.copy(deep=True)
             X_test_fit = X_test_raw.copy(deep=True)
-            arguments = {"model_name": model_name, "model_seed": _model_seed(seed, draw, n_samples, k_features), "model_n_jobs": self.config.n_jobs if model_name == "super_learner" else 1, "task": self.task, "params": self.selected_model_params[model_name], "X_train": X_fit, "y_train": y_sub, "X_test": X_test_fit, "preprocessor": FoldPreprocessor(tuple(selected_groups), self.schema.imputation, model_name)}
-            if self._prediction_request:
-                arguments["prediction_request"] = self._prediction_request
-                if formal_recipe:
-                    arguments["preprocessor"] = FoldPreprocessor(tuple(selected_groups), self.schema.imputation, "super_learner")
-            if model_name in SERIAL_OUTER_MODELS and not (self._prediction_request and self._prediction_request.get("persist_fold")):
-                fit = _run_native_model_cell_locked(self._runner, fit_arguments=arguments, on_native_crash=lambda attempt, exc: log_progress(f"native subprocess crashed attempt={attempt}/{self.config.native_process_max_attempts} model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features} error={exc}"), on_native_timeout=lambda attempt, exc: log_progress(f"native subprocess timed out attempt={attempt}/{self.config.native_process_max_attempts} model={model_name} seed={seed} draw={draw} N={n_samples} K={k_features} error={exc}"))
-            else:
-                fit = _fit_predict_model_cell(**arguments)
-            if fit.get("status") == "skipped":
-                skipped = result(empty_metrics, status="skipped", error=fit["reason"])
-                skipped["_prediction_cache_data"] = fit["prediction_cache_data"]
-                return skipped
+            fit = _fit_predict_base_model(model_name=model_name, model_seed=_model_seed(seed, draw, n_samples, k_features),
+                task=self.task, params=self.selected_model_params[model_name], X_train=X_fit, y_train=y_sub,
+                X_test=X_test_fit, preprocessor=FoldPreprocessor(tuple(selected_groups), self.schema.imputation, model_name))
+            if fit["status"] == "skipped":
+                return result(empty_metrics, status="skipped", error=fit["reason"], arrays=fit["arrays"])
             predictions = np.asarray(fit["predictions"])
-            diagnostics["mlp_diagnostics_json"] = fit.get("mlp_diagnostics_json", "")
             diagnostics["_fit_seconds"] = fit["fit_seconds"]; diagnostics["_best_rounds"] = fit["best_rounds"]; diagnostics["converged"] = fit["converged"]; diagnostics["constant_prediction"] = _constant_prediction(predictions)
-            metrics = compute_classification_metrics(y_test, predictions, y_sub) if self.task == "classification" else compute_regression_metrics(y_test, predictions, y_sub)
-            completed = result(
-                metrics, status="ok", error="", peak=int(fit["peak_rss_bytes"])
-            )
-            if "prediction_cache_data" in fit:
-                completed["_prediction_cache_data"] = fit["prediction_cache_data"]
-            return completed
+            metrics = compute_classification_metrics(y_test, predictions, y_sub, y_train_full) if self.task == "classification" else compute_regression_metrics(y_test, predictions, y_sub, y_train_full)
+            return result(metrics, status="ok", error="", peak=int(fit["peak_rss_bytes"]), arrays=fit["arrays"])
         except Exception as exc:
             return result(empty_metrics, status="failed", error=f"{type(exc).__name__}: {exc}")
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._runner.close()
             self._draw_orders.clear()
 
     def __enter__(self) -> "NKGridExecutionSession":

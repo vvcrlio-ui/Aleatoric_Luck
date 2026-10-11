@@ -1,86 +1,23 @@
-"""Versioned base prediction training and passive capture of reported SL fits.
-
-No cache lookup is performed here: callers must verify the complete immutable
-identity before supplying resumed folds. Arrays stay off the result RPC channel.
-"""
+"""Base-model test and out-of-fold predictions for one cell."""
 from __future__ import annotations
 
 import time
 import warnings
 
 import numpy as np
-from sklearn.ensemble import StackingClassifier, StackingRegressor
-from sklearn.base import clone
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import KFold, StratifiedKFold, check_cv
+from sklearn.model_selection import KFold, StratifiedKFold
 
 BASE_MODELS = ("ols", "ridge", "lasso", "random_forest", "xgboost", "lightgbm",
                "shallow_neural_network", "extra_trees")
 BASE_LIBRARY = "standalone8-v1"
+# Their OOF fits reuse the full fit's ``selection_`` instead of searching.
+TUNED_MODELS = ("ridge", "lasso", "xgboost", "lightgbm", "shallow_neural_network")
 
 
 def rows(X, indexes):
     return X.iloc[indexes] if hasattr(X, "iloc") else np.asarray(X)[indexes]
-
-
-class _CaptureStack:
-    """Intercept the actual matrix passed to sklearn's final estimator.
-
-    This keeps sklearn's fit ordering and all model settings unchanged. Capturing
-    predictions never replays cross-validation or a base estimator fit.
-    """
-    def fit(self, X, y, **kwargs):
-        self._capturing_oof = True
-        try:
-            answer = super().fit(X, y, **kwargs)
-        finally:
-            self._capturing_oof = False
-        splitter = check_cv(self.cv, y=y, classifier=isinstance(self, StackingClassifier))
-        self.oof_fold_ = np.full(len(y), -1, dtype=np.int64)
-        for fold, (_, valid) in enumerate(splitter.split(X, y)):
-            self.oof_fold_[valid] = fold
-        self.base_model_names_ = tuple(name for name, est in self.estimators if est != "drop")
-        return answer
-
-    def _concatenate_predictions(self, X, predictions):
-        design = super()._concatenate_predictions(X, predictions)
-        if self._capturing_oof:
-            self.oof_predictions_ = np.array(design[:, :len(self.estimators)], dtype=np.float64, copy=True)
-        return design
-
-
-class CapturingStackingRegressor(_CaptureStack, StackingRegressor):
-    pass
-
-
-class CapturingStackingClassifier(_CaptureStack, StackingClassifier):
-    pass
-
-
-def formal_sl_predictions(model, X_holdout, reported_prediction=None):
-    """Extract actual reported SL inputs/parameters after an opt-in captured fit."""
-    stack = model.model_
-    if not hasattr(stack, "oof_predictions_"):
-        raise ValueError("formal SL prediction capture was not enabled before fit")
-    names = list(stack.base_model_names_)
-    holdout = np.asarray(stack.transform(X_holdout), dtype=np.float64)[:, :len(names)]
-    meta = stack.final_estimator_
-    task = "classification" if hasattr(model, "predict_proba") else "regression"
-    if reported_prediction is None:
-        reported_prediction = predict_values(model, X_holdout, task)
-    return {
-        "arrays": {"base_oof_prediction": np.asarray(stack.oof_predictions_, dtype=np.float64),
-                   "base_holdout_prediction": holdout,
-                   "holdout_prediction": np.asarray(reported_prediction, dtype=np.float64),
-                   "oof_fold": np.asarray(stack.oof_fold_, dtype=np.int64)},
-        "metadata": {"pipeline_id": "reported-sl4-" + task + "-v1", "model_names": names,
-                     "coefficients": np.asarray(meta.coef_).tolist(),
-                     "intercept": np.asarray(meta.intercept_).tolist(),
-                     "classes": np.asarray(getattr(model, "classes_", [])).tolist(),
-                     "passthrough": bool(model.passthrough), "task": task,
-                     "base_fit_count": len(names) * (len(np.unique(stack.oof_fold_)) + 1)},
-    }
 
 
 def predict_values(model, X, task):
@@ -148,41 +85,19 @@ def _selected_parameters(model):
 
 
 def train_base_predictions(*, model_name, model_seed, task, params, X_train,
-                           y_train, X_test, preprocessor=None, n_jobs=1,
-                           oof_folds=5, mode="holdout_oof", resume_folds=None,
-                           persist_fold=None, pipeline_id=None, formal_params=None):
-    """Fit each full/OOF pipeline once, sharing the full prediction with scoring.
+                           y_train, X_test, preprocessor=None, oof_folds=5):
+    """Fit one model on all N rows, then once per OOF fold, sharing the full prediction with scoring.
 
-    ``persist_fold`` runs immediately after a valid prediction, before the next
-    fit, allowing durable recovery of folds and the full fit (-1). Resume entries
-    contain ``prediction``, ``positions`` and ``metadata`` and are supplied only
-    after the caller has verified their complete cache identity.
+    OOF fits of tuned models reuse the full fit's selected value (recorded as
+    fold -1's ``oof_selection``) and do not repeat its parameter search.
     """
     from .model_registry import make_model
     from .validate_input import CLASSIFICATION_CV_MODELS, REGRESSION_CV_MIN_N
     if model_name not in BASE_MODELS:
         raise ValueError("base stage cannot fit super_learner or unknown models")
-    if mode not in {"holdout", "holdout_oof"}:
-        raise ValueError("prediction training mode must be holdout or holdout_oof")
     if type(oof_folds) is not int or oof_folds < 2:
         raise ValueError("OOF folds must be an integer >= 2")
-    formal_prefix = f"reported-sl4-{task}-v1/"
-    is_formal = bool(pipeline_id and pipeline_id.startswith(formal_prefix))
-    formal_template = None
     process = preprocessor if preprocessor is not None else SimpleImputer(strategy="median", keep_empty_features=True)
-    if is_formal:
-        if formal_params is None:
-            raise ValueError("formal base recipe requires frozen formal SL parameters")
-        formal_model = make_model("super_learner", seed=model_seed, n_jobs=n_jobs, task=task,
-                                  params=formal_params, preprocessor=process)
-        templates = dict(formal_model.base_estimators())
-        internal_name = pipeline_id[len(formal_prefix):]
-        if internal_name not in templates:
-            raise ValueError(f"unknown formal SL base recipe {pipeline_id}")
-        formal_template = templates[internal_name]
-        oof_folds = int(formal_params["cv"])
-    elif pipeline_id not in (None, f"{BASE_LIBRARY}/{model_name}"):
-        raise ValueError(f"unknown base pipeline {pipeline_id}")
     if not hasattr(X_train, "iloc"):
         import pandas as pd
         X_train = pd.DataFrame(X_train)
@@ -190,15 +105,14 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
     y = np.asarray(y_train, dtype=np.float64)
     if y.shape != (len(X_train),) or not np.isfinite(y).all():
         raise ValueError("nonfinite labels or mismatching training order")
-    metadata = {"pipeline_id": pipeline_id or f"{BASE_LIBRARY}/{model_name}", "model_name": internal_name if is_formal else model_name,
-                "task": task, "status": "ok", "reason": "", "mode": mode,
+    metadata = {"pipeline_id": f"{BASE_LIBRARY}/{model_name}", "model_name": model_name,
+                "task": task, "status": "ok", "reason": "",
                 "classes": [0, 1] if task == "classification" else [],
-                "holdout_status": "ok", "oof_status": "ok" if mode == "holdout_oof" else "not_required",
+                "holdout_status": "ok", "oof_status": "ok",
                 "base_fit_count": 0, "fit_count_kind": "outer complete-pipeline fits; excludes internal tuning",
-                "full_fit_seconds": 0., "oof_fit_seconds": 0., "resumed_fits": 0,
-                "folds": [], "converged": True}
-    minimum = (2 if internal_name == "ridge" else 1) if is_formal else REGRESSION_CV_MIN_N.get(model_name, 1)
-    classification_cv = internal_name == "ridge" if is_formal else model_name in CLASSIFICATION_CV_MODELS
+                "full_fit_seconds": 0., "oof_fit_seconds": 0., "folds": [], "converged": True}
+    minimum = REGRESSION_CV_MIN_N.get(model_name, 1)
+    classification_cv = model_name in CLASSIFICATION_CV_MODELS
     def check_cv_rows(labels, stage):
         if task == "regression" and len(labels) < minimum:
             raise ValueError(f"below minimum N for {model_name}'s internal CV in {stage} training (requires N>={minimum})")
@@ -212,37 +126,22 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
         metadata.update(status="skipped", reason=str(exc), holdout_status="skipped", oof_status="skipped", oof_reason=str(exc))
         return {"arrays": {}, "metadata": metadata, "model": None, "predictions": None}
     try:
-        folds = make_oof_folds(y, task, oof_folds) if mode == "holdout_oof" else ()
+        folds = make_oof_folds(y, task, oof_folds)
         for train, _ in folds:
             check_cv_rows(y[train], "OOF")
     except ValueError as exc:
         # A legal OOF skip cannot erase a valid independent full prediction.
         folds = ()
         metadata.update(oof_status="skipped", oof_reason=str(exc))
-    resumed = resume_folds or {}
-    unknown = set(resumed) - ({-1} | set(range(len(folds))))
-    if unknown:
-        raise ValueError(f"resumed fold IDs not in frozen split: {unknown}")
     oof = np.empty(len(y), dtype=np.float64)
     fold_ids = np.full(len(y), -1, dtype=np.int64)
     full_model = None
+    fixed = model_name in TUNED_MODELS
+    selection = None
     def fit_one(fold, train, valid):
         nonlocal full_model
-        if fold in resumed:
-            record = resumed[fold]
-            expected = np.arange(len(X_test)) if fold == -1 else valid
-            if not np.array_equal(record["positions"], expected):
-                raise ValueError("resumed prediction positions differ from frozen split")
-            prediction = np.asarray(record["prediction"])
-            if prediction.dtype != np.float64 or prediction.shape != (len(expected),) or not np.isfinite(prediction).all():
-                raise ValueError("invalid resumed prediction")
-            metadata["resumed_fits"] += 1
-            metadata["folds"].append(record["metadata"])
-            metadata["converged"] &= bool(record["metadata"].get("converged", True))
-            return prediction
-        estimator = (clone(formal_template) if is_formal else
-            make_model(model_name, seed=model_seed, n_jobs=n_jobs, task=task,
-                       params=params, preprocessor=process))
+        estimator = make_model(model_name, seed=model_seed, task=task, params=params,
+                               preprocessor=process, selected=selection)
         started = time.perf_counter()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", ConvergenceWarning)
@@ -255,19 +154,19 @@ def train_base_predictions(*, model_name, model_seed, task, params, X_train,
         record = {"fold": fold, "train_size": len(train), "seconds": seconds,
                   "selected_parameters": selected, "converged": converged,
                   "convergence_warnings": convergence}
+        if fold == -1 and fixed:
+            record["oof_selection"] = estimator.selection_
         metadata["folds"].append(record)
         metadata["base_fit_count"] += 1
         metadata["full_fit_seconds" if fold == -1 else "oof_fit_seconds"] += seconds
         metadata["converged"] &= converged
-        if persist_fold is not None:
-            persist_fold(fold, {"prediction": prediction,
-                               "positions": np.arange(len(X_test), dtype=np.int64) if fold == -1 else valid,
-                               "metadata": record})
         if fold == -1:
             full_model = estimator
         return prediction
     # Full first: same independent fit and score, before additional OOF work.
     holdout = fit_one(-1, np.arange(len(y)), None)
+    if fixed:
+        selection = metadata["folds"][0]["oof_selection"]
     for fold, (train, valid) in enumerate(folds):
         if np.intersect1d(train, valid).size:
             raise RuntimeError("OOF training/validation overlap")

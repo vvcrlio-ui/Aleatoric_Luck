@@ -22,7 +22,7 @@ For each seed and draw, the training rows are put in one random order and the pr
 
 ### Repetition
 
-The production design repeats the grid for 100 seeds with 50 draws each. When the engine makes the train/test split, each seed also draws a new split; a test set defined by the data provider stays the same in every seed. With 400 grid points this gives 2,000,000 training samples per model, and 18,000,000 result rows for a panel with nine models. The spread across seeds and draws shows how much prediction quality at a given N and K depends on which observations and variables happen to be drawn.
+The production design repeats the grid for 100 seeds with 5 draws each. When the engine makes the train/test split, each seed also draws a new split; a test set defined by the data provider stays the same in every seed. With 400 grid points this gives 200,000 training samples per model, and 1,800,000 result rows for a panel with nine models. Seeds outnumber draws because at large N and K the draws of one seed train on nearly the same rows, so most of the variation there comes from the split. The spread across seeds and draws shows how much prediction quality at a given N and K depends on which observations and variables happen to be drawn.
 
 ## Models
 
@@ -32,9 +32,11 @@ The ninth model, the Super Learner (SL7), is a weighted combination of the seven
 
 ## Reading the results
 
-Every run writes to a new directory in its dataset folder, `<dataset>/outputs/<panel>-<ID>/`, which Git ignores. Each row of `final.csv` there is one model fitted at one seed, draw, N and K. `status` is `ok` for a completed fit, `skipped` when the sampled data do not allow a fit (for example, a binary outcome with only one class in the training sample), and `failed` when fitting failed. `K_expanded` is the number of model columns behind the K variables.
+Every run writes to a new directory in its dataset folder, `<dataset>/outputs/<panel>-<ID>/`, which Git ignores. Each row of `final.csv` there is one model fitted at one seed, draw, N and K. `status` is `ok` for a completed fit and `skipped` when the sampled data do not allow a fit (for example, a binary outcome with only one class in the training sample). A run in which any fit failed is not published. `K_expanded` is the number of model columns behind the K variables.
 
-For continuous outcomes, `mse` is the mean squared error on the test set. `r2_test` compares it with predicting the training-sample mean for everyone; `r2_test_mean` compares it with the test-sample mean, which is the usual test R². For binary outcomes the table has `roc_auc`, `brier`, `log_loss` and `accuracy`. A metric that cannot be computed for a particular sample is stored as NaN, which is different from a failed fit.
+For continuous outcomes, `mse` is the mean squared error on the test set. Each R² column compares it with the error of a prediction that ignores the predictors. `r2_full_train_mean` predicts the mean outcome of the whole training pool, `r2_test` the mean of the N rows sampled in that fit, and `r2_test_mean` the test-sample mean.
+
+For binary outcomes the table has `roc_auc`, `brier`, `log_loss` and `accuracy`. `brier_full_train_r2` compares the Brier score, the squared error of the predicted probability, with that of predicting the training pool's positive rate. `mcfadden_full_train_pseudo_r2` and `mcfadden_pseudo_r2` compare log-likelihoods with those of predicting the pool's and the sampled rows' positive rate. A metric that cannot be computed for a particular sample is stored as NaN, which is different from a failed fit.
 
 ## Running experiments
 

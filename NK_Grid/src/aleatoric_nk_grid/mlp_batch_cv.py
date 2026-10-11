@@ -6,11 +6,9 @@ import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.impute import SimpleImputer
-from .robust_linear import LinearRegression
 from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils import Bunch
 
 
 BATCH_CV_RULE = "mlp-batch-cv-v1-ordered-mean-fold-mse-no-shuffle-no-dedup"
@@ -40,15 +38,17 @@ class BatchSearchMLP(RegressorMixin, BaseEstimator):
 
     Only scalar diagnostics survive candidate fits. Candidate failures are
     explicit; final refit errors propagate. Constructor parameters are untouched
-    so sklearn clone and pickle preserve the selection contract.
+    so sklearn clone and pickle preserve the selection contract. A given
+    ``selected`` [alpha, batch size] skips the search and refits once.
     """
     def __init__(self, mlp, alphas, mlp_batch_candidates=DEFAULT_BATCH_CANDIDATES,
-                 max_cv_folds=3, preprocessor=None):
+                 max_cv_folds=3, preprocessor=None, selected=None):
         self.mlp = mlp
         self.alphas = alphas
         self.mlp_batch_candidates = mlp_batch_candidates
         self.max_cv_folds = max_cv_folds
         self.preprocessor = preprocessor
+        self.selected = selected
 
     def _estimator(self, alpha, batch):
         process = (clone(self.preprocessor) if self.preprocessor is not None
@@ -68,13 +68,17 @@ class BatchSearchMLP(RegressorMixin, BaseEstimator):
         started = time.perf_counter()
         self.fit_count_ = 0
         self.candidate_scores_ = []
-        folds = tuple(KFold(min(self.max_cv_folds, len(y))).split(X)) if len(y) >= 3 else ()
-        if folds and min(len(t) for t, _ in folds) < 2:
-            folds = ()
-        self.fallback_reason_ = (None if folds else
-            "inner CV would have fewer than 2 training rows; first declared alpha/batch")
+        if self.selected is None:
+            folds = tuple(KFold(min(self.max_cv_folds, len(y))).split(X)) if len(y) >= 3 else ()
+            if folds and min(len(t) for t, _ in folds) < 2:
+                folds = ()
+            self.fallback_reason_ = (None if folds else
+                "inner CV would have fewer than 2 training rows; first declared alpha/batch")
+            self.alpha_, self.batch_size_ = float(alphas[0]), self.mlp_batch_candidates[0]
+        else:
+            folds, self.fallback_reason_ = (), None
+            self.alpha_, self.batch_size_ = float(self.selected[0]), int(self.selected[1])
         best_score = float("inf")
-        self.alpha_, self.batch_size_ = float(alphas[0]), self.mlp_batch_candidates[0]
         for alpha in alphas if folds else ():
             for batch in self.mlp_batch_candidates:
                 record = {"alpha": float(alpha), "batch": batch, "folds": [], "mean_mse": None, "error": None}
@@ -133,81 +137,3 @@ class BatchSearchMLP(RegressorMixin, BaseEstimator):
 
     def predict(self, X):
         return self.model_.predict(X)
-
-
-class SerialBatchStack(RegressorMixin, BaseEstimator):
-    """Regression stacking with diagnostics from actual OOF fits, without replay."""
-    def __init__(self, estimators, cv, positive, passthrough, diagnostics=False, capture_predictions=False):
-        self.estimators = estimators
-        self.cv = cv
-        self.positive = positive
-        self.passthrough = passthrough
-        self.diagnostics = diagnostics
-        self.capture_predictions = capture_predictions
-
-    @staticmethod
-    def _mlp_diagnostics(fitted):
-        if hasattr(fitted, "diagnostics_"):
-            return fitted.diagnostics_
-        mlp = fitted[-1].regressor_
-        return {"N": mlp.fit_n_, "alpha": float(mlp.alpha),
-            "batch_partition": mlp.batch_partition, "batch_sizes": mlp.batch_sizes_,
-            "l2_normalization": mlp.l2_normalization,
-            "selected_batch": mlp.batch_size, "batch": mlp.effective_batch_size_,
-            "effective_batch": mlp.effective_batch_size_, "iterations": mlp.n_iter_,
-            "max_iter": mlp.max_iter, "reached_max_iter": mlp.n_iter_ >= mlp.max_iter,
-            "convergence_warnings": mlp.convergence_warnings_, "fit_count": 1,
-            "fit_count_kind": "pipeline fit attempts including final refit"}
-
-    def fit(self, X, y):
-        y = np.asarray(y)
-        folds = tuple(KFold(self.cv).split(X))
-        oof = np.empty((len(y), len(self.estimators)))
-        self.estimators_, self.named_estimators_ = [], Bunch()
-        self.mlp_fits_, self.base_fits_ = [], []
-        self.base_model_names_ = tuple(name for name, _ in self.estimators)
-        # A refit with diagnostics disabled must not expose a previous fit's OOF.
-        for attribute in ("oof_predictions_", "oof_fold_"):
-            if hasattr(self, attribute):
-                delattr(self, attribute)
-        for column, (name, estimator) in enumerate(self.estimators):
-            for fold, (train, valid) in enumerate(folds):
-                fitted = clone(estimator).fit(rows(X, train), y[train])
-                oof[valid, column] = fitted.predict(rows(X, valid))
-                record = {"phase": "oof", "fold": fold, "model": name, "N": len(train)}
-                if name == "shallow_nn":
-                    record.update(self._mlp_diagnostics(fitted))
-                    self.mlp_fits_.append(record)
-                if self.diagnostics:
-                    record["mse"] = float(np.mean((oof[valid, column] - y[valid]) ** 2))
-                    self.base_fits_.append(record)
-                del fitted
-            fitted = clone(estimator).fit(X, y)
-            self.estimators_.append(fitted)
-            self.named_estimators_[name] = fitted
-            record = {"phase": "full", "model": name, "N": len(y)}
-            if name == "shallow_nn":
-                record.update(self._mlp_diagnostics(fitted))
-                self.mlp_fits_.append(record)
-            if self.diagnostics:
-                self.base_fits_.append(record)
-        if not np.isfinite(oof).all():
-            raise ValueError("nonfinite stacking OOF predictions")
-        design = np.column_stack((oof, X)) if self.passthrough else oof
-        self.final_estimator_ = LinearRegression(positive=self.positive).fit(design, y)
-        if self.diagnostics or self.capture_predictions:
-            # Preserve exactly the predictions consumed by the meta-learner.
-            # The O(N * learners) array is opt-in and never enters RESULT JSON.
-            self.oof_predictions_ = oof
-            self.oof_fold_ = np.empty(len(y), dtype=int)
-            for fold, (_, valid) in enumerate(folds):
-                self.oof_fold_[valid] = fold
-        return self
-
-    def transform(self, X):
-        """Return final base predictions (and passthrough columns, if enabled)."""
-        predictions = np.column_stack([est.predict(X) for est in self.estimators_])
-        return np.column_stack((predictions, X)) if self.passthrough else predictions
-
-    def predict(self, X):
-        return self.final_estimator_.predict(self.transform(X))

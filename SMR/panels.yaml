@@ -1,5 +1,5 @@
 # One catalog for both SMR experiments. Select one with --panel.
-# All panels use holdout/OOF caches for eight base models and cache-only SL7.
+# Each cell fits the eight base models and combines SL7 (super_learner) from their OOF predictions.
 model_params: model_params.yaml
 preset: dev
 experiment_id: smr-aleatoric-v1
@@ -28,25 +28,6 @@ panels:
       - shallow_neural_network
       - extra_trees
       - super_learner
-    prediction_cache:
-      mode: holdout_oof
-      base_library: standalone8-v1
-      oof_folds: 5
-      # Keep all eight independent columns; do not train the separate SL4 control.
-      store_reported_sl_holdout: false
-    execution:
-      workflow: base_then_sl
-      barrier_scope: submission_plan
-      protocol_version: 2
-      verification_schedule: final_only
-      phase_round_limits: {base: 2, sl: 1}
-      # Fallback bounds when no unified operational compute policy is selected.
-      # The Discoverer policy supplies common base/SL resource limits instead.
-      sl_resources:
-        worker_cap: 24
-        io_concurrency: 8
-        memory: 2G
-        time_limit: '04:00:00'
     out: outputs/nk_grid_smr_hourlywage.csv
 
   - <<: *smr_panel

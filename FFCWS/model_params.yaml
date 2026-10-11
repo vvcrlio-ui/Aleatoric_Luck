@@ -1,4 +1,4 @@
-algorithm_version: nk-grid-v12-classification-cv-6
+algorithm_version: nk-grid-v13-fixed-oof-1
 
 regression:
   ols:
@@ -40,30 +40,6 @@ regression:
     learning_rate_init: 0.001
     max_iter: 2000
     early_stopping: false
-  super_learner:
-    # Fixed cap 200; ceil(actual fit N / 200) balanced batches, native L2/stopping.
-    mlp_batch_size: balanced
-    mlp_l2_normalization: batch
-    cv: 5
-    passthrough: false
-    ridge_alpha_log10_min: -4
-    ridge_alpha_log10_max: 6
-    ridge_n_alphas: 63
-    ridge_scoring: neg_mean_squared_error
-    n_estimators: 500
-    max_features: sqrt
-    min_samples_leaf: 5
-    hidden_layer_sizes:
-      - 32
-    alpha: 0.01
-    learning_rate_init: 0.001
-    # Same epoch ceiling as the standalone regression MLP; convergence may stop earlier.
-    max_iter: 2000
-    positive: true
-    lgbm_n_estimators: 200
-    lgbm_learning_rate: 0.05
-    lgbm_num_leaves: 10
-    lgbm_min_data_in_leaf: 10
   xgboost:
     objective: reg:squarederror
     eval_metric: rmse
@@ -125,27 +101,6 @@ classification:
     learning_rate_init: 0.001
     max_iter: 2000
     early_stopping: false
-  super_learner:
-    mlp_batch_size: balanced
-    mlp_l2_normalization: batch
-    cv: 5
-    passthrough: false
-    ridge_alpha_log10_min: -4
-    ridge_alpha_log10_max: 6
-    ridge_n_alphas: 63
-    ridge_max_iter: 20000
-    n_estimators: 500
-    max_features: sqrt
-    min_samples_leaf: 5
-    hidden_layer_sizes:
-      - 32
-    alpha: 0.01
-    learning_rate_init: 0.001
-    max_iter: 2000
-    lgbm_n_estimators: 200
-    lgbm_learning_rate: 0.05
-    lgbm_num_leaves: 10
-    lgbm_min_data_in_leaf: 10
   xgboost:
     objective: binary:logistic
     eval_metric: logloss
