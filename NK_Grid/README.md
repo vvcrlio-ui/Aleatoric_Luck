@@ -45,19 +45,36 @@ Binary outcomes use the same models, search grids, fold counts and network setti
 
 ## Interpreting prediction quality
 
-MSE is the mean squared prediction error. The project also saves R² measures with two baselines:
+MSE is the mean squared prediction error on the test set. An R² divides it by the test MSE of a baseline that predicts one value for everyone, and the baselines differ in what that value is:
 
 ```text
-r2_test / skill_train_mean
-  = 1 - model MSE / test MSE of predictions using the current training-sample mean
+r2_full_train_mean
+  = 1 - model MSE / null_mse_full_train_mean
+    null: the mean outcome of the whole training pool the N rows are drawn from
+
+r2_test, skill_train_mean
+  = 1 - model MSE / null_mse_train_mean
+    null: the mean outcome of the N rows sampled for this fit
 
 r2_test_mean
-  = 1 - model MSE / variance of the test outcomes
+  = 1 - model MSE / test_target_variance
+    null: the mean outcome of the test set
 ```
 
-The baseline for `r2_test` changes with the training sample. The conventional test-set R² corresponds to `r2_test_mean`. MSE can be viewed alongside these measures.
+For binary outcomes the predictions are probabilities of the positive class. The Brier score is the MSE of those probabilities, and the R² measures compare a model with a prediction of one positive rate for everyone:
 
-Classification metrics include AUC, Brier score, log loss, and accuracy. Undefined metrics under particular data conditions are stored as NaN, which is distinct from a failed model fit.
+```text
+brier_full_train_r2
+  = 1 - Brier score / Brier score of predicting the training pool's positive rate
+
+mcfadden_full_train_pseudo_r2
+  = 1 - log-likelihood / log-likelihood of predicting the training pool's positive rate
+
+mcfadden_pseudo_r2
+  = 1 - log-likelihood / log-likelihood of predicting the sampled rows' positive rate
+```
+
+The table also has AUC, average precision, log loss, balanced accuracy, F1 and accuracy. A metric that cannot be computed for a particular sample is stored as NaN, which is distinct from a failed model fit.
 
 Each result also has a status: `ok` for a completed fit, `skipped` when the sampled data do not allow a fit, and `failed` when fitting failed. Diagnostics also flag OLS fits with more columns than rows, constant predictions and convergence problems. An experiment is complete only when every combination in the design has a result.
 
