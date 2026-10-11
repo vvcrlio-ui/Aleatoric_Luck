@@ -29,7 +29,3 @@ A predictor column that is entirely missing is rejected by the input check. Part
 One-hot groups retain all declared levels. An observed row must contain exactly one 1; a missing row may contain NaN across the entire group. All-zero and partially missing groups are not valid category states.
 
 All dummy columns for an original variable are sampled together and count once toward K, including the reference-level column. Other predictors are treated as continuous variables.
-
-## Lasso penalty search
-
-For SMR, Lasso chooses its penalty from values set relative to alpha_max, the smallest penalty at which every coefficient is zero, computed separately in each training fold. It uses three folds and 25 values from alpha_max down to 0.001 × alpha_max, spaced evenly on a log scale. Each fold learns its own imputation and scaling. The value with the lowest mean validation MSE is chosen, and ties go to the stronger penalty. The final fit on all N training rows recomputes alpha_max from those rows. The convergence tolerance is 1e-4 and the iteration limit 20,000. The range is the same for every N and K, and no test outcome is used.
