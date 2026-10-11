@@ -132,6 +132,7 @@ CLASSIFICATION_METRIC_COLUMNS = (
     "accuracy",
     "mcfadden_pseudo_r2",
     "mcfadden_full_train_pseudo_r2",
+    "brier_full_train_r2",
 )
 
 BASE_RESULT_COLUMNS = (
@@ -496,6 +497,8 @@ def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> di
 
     ``y_train`` is the N sampled training rows. ``y_train_full`` is the whole training pool the
     rows were drawn from, so its null is one constant across every N, K, seed and draw.
+    ``brier_full_train_r2`` is the Fragile Families Challenge R-squared (Salganik et al. 2020, eq. 1):
+    the Brier score rescaled by that of predicting the training pool's positive rate.
     """
 
     y_true = np.asarray(y_test, dtype=int)
@@ -510,6 +513,8 @@ def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> di
     clipped = np.clip(score, 1e-15, 1 - 1e-15)
     mcfadden = _mcfadden_pseudo_r2(y_true, clipped, train)
     mcfadden_full = _mcfadden_pseudo_r2(y_true, clipped, full)
+    brier = float(brier_score_loss(y_true, score))
+    null_brier = float(np.mean((y_true - np.mean(full)) ** 2)) if len(full) else np.nan
 
     return {
         "roc_auc": (
@@ -522,7 +527,7 @@ def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> di
             if has_two_test_classes and finite_scores
             else np.nan
         ),
-        "brier": float(brier_score_loss(y_true, score)) if finite_scores else np.nan,
+        "brier": brier,
         "log_loss": (
             float(log_loss(y_true, clipped, labels=[0, 1]))
             if has_two_test_classes and finite_scores
@@ -537,6 +542,7 @@ def compute_classification_metrics(y_test, y_score, y_train, y_train_full) -> di
         "accuracy": float(accuracy_score(y_true, labels)),
         "mcfadden_pseudo_r2": float(mcfadden),
         "mcfadden_full_train_pseudo_r2": float(mcfadden_full),
+        "brier_full_train_r2": 1.0 - brier / null_brier if null_brier > 0 else np.nan,
     }
 
 
@@ -779,7 +785,7 @@ class NKGridExecutionSession:
         self.repeat_pairs = resolve_repeat_pairs(config)
         self.n_grid, self.k_grid = resolve_input_grids(config, loaded, source_definitions)
         self.semantic_contract = {
-            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else "classification-v2",
+            "metric_definition_version": METRIC_DEFINITION_VERSION if self.task == "regression" else "classification-v3",
             "kind": "nk_grid" if self.task == "regression" else "nk_grid_classification",
             "algorithm_version": algorithm_version,
             "dataset": self.dataset,
