@@ -1,9 +1,9 @@
 """Domain contributions from the fit.py results, averaged over seeds.
 
-For domain d and each subset S of the other eight domains, the gain is v(S+d) - v(S).
-"paper" averages the 256 gains with equal weight (Yan 2026, AJE 195:681);
-"shapley" weights them by |S|!(8-|S|)!/9!. "alone" is v({d}) - v(empty) and
-"last" is v(all nine) - v(all nine but d). Standard errors are across seeds.
+For domain d and each subset S of the other D-1 domains, the gain is v(S+d) - v(S).
+"paper" averages the 2^(D-1) gains with equal weight (Yan 2026, AJE 195:681);
+"shapley" weights them by |S|!(D-1-|S|)!/D!. "alone" is v({d}) - v(empty) and
+"last" is v(all domains) - v(all domains but d). Standard errors are across seeds.
 """
 
 import argparse
@@ -17,31 +17,32 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from fit import BINARY, DOMAINS
+from fit import ALL_SOURCES, BINARY, DOMAINS
 
 FFCWS = Path(__file__).resolve().parents[1]
-NINE = (1 << len(DOMAINS)) - 1
+EVERY_DOMAIN = (1 << len(DOMAINS)) - 1
 ESTIMATORS = ("paper", "shapley", "alone", "last")
 LABELS = {"demographics": "Demographics", "economy_employment": "Economy & employment",
           "housing_neighborhood": "Housing & neighborhood", "family_social_ties": "Family & social ties",
           "parenting_childcare": "Parenting & childcare", "child_development_education": "Child development & education",
-          "health": "Health", "attitudes_expectations": "Attitudes & expectations", "systems": "Systems"}
+          "health": "Health", "attitudes_expectations": "Attitudes & expectations", "systems": "Systems",
+          "parent_education_traits": "Parent education & traits"}
 METRIC_LABELS = {"r2": "R²", "pr_auc": "PR-AUC", "brier_r2": "Brier R²"}
 BLUE, ORANGE, INK, MUTED = "#2a78d6", "#eb6834", "#0b0b0b", "#52514e"
 
 
 def contributions(v):
-    """v: values indexed by mask 0..NINE for one outcome, seed and metric."""
+    """v: values indexed by mask 0..EVERY_DOMAIN for one outcome, seed and metric."""
     others = len(DOMAINS) - 1
     out = []
     for i, domain in enumerate(DOMAINS):
         bit = 1 << i
-        background = [s for s in range(NINE + 1) if not s & bit]
+        background = [s for s in range(EVERY_DOMAIN + 1) if not s & bit]
         gains = np.array([v[s | bit] - v[s] for s in background])
         weights = np.array([factorial(bin(s).count("1")) * factorial(others - bin(s).count("1"))
                             for s in background]) / factorial(len(DOMAINS))
         out += [(domain, "paper", gains.mean()), (domain, "shapley", gains @ weights),
-                (domain, "alone", v[bit] - v[0]), (domain, "last", v[NINE] - v[NINE & ~bit])]
+                (domain, "alone", v[bit] - v[0]), (domain, "last", v[EVERY_DOMAIN] - v[EVERY_DOMAIN & ~bit])]
     return out
 
 
@@ -52,8 +53,8 @@ def summarize(results):
         for metric in ("pr_auc", "brier_r2") if outcome in BINARY else ("r2",):
             v = values[metric]
             rows += [(outcome, seed, metric, d, e, x) for d, e, x in contributions(v)]
-            ends += [(outcome, seed, metric, "empty", v[0]), (outcome, seed, metric, "nine_domains", v[NINE]),
-                     (outcome, seed, metric, "all_sources", v[1023])]
+            ends += [(outcome, seed, metric, "empty", v[0]), (outcome, seed, metric, "all_domains", v[EVERY_DOMAIN]),
+                     (outcome, seed, metric, "all_sources", v[ALL_SOURCES])]
     stats = lambda frame, keys: frame.groupby(keys).value.agg(
         mean="mean", se=lambda x: x.std(ddof=1) / np.sqrt(len(x)), seeds="size").reset_index()
     summary = stats(pd.DataFrame(rows, columns=["outcome", "seed", "metric", "domain", "estimator", "value"]),

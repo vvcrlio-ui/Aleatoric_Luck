@@ -1,11 +1,12 @@
-"""Assign every FFC tree_ordinal source to one of nine analysis domains.
+"""Assign every FFC tree_ordinal source to one of ten analysis domains.
 
 Topics come from the official FFCWS metadata (Metadata Explorer /get_metadata).
 A source matches the metadata row whose old_name is unique and equal to it.
 In-home sources hv3*/hv4* lost that prefix in the metadata; they match rows of the
 same wave in the three in-home surveys whose old_name equals the rest of the name,
 choosing by label similarity when two rows qualify. The first listed topic decides
-the domain.
+the domain, except that a child-development or education source whose metadata focal
+person is a parent and not the child describes the parent and joins parent_education_traits.
 """
 
 import argparse
@@ -31,6 +32,8 @@ DOMAINS = {
     "Systems": "systems",
     "Paradata and weights": "none",
 }
+CHILD_TOPICS = ("Cognitive and behavioral development", "Education and school")
+PARENTS = ("fp_mother", "fp_father", "fp_PCG")
 IN_HOME_SURVEYS = ("Primary Caregiver", "In Home Survey", "In Home Observations")
 IN_HOME_WAVES = {"3": "Year 3", "4": "Year 5"}
 
@@ -44,6 +47,13 @@ def similarity(a, b):
     return difflib.SequenceMatcher(None, words(a), words(b)).ratio()
 
 
+def domain(row):
+    topic = row.topics.split(";")[0]
+    if topic in CHILD_TOPICS and any(row[p] == 1 for p in PARENTS) and row.fp_fchild != 1:
+        return "parent_education_traits"
+    return DOMAINS[topic]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metadata", required=True, help="FFMetadata CSV from metadata.ffcws.princeton.edu/get_metadata")
@@ -53,7 +63,7 @@ def main():
     args = parser.parse_args()
 
     meta = pd.read_csv(args.metadata, encoding="latin-1", low_memory=False,
-                       usecols=["new_name", "old_name", "varlab", "topics", "survey", "wave"])
+                       usecols=["new_name", "old_name", "varlab", "topics", "survey", "wave", "fp_fchild", *PARENTS])
     with pd.io.stata.StataReader(args.background) as reader:
         labels = reader.variable_labels()
     with open(args.universe) as handle:
@@ -75,7 +85,7 @@ def main():
                          "domain": "none", "label_similarity": "", "ffc_label": label, "metadata_label": ""})
             continue
         rows.append({"source": source, "match": match, "new_name": row.new_name, "topics": row.topics,
-                     "domain": DOMAINS[row.topics.split(";")[0]],
+                     "domain": domain(row),
                      "label_similarity": round(similarity(label, row.varlab), 3),
                      "ffc_label": label, "metadata_label": row.varlab})
 

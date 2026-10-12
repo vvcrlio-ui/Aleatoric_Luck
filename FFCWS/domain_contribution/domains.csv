@@ -136,16 +136,16 @@ m1g6,old_name,m1g6,Health and health behavior,health,1.0,Have you ever sought he
 m1h2,old_name,m1h2,Demographics,demographics,1.0,Were you born in the U.S.?,Were you born in the U.S.?
 m1h3,old_name,m1h3,Demographics,demographics,1.0,What is your race?,What is your race?
 m1h3a,old_name,m1h3a,Demographics,demographics,1.0,Are you of Hispanic or Latino origin or descent?,Are you of Hispanic or Latino origin or descent?
-cm1edu,old_name,cm1edu,Education and school,child_development_education,0.909,Mother baseline education (own report),Constructed - Mother baseline education (own report)
+cm1edu,old_name,cm1edu,Education and school,parent_education_traits,0.909,Mother baseline education (own report),Constructed - Mother baseline education (own report)
 cm1ethrace,old_name,cm1ethrace,Demographics,demographics,1.0,Mother race (baseline own report),Mother race (baseline own report)
-m1i1,old_name,m1i1,Education and school,child_development_education,1.0,What is the highest grade/years of school that you have completed?,What is the highest grade/years of school that you have completed?
+m1i1,old_name,m1i1,Education and school,parent_education_traits,1.0,What is the highest grade/years of school that you have completed?,What is the highest grade/years of school that you have completed?
 m1i2a,old_name,m1i2a,Employment,economy_employment,1.0,"When you last worked, how many hours per week did you work?","When you last worked, how many hours per week did you work?"
 m1i2b,old_name,m1i2b,Finances,economy_employment,1.0,About how much did you earn?,About how much did you earn?
 m1i2c,old_name,m1i2c,Employment,economy_employment,1.0,Was that amount per hour/day/week/month/year/other?,Was that amount per hour/day/week/month/year/other?
 m1i2d,old_name,m1i2d,Employment,economy_employment,1.0,Do you expect to work during next year?,Do you expect to work during next year?
 m1i2d1,old_name,m1i2d1,Romantic relationships,family_social_ties,1.0,Int Chk: Is father unknown?,Int Chk: Is father unknown?
 m1i2ii,old_name,m1i2ii,Employment,economy_employment,0.933,In what yr did you last work 2 weeks or more at a regular job?,In what year did you last work 2 weeks or more at a regular job?
-m1i3,old_name,m1i3,Education and school,child_development_education,0.88,What is the highest grade/years of school that BF have completed?,What is the highest grade/years of school that bio dad have completed?
+m1i3,old_name,m1i3,Education and school,parent_education_traits,0.88,What is the highest grade/years of school that BF have completed?,What is the highest grade/years of school that bio dad have completed?
 m1i4,old_name,m1i4,Demographics,demographics,0.727,What is BF's race?,What is bio dad's race?
 m1i4a,old_name,m1i4a,Demographics,demographics,0.824,Is BF of Hispanic/Latino origin or descent?,Is bio dad of Hispanic/Latino origin or descent?
 m1i6,old_name,m1i6,Employment;Education and school,economy_employment,0.889,"What was BF doing most of last week (working, going to school,else)?","What was bio dad doing most of last week (working, going to school,else)?"
@@ -308,11 +308,11 @@ f1h3,old_name,f1h3,Demographics,demographics,1.0,What is your race?,What is your
 f1h3a,old_name,f1h3a,Demographics,demographics,1.0,Are you of Hispanic/Latino origin?,Are you of Hispanic/Latino origin?
 f1h4a,old_name,f1h4a,Attitudes and expectations,attitudes_expectations,1.0,I feel attachment toward my racial/ethnic group? Agr/Disag,I feel attachment toward my racial/ethnic group? Agr/Disag
 f1h4b,old_name,f1h4b,Attitudes and expectations,attitudes_expectations,1.0,I participate in cultural practices of my own group? Agr/Disag,I participate in cultural practices of my own group? Agr/Disag
-cf1edu,old_name,cf1edu,Education and school,child_development_education,0.571,Father baseline education (combined report),"Constructed - Father baseline education (father report, then mother report)"
+cf1edu,old_name,cf1edu,Education and school,parent_education_traits,0.571,Father baseline education (combined report),"Constructed - Father baseline education (father report, then mother report)"
 cf1ethrace,old_name,cf1ethrace,Demographics,demographics,0.625,Father race (all waves combined report),Father race (first 3 waves combined father and mother report)
-f1i1,old_name,f1i1,Education and school,child_development_education,1.0,Highest grade of regular school that you completed?,Highest grade of regular school that you completed?
-f1i2,old_name,f1i2,Education and school;Finances,child_development_education,1.0,Have you ever received skills training from a gov. sponsored program?,Have you ever received skills training from a gov. sponsored program?
-f1i3,old_name,f1i3,Education and school,child_development_education,0.522,"Have you ever attended Bus.College, a VoTech., or been an Appentice?","Ever attended a business college, vocational tech, or been an apprentice?"
+f1i1,old_name,f1i1,Education and school,parent_education_traits,1.0,Highest grade of regular school that you completed?,Highest grade of regular school that you completed?
+f1i2,old_name,f1i2,Education and school;Finances,parent_education_traits,1.0,Have you ever received skills training from a gov. sponsored program?,Have you ever received skills training from a gov. sponsored program?
+f1i3,old_name,f1i3,Education and school,parent_education_traits,0.522,"Have you ever attended Bus.College, a VoTech., or been an Appentice?","Ever attended a business college, vocational tech, or been an apprentice?"
 f1i4,old_name,f1i4,Employment,economy_employment,1.0,Have you ever served in the military?,Have you ever served in the military?
 f1j1,old_name,f1j1,Employment,economy_employment,1.0,"Last week, did you do any regular work for pay?","Last week, did you do any regular work for pay?"
 f1j6,old_name,f1j6,Employment,economy_employment,0.857,How many hrs/wk do/did you work at your current/most recent job?,How many hours/week do/did you work at your current/most recent job?
@@ -571,8 +571,8 @@ m2j16a,old_name,m2j16a,Health and health behavior,health,0.889,"During past 12 m
 cm2gad_case,old_name,cm2gad_case,Health and health behavior,health,1.0,Constructed - Mother meets anxious criteria at one-year (CIDI),Constructed - Mother meets anxious criteria at one-year (CIDI)
 cm2md_case_con,old_name,cm2md_case_con,Health and health behavior,health,1.0,Constructed - Mother meets depression criteria (conservative) at one-year (CIDI),Constructed - Mother meets depression criteria (conservative) at one-year (CIDI)
 cm2md_case_lib,old_name,cm2md_case_lib,Health and health behavior,health,1.0,Constructed - Mother meets depression criteria (liberal) at one-year (CIDI),Constructed - Mother meets depression criteria (liberal) at one-year (CIDI)
-m2k1,old_name,m2k1,Education and school,child_development_education,1.0,Are you currently attending any school/training?,Are you currently attending any school/training?
-m2k3,old_name,m2k3,Education and school,child_development_education,1.0,Have you completed any training/schooling since child was born?,Have you completed any training/schooling since child was born?
+m2k1,old_name,m2k1,Education and school,parent_education_traits,1.0,Are you currently attending any school/training?,Are you currently attending any school/training?
+m2k3,old_name,m2k3,Education and school,parent_education_traits,1.0,Have you completed any training/schooling since child was born?,Have you completed any training/schooling since child was born?
 m2k4,old_name,m2k4,Employment,economy_employment,1.0,Have you ever served in the military?,Have you ever served in the military?
 m2k5,old_name,m2k5,Employment,economy_employment,1.0,Did you do any regular work for pay last week?,Did you do any regular work for pay last week?
 m2k8,old_name,m2k8,Employment,economy_employment,1.0,Int Chk: Has mother worked since child's birth?,Int Chk: Has mother worked since child's birth?
@@ -766,21 +766,21 @@ f2j12,old_name,f2j12,Health and health behavior,health,0.903,"During past 12 mth
 f2j14,old_name,f2j14,Health and health behavior,health,0.897,During past 12 mths have you ever lost interest in hobbies/work for 2+ weeks?,During past year have you ever lost interest in hobbies/work for 2+ weeks?
 f2j16,old_name,f2j16,Health and health behavior,health,0.897,"During past 12 mths, was there a 1+ mth period when you felt tense/anxious?","During past year, was there a 1+ mth period when you felt tense/anxious?"
 f2j16a,old_name,f2j16a,Health and health behavior,health,0.889,"During past 12 mths, did you worry a lot more than most people would?","During past year, did you worry a lot more than most people would?"
-f2j21,old_name,f2j21,Cognitive and behavioral development,child_development_education,1.0,Do you agree/disagree-I will often say whatever comes into head w/o thinking,Do you agree/disagree-I will often say whatever comes into head w/o thinking
-f2j22,old_name,f2j22,Cognitive and behavioral development,child_development_education,1.0,Do you agree/disagree-Often I don't think enough before I act,Do you agree/disagree-Often I don't think enough before I act
-f2j23,old_name,f2j23,Cognitive and behavioral development,child_development_education,1.0,Do you agree/disagree-I often say/do things w/o considering the consequences,Do you agree/disagree-I often say/do things w/o considering the consequences
-f2j24,old_name,f2j24,Cognitive and behavioral development,child_development_education,1.0,Do you agree/disagree-I get into trouble because I don't think before I act,Do you agree/disagree-I get into trouble because I don't think before I act
-f2j25,old_name,f2j25,Cognitive and behavioral development,child_development_education,1.0,Do you agree/disagree-My plans fail because I fail to think them thru first,Do you agree/disagree-My plans fail because I fail to think them thru first
-f2j26,old_name,f2j26,Cognitive and behavioral development,child_development_education,1.0,Do you agree/disagree-I often make up my mind w/o considering the situation,Do you agree/disagree-I often make up my mind w/o considering the situation
+f2j21,old_name,f2j21,Cognitive and behavioral development,parent_education_traits,1.0,Do you agree/disagree-I will often say whatever comes into head w/o thinking,Do you agree/disagree-I will often say whatever comes into head w/o thinking
+f2j22,old_name,f2j22,Cognitive and behavioral development,parent_education_traits,1.0,Do you agree/disagree-Often I don't think enough before I act,Do you agree/disagree-Often I don't think enough before I act
+f2j23,old_name,f2j23,Cognitive and behavioral development,parent_education_traits,1.0,Do you agree/disagree-I often say/do things w/o considering the consequences,Do you agree/disagree-I often say/do things w/o considering the consequences
+f2j24,old_name,f2j24,Cognitive and behavioral development,parent_education_traits,1.0,Do you agree/disagree-I get into trouble because I don't think before I act,Do you agree/disagree-I get into trouble because I don't think before I act
+f2j25,old_name,f2j25,Cognitive and behavioral development,parent_education_traits,1.0,Do you agree/disagree-My plans fail because I fail to think them thru first,Do you agree/disagree-My plans fail because I fail to think them thru first
+f2j26,old_name,f2j26,Cognitive and behavioral development,parent_education_traits,1.0,Do you agree/disagree-I often make up my mind w/o considering the situation,Do you agree/disagree-I often make up my mind w/o considering the situation
 cf2gad_case,old_name,cf2gad_case,Health and health behavior,health,1.0,Constructed - Father meets anxious criteria at one-year (CIDI),Constructed - Father meets anxious criteria at one-year (CIDI)
 cf2md_case_con,old_name,cf2md_case_con,Health and health behavior,health,1.0,Constructed - Father meets depression criteria (conservative) at one-year (CIDI),Constructed - Father meets depression criteria (conservative) at one-year (CIDI)
 cf2md_case_lib,old_name,cf2md_case_lib,Health and health behavior,health,1.0,Constructed - Father meets depression criteria (liberal) at one-year (CIDI),Constructed - Father meets depression criteria (liberal) at one-year (CIDI)
 f2k1,old_name,f2k1,Paradata and weights,none,1.0,Int Chk: Was father interviewed at baseline?,Int Chk: Was father interviewed at baseline?
-f2k2,old_name,f2k2,Education and school,child_development_education,1.0,Are you currently attending any school or training programs?,Are you currently attending any school or training programs?
-f2k5,old_name,f2k5,Education and school,child_development_education,1.0,Have you completed any training/schooling since child was born?,Have you completed any training/schooling since child was born?
+f2k2,old_name,f2k2,Education and school,parent_education_traits,1.0,Are you currently attending any school or training programs?,Are you currently attending any school or training programs?
+f2k5,old_name,f2k5,Education and school,parent_education_traits,1.0,Have you completed any training/schooling since child was born?,Have you completed any training/schooling since child was born?
 f2k6,old_name,f2k6,Employment,economy_employment,1.0,Have you ever served in the military?,Have you ever served in the military?
 f2k7,old_name,f2k7,Demographics,demographics,1.0,Int Chk: Is the respondent at least 22 years old?,Int Chk: Is the respondent at least 22 years old?
-f2k7a,old_name,f2k7a,Education and school,child_development_education,1.0,"After 20th birthday, did you attend any school/training?","After 20th birthday, did you attend any school/training?"
+f2k7a,old_name,f2k7a,Education and school,parent_education_traits,1.0,"After 20th birthday, did you attend any school/training?","After 20th birthday, did you attend any school/training?"
 f2k7c,old_name,f2k7c,Employment,economy_employment,1.0,"During the year after your 20th birthday, did you have full-time job?","During the year after your 20th birthday, did you have full-time job?"
 f2k7e,old_name,f2k7e,Employment,economy_employment,1.0,How many different jobs did you have in the year you were 20?,How many different jobs did you have in the year you were 20?
 f2k8,old_name,f2k8,Employment,economy_employment,1.0,Did you do any regular work for pay last week?,Did you do any regular work for pay last week?
@@ -1071,12 +1071,12 @@ m3j18a,old_name,m3j18a,Health and health behavior,health,1.0,"In past year, did 
 m3j28,old_name,m3j28,Health and health behavior,health,1.0,What is the largest number of drinks consumed in a day in past year?,What is the largest number of drinks consumed in a day in past year?
 m3j36j,old_name,m3j36j,Health and health behavior,health,1.0,Did respondent use one/more drugs?,Did respondent use one/more drugs?
 m3j43a,old_name,m3j43a,Health and health behavior,health,1.0,"In past year, received counseling/therapy for personal problems?","In past year, received counseling/therapy for personal problems?"
-m3j44a,old_name,m3j44a,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: I often say what comes into my head without thinking,Agree/disagree: I often say what comes into my head without thinking
-m3j44b,old_name,m3j44b,Cognitive and behavioral development,child_development_education,1.0,"Agree/disagree: Often, I don't think enough before I act","Agree/disagree: Often, I don't think enough before I act"
-m3j44c,old_name,m3j44c,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: I often say/do things without considering consequences,Agree/disagree: I often say/do things without considering consequences
-m3j44d,old_name,m3j44d,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: I often get in trouble because I don't think before I act,Agree/disagree: I often get in trouble because I don't think before I act
-m3j44e,old_name,m3j44e,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: Plans don't work out because I don't go over them carefully,Agree/disagree: Plans don't work out because I don't go over them carefully
-m3j44f,old_name,m3j44f,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: Make up mind without considering situation from all angles,Agree/disagree: Make up mind without considering situation from all angles
+m3j44a,old_name,m3j44a,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: I often say what comes into my head without thinking,Agree/disagree: I often say what comes into my head without thinking
+m3j44b,old_name,m3j44b,Cognitive and behavioral development,parent_education_traits,1.0,"Agree/disagree: Often, I don't think enough before I act","Agree/disagree: Often, I don't think enough before I act"
+m3j44c,old_name,m3j44c,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: I often say/do things without considering consequences,Agree/disagree: I often say/do things without considering consequences
+m3j44d,old_name,m3j44d,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: I often get in trouble because I don't think before I act,Agree/disagree: I often get in trouble because I don't think before I act
+m3j44e,old_name,m3j44e,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: Plans don't work out because I don't go over them carefully,Agree/disagree: Plans don't work out because I don't go over them carefully
+m3j44f,old_name,m3j44f,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: Make up mind without considering situation from all angles,Agree/disagree: Make up mind without considering situation from all angles
 m3j45,old_name,m3j45,Health and health behavior;Family and social ties,health,0.917,Did bio. father ever have pds where depressed 2 weeks or more?,Did bio. father ever have periods where depressed 2 weeks or more?
 m3j46,old_name,m3j46,Health and health behavior;Family and social ties,health,1.0,Did bio. father have periods of month or more where he was nervous/anxious?,Did bio. father have periods of month or more where he was nervous/anxious?
 m3j47,old_name,m3j47,Family and social ties;Health and health behavior,family_social_ties,1.0,Did bio. father ever have a problem with drinking?,Did bio. father ever have a problem with drinking?
@@ -1100,9 +1100,9 @@ m3r4,old_name,m3r4,Family and social ties;Attitudes and expectations,family_soci
 m3r9,old_name,m3r9,Family and social ties;Attitudes and expectations,family_social_ties,1.0,Agree/disagree: Religious faith is guide for way I treat my family,Agree/disagree: Religious faith is guide for way I treat my family
 m3r10,old_name,m3r10,Family and social ties,family_social_ties,1.0,How often do you attend religious services?,How often do you attend religious services?
 m3r11,old_name,m3r11,Family and social ties,family_social_ties,1.0,"Since child's birth, had any religious experience that transformed your life?","Since child's birth, had any religious experience that transformed your life?"
-m3k1,old_name,m3k1,Education and school,child_development_education,1.0,Are you currently in school/training program/classes?,Are you currently in school/training program/classes?
-m3k3,old_name,m3k3,Education and school,child_development_education,1.0,Have you completed training programs/school since child's first birthday?,Have you completed training programs/school since child's first birthday?
-m3k3b,old_name,m3k3b,Education and school;Finances,child_development_education,1.0,"Since child's 1st birthday, any classes to improve job skills?","Since child's 1st birthday, any classes to improve job skills?"
+m3k1,old_name,m3k1,Education and school,parent_education_traits,1.0,Are you currently in school/training program/classes?,Are you currently in school/training program/classes?
+m3k3,old_name,m3k3,Education and school,parent_education_traits,1.0,Have you completed training programs/school since child's first birthday?,Have you completed training programs/school since child's first birthday?
+m3k3b,old_name,m3k3b,Education and school;Finances,parent_education_traits,1.0,"Since child's 1st birthday, any classes to improve job skills?","Since child's 1st birthday, any classes to improve job skills?"
 m3k3c,old_name,m3k3c,Finances,economy_employment,1.0,"Since child's 1st birthday, received employment counseling?","Since child's 1st birthday, received employment counseling?"
 m3k4,old_name,m3k4,Employment,economy_employment,1.0,"Last week, did you do any regular work for pay?","Last week, did you do any regular work for pay?"
 m3k10,old_name,m3k10,Employment,economy_employment,1.0,How many hours/week do you usually work that job?,How many hours/week do you usually work that job?
@@ -1141,7 +1141,7 @@ cm3hhinc,old_name,cm3hhinc,Finances,economy_employment,1.0,Constructed - Househo
 cm3hhimp,old_name,cm3hhimp,Finances;Paradata and weights,economy_employment,1.0,Constructed - Flag variable for household income imputation,Constructed - Flag variable for household income imputation
 cm3povco,old_name,cm3povco,Finances,economy_employment,1.0,Constructed - Poverty ratio - mother's household income/poverty threshold,Constructed - Poverty ratio - mother's household income/poverty threshold
 cm3povca,old_name,cm3povca,Finances,economy_employment,1.0,Constructed - Poverty categories,Constructed - Poverty categories
-cm3cogsc,old_name,cm3cogsc,Cognitive and behavioral development,child_development_education,1.0,Constructed - sum score - WAIS-R similarities subtest,Constructed - sum score - WAIS-R similarities subtest
+cm3cogsc,old_name,cm3cogsc,Cognitive and behavioral development,parent_education_traits,1.0,Constructed - sum score - WAIS-R similarities subtest,Constructed - sum score - WAIS-R similarities subtest
 cm3tele,old_name,cm3tele,Paradata and weights,none,1.0,Constructed - Interview conducted by telephone,Constructed - Interview conducted by telephone
 cm3span,old_name,cm3span,Paradata and weights;Demographics,none,1.0,Constructed - Interview conducted in Spanish,Constructed - Interview conducted in Spanish
 m3citywt_rep1,old_name,m3citywt_rep1,Paradata and weights,none,1.0,Mother three-year city replicate weight no. 1,Mother three-year city replicate weight no. 1
@@ -1348,9 +1348,9 @@ f3r9,old_name,f3r9,Family and social ties;Attitudes and expectations,family_soci
 f3r10,old_name,f3r10,Family and social ties,family_social_ties,1.0,How often do you attend religious services?,How often do you attend religious services?
 f3r11,old_name,f3r11,Family and social ties,family_social_ties,1.0,"Since child's birth, have you had any life transforming religious experiences?","Since child's birth, have you had any life transforming religious experiences?"
 f3k0,old_name,f3k0,Paradata and weights,none,1.0,INT CHK: WAS FATHER INTERVIEWED AT 12 MONTH?,INT CHK: WAS FATHER INTERVIEWED AT 12 MONTH?
-f3k1,old_name,f3k1,Education and school,child_development_education,1.0,Are you currently in school/training program/classes?,Are you currently in school/training program/classes?
-f3k3,old_name,f3k3,Education and school,child_development_education,1.0,Have you completed training since child's first birthday?,Have you completed training since child's first birthday?
-f3k3b,old_name,f3k3b,Education and school;Finances,child_development_education,1.0,"Since child's first birthday, any classes to improve job skills?","Since child's first birthday, any classes to improve job skills?"
+f3k1,old_name,f3k1,Education and school,parent_education_traits,1.0,Are you currently in school/training program/classes?,Are you currently in school/training program/classes?
+f3k3,old_name,f3k3,Education and school,parent_education_traits,1.0,Have you completed training since child's first birthday?,Have you completed training since child's first birthday?
+f3k3b,old_name,f3k3b,Education and school;Finances,parent_education_traits,1.0,"Since child's first birthday, any classes to improve job skills?","Since child's first birthday, any classes to improve job skills?"
 f3k3c,old_name,f3k3c,Finances,economy_employment,1.0,"Since child's first birthday, received employment counseling?","Since child's first birthday, received employment counseling?"
 f3k4,old_name,f3k4,Employment,economy_employment,1.0,"Last week, did you do any regular work for pay?","Last week, did you do any regular work for pay?"
 f3k10,old_name,f3k10,Employment,economy_employment,1.0,How many hours/week do you usually work that job?,How many hours/week do you usually work that job?
@@ -1389,7 +1389,7 @@ cf3povco,old_name,cf3povco,Finances,economy_employment,1.0,Constructed - Poverty
 cf3povca,old_name,cf3povca,Finances,economy_employment,1.0,Constructed - Poverty categories,Constructed - Poverty categories
 cf3povcob,old_name,cf3povcob,Finances,economy_employment,1.0,Constructed - Poverty ratio - mother report for married/cohab,Constructed - Poverty ratio - mother report for married/cohab
 cf3povcab,old_name,cf3povcab,Finances,economy_employment,1.0,Constructed - Poverty categories - mother report for married/cohab,Constructed - Poverty categories - mother report for married/cohab
-cf3cogsc,old_name,cf3cogsc,Cognitive and behavioral development,child_development_education,1.0,Constructed - sum score - WAIS-R similarities subtest,Constructed - sum score - WAIS-R similarities subtest
+cf3cogsc,old_name,cf3cogsc,Cognitive and behavioral development,parent_education_traits,1.0,Constructed - sum score - WAIS-R similarities subtest,Constructed - sum score - WAIS-R similarities subtest
 cf3tele,old_name,cf3tele,Paradata and weights,none,1.0,Constructed - Interview conducted by telephone,Constructed - Interview conducted by telephone
 cf3span,old_name,cf3span,Paradata and weights;Demographics,none,1.0,Constructed - Interview conducted in Spanish,Constructed - Interview conducted in Spanish
 f3citywt_rep1,old_name,f3citywt_rep1,Paradata and weights,none,1.0,Father three-year city replicate weight no. 1,Father three-year city replicate weight no. 1
@@ -1523,12 +1523,12 @@ m4c36,old_name,m4c36,Employment;Education and school,economy_employment,1.0,"Wha
 m4c37,old_name,m4c37,Systems,systems,1.0,Has father spent any time in jail in the past two years?,Has father spent any time in jail in the past two years?
 m4c38,old_name,m4c38,Health and health behavior,health,1.0,Father have phys/mental health condit limit the kind/amt work can do?,Father have phys/mental health condit limit the kind/amt work can do?
 m4c39,old_name,m4c39,Health and health behavior;Employment,health,1.0,"Father have problems keeping job, getting along fam/friends b/c alc/drugs?","Father have problems keeping job, getting along fam/friends b/c alc/drugs?"
-m4c40a,old_name,m4c40a,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: Father often says/does things w/o considering consequences,Agree/disagree: Father often says/does things w/o considering consequences
-m4c40b,old_name,m4c40b,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: Father often gets into trouble b/c doesn't think before acts,Agree/disagree: Father often gets into trouble b/c doesn't think before acts
-m4c41a,old_name,m4c41a,Cognitive and behavioral development,child_development_education,1.0,True/not true: father does things that may cause trouble with the law?,True/not true: father does things that may cause trouble with the law?
-m4c41b,old_name,m4c41b,Cognitive and behavioral development,child_development_education,1.0,True/not true: father lies or treats?,True/not true: father lies or treats?
-m4c41c,old_name,m4c41c,Cognitive and behavioral development,child_development_education,1.0,True/not true: father frequently gets into fights?,True/not true: father frequently gets into fights?
-m4c41d,old_name,m4c41d,Cognitive and behavioral development,child_development_education,1.0,True/not true: father doesn't seem to feel guilty when he misbehaves?,True/not true: father doesn't seem to feel guilty when he misbehaves?
+m4c40a,old_name,m4c40a,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: Father often says/does things w/o considering consequences,Agree/disagree: Father often says/does things w/o considering consequences
+m4c40b,old_name,m4c40b,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: Father often gets into trouble b/c doesn't think before acts,Agree/disagree: Father often gets into trouble b/c doesn't think before acts
+m4c41a,old_name,m4c41a,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: father does things that may cause trouble with the law?,True/not true: father does things that may cause trouble with the law?
+m4c41b,old_name,m4c41b,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: father lies or treats?,True/not true: father lies or treats?
+m4c41c,old_name,m4c41c,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: father frequently gets into fights?,True/not true: father frequently gets into fights?
+m4c41d,old_name,m4c41d,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: father doesn't seem to feel guilty when he misbehaves?,True/not true: father doesn't seem to feel guilty when he misbehaves?
 m4c43a,old_name,m4c43a,Health and health behavior,health,0.957,"Since childӳ birth, father felt sad/depressed/lost interest in things?","Since childs birth, father felt sad/depressed/lost interest in things?"
 m4c44a,old_name,m4c44a,Health and health behavior,health,1.0,"Since ch's birth, father had period 1 mo plus when felt worried/tense/anxious?","Since ch's birth, father had period 1 mo plus when felt worried/tense/anxious?"
 cm4finjail,old_name,cm4finjail,Systems,systems,1.0,"Constructed - mother report, father in jail at mother five-year interview","Constructed - mother report, father in jail at mother five-year interview"
@@ -1664,21 +1664,21 @@ m4j9,old_name,m4j9,Health and health behavior,health,1.0,"In past yr, time 2 wee
 m4j18,old_name,m4j18,Health and health behavior,health,0.875,"In the past month, did you smoke cigarattes?","In the past month, did you smoke cigarettes?"
 m4j20,old_name,m4j20,Health and health behavior,health,0.889,What is largest number drinks you had in single day during past 12 months?,What is largest number drinks you had in single day during past year?
 m4j24a,old_name,m4j24a,Health and health behavior,health,0.87,"In past 12 months, you received counseling/therapy/treatment for personal probs?","In past year, you received counseling/therapy/treatment for personal probs?"
-m4j25a1,old_name,m4j25a1,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: I often say and do things without considering the consequences,Agree/disagree: I often say and do things without considering the consequences
-m4j25a2,old_name,m4j25a2,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: I often get into trouble because I don't think before I act,Agree/disagree: I often get into trouble because I don't think before I act
-m4j25b1,old_name,m4j25b1,Cognitive and behavioral development,child_development_education,1.0,True/not true: I do things that may cause trouble with the law,True/not true: I do things that may cause trouble with the law
-m4j25b2,old_name,m4j25b2,Cognitive and behavioral development,child_development_education,1.0,True/not true: I lie or cheat,True/not true: I lie or cheat
-m4j25b3,old_name,m4j25b3,Cognitive and behavioral development,child_development_education,1.0,True/not true: I frequently get into fights,True/not true: I frequently get into fights
-m4j25b4,old_name,m4j25b4,Cognitive and behavioral development,child_development_education,1.0,True/not true: I don't seem to feel guilty when I misbehave,True/not true: I don't seem to feel guilty when I misbehave
+m4j25a1,old_name,m4j25a1,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: I often say and do things without considering the consequences,Agree/disagree: I often say and do things without considering the consequences
+m4j25a2,old_name,m4j25a2,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: I often get into trouble because I don't think before I act,Agree/disagree: I often get into trouble because I don't think before I act
+m4j25b1,old_name,m4j25b1,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: I do things that may cause trouble with the law,True/not true: I do things that may cause trouble with the law
+m4j25b2,old_name,m4j25b2,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: I lie or cheat,True/not true: I lie or cheat
+m4j25b3,old_name,m4j25b3,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: I frequently get into fights,True/not true: I frequently get into fights
+m4j25b4,old_name,m4j25b4,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: I don't seem to feel guilty when I misbehave,True/not true: I don't seem to feel guilty when I misbehave
 m4j25c,old_name,m4j25c,Paradata and weights,none,1.0,INT CHK: WAS RESPONDENT INTERVIEWED AT THREE-YEAR?,INT CHK: WAS RESPONDENT INTERVIEWED AT THREE-YEAR?
 cm4md_case_con,old_name,cm4md_case_con,Health and health behavior,health,1.0,Constructed - Mother meets depression criteria (conservative) at five-year (CIDI,Constructed - Mother meets depression criteria (conservative) at five-year (CIDI
 cm4md_case_lib,old_name,cm4md_case_lib,Health and health behavior,health,1.0,Constructed - Mother meets depression criteria (liberal) at five-year (CIDI),Constructed - Mother meets depression criteria (liberal) at five-year (CIDI)
 m4r1,old_name,m4r1,Family and social ties;Attitudes and expectations,family_social_ties,1.0,Agree/disagree: My religious faith is an important guide for my daily life,Agree/disagree: My religious faith is an important guide for my daily life
 m4r2,old_name,m4r2,Family and social ties,family_social_ties,1.0,How often do you attend religious services?,How often do you attend religious services?
 m4r3,old_name,m4r3,Family and social ties,family_social_ties,1.0,"In last 2 yrs, you had religious experiences that transformed your life?","In last 2 yrs, you had religious experiences that transformed your life?"
-m4k1,old_name,m4k1,Education and school,child_development_education,1.0,"Are you currently attending any school, any training programs or any place?","Are you currently attending any school, any training programs or any place?"
-m4k3,old_name,m4k3,Education and school,child_development_education,1.0,Have you completed any training prog or any yrs schooling in last 2 yrs?,Have you completed any training prog or any yrs schooling in last 2 yrs?
-m4k3b,old_name,m4k3b,Education and school;Finances,child_development_education,1.0,"In the last 2 years, have you taken any classes to improve your job skills?","In the last 2 years, have you taken any classes to improve your job skills?"
+m4k1,old_name,m4k1,Education and school,parent_education_traits,1.0,"Are you currently attending any school, any training programs or any place?","Are you currently attending any school, any training programs or any place?"
+m4k3,old_name,m4k3,Education and school,parent_education_traits,1.0,Have you completed any training prog or any yrs schooling in last 2 yrs?,Have you completed any training prog or any yrs schooling in last 2 yrs?
+m4k3b,old_name,m4k3b,Education and school;Finances,parent_education_traits,1.0,"In the last 2 years, have you taken any classes to improve your job skills?","In the last 2 years, have you taken any classes to improve your job skills?"
 m4k3c,old_name,m4k3c,Finances,economy_employment,1.0,"In the last 2 years, have you received any kind of employment counseling?","In the last 2 years, have you received any kind of employment counseling?"
 m4k4,old_name,m4k4,Employment,economy_employment,1.0,"Last week, did you do any regular work for pay?","Last week, did you do any regular work for pay?"
 m4k10,old_name,m4k10,Employment,economy_employment,1.0,How many hours do you usually work per week at that job?,How many hours do you usually work per week at that job?
@@ -1754,12 +1754,12 @@ f4c36,old_name,f4c36,Employment;Education and school,economy_employment,1.0,What
 f4c37,old_name,f4c37,Systems,systems,1.0,Has mother spent any time in jail in last 2 yrs?,Has mother spent any time in jail in last 2 yrs?
 f4c38,old_name,f4c38,Health and health behavior,health,1.0,Does mother have any phys/mental health conditions limits work can do?,Does mother have any phys/mental health conditions limits work can do?
 f4c39,old_name,f4c39,Health and health behavior,health,1.0,Does mother have problems keeping job/getting along with friends because alc/dru,Does mother have problems keeping job/getting along with friends because alc/dru
-f4c40a,old_name,f4c40a,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: mother often says/does things without considering consequences,Agree/disagree: mother often says/does things without considering consequences
-f4c40b,old_name,f4c40b,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: mother  often gets into trouble because doesn't think before act,Agree/disagree: mother  often gets into trouble because doesn't think before act
-f4c41a,old_name,f4c41a,Cognitive and behavioral development,child_development_education,1.0,True/not true: mother does things that may cause trouble with the law,True/not true: mother does things that may cause trouble with the law
-f4c41b,old_name,f4c41b,Cognitive and behavioral development,child_development_education,1.0,True/not true: mother lies or cheats,True/not true: mother lies or cheats
-f4c41c,old_name,f4c41c,Cognitive and behavioral development,child_development_education,1.0,True/not true: mother frequently gets into fights,True/not true: mother frequently gets into fights
-f4c41d,old_name,f4c41d,Cognitive and behavioral development,child_development_education,1.0,True/not true: mother doesn't seem to feel guilty when misbehaves,True/not true: mother doesn't seem to feel guilty when misbehaves
+f4c40a,old_name,f4c40a,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: mother often says/does things without considering consequences,Agree/disagree: mother often says/does things without considering consequences
+f4c40b,old_name,f4c40b,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: mother  often gets into trouble because doesn't think before act,Agree/disagree: mother  often gets into trouble because doesn't think before act
+f4c41a,old_name,f4c41a,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: mother does things that may cause trouble with the law,True/not true: mother does things that may cause trouble with the law
+f4c41b,old_name,f4c41b,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: mother lies or cheats,True/not true: mother lies or cheats
+f4c41c,old_name,f4c41c,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: mother frequently gets into fights,True/not true: mother frequently gets into fights
+f4c41d,old_name,f4c41d,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: mother doesn't seem to feel guilty when misbehaves,True/not true: mother doesn't seem to feel guilty when misbehaves
 f4c43a,old_name,f4c43a,Health and health behavior,health,1.0,"Since child's birth, has there been time when mother  felt sad/depressed?","Since child's birth, has there been time when mother  felt sad/depressed?"
 f4c44a,old_name,f4c44a,Health and health behavior,health,1.0,"Since child's birth, has mother had period 1 mo+ when worried/tense/anxious?","Since child's birth, has mother had period 1 mo+ when worried/tense/anxious?"
 f4d1,old_name,f4d1,Parenting,parenting_childcare,1.0,INT CHK: DOES MOTHER HAVE ANY CONTACT WITH CHILD?,INT CHK: DOES MOTHER HAVE ANY CONTACT WITH CHILD?
@@ -1882,21 +1882,21 @@ f4j9,old_name,f4j9,Health and health behavior,health,1.0,"In past yr, time 2 wee
 f4j18,old_name,f4j18,Health and health behavior,health,1.0,"In the past month, did you smoke cigarettes?","In the past month, did you smoke cigarettes?"
 f4j20,old_name,f4j20,Health and health behavior,health,1.0,What is largest number drinks you had in single day during past years?,What is largest number drinks you had in single day during past years?
 f4j24a,old_name,f4j24a,Health and health behavior,health,1.0,"In past year, you received counseling/therapy/treatment for personal problems?","In past year, you received counseling/therapy/treatment for personal problems?"
-f4j25a1,old_name,f4j25a1,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: I often say and do things without considering the consequences,Agree/disagree: I often say and do things without considering the consequences
-f4j25a2,old_name,f4j25a2,Cognitive and behavioral development,child_development_education,1.0,Agree/disagree: I often get into trouble because I don't think before I act,Agree/disagree: I often get into trouble because I don't think before I act
-f4j25b1,old_name,f4j25b1,Cognitive and behavioral development,child_development_education,1.0,True/not true: I do things that may cause trouble with the law,True/not true: I do things that may cause trouble with the law
-f4j25b2,old_name,f4j25b2,Cognitive and behavioral development,child_development_education,1.0,True/not true: I lie or cheat,True/not true: I lie or cheat
-f4j25b3,old_name,f4j25b3,Cognitive and behavioral development,child_development_education,1.0,True/not true: I frequently get into fights,True/not true: I frequently get into fights
-f4j25b4,old_name,f4j25b4,Cognitive and behavioral development,child_development_education,1.0,True/not true: I don't seem to feel guilty when I misbehave,True/not true: I don't seem to feel guilty when I misbehave
+f4j25a1,old_name,f4j25a1,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: I often say and do things without considering the consequences,Agree/disagree: I often say and do things without considering the consequences
+f4j25a2,old_name,f4j25a2,Cognitive and behavioral development,parent_education_traits,1.0,Agree/disagree: I often get into trouble because I don't think before I act,Agree/disagree: I often get into trouble because I don't think before I act
+f4j25b1,old_name,f4j25b1,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: I do things that may cause trouble with the law,True/not true: I do things that may cause trouble with the law
+f4j25b2,old_name,f4j25b2,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: I lie or cheat,True/not true: I lie or cheat
+f4j25b3,old_name,f4j25b3,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: I frequently get into fights,True/not true: I frequently get into fights
+f4j25b4,old_name,f4j25b4,Cognitive and behavioral development,parent_education_traits,1.0,True/not true: I don't seem to feel guilty when I misbehave,True/not true: I don't seem to feel guilty when I misbehave
 f4j25c,old_name,f4j25c,Paradata and weights,none,1.0,INT CHK: WAS RESPONDENT INTERVIEWED AT THREE-YEAR?,INT CHK: WAS RESPONDENT INTERVIEWED AT THREE-YEAR?
 cf4md_case_con,old_name,cf4md_case_con,Health and health behavior,health,0.8,Constructed - Father meets depression criteria (conservative) at five-year (CIDI,Constructed - Father meets depression criteria (conservative) at 5-yr (CIDI)
 cf4md_case_lib,old_name,cf4md_case_lib,Health and health behavior,health,0.8,Constructed - Father meets depression criteria (liberal) at five-year (CIDI),Constructed - Father meets depression criteria (liberal) at 5-yr (CIDI)
 f4r1,old_name,f4r1,Family and social ties;Attitudes and expectations,family_social_ties,1.0,Agree/disagree? - My religious faith is an important guide for my daily life,Agree/disagree? - My religious faith is an important guide for my daily life
 f4r2,old_name,f4r2,Family and social ties,family_social_ties,1.0,How often do you attend religious services?,How often do you attend religious services?
 f4r3,old_name,f4r3,Family and social ties,family_social_ties,1.0,"In last 2 yrs, you had religious experiences that transformed your life?","In last 2 yrs, you had religious experiences that transformed your life?"
-f4k1,old_name,f4k1,Education and school,child_development_education,1.0,"Are you currently attending any school, any training programs or any classes?","Are you currently attending any school, any training programs or any classes?"
-f4k3,old_name,f4k3,Education and school,child_development_education,1.0,Have you completed any training program or any yrs schooling in last 2 yrs?,Have you completed any training program or any yrs schooling in last 2 yrs?
-f4k3b,old_name,f4k3b,Education and school;Finances,child_development_education,1.0,"In the last 2 years, have you taken any classes to improve your job skills?","In the last 2 years, have you taken any classes to improve your job skills?"
+f4k1,old_name,f4k1,Education and school,parent_education_traits,1.0,"Are you currently attending any school, any training programs or any classes?","Are you currently attending any school, any training programs or any classes?"
+f4k3,old_name,f4k3,Education and school,parent_education_traits,1.0,Have you completed any training program or any yrs schooling in last 2 yrs?,Have you completed any training program or any yrs schooling in last 2 yrs?
+f4k3b,old_name,f4k3b,Education and school;Finances,parent_education_traits,1.0,"In the last 2 years, have you taken any classes to improve your job skills?","In the last 2 years, have you taken any classes to improve your job skills?"
 f4k3c,old_name,f4k3c,Finances,economy_employment,1.0,"In the last 2 years, have you received any kind of employment counseling?","In the last 2 years, have you received any kind of employment counseling?"
 f4k4,old_name,f4k4,Employment,economy_employment,1.0,"Last week, did you do any regular work for pay?","Last week, did you do any regular work for pay?"
 f4k10,old_name,f4k10,Employment,economy_employment,1.0,How many hours do you usually work per week at that job?,How many hours do you usually work per week at that job?
@@ -2141,9 +2141,9 @@ m5g35,old_name,m5g35,Health and health behavior,health,1.0,G35. Age when you had
 m5h1,old_name,m5h1,Family and social ties;Attitudes and expectations,family_social_ties,1.0,H1. My religious faith is an important guide for my daily life,H1. My religious faith is an important guide for my daily life
 m5h2,old_name,m5h2,Family and social ties,family_social_ties,1.0,H2. Frequency you attend religious services,H2. Frequency you attend religious services
 m5h3,old_name,m5h3,Family and social ties,family_social_ties,1.0,H3. You had a religious experience that transformed your life since last intervi,H3. You had a religious experience that transformed your life since last intervi
-m5i1,old_name,m5i1,Education and school,child_development_education,1.0,I1. You are currently attending any school/trainings program/classes,I1. You are currently attending any school/trainings program/classes
-m5i3,old_name,m5i3,Education and school,child_development_education,1.0,I3. Have completed training programs or years of schooling since last interview,I3. Have completed training programs or years of schooling since last interview
-m5i3b,old_name,m5i3b,Education and school;Finances,child_development_education,1.0,I3B. You have taken classes to improve job skills since last interview,I3B. You have taken classes to improve job skills since last interview
+m5i1,old_name,m5i1,Education and school,parent_education_traits,1.0,I1. You are currently attending any school/trainings program/classes,I1. You are currently attending any school/trainings program/classes
+m5i3,old_name,m5i3,Education and school,parent_education_traits,1.0,I3. Have completed training programs or years of schooling since last interview,I3. Have completed training programs or years of schooling since last interview
+m5i3b,old_name,m5i3b,Education and school;Finances,parent_education_traits,1.0,I3B. You have taken classes to improve job skills since last interview,I3B. You have taken classes to improve job skills since last interview
 m5i3c,old_name,m5i3c,Finances,economy_employment,1.0,I3C. You received any kind of employment counseling since last interview,I3C. You received any kind of employment counseling since last interview
 m5i4,old_name,m5i4,Employment,economy_employment,1.0,I4. You did regular work for pay last week,I4. You did regular work for pay last week
 m5i10,old_name,m5i10,Employment,economy_employment,1.0,I10. Number of hours you usually work per week,I10. Number of hours you usually work per week
@@ -2250,9 +2250,9 @@ f5g35,old_name,f5g35,Health and health behavior,health,1.0,G35. Age when you had
 f5h1,old_name,f5h1,Family and social ties;Attitudes and expectations,family_social_ties,1.0,H1. My religious faith is an important guide for my daily life,H1. My religious faith is an important guide for my daily life
 f5h2,old_name,f5h2,Family and social ties,family_social_ties,1.0,H2. Frequency you attend religious services,H2. Frequency you attend religious services
 f5h3,old_name,f5h3,Family and social ties,family_social_ties,1.0,H3. You had a religious experience that transformed your life since last intervi,H3. You had a religious experience that transformed your life since last intervi
-f5i1,old_name,f5i1,Education and school,child_development_education,1.0,I1. You are currently attending any school/trainings program/classes,I1. You are currently attending any school/trainings program/classes
-f5i3,old_name,f5i3,Education and school,child_development_education,1.0,I3. Have completed training programs or years of schooling since last interview,I3. Have completed training programs or years of schooling since last interview
-f5i3b,old_name,f5i3b,Education and school;Finances,child_development_education,1.0,I3B. You have taken classes to improve job skills since last interview,I3B. You have taken classes to improve job skills since last interview
+f5i1,old_name,f5i1,Education and school,parent_education_traits,1.0,I1. You are currently attending any school/trainings program/classes,I1. You are currently attending any school/trainings program/classes
+f5i3,old_name,f5i3,Education and school,parent_education_traits,1.0,I3. Have completed training programs or years of schooling since last interview,I3. Have completed training programs or years of schooling since last interview
+f5i3b,old_name,f5i3b,Education and school;Finances,parent_education_traits,1.0,I3B. You have taken classes to improve job skills since last interview,I3B. You have taken classes to improve job skills since last interview
 f5i3c,old_name,f5i3c,Finances,economy_employment,1.0,I3C. You received any kind of employment counseling since last interview,I3C. You received any kind of employment counseling since last interview
 f5i4,old_name,f5i4,Employment,economy_employment,1.0,I4. You did regular work for pay last week,I4. You did regular work for pay last week
 f5i10,old_name,f5i10,Employment,economy_employment,1.0,I10. Number of hours you usually work per week,I10. Number of hours you usually work per week
@@ -2359,7 +2359,7 @@ p5i20a,old_name,p5i20a,Housing and neighborhood,housing_neighborhood,1.0,I20A. C
 p5i20b,old_name,p5i20b,Housing and neighborhood,housing_neighborhood,1.0,I20B. Number of books that belong to child,I20B. Number of books that belong to child
 p5i20c,old_name,p5i20c,Housing and neighborhood,housing_neighborhood,1.0,I20C. Child has a dictionary,I20C. Child has a dictionary
 p5i21a,old_name,p5i21a,Cognitive and behavioral development,child_development_education,1.0,I21A. Child read book for fun in the last three months,I21A. Child read book for fun in the last three months
-p5i21b,old_name,p5i21b,Cognitive and behavioral development,child_development_education,1.0,I21B. You read book for fun in the last three months,I21B. You read book for fun in the last three months
+p5i21b,old_name,p5i21b,Cognitive and behavioral development,parent_education_traits,1.0,I21B. You read book for fun in the last three months,I21B. You read book for fun in the last three months
 p5i22a,old_name,p5i22a,Housing and neighborhood,housing_neighborhood,1.0,I22A. You can't hear yourself think in home,I22A. You can't hear yourself think in home
 p5i22b,old_name,p5i22b,Housing and neighborhood,housing_neighborhood,1.0,I22B. Home is a real zoo,I22B. Home is a real zoo
 p5i22c,old_name,p5i22c,Parenting;Housing and neighborhood,parenting_childcare,1.0,I22C. Children have a regular bedtime routine,I22C. Children have a regular bedtime routine
@@ -2714,17 +2714,17 @@ o5e8,old_name,o5e8,Parenting,parenting_childcare,1.0,E8. Parent/PCG shouted at c
 o5e9,old_name,o5e9,Parenting,parenting_childcare,1.0,E9. Parent/PCG expressed overt annoyance with or hostility toward child,E9. Parent/PCG expressed overt annoyance with or hostility toward child
 o5e10,old_name,o5e10,Parenting,parenting_childcare,1.0,E10. Parent/PCG slapped or spanked child during visit,E10. Parent/PCG slapped or spanked child during visit
 o5e11,old_name,o5e11,Parenting,parenting_childcare,1.0,"E11. Parent/PCG scolded, derogated or criticized child more than once during vis","E11. Parent/PCG scolded, derogated or criticized child more than once during vis"
-o5e12,old_name,o5e12,Cognitive and behavioral development,child_development_education,1.0,E12. Parent/PCG appeared to be calm,E12. Parent/PCG appeared to be calm
-o5e13,old_name,o5e13,Cognitive and behavioral development,child_development_education,1.0,"E13. Parent/PCG's speech was distinct, clear, and audible","E13. Parent/PCG's speech was distinct, clear, and audible"
-o5e14,old_name,o5e14,Cognitive and behavioral development,child_development_education,1.0,E14. Parent/PCG initiated verbal exchanges with visitor,E14. Parent/PCG initiated verbal exchanges with visitor
-o5e15,old_name,o5e15,Cognitive and behavioral development,child_development_education,1.0,E15. Parent/PCG expressed ideas freely and easily,E15. Parent/PCG expressed ideas freely and easily
-o5e16,old_name,o5e16,Cognitive and behavioral development,child_development_education,1.0,E16. Parent/PCG appeared to understand interviewer's questions,E16. Parent/PCG appeared to understand interviewer's questions
+o5e12,old_name,o5e12,Cognitive and behavioral development,parent_education_traits,1.0,E12. Parent/PCG appeared to be calm,E12. Parent/PCG appeared to be calm
+o5e13,old_name,o5e13,Cognitive and behavioral development,parent_education_traits,1.0,"E13. Parent/PCG's speech was distinct, clear, and audible","E13. Parent/PCG's speech was distinct, clear, and audible"
+o5e14,old_name,o5e14,Cognitive and behavioral development,parent_education_traits,1.0,E14. Parent/PCG initiated verbal exchanges with visitor,E14. Parent/PCG initiated verbal exchanges with visitor
+o5e15,old_name,o5e15,Cognitive and behavioral development,parent_education_traits,1.0,E15. Parent/PCG expressed ideas freely and easily,E15. Parent/PCG expressed ideas freely and easily
+o5e16,old_name,o5e16,Cognitive and behavioral development,parent_education_traits,1.0,E16. Parent/PCG appeared to understand interviewer's questions,E16. Parent/PCG appeared to understand interviewer's questions
 o5e18a,old_name,o5e18a,Paradata and weights,none,1.0,E18A. Phone rang more than once during visit,E18A. Phone rang more than once during visit
 o5e18b,old_name,o5e18b,Paradata and weights,none,1.0,E18B. Parent/PCG answered phone at least once during visit,E18B. Parent/PCG answered phone at least once during visit
 o5e18c,old_name,o5e18c,Paradata and weights,none,1.0,E18C. People came in during visit,E18C. People came in during visit
 o5e18d,old_name,o5e18d,Paradata and weights,none,1.0,E18D. People were going out during visit,E18D. People were going out during visit
 o5e18e,old_name,o5e18e,Cognitive and behavioral development,child_development_education,1.0,E18E. Children screamed or yelled during visit,E18E. Children screamed or yelled during visit
-o5e18f,old_name,o5e18f,Cognitive and behavioral development,child_development_education,1.0,E18F. Parent/PCG shouted at someone other than child during visit,E18F. Parent/PCG shouted at someone other than child during visit
+o5e18f,old_name,o5e18f,Cognitive and behavioral development,parent_education_traits,1.0,E18F. Parent/PCG shouted at someone other than child during visit,E18F. Parent/PCG shouted at someone other than child during visit
 o5e18g,old_name,o5e18g,Paradata and weights,none,1.0,E18G. Other children in household interrupted parent/PCG during visit,E18G. Other children in household interrupted parent/PCG during visit
 o5e18h,old_name,o5e18h,Paradata and weights,none,1.0,E18H. Other adults in household interrupted parent/PCG during visit,E18H. Other adults in household interrupted parent/PCG during visit
 o5e18i,old_name,o5e18i,Paradata and weights;Housing and neighborhood,none,1.0,E18I. Someone in household turned on TV or loud music during visit,E18I. Someone in household turned on TV or loud music during visit
@@ -2740,14 +2740,14 @@ o5f9,old_name,o5f9,Cognitive and behavioral development,child_development_educat
 o5f10,old_name,o5f10,Cognitive and behavioral development,child_development_education,1.0,F10. Child's cooperation during child interview,F10. Child's cooperation during child interview
 o5f11,old_name,o5f11,Cognitive and behavioral development,child_development_education,1.0,F11. Child's cooperation while being weighed and measured,F11. Child's cooperation while being weighed and measured
 o5g1,old_name,o5g1,Paradata and weights,none,1.0,G1. Interview conducted in English or Spanish,G1. Interview conducted in English or Spanish
-o5g2,old_name,o5g2,Cognitive and behavioral development,child_development_education,1.0,G2. Parent/PCG's attention to interviewer,G2. Parent/PCG's attention to interviewer
+o5g2,old_name,o5g2,Cognitive and behavioral development,parent_education_traits,1.0,G2. Parent/PCG's attention to interviewer,G2. Parent/PCG's attention to interviewer
 o5g3,old_name,o5g3,Paradata and weights,none,1.0,G3. Parent/PCG's understanding of the questions,G3. Parent/PCG's understanding of the questions
 o5g4,old_name,o5g4,Paradata and weights,none,1.0,G4. Parent/PCG's ability to articulate answers,G4. Parent/PCG's ability to articulate answers
 o5g5,old_name,o5g5,Paradata and weights,none,1.0,G5. Parent/PCG's cooperation throughout most of interview,G5. Parent/PCG's cooperation throughout most of interview
-o5g6a,old_name,o5g6a,Cognitive and behavioral development,child_development_education,1.0,G6A. Parent/PCG appeared suspicious,G6A. Parent/PCG appeared suspicious
-o5g6b,old_name,o5g6b,Cognitive and behavioral development,child_development_education,1.0,G6B. Parent/PCG appeared uncommunicative,G6B. Parent/PCG appeared uncommunicative
-o5g6c,old_name,o5g6c,Cognitive and behavioral development,child_development_education,1.0,G6C. Parent/PCG appeared anxious/nervous,G6C. Parent/PCG appeared anxious/nervous
-o5g6d,old_name,o5g6d,Cognitive and behavioral development,child_development_education,1.0,G6D. Parent/PCG appeared hostile,G6D. Parent/PCG appeared hostile
+o5g6a,old_name,o5g6a,Cognitive and behavioral development,parent_education_traits,1.0,G6A. Parent/PCG appeared suspicious,G6A. Parent/PCG appeared suspicious
+o5g6b,old_name,o5g6b,Cognitive and behavioral development,parent_education_traits,1.0,G6B. Parent/PCG appeared uncommunicative,G6B. Parent/PCG appeared uncommunicative
+o5g6c,old_name,o5g6c,Cognitive and behavioral development,parent_education_traits,1.0,G6C. Parent/PCG appeared anxious/nervous,G6C. Parent/PCG appeared anxious/nervous
+o5g6d,old_name,o5g6d,Cognitive and behavioral development,parent_education_traits,1.0,G6D. Parent/PCG appeared hostile,G6D. Parent/PCG appeared hostile
 o5g6e,old_name,o5g6e,Health and health behavior;Paradata and weights,health,1.0,G6E. Parent/PCG appeared to be on drugs,G6E. Parent/PCG appeared to be on drugs
 o5g7,old_name,o5g7,Paradata and weights,none,1.0,G7. Anyone else present during the interview,G7. Anyone else present during the interview
 o5notinhouse,old_name,co5notinhouse,Paradata and weights,none,1.0,Flag: Interviewer indicated home visit occured in location other than PCG's resi,Flag: Interviewer indicated home visit occured in location other than PCG's resi
@@ -2833,8 +2833,8 @@ cf5finjail,old_name,cf5finjail,Systems,systems,1.0,"Constructed - father report,
 cmf5finjail,old_name,cm5ffinjail,Systems,systems,1.0,"Constructed - mother and father reports, father in jail at either nine-year inte","Constructed - mother and father reports, father in jail at either nine-year inte"
 cf5fevjail,old_name,cf5fevjail,Systems,systems,1.0,"Constructed - father report, father has spent time in jail by his nine-year inte","Constructed - father report, father has spent time in jail by his nine-year inte"
 cmf5fevjail,old_name,cm5ffevjail,Systems,systems,1.0,"Constructed - mother and father reports, dad ever in jail by either nine-year in","Constructed - mother and father reports, dad ever in jail by either nine-year in"
-cm5edu,old_name,cm5edu,Education and school,child_development_education,0.909,Mother's education: year 9,Constructed - Mother's education: year 9
-cf5edu,old_name,cf5edu,Education and school,child_development_education,0.909,Father's education: year 9,Constructed - Father's education: year 9
+cm5edu,old_name,cm5edu,Education and school,parent_education_traits,0.909,Mother's education: year 9,Constructed - Mother's education: year 9
+cf5edu,old_name,cf5edu,Education and school,parent_education_traits,0.909,Father's education: year 9,Constructed - Father's education: year 9
 cm5hhinc,old_name,cm5hhinc,Finances,economy_employment,1.0,Constructed - Mother's Household income (with imputed values),Constructed - Mother's Household income (with imputed values)
 cf5hhinc,old_name,cf5hhinc,Finances,economy_employment,1.0,Constructed - Father's Household income (with imputed values),Constructed - Father's Household income (with imputed values)
 cm5hhimp,old_name,cm5hhimp,Finances;Paradata and weights,economy_employment,1.0,Flag var for household income imputation - mothers,Flag var for household income imputation - mothers
@@ -3083,14 +3083,14 @@ hv3m48,in_home,p3m48,Cognitive and behavioral development,child_development_educ
 hv3m49,in_home,p3m49,Cognitive and behavioral development,child_development_education,0.571,m49: he/she is whiny,M49. Child is whiny
 hv3m50,in_home,p3m50,Cognitive and behavioral development,child_development_education,0.545,m50 he/she is withdrawn -does not get involved with others,"M50. Child is withdrawn, he/she doesn't get involved with others"
 hv3v1,in_home,o3v1,Paradata and weights;Demographics,none,0.857,v1: interview was conducted in (enhlish or spanish)?,V1. Interview was conducted in English or Spanish?
-hv3v2,in_home,o3v2,Cognitive and behavioral development,child_development_education,0.909,v2: respondent's attention to interviewer was:,V2. Respondent's attention to interviewer
+hv3v2,in_home,o3v2,Cognitive and behavioral development,parent_education_traits,0.909,v2: respondent's attention to interviewer was:,V2. Respondent's attention to interviewer
 hv3v3,in_home,o3v3,Paradata and weights,none,0.769,v3: respondent's understanding of the questions was:,V3. Respondent's understanding of the question
 hv3v4,in_home,o3v4,Paradata and weights,none,0.923,v4: respondent's ability to articulate answers was:,V4. Respondent's ability to articulate answers
 hv3v5,in_home,o3v5,Paradata and weights,none,0.941,v5: respondent's cooperation throughout most of the interview was:,V5. Respondent's cooperation throughout most of the interview
-hv3v6a,in_home,o3v6a,Cognitive and behavioral development,child_development_education,1.0,v6a: did respondent appear suspicious?,V6a. Did respondent appear suspicious?
-hv3v6b,in_home,o3v6b,Cognitive and behavioral development,child_development_education,1.0,v6b: did respondent appear uncommunicative?,V6b. Did respondent appear uncommunicative?
-hv3v6c,in_home,o3v6c,Cognitive and behavioral development,child_development_education,1.0,v6c: did respondent appear anxious/nervous?,V6c. Did respondent appear anxious/nervous?
-hv3v6d,in_home,o3v6d,Cognitive and behavioral development,child_development_education,1.0,v6d: did respondent appear hostile?,V6d. Did respondent appear hostile?
+hv3v6a,in_home,o3v6a,Cognitive and behavioral development,parent_education_traits,1.0,v6a: did respondent appear suspicious?,V6a. Did respondent appear suspicious?
+hv3v6b,in_home,o3v6b,Cognitive and behavioral development,parent_education_traits,1.0,v6b: did respondent appear uncommunicative?,V6b. Did respondent appear uncommunicative?
+hv3v6c,in_home,o3v6c,Cognitive and behavioral development,parent_education_traits,1.0,v6c: did respondent appear anxious/nervous?,V6c. Did respondent appear anxious/nervous?
+hv3v6d,in_home,o3v6d,Cognitive and behavioral development,parent_education_traits,1.0,v6d: did respondent appear hostile?,V6d. Did respondent appear hostile?
 hv3v6e,in_home,o3v6e,Health and health behavior;Paradata and weights,health,1.0,v6e: did respondent appear to be on drugs?,V6e. Did respondent appear to be on drugs?
 hv3v7,in_home,o3v7,Paradata and weights,none,1.0,v7: was anyone else present during the interview?,V7. Was anyone else present during the interview?
 hv3cflag,in_home,ch3cflag,Health and health behavior;Paradata and weights,health,0.167,cv: flag for problem measure in child,Constructed - Child anthropometric measurement problems flag
@@ -3125,12 +3125,12 @@ hv3pvnceil,in_home,ch3pvnceil,Cognitive and behavioral development,child_develop
 hv3pvceilr,in_home,ch3pvceilr,Cognitive and behavioral development,child_development_education,0.222,cv (mpr): last block adm. if no ppvt ceiling reached (child),Constructed - Child PPVT - Last last block administered
 hv3pvpercom,in_home,ch3pvpercom,Cognitive and behavioral development,child_development_education,0.571,cv (mpr): percent of items missing for total ppvt score (child),Constructed - Child PPVT - Percent of items for total score missing
 hv3ppvtage_m,in_home,ch3ppvtage_m,Demographics;Paradata and weights,demographics,0.444,cv (mpr): age of parent in months at ppvt administration,Constructed - PCG age at PPVT/TVIP administration (months)
-hv3pvbasal_m,in_home,ch3pvbasal_m,Cognitive and behavioral development,child_development_education,0.5,cv (mpr): parent's ppvt basal value,Constructed - PCG PPVT - Basal value
-hv3pvnbasal_m,in_home,ch3pvnbasal_m,Cognitive and behavioral development,child_development_education,0.375,cv (mpr): if no basal value was reached (parent),Constructed - PCG PPVT - Basal value not reached
-hv3pvtwceil_m,in_home,ch3pvtwceil_m,Cognitive and behavioral development,child_development_education,0.556,cv (mpr): if two ceiling ppvt values were reached (parent),Constructed - PCG PPVT - Two ceiling values were reached
-hv3pvnceil_m,in_home,ch3pvnceil_m,Cognitive and behavioral development,child_development_education,0.333,cv (mpr): if no ppvt ceiling value was reached (parent),Constructed - PCG PPVT - No ceiling values were reached
-hv3pvceilr_m,in_home,ch3pvceilr_m,Cognitive and behavioral development,child_development_education,0.222,cv (mpr): last block adm. if no ppvt ceiling reached (parent),Constructed - PCG PPVT - Last last block administered
-hv3pvpercom_m,in_home,ch3pvpercom_m,Cognitive and behavioral development,child_development_education,0.571,cv (mpr): percent of items missing for total ppvt score (parent),Constructed - PCG PPVT - Percent of items for total score missing
+hv3pvbasal_m,in_home,ch3pvbasal_m,Cognitive and behavioral development,parent_education_traits,0.5,cv (mpr): parent's ppvt basal value,Constructed - PCG PPVT - Basal value
+hv3pvnbasal_m,in_home,ch3pvnbasal_m,Cognitive and behavioral development,parent_education_traits,0.375,cv (mpr): if no basal value was reached (parent),Constructed - PCG PPVT - Basal value not reached
+hv3pvtwceil_m,in_home,ch3pvtwceil_m,Cognitive and behavioral development,parent_education_traits,0.556,cv (mpr): if two ceiling ppvt values were reached (parent),Constructed - PCG PPVT - Two ceiling values were reached
+hv3pvnceil_m,in_home,ch3pvnceil_m,Cognitive and behavioral development,parent_education_traits,0.333,cv (mpr): if no ppvt ceiling value was reached (parent),Constructed - PCG PPVT - No ceiling values were reached
+hv3pvceilr_m,in_home,ch3pvceilr_m,Cognitive and behavioral development,parent_education_traits,0.222,cv (mpr): last block adm. if no ppvt ceiling reached (parent),Constructed - PCG PPVT - Last last block administered
+hv3pvpercom_m,in_home,ch3pvpercom_m,Cognitive and behavioral development,parent_education_traits,0.571,cv (mpr): percent of items missing for total ppvt score (parent),Constructed - PCG PPVT - Percent of items for total score missing
 hv4a1,in_home,p4a1,Health and health behavior,health,0.941,"a1: In general, how would you describe (childӳ) health","A1. In general, how would you describe child's health?"
 hv4a4,in_home,p4a4,Health and health behavior,health,1.0,a4: Has child ever been tested for lead poisoning?,A4. Has child ever been tested for lead poisoning?
 hv4a6,in_home,p4a6,Health and health behavior,health,0.222,"a6: Last 12m, how many times has child been seen by doctor/hlh prof for reg chk-","A6. In past 12M, number of times child had regular check-up"
@@ -3351,14 +3351,14 @@ hv4l64,in_home,p4l64,Cognitive and behavioral development,child_development_educ
 hv4l65,in_home,p4l65,Cognitive and behavioral development,child_development_education,0.4,l65: (he/she) worries,L65. Child worries
 hv4l66,in_home,p4l66,Cognitive and behavioral development,child_development_education,0.727,l66: (he/she) enjoys talking to you,L66. Child enjoys talking to you
 hv4v1,in_home,o4v1,Paradata and weights;Demographics,none,0.727,v1: Interview was conducted in:,V1. Interview was conducted in English or Spanish?
-hv4v2,in_home,o4v2,Cognitive and behavioral development,child_development_education,0.8,v2: Respondentӳ attention to interviewer was:,V2. Respondent's attention to interviewer
+hv4v2,in_home,o4v2,Cognitive and behavioral development,parent_education_traits,0.8,v2: Respondentӳ attention to interviewer was:,V2. Respondent's attention to interviewer
 hv4v3,in_home,o4v3,Paradata and weights,none,0.667,v3: Respondentӳ understanding of the questions was:,V3. Respondent's understanding of the question
 hv4v4,in_home,o4v4,Paradata and weights,none,0.833,v4: Respondentӳ ability to articulate answers was:,V4. Respondent's ability to articulate answers
 hv4v5,in_home,o4v5,Paradata and weights,none,0.875,v5: Respondentӳ cooperation throughout most of the interview was:,V5. Respondent's cooperation throughout most of the interview
-hv4v6a,in_home,o4v6a,Cognitive and behavioral development,child_development_education,1.0,v6a: Did respondent appear suspicious?,V6a. Did respondent appear suspicious?
-hv4v6b,in_home,o4v6b,Cognitive and behavioral development,child_development_education,1.0,v6b: Did respondent appear uncommunicative?,V6b. Did respondent appear uncommunicative?
-hv4v6c,in_home,o4v6c,Cognitive and behavioral development,child_development_education,1.0,v6c: Did respondent appear anxious/nervous?,V6c. Did respondent appear anxious/nervous?
-hv4v6d,in_home,o4v6d,Cognitive and behavioral development,child_development_education,1.0,v6d: Did respondent appear hostile?,V6d. Did respondent appear hostile?
+hv4v6a,in_home,o4v6a,Cognitive and behavioral development,parent_education_traits,1.0,v6a: Did respondent appear suspicious?,V6a. Did respondent appear suspicious?
+hv4v6b,in_home,o4v6b,Cognitive and behavioral development,parent_education_traits,1.0,v6b: Did respondent appear uncommunicative?,V6b. Did respondent appear uncommunicative?
+hv4v6c,in_home,o4v6c,Cognitive and behavioral development,parent_education_traits,1.0,v6c: Did respondent appear anxious/nervous?,V6c. Did respondent appear anxious/nervous?
+hv4v6d,in_home,o4v6d,Cognitive and behavioral development,parent_education_traits,1.0,v6d: Did respondent appear hostile?,V6d. Did respondent appear hostile?
 hv4v6e,in_home,o4v6e,Health and health behavior;Paradata and weights,health,1.0,v6e: Did respondent appear to be on drugs?,V6e. Did respondent appear to be on drugs?
 hv4v7,in_home,o4v7,Paradata and weights,none,1.0,v7: Was anyone else present during the interview?,V7. Was anyone else present during the interview?
 hv4v9,unmatched,,,none,,v9: Additional comments:,
@@ -3377,7 +3377,7 @@ hv4pvnceil,in_home,ch4pvnceil,Cognitive and behavioral development,child_develop
 hv4pvceilr,in_home,ch4pvceilr,Cognitive and behavioral development,child_development_education,0.375,cv (mpr): last block administered if no ceiling reached (child),Constructed - Child PPVT - Last block administered
 hv4pvpercom,in_home,ch4pvpercom,Cognitive and behavioral development,child_development_education,0.7,cv (mpr): percent of items for total score missing (child),Constructed - Child PPVT - Percent of items for total score missing
 hv4pverr,in_home,ch4pverr,Cognitive and behavioral development,child_development_education,0.5,cv (mpr): total number of errors (child's ppvt),Constructed - Child PPVT - Total number of errors
-hv4ppvtparent,in_home,ch4ppvtparent,Cognitive and behavioral development;Paradata and weights,child_development_education,0.727,cv: participated in ppvt/tvip (parent)?,Constructed - PCG participated in PPVT/TVIP
+hv4ppvtparent,in_home,ch4ppvtparent,Cognitive and behavioral development;Paradata and weights,parent_education_traits,0.727,cv: participated in ppvt/tvip (parent)?,Constructed - PCG participated in PPVT/TVIP
 hv4wj_test,in_home,ch4wj_test,Cognitive and behavioral development;Paradata and weights,child_development_education,0.727,cv: participated in w-j test?,Constructed - Child participated in W-J
 hv4wjraw22,in_home,ch4wjraw22,Cognitive and behavioral development,child_development_education,0.111,wraw22: CV: Total correct raw score of test 22 (January 2009),Constructed - Child W-J - Total items correctly answered
 hv4wjsc22,in_home,ch4wjsc22,Cognitive and behavioral development,child_development_education,0.435,"CV: W score, generated based on the total raw score (wjraw22)",Constructed - Child W-J - W-J total score converted from total raw score

@@ -1,9 +1,9 @@
-"""Fit LightGBM on every subset of the nine FFC domains, for one outcome and seed at a time.
+"""Fit LightGBM on every subset of the ten FFC domains, for one outcome and seed at a time.
 
 Families with an observed outcome are pooled from train.csv and test.csv and split
 70/30 by the seed (stratified for binary outcomes); every subset of one outcome and
 seed uses that split. Mask bit i selects DOMAINS[i]. Mask 0 is the constant
-training-mean prediction, and mask 1023 adds the sources outside every domain, so it
+training-mean prediction, and mask 2047 adds the sources outside every domain, so it
 holds all 3,400 sources.
 """
 
@@ -32,8 +32,8 @@ from aleatoric_nk_grid.model_registry import load_model_params, make_model
 
 DOMAINS = ("demographics", "economy_employment", "housing_neighborhood", "family_social_ties",
            "parenting_childcare", "child_development_education", "health",
-           "attitudes_expectations", "systems")
-ALL_SOURCES = 1023
+           "attitudes_expectations", "systems", "parent_education_traits")
+ALL_SOURCES = 2047
 BINARY = {"eviction", "layoff", "jobTraining"}
 
 state = {}
