@@ -6,7 +6,7 @@ The method follows Yan, "Revisiting the social determinants of health with expla
 
 ## Domains
 
-Each background variable is assigned a domain through the topics in the official [FFCWS metadata](https://metadata.ffcws.princeton.edu/). A variable carries up to two topics, and its first topic decides. Four pairs of closely related topics are merged, because information split across two domains leaves each with only part of the credit.
+Each background variable is assigned a domain through the topics in the official [FFCWS metadata](https://metadata.ffcws.princeton.edu/). A variable carries up to two topics, and its first topic decides. Four pairs of topics that describe the same part of family life are merged, in line with the broader domains of the reference paper, whose socioeconomic domain holds income, wealth and occupation together and whose social-connections domain holds marriage and relations with family and friends. Childcare, with 14 variables, would otherwise stand alone.
 
 The child development and education topics also hold questions about the parents themselves: their schooling and job training, their own cognitive tests and impulsivity, and the interviewer's impressions of the caregiver. The metadata records whom each question is about, and the 99 questions about a parent and not about the child form a domain of their own. Left in the child domain, they would credit the child's development with information about the parents, such as the parents' earlier job training when the outcome is the caregiver's job training.
 

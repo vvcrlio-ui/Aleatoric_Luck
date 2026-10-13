@@ -13,7 +13,11 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+matplotlib.rcParams.update({"font.family": "DejaVu Sans", "savefig.facecolor": "white"})
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pandas as pd
 
@@ -29,6 +33,27 @@ LABELS = {"demographics": "Demographics", "economy_employment": "Economy & emplo
           "parent_education_traits": "Parent education & traits"}
 METRIC_LABELS = {"r2": "R²", "pr_auc": "PR-AUC", "brier_r2": "Brier R²"}
 BLUE, ORANGE, INK, MUTED = "#2a78d6", "#eb6834", "#0b0b0b", "#52514e"
+# Palette and type of the project's range-bar figures (runs/mh-range-bars-20261010/plot_range_bars_2d.py).
+NAVY, TEXT, SUBTITLE, FOOT, AXIS, GRID = "#203b4c", "#39464d", "#5c6971", "#74808a", "#77818a", "#c9ced3"
+FILL, NEGATIVE = "#4a6fae", "#9b4f58"
+CMAP = LinearSegmentedColormap.from_list(
+    "diverging", list(zip([0, 0.2, 0.4, 0.5, 0.6, 0.8, 1],
+                          ["#7d3c45", "#b9767d", "#e7cacc", "#ebeae8", "#b6cae7", "#6f92c8", "#2f5596"])))
+NORM = TwoSlopeNorm(vmin=-0.02, vcenter=0, vmax=0.10)
+OUTCOMES = ("materialHardship", "eviction", "layoff", "gpa", "grit", "jobTraining")
+NAMES = {"materialHardship": "Material hardship", "eviction": "Eviction", "layoff": "Layoff", "gpa": "GPA",
+         "grit": "Grit", "jobTraining": "Job training"}
+GROUPS = (("Household", 0, 2), ("Child", 3, 4), ("Caregiver", 5, 5))
+RADAR_ORDER = ("family_social_ties", "parenting_childcare", "child_development_education", "parent_education_traits",
+               "health", "demographics", "attitudes_expectations", "systems", "housing_neighborhood",
+               "economy_employment")
+READ_CELL = ("Each cell is the test-score gain from adding\none domain, averaged over every subset of\n"
+             "the other nine domains (Yan 2026, AJE).\n\nBold number: mean over seeds.\n"
+             "± : standard error across seeds; the seeds\nshare families, so it understates the\n"
+             "uncertainty.\n\nR² for continuous outcomes, PR-AUC for\nbinary outcomes: compare cells within a\n"
+             "column, not across columns.\n\nRed: adding the domain lowers the score.")
+FOOTER = ("Source: FFC domain contribution, LightGBM on the tree_ordinal inputs; domains from FFCWS metadata "
+          "topics (FFMetadata v20)")
 
 
 def contributions(v):
@@ -97,21 +122,108 @@ def figures(summary, out):
         fig.savefig(out / f"{outcome}_{metric}.png", dpi=150)
         plt.close(fig)
 
-    table = primary[primary.estimator == "paper"].pivot(index="domain", columns="outcome", values="mean")
-    table = table.loc[[d for d in DOMAINS if d in table.index]]
-    limit = np.nanmax(np.abs(table.to_numpy()))
-    fig, ax = plt.subplots(figsize=(1.6 * table.shape[1] + 5, 5.5))
-    cmap = matplotlib.colors.LinearSegmentedColormap.from_list("diverging", ["#d03b3b", "#f0efec", BLUE])
-    image = ax.imshow(table.to_numpy(), cmap=cmap, vmin=-limit, vmax=limit, aspect="auto")
-    for (r, c), value in np.ndenumerate(table.to_numpy()):
-        ax.text(c, r, f"{round(value, 3) + 0:.3f}", ha="center", va="center", color=INK, fontsize=9)
-    ax.set_xticks(range(table.shape[1]), [f"{o}\n({'PR-AUC' if o in BINARY else 'R²'})" for o in table.columns])
-    ax.set_yticks(range(table.shape[0]), [LABELS[d] for d in table.index])
-    ax.set_title("Mean gain over subsets (paper estimator)", loc="left", color=INK)
-    fig.colorbar(image, ax=ax, shrink=0.8, label="Gain")
-    fig.tight_layout()
-    fig.savefig(out / "heatmap_paper.png", dpi=150)
+    heatmap(primary[primary.estimator == "paper"], out)
+    radars(primary[primary.estimator == "paper"], out)
+
+
+def heatmap(paper, out):
+    mean = paper.pivot(index="domain", columns="outcome", values="mean").loc[list(RADAR_ORDER), list(OUTCOMES)]
+    se = paper.pivot(index="domain", columns="outcome", values="se").loc[list(RADAR_ORDER), list(OUTCOMES)]
+    seeds = int(paper.seeds.max())
+    fig = plt.figure(figsize=(16, 9.6), facecolor="white")
+    ax = fig.add_axes([0.2, 0.1, 0.52, 0.66])
+    ax.imshow(mean.to_numpy(), cmap=CMAP, norm=NORM, aspect="auto")
+    for (r, c), value in np.ndenumerate(mean.to_numpy()):
+        ink = "white" if abs(NORM(value) - 0.5) > 0.32 else INK
+        ax.text(c, r - 0.1, f"{round(value, 3) + 0:.3f}", ha="center", va="center", fontsize=11.5,
+                fontweight="bold", color=ink)
+        ax.text(c, r + 0.24, f"± {se.iat[r, c]:.3f}", ha="center", va="center", fontsize=8, color=ink)
+    ax.set_xticks(np.arange(len(OUTCOMES) + 1) - 0.5, minor=True)
+    ax.set_yticks(np.arange(len(RADAR_ORDER) + 1) - 0.5, minor=True)
+    ax.grid(which="minor", color="white", linewidth=3)
+    ax.tick_params(which="both", length=0)
+    ax.set_xticks(range(len(OUTCOMES)), [f"{NAMES[o]}\n{'PR-AUC' if o in BINARY else 'R²'}" for o in OUTCOMES],
+                  fontsize=11, color=TEXT)
+    ax.xaxis.tick_top()
+    ax.set_yticks(range(len(RADAR_ORDER)), [LABELS[d] for d in RADAR_ORDER], fontsize=11.5, fontweight="bold",
+                  color=NAVY)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.canvas.draw()
+    to_figure = fig.transFigure.inverted()
+    for label, first, last in GROUPS:
+        left = to_figure.transform(ax.transData.transform((first - 0.45, 0)))[0]
+        right = to_figure.transform(ax.transData.transform((last + 0.45, 0)))[0]
+        fig.text((left + right) / 2, 0.84, label, ha="center", fontsize=13, fontweight="bold", color=NAVY)
+        fig.add_artist(plt.Line2D([left, right], [0.832, 0.832], color=AXIS, linewidth=0.8))
+    fig.text(0.02, 0.975, "Domain contribution to predicting FFC outcomes", fontsize=22, fontweight="bold",
+             color=NAVY, va="top")
+    fig.text(0.02, 0.928, "Mean gain in test score from adding a domain, over all 512 subsets of the other nine "
+             f"domains · LightGBM · {seeds} seeds × random 70/30 splits", fontsize=11.5, color=SUBTITLE, va="top")
+    fig.text(0.76, 0.76, "How to read a cell", fontsize=13, fontweight="bold", color=NAVY, va="top")
+    fig.text(0.76, 0.72, READ_CELL, fontsize=9.5, color=TEXT, va="top", linespacing=1.5)
+    colorbar_axis(fig, [0.76, 0.17, 0.17, 0.022], "Cell colour: mean gain")
+    fig.text(0.02, 0.02, FOOTER, fontsize=9, color=FOOT)
+    fig.savefig(out / "heatmap_paper.png", dpi=200)
     plt.close(fig)
+
+
+def radars(paper, out):
+    angles = np.pi / 2 - np.arange(len(RADAR_ORDER)) * 2 * np.pi / len(RADAR_ORDER)
+    closed = np.append(angles, angles[0])
+    seeds = int(paper.seeds.max())
+    fig = plt.figure(figsize=(24, 17), facecolor="white")
+    width, height = 0.16, 0.16 * 24 / 17
+    for k, outcome in enumerate(OUTCOMES):
+        values = paper[paper.outcome == outcome].set_index("domain")["mean"].loc[list(RADAR_ORDER)].to_numpy()
+        centre, bottom = (0.18, 0.5, 0.82)[k % 3], (0.55, 0.12)[k // 3]
+        ax = fig.add_axes([centre - width / 2, bottom, width, height], polar=True)
+        rings = MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(0, values.max())
+        rings = rings[rings > 0]
+        outer = rings[-1]
+        shown = np.clip(values, 0, None)
+        circle = np.linspace(0, 2 * np.pi, 200)
+        ax.fill(closed, np.append(shown, shown[0]), color=FILL, alpha=0.85, zorder=2)
+        ax.plot(closed, np.append(shown, shown[0]), color=INK, linewidth=1.3, zorder=3)
+        ax.scatter(angles, shown, s=18, color=INK, zorder=4)
+        for ring in rings:
+            ax.plot(circle, np.full(200, ring), color=GRID, linewidth=0.8, linestyle=(0, (4, 3)), zorder=1)
+            ax.text(np.deg2rad(72), ring, f"{ring:g}", fontsize=8.5, color=FOOT, ha="left", va="bottom", zorder=5)
+        for angle in angles:
+            ax.plot([angle, angle], [0, outer], color=GRID, linewidth=0.8, linestyle=(0, (4, 3)), zorder=1)
+        ax.set_ylim(0, outer)
+        ax.grid(False)
+        ax.spines["polar"].set_visible(False)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for angle, domain, value in zip(angles, RADAR_ORDER, values):
+            x = np.cos(angle)
+            ha = "center" if abs(x) < 0.3 else ("left" if x > 0 else "right")
+            shown = round(value, 3) + 0
+            ax.text(angle, outer * 1.2, f"{LABELS[domain].replace(' & ', ' &' + chr(10))}\n{shown:.3f}",
+                    ha=ha, va="center", fontsize=11, linespacing=1.25,
+                    color=NEGATIVE if shown < 0 else TEXT)
+        top = bottom + height + 0.075
+        fig.text(centre, top, NAMES[outcome], ha="center", fontsize=19, fontweight="bold", color=NAVY)
+        fig.text(centre, top - 0.02, f"gain in test {'PR-AUC' if outcome in BINARY else 'R²'}", ha="center",
+                 fontsize=11, color=SUBTITLE)
+    fig.text(0.02, 0.975, "Domain contribution by outcome", fontsize=26, fontweight="bold", color=NAVY, va="top")
+    fig.text(0.02, 0.945, "Mean gain from adding a domain, over all 512 subsets of the other nine domains · "
+             f"LightGBM · {seeds} seeds · each panel has its own radial scale · negative means (lowest "
+             f"{paper['mean'].min():.3f}) are drawn at the centre and labelled in red", fontsize=13, color=SUBTITLE, va="top")
+    fig.text(0.02, 0.012, FOOTER, fontsize=10, color=FOOT)
+    fig.savefig(out / "radar_paper.png", dpi=200)
+    plt.close(fig)
+
+
+def colorbar_axis(fig, box, label):
+    cax = fig.add_axes(box)
+    bar = fig.colorbar(ScalarMappable(norm=NORM, cmap=CMAP), cax=cax, orientation="horizontal",
+                       ticks=[NORM.vmin, 0, 0.05, NORM.vmax])
+    bar.ax.set_xticklabels([f"≤−{-NORM.vmin:.2f}", "0", "0.05", f"≥{NORM.vmax:.2f}"])
+    bar.ax.tick_params(labelsize=8.5, length=2)
+    bar.set_label(label, fontsize=9, labelpad=6)
+    bar.outline.set_linewidth(0.45)
 
 
 def main():

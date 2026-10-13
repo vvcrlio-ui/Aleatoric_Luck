@@ -43,8 +43,9 @@ def load(data, outcome, seed):
     features = pd.read_parquet(data / "adapter_work" / "tree_ordinal" / "features.parquet").set_index("challengeID")
     y = pd.concat([pd.read_csv(data / "train.csv"), pd.read_csv(data / "test.csv")]).set_index("challengeID")[outcome].dropna()
     manifest = pd.read_csv(data / "adapter_work" / "tree_ordinal" / "feature_manifest.csv")
-    domain = pd.read_csv(FFCWS / "domain_contribution" / "domains.csv").set_index("source").domain
-    column_domain = manifest.set_index("feature_name").source_column.map(domain)
+    domains = pd.read_csv(FFCWS / "domain_contribution" / "domains.csv").set_index("source")
+    column_source = manifest.set_index("feature_name").source_column
+    column_domain = column_source.map(domains.domain)
     binary = outcome in BINARY
     train, test = train_test_split(y.index, test_size=0.3, random_state=seed, stratify=y if binary else None)
     state.update(
@@ -52,6 +53,7 @@ def load(data, outcome, seed):
         X_train=features.loc[train], X_test=features.loc[test],
         y_train=y[train].to_numpy(int if binary else float), y_test=y[test].to_numpy(int if binary else float),
         columns={d: [c for c in features.columns if column_domain[c] == d] for d in DOMAINS},
+        topic=column_source.map(domains.topics.fillna("").str.split(";").str[0]),
         params=load_model_params(FFCWS / "model_params.yaml", task="classification" if binary else "regression",
                                  models=["lightgbm"])["lightgbm"])
 
@@ -72,10 +74,10 @@ def scores(prediction):
     return {"r2": metrics["skill_train_mean"], "mse": metrics["mse"]}
 
 
-def fit(mask):
-    selected = columns(mask)
+def evaluate(selected):
+    """Fit LightGBM on the selected columns and score it on the test rows; no columns predicts the training mean."""
     start = time.perf_counter()
-    if mask == 0:
+    if not selected:
         rounds, prediction = 0, np.full(len(state["y_test"]), state["y_train"].mean())
     else:
         model = make_model("lightgbm", state["seed"], 1, "classification" if state["binary"] else "regression",
@@ -84,11 +86,16 @@ def fit(mask):
         rounds = model.best_rounds_
         X_test = state["X_test"][selected]
         prediction = model.predict_proba(X_test)[:, 1] if state["binary"] else model.predict(X_test)
-    return {"outcome": state["outcome"], "seed": state["seed"], "mask": mask,
-            "domains": "all_sources" if mask == ALL_SOURCES else "+".join(d for i, d in enumerate(DOMAINS) if mask >> i & 1),
+    return {"outcome": state["outcome"], "seed": state["seed"],
             "n_sources": len(selected), "n_train": len(state["y_train"]), "n_test": len(state["y_test"]),
             "test_positives": int(state["y_test"].sum()) if state["binary"] else "",
             "rounds": rounds, **scores(prediction), "fit_seconds": time.perf_counter() - start}
+
+
+def fit(mask):
+    row = evaluate(columns(mask))
+    domains = "all_sources" if mask == ALL_SOURCES else "+".join(d for i, d in enumerate(DOMAINS) if mask >> i & 1)
+    return {"outcome": row.pop("outcome"), "seed": row.pop("seed"), "mask": mask, "domains": domains, **row}
 
 
 def main():
