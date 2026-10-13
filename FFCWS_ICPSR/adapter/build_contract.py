@@ -54,6 +54,9 @@ OUTCOMES = {
 }
 NUMERIC_TYPES = ("Continuous", "Binary", "Ordered Categorical")
 N_SIZES = 6
+# Ten seeds (each a new 70/30 split) with five draws each.
+SEEDS = list(range(12345, 12355))
+DRAWS = list(range(5))
 MIN_N = 50
 MODELS = [
     "ols", "ridge", "lasso", "random_forest", "xgboost", "lightgbm",
@@ -166,6 +169,9 @@ def panel_catalog(summary: dict[str, Any]) -> str:
         "preset: dev",
         "experiment_id: ffcws-icpsr-hardship-v1",
         "data_version: ffcws-icpsr-hardship-ard-v1",
+        "repeat_plan:",
+        f"  - seeds: [{', '.join(map(str, SEEDS))}]",
+        f"    draws: [{', '.join(map(str, DRAWS))}]",
         "",
         "preparation:",
         "  adapter: adapter/adapter.py",

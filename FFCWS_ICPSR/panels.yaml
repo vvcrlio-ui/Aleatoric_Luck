@@ -7,6 +7,9 @@ model_spec_version: nkgrid-models-v6-balanced-batch-1
 preset: dev
 experiment_id: ffcws-icpsr-hardship-v1
 data_version: ffcws-icpsr-hardship-ard-v1
+repeat_plan:
+  - seeds: [12345, 12346, 12347, 12348, 12349, 12350, 12351, 12352, 12353, 12354]
+    draws: [0, 1, 2, 3, 4]
 
 preparation:
   adapter: adapter/adapter.py
