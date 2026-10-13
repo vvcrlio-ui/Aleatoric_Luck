@@ -109,6 +109,10 @@ def build_contract(source: Path, metadata_path: Path) -> tuple[dict[str, Any], d
                 continue
         elif row["type"] not in NUMERIC_TYPES:
             raise ValueError(f"Unexpected metadata type for {name}: {row['type']!r}")
+        elif row["type"] != "Continuous" and max(value_labels.get(original[name], {0: ""})) >= 100:
+            # Codes of 100 and above answer on a second scale (e.g. 0-7 days a week
+            # or "201 almost every day"), so the variable has no single numeric order.
+            levels = _levels(value_labels[original[name]])
         candidates.append({"name": name, "landmark": wave_landmark[row["wave"]], "levels": levels})
 
     items = [item for definition in OUTCOMES.values() for item in definition["items"]]
@@ -168,7 +172,7 @@ def panel_catalog(summary: dict[str, Any]) -> str:
         "model_spec_version: nkgrid-models-v6-balanced-batch-1",
         "preset: dev",
         "experiment_id: ffcws-icpsr-hardship-v1",
-        "data_version: ffcws-icpsr-hardship-ard-v1",
+        "data_version: ffcws-icpsr-hardship-ard-v2",
         "repeat_plan:",
         f"  - seeds: [{', '.join(map(str, SEEDS))}]",
         f"    draws: [{', '.join(map(str, DRAWS))}]",
