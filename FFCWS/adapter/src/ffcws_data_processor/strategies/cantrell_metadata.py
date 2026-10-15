@@ -20,7 +20,7 @@ from ..common.schema import level_token, safe_identifier
 
 
 STRATEGY = "cantrell_metadata"
-RESOURCES = Path(__file__).resolve().parents[1] / "cantrell_scales" / "data"
+RESOURCES = Path(__file__).resolve().parents[1] / "cantrell_scales" / "rules"
 WAVES = ("Baseline", "Year 1", "Year 3", "Year 5", "Year 9")
 TYPES = ("Continuous", "Binary", "Ordered Categorical", "Unordered Categorical")
 MIN_CITIES = 18
