@@ -23,6 +23,7 @@ strategies:
   - median_mode
   - median_missing_indicator
   - tree_ordinal
+  - cantrell_metadata
 
 missing_value_codes:
   - -9

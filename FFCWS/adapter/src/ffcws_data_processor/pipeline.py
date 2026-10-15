@@ -34,6 +34,7 @@ from .common.schema import FFC_MISSING_CODES, SchemaConfig, build_shared_schema
 from .common.validation import ensure_disjoint_ids, ensure_unique_ids
 from .contract import enforce_outcome_train_category_coverage, write_engine_schema
 from .strategies import STRATEGIES
+from .strategies.cantrell_metadata import STRATEGY as CANTRELL, encode_cantrell_metadata
 
 
 DEFAULT_OUTCOMES = (
@@ -110,7 +111,7 @@ def _build_pipeline(
     selected_validation_models = tuple(validation_models)
     if not selected_validation_models:
         raise ValueError("At least one validation model is required")
-    unknown = [name for name in selected if name not in STRATEGIES]
+    unknown = [name for name in selected if name not in (*STRATEGIES, CANTRELL)]
     if unknown:
         raise ValueError(f"Unknown preprocessing strategy: {', '.join(unknown)}")
     for strategy in selected:
@@ -135,7 +136,7 @@ def _build_pipeline(
     source_manifest = source_manifest_frame(schema)
 
     results = []
-    for strategy in selected:
+    for strategy in (name for name in selected if name != CANTRELL):
         result = STRATEGIES[strategy](
             background,
             schema,
@@ -147,6 +148,18 @@ def _build_pipeline(
         )
         results.append(result)
     validate_cross_strategy_sources(results)
+    if CANTRELL in selected:
+        # Its variables come from the FFCWS metadata, not the shared schema.
+        result = encode_cantrell_metadata(
+            background,
+            value_labels,
+            id_column=id_column,
+            train_ids=train[id_column],
+        )
+        validate_feature_manifest(
+            result.features, result.feature_manifest, id_column=id_column
+        )
+        results.append(result)
     output_root.mkdir(parents=True, exist_ok=True)
     write_frame(output_root / "source_manifest.csv", source_manifest)
     write_json(output_root / "schema.json", schema.to_dict())
@@ -223,6 +236,7 @@ def _build_pipeline(
                 manifest_path=manifest_ard,
                 manifest=persisted_manifest,
                 id_column=id_column,
+                imputation=result.imputation,
                 feature_universe_stem=f"ffc_{result.strategy}",
             )
             loaded = load_input(schema_path, outcome)
@@ -333,7 +347,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--strategy",
         nargs="+",
-        choices=tuple(STRATEGIES),
+        choices=(*STRATEGIES, CANTRELL),
         default=None,
         help="One or more strategies; defaults to the config list.",
     )

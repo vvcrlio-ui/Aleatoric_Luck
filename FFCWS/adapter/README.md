@@ -2,7 +2,7 @@
 
 FFCWS inputs comprise a background-variable table and official train/test outcome tables. The code joins them by `challengeID`, preserving the official split and the row order of each outcome table. Only the official training pool determines variable retention and encoding; the same rules are then applied to test data.
 
-FFC has six outcomes. GPA, grit and material hardship are continuous; eviction, layoff and job training are binary. Each outcome is prepared in each of the three encodings described in section 2, which gives the 18 panels in [panels.yaml](../panels.yaml), named `ffc_<encoding>_<outcome>`.
+FFC has six outcomes. GPA, grit and material hardship are continuous; eviction, layoff and job training are binary. Each outcome is prepared in each of the three encodings described in section 2, which gives 18 panels in [panels.yaml](../panels.yaml), named `ffc_<encoding>_<outcome>`. GPA and material hardship are also prepared with the preprocessing of Cantrell et al., described in section 5.
 
 The steps are: identify missing values, screen variables in the training pool, determine variable types and category vocabularies, build the three representations, join the selected outcome, and validate the inputs before they go to the training engine.
 
@@ -69,8 +69,22 @@ For categories outside the training vocabulary, the code records counts and rate
 
 Coverage is checked again for each outcome. A category may occur in the official training pool only in rows missing the selected outcome. The code therefore checks coverage using training rows with an observed outcome. Uncovered categories in test rows with an observed outcome become NaN, subject to the same rate threshold. This check uses outcome availability, not outcome values, to determine category coverage.
 
-## 5. Code locations
+## 5. The preprocessing of Cantrell et al.
 
-[pipeline.py](src/ffcws_data_processor/pipeline.py) coordinates the process. [common/schema.py](src/ffcws_data_processor/common/schema.py) identifies missingness, screens variables, and defines their representations. [common/io.py](src/ffcws_data_processor/common/io.py) joins official outcome tables. [contract.py](src/ffcws_data_processor/contract.py) handles category coverage for rows with observed outcomes and generates engine input definitions.
+Cantrell et al. predicted hundreds of FFCWS outcomes with many pipelines ([predicting-life-outcomes-ffcws](https://github.com/emilycantrell/predicting-life-outcomes-ffcws)). Their preprocessing chooses predictors from the FFCWS metadata, where each variable carries a type, a survey wave, the number of cities that asked it and warnings about irregular coding. Ours chooses them from the data alone. The `cantrell_metadata` encoding applies their predictor rules to the same FFC data, to see whether the N×K curves depend on which preprocessing is used.
+
+Their rules refer to the original FFCWS names in the v09 metadata. Most Challenge columns keep those names; others match the metadata's old name, and the home-visit variables `hv3*` to `hv5*` are `p*` or `ch*` in the metadata, with the same question text. Columns that match none of these have no metadata and are left out.
+
+A variable is kept if it comes from the baseline to year 9 surveys, was asked in at least 18 cities, is not a survey weight or paradata, and has none of the metadata warnings 1, 2, 4 or 5 (misordered categories, special answers inside a continuous scale, a valid answer coded as a negative number, missing data not coded with the usual negative codes). Dollar amounts and durations whose units vary between respondents are replaced by versions converted to one unit, and about 340 scales and dates they construct from the raw items are added. Any value from −9 to −1 is missing. Variables missing in the whole training pool or with no variation there are dropped.
+
+The metadata type decides the encoding. Binary, ordered and continuous variables are used as numbers; an unordered categorical becomes one 0/1 column per level, plus one for missing. A column is dropped when fewer than 10 training-pool rows differ from its most common value. Every numeric column that has missing values gets a 0/1 column marking them, and in training all models, including XGBoost and LightGBM, receive the missing values filled with the training mean.
+
+Cantrell et al. apply the last two rules inside each cross-validation fold of about 1,700 rows. Here they use the training pool, because N goes down to a few dozen rows and a 10-row threshold inside such samples would remove most columns. Their selection of the 1 to 50 best features is not used, since K, the number of randomly sampled variables, is what the experiment varies.
+
+With these rules about twice as many variables reach the pool as with the three encodings above, many of them mostly missing, so the K grid extends further.
+
+## 6. Code locations
+
+[pipeline.py](src/ffcws_data_processor/pipeline.py) coordinates the process. [common/schema.py](src/ffcws_data_processor/common/schema.py) identifies missingness, screens variables, and defines their representations. [common/io.py](src/ffcws_data_processor/common/io.py) joins official outcome tables. [contract.py](src/ffcws_data_processor/contract.py) handles category coverage for rows with observed outcomes and generates engine input definitions. [strategies/cantrell_metadata.py](src/ffcws_data_processor/strategies/cantrell_metadata.py) implements section 5; [cantrell_scales](src/ffcws_data_processor/cantrell_scales/__init__.py) holds their scale code and the metadata files it reads.
 
 A new data version is published only after all selected input checks pass. Reports record why each variable was discarded and which test values became missing. Prepared data keep the rules in force when they were built; regenerating the inputs applies the current rules.

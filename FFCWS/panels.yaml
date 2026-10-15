@@ -1,4 +1,4 @@
-# One catalog for all 18 FFC experiments. Select one with --panel.
+# One catalog for all 20 FFC experiments. Select one with --panel.
 # Each cell fits the eight base models and combines SL7 (super_learner) from their OOF predictions.
 model_params: model_params.yaml
 preset: dev
@@ -13,7 +13,7 @@ preparation:
     background: background.dta
     train: train.csv
     test: test.csv
-  panel_pattern: 'ffc_(?P<strategy>median_mode|median_missing_indicator|tree_ordinal)_(?P<outcome>.+)'
+  panel_pattern: 'ffc_(?P<strategy>median_mode|median_missing_indicator|tree_ordinal|cantrell_metadata)_(?P<outcome>.+)'
   arguments: [--strategy, '{strategy}']
   schema: 'schema/{panel}.json'
 
@@ -135,3 +135,16 @@ panels:
     schema: schema/ffc_tree_ordinal_jobTraining.json
     outcome: jobTraining
     out: outputs/nk_grid_ffc_tree_ordinal_jobTraining.csv
+
+  # Predictor preprocessing of Cantrell et al. (predicting-life-outcomes-ffcws).
+  - <<: *ffc_panel
+    name: ffc_cantrell_metadata_gpa
+    schema: schema/ffc_cantrell_metadata_gpa.json
+    outcome: gpa
+    out: outputs/nk_grid_ffc_cantrell_metadata_gpa.csv
+
+  - <<: *ffc_panel
+    name: ffc_cantrell_metadata_materialHardship
+    schema: schema/ffc_cantrell_metadata_materialHardship.json
+    outcome: materialHardship
+    out: outputs/nk_grid_ffc_cantrell_metadata_materialHardship.csv
