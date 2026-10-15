@@ -136,6 +136,7 @@ def write_engine_schema(
     manifest_path: Path,
     manifest: pd.DataFrame,
     id_column: str,
+    imputation: dict[str, Any],
     feature_universe_stem: str | None = None,
 ) -> Path:
     schema_root.mkdir(parents=True, exist_ok=True)
@@ -179,15 +180,7 @@ def write_engine_schema(
             "definition_file": definition_path.name,
         },
         "group_column": None,
-        "imputation": {
-            "continuous": "median",
-            "ordinal": "median_snap",
-            "onehot_group": "atomic_mode",
-            "model_overrides": {
-                "lightgbm": "passthrough",
-                "xgboost": "passthrough",
-            },
-        },
+        "imputation": imputation,
         "max_train_outcome_missing_ratio": 0.5,
         "max_test_outcome_missing_ratio": 0.5,
         "continuous_priors": None,

@@ -10,6 +10,17 @@ import pandas as pd
 from .schema import FeatureDef, SharedSchema, SourceSpec
 
 
+SHARED_IMPUTATION = {
+    "continuous": "median",
+    "ordinal": "median_snap",
+    "onehot_group": "atomic_mode",
+    "model_overrides": {
+        "lightgbm": "passthrough",
+        "xgboost": "passthrough",
+    },
+}
+
+
 @dataclass
 class EncodedResult:
     strategy: str
@@ -17,6 +28,7 @@ class EncodedResult:
     feature_manifest: pd.DataFrame
     qa: dict[str, Any] = field(default_factory=dict)
     ordinal_mappings: dict[str, Any] = field(default_factory=dict)
+    imputation: dict[str, Any] = field(default_factory=lambda: SHARED_IMPUTATION)
 
 
 def source_manifest_frame(schema: SharedSchema) -> pd.DataFrame:
