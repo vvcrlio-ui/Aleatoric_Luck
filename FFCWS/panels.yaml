@@ -1,4 +1,4 @@
-# One catalog for all 20 FFC experiments. Select one with --panel.
+# One catalog for all 21 FFC experiments. Select one with --panel.
 # Each cell fits the eight base models and combines SL7 (super_learner) from their OOF predictions.
 model_params: model_params.yaml
 preset: dev
@@ -148,3 +148,9 @@ panels:
     schema: schema/ffc_cantrell_metadata_materialHardship.json
     outcome: materialHardship
     out: outputs/nk_grid_ffc_cantrell_metadata_materialHardship.csv
+
+  - <<: *ffc_panel
+    name: ffc_cantrell_metadata_grit
+    schema: schema/ffc_cantrell_metadata_grit.json
+    outcome: grit
+    out: outputs/nk_grid_ffc_cantrell_metadata_grit.csv
