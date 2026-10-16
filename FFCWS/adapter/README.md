@@ -2,7 +2,7 @@
 
 FFCWS inputs comprise a background-variable table and official train/test outcome tables. The code joins them by `challengeID`, preserving the official split and the row order of each outcome table. Only the official training pool determines variable retention and encoding; the same rules are then applied to test data.
 
-FFC has six outcomes. GPA, grit and material hardship are continuous; eviction, layoff and job training are binary. Each outcome is prepared in each of the three encodings described in section 2, which gives 18 panels in [panels.yaml](../panels.yaml), named `ffc_<encoding>_<outcome>`. GPA and material hardship are also prepared with the preprocessing of Cantrell et al., described in section 5.
+FFC has six outcomes. GPA, grit and material hardship are continuous; eviction, layoff and job training are binary. Each outcome is prepared in each of the three encodings described in section 2, which gives 18 panels in [panels.yaml](../panels.yaml), named `ffc_<encoding>_<outcome>`. GPA, grit and material hardship are also prepared with the preprocessing of Cantrell et al., described in section 5.
 
 The steps are: identify missing values, screen variables in the training pool, determine variable types and category vocabularies, build the three representations, join the selected outcome, and validate the inputs before they go to the training engine.
 
