@@ -32,10 +32,11 @@ LABELS = {"demographics": "Demographics", "economy_employment": "Economy & emplo
           "health": "Health", "attitudes_expectations": "Attitudes & expectations", "systems": "Systems",
           "parent_education_traits": "Parent education & traits"}
 METRIC_LABELS = {"r2": "R²", "pr_auc": "PR-AUC", "brier_r2": "Brier R²"}
-BLUE, ORANGE, INK, MUTED = "#2a78d6", "#eb6834", "#0b0b0b", "#52514e"
+INK = "#0b0b0b"
 # Palette and type of the project's range-bar figures (runs/mh-range-bars-20261010/plot_range_bars_2d.py).
 NAVY, TEXT, SUBTITLE, FOOT, AXIS, GRID = "#203b4c", "#39464d", "#5c6971", "#74808a", "#77818a", "#c9ced3"
 FILL, NEGATIVE = "#4a6fae", "#9b4f58"
+DEEP, LIGHT = "#2f5596", "#8fb0dd"
 CMAP = LinearSegmentedColormap.from_list(
     "diverging", list(zip([0, 0.2, 0.4, 0.5, 0.6, 0.8, 1],
                           ["#7d3c45", "#b9767d", "#e7cacc", "#ebeae8", "#b6cae7", "#6f92c8", "#2f5596"])))
@@ -92,34 +93,43 @@ def summarize(results):
 def bar_pair(ax, frame, first, second, names):
     order = frame[frame.estimator == first].sort_values("mean").domain
     y = np.arange(len(order))
-    for offset, estimator, color, name in ((0.2, first, BLUE, names[0]), (-0.2, second, ORANGE, names[1])):
+    for offset, estimator, color, name in ((0.2, first, DEEP, names[0]), (-0.2, second, LIGHT, names[1])):
         part = frame[frame.estimator == estimator].set_index("domain").loc[order]
-        ax.barh(y + offset, part["mean"], height=0.36, color=color, label=name,
-                xerr=part.se.fillna(0), error_kw={"ecolor": MUTED, "elinewidth": 1, "capsize": 2})
-    ax.axvline(0, color=MUTED, linewidth=0.8)
-    ax.set_yticks(y, [LABELS[d] for d in order], color=INK)
-    ax.grid(axis="x", color="#e4e3df", linewidth=0.6)
+        ax.barh(y + offset, part["mean"], height=0.36, color=color, label=name, edgecolor="white", linewidth=0.6,
+                xerr=part.se.fillna(0), error_kw={"ecolor": TEXT, "elinewidth": 0.9, "capsize": 2}, zorder=2)
+    ax.axvline(0, color=AXIS, linewidth=0.9, zorder=3)
+    ax.set_yticks(y, [LABELS[d] for d in order], fontsize=11, fontweight="bold", color=NAVY)
+    ax.tick_params(axis="x", labelsize=9.5, colors=TEXT)
+    ax.tick_params(axis="y", length=0)
+    ax.grid(axis="x", color="#e4e3df", linewidth=0.6, zorder=0)
     ax.set_axisbelow(True)
-    for side in ("top", "right"):
+    for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(AXIS)
 
 
 def figures(summary, out):
     out.mkdir(parents=True, exist_ok=True)
     primary = summary[summary.metric.isin(["r2", "pr_auc"])]
     for (outcome, metric), frame in summary.groupby(["outcome", "metric"]):
-        fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), sharey=False)
-        bar_pair(axes[0], frame, "paper", "shapley", ("Equal-weight mean (paper)", "Shapley"))
-        bar_pair(axes[1], frame, "alone", "last", ("Alone: v({d}) − v(∅)", "Last: v(G) − v(G∖d)"))
+        fig = plt.figure(figsize=(16, 7.6), facecolor="white")
+        axes = [fig.add_axes([0.2, 0.12, 0.29, 0.66]), fig.add_axes([0.685, 0.12, 0.29, 0.66])]
+        bar_pair(axes[0], frame, "paper", "shapley", ("Equal-weight mean (paper)", "Shapley value"))
+        bar_pair(axes[1], frame, "alone", "last", ("Alone: v({d}) − v(∅)", "Added last: v(G) − v(G∖d)"))
         seeds = int(frame.seeds.max())
-        for ax, title in zip(axes, ("Average gain over subsets", "Endpoints")):
-            ax.set_title(title, loc="left", color=INK)
-            ax.set_xlabel(f"Gain in test {METRIC_LABELS[metric]}", color=MUTED)
-            ax.legend(frameon=False, loc="lower right")
-        fig.suptitle(f"{outcome}: domain contribution to {METRIC_LABELS[metric]} (LightGBM, {seeds} seed"
-                     f"{'s' if seeds > 1 else ''}; bars ±1 SE)", x=0.01, ha="left", color=INK)
-        fig.tight_layout()
-        fig.savefig(out / f"{outcome}_{metric}.png", dpi=150)
+        for ax, title, note in zip(axes, ("Average gain over subsets", "Two ends"),
+                                   ("over all 512 subsets of the other nine domains",
+                                    "the domain on its own, and after the other nine")):
+            ax.set_title(title, loc="left", fontsize=14, fontweight="bold", color=NAVY, pad=30)
+            ax.text(0, 1.025, note, transform=ax.transAxes, fontsize=10, color=SUBTITLE)
+            ax.set_xlabel(f"Gain in test {METRIC_LABELS[metric]}", fontsize=10, color=TEXT)
+            ax.legend(frameon=False, loc="lower right", fontsize=10, labelcolor=TEXT)
+        fig.text(0.02, 0.965, f"{NAMES[outcome]}: domain contribution to test {METRIC_LABELS[metric]}",
+                 fontsize=20, fontweight="bold", color=NAVY, va="top")
+        fig.text(0.02, 0.905, f"LightGBM · {seeds} seeds × random 70/30 splits · bars are means over seeds, "
+                 "whiskers ±1 standard error across seeds", fontsize=11.5, color=SUBTITLE, va="top")
+        fig.text(0.02, 0.02, FOOTER, fontsize=9, color=FOOT)
+        fig.savefig(out / f"{outcome}_{metric}.png", dpi=200)
         plt.close(fig)
 
     heatmap(primary[primary.estimator == "paper"], out)
