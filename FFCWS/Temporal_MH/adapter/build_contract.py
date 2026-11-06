@@ -1,6 +1,6 @@
 """Author the fixed hardship feature contract and the panel catalog from ICPSR 31622.
 
-Run from the repository root: python -m FFCWS_ICPSR.adapter.build_contract ...
+Run from the repository root: python -m FFCWS.Temporal_MH.adapter.build_contract ...
 
 Run once when the source release changes. Variable selection, types and category
 levels come from the FFCWS metadata and the Stata value labels, not from row
@@ -22,7 +22,7 @@ import pandas as pd
 
 from aleatoric_nk_grid.run_panels import DEFAULTS
 
-from FFCWS_ICPSR.adapter.adapter import hardship_scores, numeric_values, onehot_values, read_columns
+from FFCWS.Temporal_MH.adapter.adapter import hardship_scores, numeric_values, onehot_values, read_columns
 
 
 DATASET_PREFIX = "ffcws_icpsr_hardship"
