@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=mh-plot-means
+#SBATCH --account=ehpc-dev-2026d08-299
+#SBATCH --qos=ehpc-dev-2026d08-299
+#SBATCH --partition=cn
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --ntasks-per-core=1
+#SBATCH --mem=2G
+#SBATCH --time=00:15:00
+#SBATCH --chdir=/valhalla/projects/ehpc-dev-2026d08-299/mh-surfaces-20260923
+#SBATCH --output=/valhalla/projects/ehpc-dev-2026d08-299/mh-surfaces-20260923/aggregate-%j.log
+set -euo pipefail
+module purge
+module load python/3/3.12/3.12.4
+export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+cd /valhalla/projects/ehpc-dev-2026d08-299/mh-surfaces-20260923
+python3 aggregate_remote.py aggregate.json
